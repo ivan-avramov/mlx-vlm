@@ -3,6 +3,7 @@ import gc
 import json
 import os
 import re
+import sys
 import time
 import traceback
 import uuid
@@ -34,16 +35,231 @@ from .generate import (
     generate,
     normalize_resize_shape,
     stream_generate,
+    PromptCacheState,
 )
+import functools
 from .prompt_utils import apply_chat_template
 from .tool_parsers import _infer_tool_parser, load_tool_module
 from .utils import load
 from .version import __version__
 from .vision_cache import VisionFeatureCache
+import logging
+
+from collections import OrderedDict
+from .turboquant import register_allocation_hook
+from .utils import sanitize_strict_json
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
 
+class MultiCacheManager:
+    def __init__(self, threshold_percent: float):
+        self.caches = OrderedDict()
+        self.threshold_percent = threshold_percent
+        self.active_session = None
+
+    def get_free_percent(self):
+        active = mx.metal.get_active_memory()
+        limit = mx.device_info().get("max_recommended_working_set_size", active * 1.5)
+        return max(0.0, ((limit - active) / limit) * 100.0)
+
+    def check_and_evict(self):
+        evicted = False
+        # Keep evicting while memory is below threshold, as long as dormant caches exist
+        while len(self.caches) > 0 and self.get_free_percent() < self.threshold_percent:
+            # Find the oldest session that is NOT the currently active session
+            oldest_session = None
+            for session_id in self.caches:
+                if session_id != self.active_session:
+                    oldest_session = session_id
+                    break
+
+            if oldest_session is None:
+                # Only the active session remains; we cannot evict it
+                break
+
+            oldest_state = self.caches.pop(oldest_session)
+            logging.info(
+                f"Multi-Cache | Critical Memory ({self.get_free_percent():.1f}% free < {self.threshold_percent}%). "
+                f"Evicting dormant session: {oldest_session}"
+            )
+
+            # Destroy references to force memory release
+            oldest_state.cache = None
+            oldest_state.token_ids = None
+            del oldest_state
+            evicted = True
+
+        if evicted:
+            mx.metal.clear_cache()
+            gc.collect()
+
+    def get_or_create(self, session_id):
+        self.active_session = session_id
+        if session_id in self.caches:
+            state = self.caches.pop(session_id)
+            self.caches[session_id] = state  # Move to MRU position
+            logging.info(f"Multi-Cache | Resuming session: {session_id}")
+        else:
+            state = PromptCacheState()
+            self.caches[session_id] = state
+            logging.info(f"Multi-Cache | New session allocated: {session_id}")
+
+        # Check memory immediately upon assignment
+        self.check_and_evict()
+        return state
+
+def _resolve_tool_calls(text: str, tool_parser_type=None, tool_module=None, tools=None):
+    if tool_parser_type is None or tool_module is None:
+        return {"calls": [], "remaining_text": text}
+
+    # 1. Let the native MLX parser do the heavy lifting
+    tool_calls = process_tool_calls(
+        model_output=text,
+        tool_module=tool_module,
+        tools=tools,
+    )
+
+    # 2. Enforce OpenAI API / OpenWebUI Schema Strictness
+    if tool_calls and "calls" in tool_calls:
+        for call in tool_calls["calls"]:
+            # Add missing mandatory fields
+            if "id" not in call:
+                call["id"] = f"call_{uuid.uuid4().hex[:8]}"
+            if "type" not in call:
+                call["type"] = "function"
+
+            # Stringify the arguments dict (OpenWebUI expects a string, not a dict)
+            func_data = call.get("function", {})
+            if "arguments" in func_data and isinstance(func_data["arguments"], dict):
+                func_data["arguments"] = json.dumps(func_data["arguments"])
+
+    return tool_calls
+
+
+class StreamingTranslator:
+    """Consumptive buffer for reliable translation of stream tags using stateful boundary detection."""
+
+    def __init__(self):
+        self.buffer = ""
+        self.in_thought = False
+        self.is_beginning = True
+
+    def translate(self, text: str):
+        while True:
+            open_match = re.search(r"<\|channel>\s*thought[\s\n]*", text, flags=re.IGNORECASE)
+            close_match = re.search(r"<channel\|>", text, flags=re.IGNORECASE)
+
+            hallucinated_open = None
+            if not self.in_thought:
+                hallucinated_open = re.search(r"(?:^|\n)\s*(?:\**thought\**\s*[:\n]|\**thinking\**\s*[:\n])", text, flags=re.IGNORECASE)
+
+            open_idx = open_match.start() if open_match else float("inf")
+            close_idx = close_match.start() if close_match else float("inf")
+            hallucinated_idx = hallucinated_open.start() if hallucinated_open else float("inf")
+
+            if open_idx == float("inf") and close_idx == float("inf") and hallucinated_idx == float("inf"):
+                break
+
+            min_idx = min(open_idx, close_idx, hallucinated_idx)
+
+            if min_idx == open_idx:
+                text = text[:open_idx] + "<think>\n" + text[open_match.end() :]
+                self.in_thought = True
+            elif min_idx == hallucinated_idx:
+                idx = hallucinated_open.start()
+                match_str = text[idx:hallucinated_open.end()]
+                prefix = text[:idx]
+                if match_str.startswith('\n'):
+                    text = prefix + "\n<think>\n" + text[hallucinated_open.end() :]
+                else:
+                    text = prefix + "<think>\n" + text[hallucinated_open.end() :]
+                self.in_thought = True
+            else:
+                if self.in_thought:
+                    text = text[:close_idx] + "\n</think>\n" + text[close_match.end() :]
+                    self.in_thought = False
+                else:
+                    text = text[:close_idx] + text[close_match.end() :]
+
+        return text
+
+    def feed(self, text: str):
+        self.buffer += text
+
+        # Guard at the very beginning of the stream
+        if self.is_beginning:
+            self.buffer = re.sub(r"^\s*(?:response|answer)\s*[:\.]\s*[\r\n]*", "", self.buffer, flags=re.IGNORECASE)
+            self.buffer = re.sub(r"^\s*(?:[a-zA-Z0-9/_'-]+\s*){1,2}[\.\:]\s*[\r\n]+", "", self.buffer)
+
+            # Un-fuse missing spaces on the very first word of the generation
+            self.buffer = re.sub(
+                r"\b(This|The|Here|There)(is|provided|search|user|context|results|model)\b",
+                r"\1 \2",
+                self.buffer,
+                flags=re.IGNORECASE,
+            )
+
+        self.buffer = self.translate(self.buffer)
+
+        # 15-character delay prevents splitting words before the regex can catch them
+        split_idx = max(0, len(self.buffer) - 15)
+
+        last_open = self.buffer.rfind("<")
+        last_close = self.buffer.rfind(">")
+        if last_open != -1 and last_open > last_close:
+            split_idx = min(split_idx, last_open)
+
+        channel_idx = self.buffer.rfind("<|channel>")
+        if channel_idx != -1:
+            split_idx = min(split_idx, channel_idx)
+
+        chunk = self.buffer[:split_idx]
+        self.buffer = self.buffer[split_idx:]
+
+        if chunk.strip() and not chunk.endswith("<think>\n"):
+            self.is_beginning = False
+
+        return chunk
+
+    def pre_tool_flush(self):
+        self.buffer = self.translate(self.buffer)
+        split_idx = self.buffer.find("<|tool_call>")
+        if split_idx != -1:
+            chunk = self.buffer[:split_idx]
+
+            has_close_tag = "</think>" in chunk
+
+            if has_close_tag:
+                tag_idx = chunk.find("</think>") + len("</think>")
+                pre_tag = chunk[:tag_idx]
+                post_tag = chunk[tag_idx:]
+
+                if len(post_tag.strip()) < 60:
+                    chunk = pre_tag + "\n"
+                else:
+                    chunk = pre_tag + re.sub(r"\s*[\w\./\\]+[\.\:]?\s*$", "\n", post_tag)
+            else:
+                if len(chunk.strip()) < 60:
+                    chunk = ""
+                else:
+                    chunk = re.sub(r"\s*[\w\./\\]+[\.\:]?\s*$", "\n", chunk)
+
+            if self.in_thought:
+                chunk += "\n</think>\n"
+                self.in_thought = False
+
+            self.buffer = self.buffer[split_idx:]
+            return chunk
+        return ""
+
+    def flush(self):
+        chunk = self.translate(self.buffer)
+        if self.in_thought:
+            chunk += "\n</think>\n"
+            self.in_thought = False
+        self.buffer = ""
+        return chunk
 
 def get_prefill_step_size():
     return int(os.environ.get("PREFILL_STEP_SIZE", DEFAULT_PREFILL_STEP_SIZE))
@@ -77,7 +293,6 @@ def get_max_kv_size(model: str):
         print(
             f"Model {model} uses QuantizedKVCache cache, can't set max KV size, use --kv-bits [bits] instead."
         )
-        return None
     return max_kv_tokens
 
 
@@ -186,6 +401,7 @@ def get_cached_model(model_path: str, adapter_path: Optional[str] = None):
         "processor": processor,
         "config": config,
         "vision_cache": VisionFeatureCache(),
+        "multi_cache_manager": None, # lazy initialization to perform registration of allocation hook only when a model is loaded
     }
 
     return model, processor, config
@@ -298,7 +514,9 @@ class ChatMessage(FlexibleBaseModel):
             ResponseOutputMessageContentList,
         ]
     ] = Field(None, description="Content of the message.")
-    tool_calls: List = []
+    tool_calls: Optional[List] = None
+    tool_call_id: Optional[str] = None
+    name: Optional[str] = None
 
 
 class GenerationParams(FlexibleBaseModel):
@@ -563,6 +781,8 @@ class VLMRequest(GenerationParams, TemplateParams):
         None,
         description="Resize shape for the image. Provide one integer for a square resize or two integers for (height, width).",
     )
+    user: Optional[str] = Field(None, description="OpenAI standard user/session identifier.")
+    session_id: Optional[str] = Field(None, description="Custom session identifier.")
 
     @field_validator("resize_shape", mode="before")
     @classmethod
@@ -602,6 +822,7 @@ class UsageStats(OpenAIUsage):
 
 class ChatRequest(GenerationRequest):
     messages: List[ChatMessage]
+    tools: Optional[List[Any]] = None
 
 
 class ChatChoice(BaseModel):
@@ -909,22 +1130,28 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                     )
 
                     full_text = ""
+                    translator = StreamingTranslator()
+                    usage_stats = {"input_tokens": 0, "output_tokens": 0}
+
                     for chunk in token_iterator:
                         if chunk is None or not hasattr(chunk, "text"):
                             continue
 
-                        delta = chunk.text
-                        full_text += delta
-
+                        delta = translator.feed(chunk.text)
                         usage_stats = {
                             "input_tokens": chunk.prompt_tokens,
                             "output_tokens": chunk.generation_tokens,
                         }
 
-                        # Send response.output_text.delta event
-                        yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
+                        if delta:
+                            full_text += delta
+                            yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
 
-                    # Send response.output_text.done event (to match the openai pipeline)
+                    final_delta = translator.flush()
+                    if final_delta:
+                        full_text += final_delta
+                        yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=final_delta).model_dump_json()}\n\n"
+
                     yield f"event: response.output_text.done\ndata: {ResponseOutputTextDoneEvent(type='response.output_text.done', item_id=message_id, output_index=0, content_index=0, text=full_text).model_dump_json()}\n\n"
 
                     # Send response.content_part.done event (to match the openai pipeline)
@@ -956,6 +1183,7 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                             },
                         }
                     )
+                    logging.info(f"Responses Stream Usage: {json.dumps(completed_response.usage)}")
                     yield f"event: response.completed\ndata: {ResponseCompletedEvent(type='response.completed', response=completed_response).model_dump_json()}\n\n"
 
                 except Exception as e:
@@ -1066,56 +1294,170 @@ async def chat_completions_endpoint(request: ChatRequest):
         images = []
         audio = []
         processed_messages = []
+
         for message in request.messages:
+            msg_dict = {"role": message.role}
+
+            if hasattr(message, "tool_calls") and message.tool_calls:
+                parsed_tool_calls = []
+                for tc in message.tool_calls:
+                    tc_dict = tc.model_dump() if hasattr(tc, "model_dump") else dict(tc)
+                    if "function" in tc_dict and isinstance(
+                        tc_dict["function"].get("arguments"), str
+                    ):
+                        try:
+                            tc_dict["function"]["arguments"] = json.loads(
+                                tc_dict["function"]["arguments"]
+                            )
+                        except Exception as e:
+                            logging.error(
+                                f"Failed to parse tool arguments to dict: {e}"
+                            )
+                    parsed_tool_calls.append(tc_dict)
+                msg_dict["tool_calls"] = parsed_tool_calls
+
+            if hasattr(message, "tool_call_id") and message.tool_call_id:
+                msg_dict["tool_call_id"] = message.tool_call_id
+            if hasattr(message, "name") and message.name:
+                msg_dict["name"] = message.name
+            logging.debug(f"msg:({message.content})")
             if message.content is None:
-                processed_messages.append({"role": message.role, "content": ""})
+                msg_dict["content"] = ""
             elif isinstance(message.content, str):
-                processed_messages.append(
-                    {"role": message.role, "content": message.content}
-                )
+                content = message.content
+                if message.role == "assistant":
+                    # Strip OpenWebUI thought blocks entirely to prevent token fragmentation
+                    content = re.sub(r"<think>.*?</think>\n*", "", content, flags=re.DOTALL)
+                msg_dict["content"] = content.strip()
+
             elif isinstance(message.content, list):
-                text_content = ""
+                new_content = []
                 for item in message.content:
                     if isinstance(item, dict):
-                        # Only extract images/audio from user messages
-                        if message.role == "user":
-                            if item["type"] == "input_image":
-                                images = [item["image_url"]]
-                            elif item["type"] == "image_url":
-                                images = [item["image_url"]["url"]]
-                            elif item["type"] == "input_audio":
-                                audio.append(item["input_audio"]["data"])
-                        if item["type"] in ("text", "input_text"):
-                            text_content = item.get("text", "")
-                processed_messages.append(
-                    {"role": message.role, "content": text_content}
-                )
+                        if item["type"] == "input_image":
+                            images.append(item["image_url"])
+                            # CRITICAL: Rename to standard HF schema so the Jinja template renders the token
+                            new_content.append({"type": "image"})
+                        elif item["type"] == "image_url":
+                            if isinstance(item["image_url"], dict):
+                                images.append(item["image_url"]["url"])
+                            else:
+                                images.append(item["image_url"])
+                            # CRITICAL: Rename to standard HF schema so the Jinja template renders the token
+                            new_content.append({"type": "image"})
+                        elif item["type"] == "input_audio":
+                            audio.append(item["input_audio"]["data"])
+                            new_content.append({"type": "audio"})
+                        elif item["type"] in ("text", "input_text"):
+                            text_val = item.get("text", "")
+                            if message.role == "assistant":
+                                # Strip thought blocks from multimodal history
+                                text_val = re.sub(r"<think>.*?</think>\n*", "", text_val, flags=re.DOTALL)
+                            if text_val.strip():
+                                new_content.append(
+                                    {"type": "text", "text": text_val.strip()}
+                                )
+
+                if len(new_content) == 1 and new_content[0].get("type") == "text":
+                    msg_dict["content"] = new_content[0]["text"]
+                elif len(new_content) == 0:
+                    msg_dict["content"] = ""
+                else:
+                    msg_dict["content"] = new_content
+
+            processed_messages.append(msg_dict)
+
+        # --- GHOST PROMPT MATH GUARD ---
+        math_guard = "Enclose inline math in \\( and \\). Enclose display math in \\[ and \\] on their own lines."
+        has_system_prompt = False
+
+        for msg in processed_messages:
+            if msg.get("role") == "system":
+                # Ensure content is a string before appending (handles multimodal lists)
+                if isinstance(msg["content"], str):
+                    msg["content"] += f"\n{math_guard}"
+                elif isinstance(msg["content"], list):
+                    msg["content"].append({"type": "text", "text": f"\n{math_guard}"})
+                has_system_prompt = True
+                break
+
+        if not has_system_prompt:
+            processed_messages.insert(0, {"role": "system", "content": math_guard})
 
         tools = None
-        if hasattr(request, "tools"):
+        if hasattr(request, "tools") and request.tools:
             tools = request.tools
 
         tool_parser_type = None
+        tool_module = None
         tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
-        if hasattr(tokenizer, "chat_template"):
-            tool_parser_type = _infer_tool_parser(tokenizer.chat_template)
+
+        chat_template = getattr(tokenizer, "chat_template", None)
+
+        if chat_template is None and hasattr(tokenizer, "default_chat_template"):
+            chat_template = tokenizer.default_chat_template
+
+        if chat_template is not None:
+            tokenizer.chat_template = chat_template
+
+            tool_parser_type = _infer_tool_parser(chat_template)
             if tool_parser_type is not None:
                 tool_module = load_tool_module(tool_parser_type)
+
         template_kwargs = request.template_kwargs()
-        formatted_prompt = apply_chat_template(
-            processor,
-            config,
-            processed_messages,
-            num_images=len(images),
-            num_audios=len(audio),
-            tools=tools,
-            **template_kwargs,
-        )
+
+        try:
+            formatted_prompt = tokenizer.apply_chat_template(
+                processed_messages,
+                tools=tools,
+                tokenize=False,
+                add_generation_prompt=True,
+                **template_kwargs,
+            )
+        except Exception as e:
+            logging.error(f"Native template failed, falling back: {e}")
+            formatted_prompt = apply_chat_template(
+                processor,
+                config,
+                processed_messages,
+                num_images=len(images),
+                num_audios=len(audio),
+                tools=tools,
+                **template_kwargs,
+            )
+
+        # --- LRU MULTI-CACHE MANAGER ---
+        # 1. Extract or generate the session fingerprint
+        current_session_id = request.session_id or request.user
+
+        # Fallback: Hash the root message or generate a transient ID
+        if not current_session_id:
+            if len(request.messages) > 0:
+                root_content = request.messages[0].content
+                if isinstance(root_content, list):
+                    # Handle multimodal root messages
+                    root_content = str([item.get("text", "") for item in root_content if isinstance(item, dict)])
+                current_session_id = str(hash(str(root_content)))
+            else:
+                current_session_id = f"transient_{uuid.uuid4().hex[:8]}"
+
+        # Lazily initialize the manager and register the hook
+        if model_cache.get("multi_cache_manager") is None:
+            min_free = float(os.environ.get("LRU_MIN_FREE_RAM_PERCENT", "10.0"))
+            manager = MultiCacheManager(min_free)
+            register_allocation_hook(manager.check_and_evict)
+            model_cache["multi_cache_manager"] = manager
+
+        # Universal cache application (for both stream and non-stream)
         generation_kwargs = build_generation_kwargs(request, template_kwargs)
+        manager = model_cache["multi_cache_manager"]
+        generation_kwargs["prompt_cache_state"] = manager.get_or_create(current_session_id)
 
         if request.stream:
+            # Main chat interactions use streaming. Link the global state-aware cache.
+
             # Streaming response
             async def stream_generator():
                 token_iterator = None
@@ -1131,14 +1473,26 @@ async def chat_completions_endpoint(request: ChatRequest):
                         **generation_kwargs,
                     )
 
-                    output_text = ""
+                    full_output_text = ""
                     request_id = f"chatcmpl-{uuid.uuid4()}"
+                    is_tool_call_sequence = False
+                    translator = StreamingTranslator()
+
+                    usage_stats = {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "total_tokens": 0,
+                        "prompt_tps": 0.0,
+                        "generation_tps": 0.0,
+                        "peak_memory": 0.0,
+                    }
+
                     for chunk in token_iterator:
                         if chunk is None or not hasattr(chunk, "text"):
-                            print("Warning: Received unexpected chunk format:", chunk)
+                            logging.warning("Warning: Received unexpected chunk format: '{chunk}'")
                             continue
 
-                        output_text += chunk.text
+                        full_output_text += chunk.text
 
                         # Yield chunks in Server-Sent Events (SSE) format
                         usage_stats = {
@@ -1151,39 +1505,77 @@ async def chat_completions_endpoint(request: ChatRequest):
                             "peak_memory": chunk.peak_memory,
                         }
 
-                        choices = [
-                            ChatStreamChoice(
-                                delta=ChatMessage(role="assistant", content=chunk.text)
+                        if not is_tool_call_sequence:
+                            if "<|tool_call>" in translator.buffer + chunk.text:
+                                translator.buffer += chunk.text
+                                delta = translator.pre_tool_flush()
+                                is_tool_call_sequence = True
+                            else:
+                                delta = translator.feed(chunk.text)
+
+                            if delta:
+                                choices = [
+                                    ChatStreamChoice(
+                                        delta=ChatMessage(
+                                            role="assistant", content=delta
+                                        )
+                                    )
+                                ]
+                                chunk_data = ChatStreamChunk(
+                                    id=request_id,
+                                    created=int(time.time()),
+                                    model=request.model,
+                                    usage=usage_stats,
+                                    choices=choices,
+                                )
+                                logging.debug(f"DEBUG STREAMING DELTA: {chunk_data}")
+                                yield f"data: {chunk_data.model_dump_json()}\n\n"
+                        else:
+                            translator.buffer += chunk.text
+
+                    if not is_tool_call_sequence:
+                        final_delta = translator.flush()
+                        if final_delta:
+                            choices = [
+                                ChatStreamChoice(
+                                    delta=ChatMessage(
+                                        role="assistant", content=final_delta
+                                    )
+                                )
+                            ]
+                            chunk_data = ChatStreamChunk(
+                                id=request_id,
+                                created=int(time.time()),
+                                model=request.model,
+                                usage=usage_stats,
+                                choices=choices,
                             )
-                        ]
-                        chunk_data = ChatStreamChunk(
-                            id=request_id,
-                            created=int(time.time()),
-                            model=request.model,
-                            usage=usage_stats,
-                            choices=choices,
-                        )
+                            logging.debug(f"DEBUG STREAMING FINAL DELTA: {chunk_data}")
+                            yield f"data: {chunk_data.model_dump_json()}\n\n"
 
-                        yield f"data: {chunk_data.model_dump_json()}\n\n"
+                    tool_calls = _resolve_tool_calls(
+                        full_output_text, tool_parser_type, tool_module, tools
+                    )
+                    has_tools = len(tool_calls.get("calls", [])) > 0
 
-                    if tool_parser_type is not None:
-                        tool_calls = process_tool_calls(
-                            model_output=output_text,
-                            tool_module=tool_module,
-                            tools=tools,
-                        )
+                    if has_tools:
+                        final_content = None
                     else:
-                        tool_calls = {}
-                        tool_calls["calls"] = []
+                        # Rescue the buffered text if the model started a tool sequence but failed to write valid JSON
+                        if is_tool_call_sequence:
+                            final_content = StreamingTranslator().translate(tool_calls["remaining_text"])
+                        else:
+                            final_content = ""
 
-                    # Signal stream end
                     choices = [
                         ChatStreamChoice(
-                            finish_reason="stop",
+                            finish_reason="tool_calls" if has_tools else "stop",
                             delta=ChatMessage(
                                 role="assistant",
-                                content="",
-                                tool_calls=tool_calls["calls"],
+                                content=final_content,
+                                tool_calls=(
+                                    tool_calls.get("calls") if has_tools else None
+                                ),
                             ),
                         )
                     ]
@@ -1195,12 +1587,14 @@ async def chat_completions_endpoint(request: ChatRequest):
                         usage=usage_stats,
                         choices=choices,
                     )
-                    yield f"data: {chunk_data.model_dump_json()}\n\n"
+                    logging.debug(f"DEBUG STREAMING CONTENT post token iterator: {chunk_data}")
 
+                    yield f"data: {chunk_data.model_dump_json()}\n\n"
+                    logging.info(f"Chat Stream Usage: {json.dumps(usage_stats)}")
                     yield "data: [DONE]\n\n"
 
                 except Exception as e:
-                    print(f"Error during stream generation: {e}")
+                    logging.error(f"Error during stream generation: {e}")
                     traceback.print_exc()
                     error_data = json.dumps({"error": str(e)})
                     yield f"data: {error_data}\n\n"
@@ -1208,7 +1602,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                 finally:
                     mx.clear_cache()
                     gc.collect()
-                    print("Stream finished, cleared cache.")
+                    logging.debug("Stream finished, cleared cache.")
 
             return StreamingResponse(
                 stream_generator(),
@@ -1237,7 +1631,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                 # Clean up resources
                 mx.clear_cache()
                 gc.collect()
-                print("Generation finished, cleared cache.")
+                logging.debug("Generation finished, cleared cache.")
 
                 usage_stats = UsageStats(
                     input_tokens=gen_result.prompt_tokens,
@@ -1247,25 +1641,28 @@ async def chat_completions_endpoint(request: ChatRequest):
                     generation_tps=gen_result.generation_tps,
                     peak_memory=gen_result.peak_memory,
                 )
+                logging.info(f"Chat Completion Usage: {usage_stats.model_dump_json()}")
+                tool_calls = _resolve_tool_calls(
+                    gen_result.text, tool_parser_type, tool_module, tools
+                )
+                has_tools = len(tool_calls.get("calls", [])) > 0
 
-                if tool_parser_type is not None:
-                    tool_calls = process_tool_calls(
-                        model_output=gen_result.text,
-                        tool_module=tool_module,
-                        tools=tools,
-                    )
+                if not has_tools:
+                    translator = StreamingTranslator()
+                    processed_chunk = translator.feed(tool_calls["remaining_text"])
+                    final_content = processed_chunk + translator.flush()
                 else:
-                    tool_calls = {}
-                    tool_calls["calls"] = []
-                    tool_calls["remaining_text"] = gen_result.text
+                    final_content = None
+
+                final_content = sanitize_strict_json(final_content) if final_content else None
 
                 choices = [
                     ChatChoice(
-                        finish_reason="stop",
+                        finish_reason="tool_calls" if has_tools else "stop",
                         message=ChatMessage(
                             role="assistant",
-                            content=tool_calls["remaining_text"],
-                            tool_calls=tool_calls["calls"],
+                            content=final_content,
+                            tool_calls=tool_calls.get("calls") if has_tools else None,
                         ),
                     )
                 ]
@@ -1273,11 +1670,11 @@ async def chat_completions_endpoint(request: ChatRequest):
                 result = ChatResponse(
                     model=request.model, usage=usage_stats, choices=choices
                 )
-
+                logging.debug(f"DEBUG FINAL CONTENT: {result}")
                 return result
 
             except Exception as e:
-                print(f"Error during generation: {e}")
+                logging.error(f"Error during generation: {e}")
                 traceback.print_exc()
                 mx.clear_cache()
                 gc.collect()
@@ -1285,10 +1682,11 @@ async def chat_completions_endpoint(request: ChatRequest):
 
     except HTTPException as http_exc:
         # Re-raise HTTP exceptions (like model loading failure)
+        logging.error(f"HTTPException error in /generate endpoint: {http_exc}")
         raise http_exc
     except Exception as e:
         # Catch unexpected errors
-        print(f"Unexpected error in /generate endpoint: {e}")
+        logging.error(f"Unexpected error in /generate endpoint: {e}")
         traceback.print_exc()
         mx.clear_cache()
         gc.collect()
@@ -1441,6 +1839,26 @@ def main():
         "WARNING: watches the entire working directory — can cause excessive memory "
         "usage with large models in repos with frequent file changes.",
     )
+    parser.add_argument(
+        "--lru-min-free-ram-percent",
+        type=float,
+        default=10.0,
+        help="Minimum free system memory percentage before LRU eviction of multi-caches (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--log-file",
+        type=str,
+        default="log_file",
+        help="File to write logs to.",
+    )
+    parser.add_argument(
+        '--log-level',
+        type=str,
+        default='INFO',
+        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
+        help='Set the logging level (default: INFO)',
+    )
+
     args = parser.parse_args()
     if args.trust_remote_code:
         os.environ["MLX_TRUST_REMOTE_CODE"] = "true"
@@ -1454,7 +1872,24 @@ def main():
     os.environ["KV_QUANT_SCHEME"] = args.kv_quant_scheme
     os.environ["MAX_KV_SIZE"] = str(args.max_kv_size)
     os.environ["QUANTIZED_KV_START"] = str(args.quantized_kv_start)
+    os.environ["LRU_MIN_FREE_RAM_PERCENT"] = str(args.lru_min_free_ram_percent)
 
+    if args.log_file != "<stdout>":
+        logging.basicConfig(
+            level=args.log_level,
+            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            filename=args.log_file,
+            filemode='a'
+        )
+    else:
+        logging.basicConfig(
+            level=args.log_level,
+            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            stream=sys.stdout
+        )
+
+    logging.info(f"args: {args}")
+    logging.info(f"environment: {os.environ}")
     uvicorn.run(
         "mlx_vlm.server:app",
         host=args.host,

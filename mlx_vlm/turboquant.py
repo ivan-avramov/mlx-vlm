@@ -7,6 +7,17 @@ from typing import NamedTuple, Optional
 import mlx.core as mx
 import numpy as np
 from mlx_lm.models.cache import _BaseCache, create_attention_mask
+import logging
+
+_ALLOCATION_HOOKS = []
+
+def register_allocation_hook(hook):
+    if hook not in _ALLOCATION_HOOKS:
+        _ALLOCATION_HOOKS.append(hook)
+
+def _trigger_allocation_hooks():
+    for hook in _ALLOCATION_HOOKS:
+        hook()
 
 DEFAULT_TURBOQUANT_SEED = 0
 _EPS = 1e-6
@@ -1777,6 +1788,62 @@ def _multi_query_prod_score_kernel(
         """,
     )
 
+@lru_cache(maxsize=None)
+def _multi_query_mse_score_kernel(
+    key_mse_bits: int, repeat_count: int, num_queries: int, dims_per_lane: int
+):
+    if not _metal_available() or repeat_count < 1 or num_queries < 1:
+        return None
+
+    mse_mask = (1 << key_mse_bits) - 1
+
+    return mx.fast.metal_kernel(
+        name=f"mq_mse_score_{key_mse_bits}_r{repeat_count}_l{num_queries}",
+        input_names=[
+            "q_rot",
+            "key_norms",
+            "key_mse",
+            "key_codebook",
+        ],
+        output_names=["out"],
+        source=f"""
+            auto lane = thread_position_in_grid.x;
+            auto ri = thread_position_in_grid.y;
+            auto n = thread_position_in_grid.z;
+            auto tc = key_norms_shape[2];
+            auto kh = key_norms_shape[1];
+            auto b = n / (kh * tc);
+            auto rem = n % (kh * tc);
+            auto h = rem / tc;
+            auto t = rem % tc;
+            if (ri >= {repeat_count}) return;
+
+            auto mt = key_mse + ((b*kh+h)*tc+t) * KMsePackedWidth;
+            float kn = static_cast<float>(key_norms[(b*kh+h)*tc+t]);
+
+            // Unpack key ONCE (No signs/residuals overhead)
+            float kc[{dims_per_lane}];
+            for (int i=0, d=lane; d < Dim; i++, d+=32) {{
+                int bo = d * {key_mse_bits};
+                uint idx = (mt[bo>>5] >> (bo&31));
+                if (((bo&31)+{key_mse_bits}) > 32) idx |= mt[(bo>>5)+1] << ({key_mse_bits} - ((bo&31)+{key_mse_bits}-32));
+                idx &= {mse_mask}u;
+                kc[i] = key_codebook[idx];
+            }}
+
+            // Loop over L queries
+            auto bq = (b*kh+h) * {repeat_count} + ri;
+            for (int l = 0; l < {num_queries}; l++) {{
+                float ps = 0.0f;
+                for (int i=0, d=lane; d < Dim; i++, d+=32) {{
+                    ps += kn * static_cast<float>(q_rot[(bq*{num_queries}+l)*Dim+d]) * kc[i];
+                }}
+                float s = simd_sum(ps);
+                if (lane == 0)
+                    out[((b*kh+h)*{repeat_count}+ri)*{num_queries}*tc + l*tc + t] = s;
+            }}
+        """,
+    )
 
 @lru_cache(maxsize=None)
 def _single_tile_value_weighted_sum_kernel(
@@ -4013,8 +4080,19 @@ def _reserve_state_capacity(state, used: int, needed: int, step: int):
     capacity = _state_length(state)
     if capacity >= needed:
         return state
-    # Round up to next step boundary — avoids 2x growth spikes
-    new_capacity = ((needed + step - 1) // step) * step
+
+    # Calculate arithmetic step growth
+    step_capacity = ((needed + step - 1) // step) * step
+
+    # Calculate geometric 1.25x growth (prevents O(N^2) reallocation thrashing at large contexts)
+    geometric_capacity = int(capacity * 1.25)
+
+    # Use whichever is larger to scale aggressively when the cache gets huge
+    new_capacity = max(step_capacity, geometric_capacity)
+    logging.debug(f"Reallocating old:{capacity}, new:{new_capacity}")
+
+    _trigger_allocation_hooks()
+
     grown = _allocate_state_like(state, new_capacity)
     if used > 0:
         _write_state(grown, _slice_state(state, used), 0)
@@ -4824,9 +4902,10 @@ class TurboQuantKVCache(_BaseCache):
     prefill_query_block_size = 16
     cache_step = 256
 
-    def __init__(self, bits: float, seed: int = DEFAULT_TURBOQUANT_SEED):
+    def __init__(self, bits: float, seed: int = DEFAULT_TURBOQUANT_SEED, max_kv_size: Optional[int] = None):
         self.bits = _validate_bits(bits)
         self.seed = seed
+        self.max_kv_size = max_kv_size
         self.offset = 0
         self.keys = None
         self.values = None
@@ -4839,9 +4918,9 @@ class TurboQuantKVCache(_BaseCache):
 
     @classmethod
     def from_cache(
-        cls, cache, bits: float, seed: int = DEFAULT_TURBOQUANT_SEED
+        cls, cache, bits: float, seed: int = DEFAULT_TURBOQUANT_SEED, max_kv_size: Optional[int] = None
     ) -> "TurboQuantKVCache":
-        turbo_cache = cls(bits=bits, seed=seed)
+        turbo_cache = cls(bits=bits, seed=seed, max_kv_size=max_kv_size)
         keys, values = cache.state
         if keys is not None:
             turbo_cache.update_and_fetch(keys, values)
@@ -4932,8 +5011,10 @@ class TurboQuantKVCache(_BaseCache):
 
         new_end = self.offset + keys.shape[2]
         if self.keys is None:
-            self.keys = _allocate_state_like(new_keys, new_end)
-            self.values = _allocate_state_like(new_values, new_end)
+            _trigger_allocation_hooks()
+            initial_alloc = max(new_end, self.max_kv_size) if self.max_kv_size is not None else new_end
+            self.keys = _allocate_state_like(new_keys, initial_alloc)
+            self.values = _allocate_state_like(new_values, initial_alloc)
         else:
             self.keys = _reserve_state_capacity(
                 self.keys, self.offset, new_end, self.cache_step
@@ -5114,10 +5195,18 @@ class TurboQuantKVCache(_BaseCache):
         keys_state = self._unwrap(keys_state)
         values_state = self._unwrap(values_state)
 
+        is_prod_key = isinstance(self.key_codec, _TurboQuantProdCodec)
+        is_mse_key = isinstance(self.key_codec, _TurboQuantMSECodec)
+
+        # 1. Strict State Guard
+        # Ensure that if we have a Prod codec, we have a Prod state. If MSE codec, MSE state.
+        if is_prod_key and not isinstance(keys_state, TurboQuantProdState):
+            return None
+        if is_mse_key and not isinstance(keys_state, TurboQuantMSEState):
+            return None
         if not (
-            isinstance(self.key_codec, _TurboQuantProdCodec)
+            (is_prod_key or is_mse_key)
             and isinstance(self.value_codec, _TurboQuantMSECodec)
-            and isinstance(keys_state, TurboQuantProdState)
             and isinstance(values_state, TurboQuantMSEState)
         ):
             return None
@@ -5126,6 +5215,25 @@ class TurboQuantKVCache(_BaseCache):
         n_kv_heads = keys_state.norms.shape[1]
         n_repeats = n_q_heads // n_kv_heads
         T = keys_state.norms.shape[2]
+
+        # 2. Telemetry & Hardware Limit Guard
+        if T > 0:
+            # Predict the FP32 intermediate activation tensors (scores + weights)
+            bytes_per_element = 4
+            elements = B * n_q_heads * L * T
+            projected_bytes = (elements * bytes_per_element) * 2
+
+            active_mem = mx.metal.get_active_memory()
+            peak_mem = mx.metal.get_peak_memory()
+            device_limit = mx.device_info().get("max_recommended_working_set_size", 0)
+
+            logging.debug(
+                f"Prefill Telemetry - T: {T}, L: {L} | "
+                f"Projected Activations: {projected_bytes / 1e9:.3f} GB | "
+                f"Active VRAM: {active_mem / 1e9:.3f} GB | "
+                f"Peak VRAM: {peak_mem / 1e9:.3f} GB | "
+                f"Device Limit: {device_limit / 1e9:.3f} GB"
+            )
 
         if T == 0:
             return None  # empty cache, let fallback handle it
@@ -5141,42 +5249,72 @@ class TurboQuantKVCache(_BaseCache):
         if val_kernel is None:
             return None
 
-        # Multi-query score: unpack key ONCE per token, loop over L queries
-        mq_score = _multi_query_prod_score_kernel(
-            self.key_codec.mse_codec.bits,
-            n_repeats,
-            L,
-            dims_per_lane,
-        )
-        if mq_score is None:
-            return None
-
         grouped = (queries * scale).reshape(B, n_kv_heads, n_repeats, L, D)
-        qt = mx.matmul(grouped, self.key_codec.query_transform_t)
-        q_rot = qt[..., :D].reshape(B * n_kv_heads * n_repeats, L, D)
-        q_proj = qt[..., D:].reshape(B * n_kv_heads * n_repeats, L, D)
 
-        scores = mq_score(
-            inputs=[
-                q_rot,
-                q_proj,
-                keys_state.norms,
-                keys_state.mse_indices,
-                keys_state.residual_norms,
-                keys_state.qjl_signs,
-                self.key_codec.mse_codec.codebook,
-                self.key_codec.scale_array,
-            ],
-            template=[
-                ("Dim", D),
-                ("KMsePackedWidth", keys_state.mse_indices.shape[-1]),
-                ("KSignPackedWidth", keys_state.qjl_signs.shape[-1]),
-            ],
-            grid=(32, n_repeats, B * n_kv_heads * T),
-            threadgroup=(32, 1, 1),
-            output_shapes=[(B * n_kv_heads * n_repeats, L, T)],
-            output_dtypes=[mx.float32],
-        )[0]
+        # 3. Router: Execute Prod vs MSE Key Math
+        if is_prod_key:
+            mq_score = _multi_query_prod_score_kernel(
+                self.key_codec.mse_codec.bits,
+                n_repeats,
+                L,
+                dims_per_lane,
+            )
+            if mq_score is None: return None
+
+            qt = mx.matmul(grouped, self.key_codec.query_transform_t)
+            q_rot = qt[..., :D].reshape(B * n_kv_heads * n_repeats, L, D)
+            q_proj = qt[..., D:].reshape(B * n_kv_heads * n_repeats, L, D)
+
+            scores = mq_score(
+                inputs=[
+                    q_rot,
+                    q_proj,
+                    keys_state.norms,
+                    keys_state.mse_indices,
+                    keys_state.residual_norms,
+                    keys_state.qjl_signs,
+                    self.key_codec.mse_codec.codebook,
+                    self.key_codec.scale_array,
+                ],
+                template=[
+                    ("Dim", D),
+                    ("KMsePackedWidth", keys_state.mse_indices.shape[-1]),
+                    ("KSignPackedWidth", keys_state.qjl_signs.shape[-1]),
+                ],
+                grid=(32, n_repeats, B * n_kv_heads * T),
+                threadgroup=(32, 1, 1),
+                output_shapes=[(B * n_kv_heads * n_repeats, L, T)],
+                output_dtypes=[mx.float32],
+            )[0]
+        else:
+            mq_score = _multi_query_mse_score_kernel(
+                int(self.key_codec.bits),
+                n_repeats,
+                L,
+                dims_per_lane,
+            )
+            if mq_score is None: return None
+
+            q_rot_raw = self.key_codec.prepare_queries(grouped)
+            q_rot = q_rot_raw.reshape(B * n_kv_heads * n_repeats, L, D)
+
+            scores = mq_score(
+                inputs=[
+                    q_rot,
+                    keys_state.norms,
+                    keys_state.indices,
+                    self.key_codec.codebook,
+                ],
+                template=[
+                    ("Dim", D),
+                    ("KMsePackedWidth", keys_state.indices.shape[-1]),
+                ],
+                grid=(32, n_repeats, B * n_kv_heads * T),
+                threadgroup=(32, 1, 1),
+                output_shapes=[(B * n_kv_heads * n_repeats, L, T)],
+                output_dtypes=[mx.float32],
+            )[0]
+
         # Reshape: (B*H*R, L, T) → (B, H, R, L, T)
         scores = scores.reshape(B, n_kv_heads, n_repeats, L, T)
 

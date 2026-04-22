@@ -2,6 +2,8 @@ import glob
 import importlib
 import inspect
 import json
+import re
+import json_repair
 import logging
 from io import BytesIO
 from pathlib import Path
@@ -1555,3 +1557,29 @@ def print_array_report(t: mx.array, label: Optional[str]) -> dict:
             print(f" '{key}': {repr(value)},")
     print("}")
     return report
+
+def _escape_math_block(match: re.Match) -> str:
+    # Double-escape any backslash not followed by another backslash or quote
+    return re.sub(r'(?<!\\)\\(?!\\|")', r'\\\\', match.group(0))
+
+def sanitize_strict_json(text: str) -> str:
+    logging.debug(f"Sanitizing text for strict JSON parsing. Original Text: {text}")
+    text_stripped = text.strip()
+
+    # Detect intent: is this meant to be JSON?
+    if text_stripped.startswith("```json"):
+        # Markdown JSON block — strip wrapper
+        inner = text_stripped.strip("`").removeprefix("json").strip()
+    elif text_stripped.startswith(("{", "[")):
+        # Raw JSON object or array
+        inner = text_stripped
+    else:
+        logging.debug("Text does not appear to be JSON. Returning original text")
+        return text  # Not JSON-intended — pass through untouched
+
+    # Pre-escape math blocks BEFORE json_repair sees them,
+    # otherwise valid JSON escapes like \f, \b, \n silently destroy LaTeX
+    math_block_pattern = r'\$\$[\s\S]*?\$\$|\$[^\$]*?\$|\\\[[\s\S]*?\\\]|\\\([\s\S]*?\\\)'
+    math_escaped = re.sub(math_block_pattern, _escape_math_block, inner)
+
+    return json_repair.repair_json(math_escaped)

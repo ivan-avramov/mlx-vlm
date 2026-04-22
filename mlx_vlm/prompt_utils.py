@@ -662,6 +662,13 @@ def apply_chat_template(
     # Build messages from prompts
     messages = []
 
+    # fallback to the underlying tokenizer chat_template if the processor lacks one
+    if (getattr(processor, "chat_template", None) is None
+        and hasattr(processor, "tokenizer")
+        and getattr(processor.tokenizer, "chat_template", None) is not None
+        ):
+        processor.chat_template = processor.tokenizer.chat_template
+
     if isinstance(prompt, str):
         # Single string prompt
         messages.append(
