@@ -49,6 +49,24 @@ DEFAULT_QUANTIZED_KV_START = 5000
 DEFAULT_PREFILL_STEP_SIZE = 2048
 
 
+def _kv_seq_axis(shape) -> int:
+    """Return the sequence-length axis for a KV cache tensor.
+
+    MLX convention is [B, H, L, D] (axis 2).  Some models use [B, L, H, D]
+    (axis 1).  We disambiguate by checking ndim and falling back to 2 when the
+    two middle dims are equal (which is the common MLX layout).
+    """
+    if len(shape) < 3:
+        return 1
+    # Unambiguous cases
+    if shape[1] > shape[2]:
+        return 1
+    if shape[2] > shape[1]:
+        return 2
+    # Equal dims — default to the standard MLX layout [B, H, L, D]
+    return 2
+
+
 def parse_arguments():
     parser = argparse.ArgumentParser(
         description="Generate text from an image using a model."
@@ -248,6 +266,7 @@ def maybe_quantize_kv_cache(
     kv_bits,
     kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
     max_kv_size: Optional[int] = None,
+    serialize_kv_quantization: bool = False,
 ):
     if kv_bits is None:
         return
@@ -295,19 +314,27 @@ def maybe_quantize_kv_cache(
 
             prompt_cache[index] = quantize_entry(layer_cache)
 
-            # Serialize Graph Compilation!
-            # If this layer just breached the QUANTIZED_KV_START threshold and converted
-            # its FP16 history, evaluate it IMMEDIATELY before moving to the next layer.
-            if was_unquantized and isinstance(prompt_cache[index], TurboQuantKVCache):
+            # Serialize Graph Compilation: evaluate each layer immediately after
+            # conversion to prevent MLX from building one giant FP32 intermediate
+            # graph for all layers at once (which causes multi-GB OOM spikes).
+            if serialize_kv_quantization and was_unquantized and isinstance(prompt_cache[index], TurboQuantKVCache):
                 mx.eval(prompt_cache[index].keys, prompt_cache[index].values)
         return
 
-    mlx_maybe_quantize_kv_cache(
-        prompt_cache,
-        quantized_kv_start=quantized_kv_start,
-        kv_group_size=kv_group_size,
-        kv_bits=int(kv_bits),
-    )
+    # Uniform quantization path — replaces upstream mlx_maybe_quantize_kv_cache
+    # to safely skip RotatingKVCache (which raises NotImplementedError) and
+    # support serialized per-layer evaluation.
+    kv_bits_int = int(kv_bits)
+    for index, c in enumerate(prompt_cache):
+        if isinstance(c, cache.RotatingKVCache):
+            continue
+        if not hasattr(c, "to_quantized") or c.offset < quantized_kv_start:
+            continue
+        prompt_cache[index] = c.to_quantized(group_size=kv_group_size, bits=kv_bits_int)
+        if serialize_kv_quantization:
+            keys, values = prompt_cache[index].state
+            if keys is not None:
+                mx.eval(keys, values)
 
 
 @contextlib.contextmanager
@@ -409,6 +436,7 @@ def generate_step(
     kv_group_size: int = DEFAULT_KV_GROUP_SIZE,
     kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
     quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
+    serialize_kv_quantization: bool = False,
     sampler: Optional[Callable[[mx.array], mx.array]] = None,
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
     prefill_step_size: Optional[int] = DEFAULT_PREFILL_STEP_SIZE,
@@ -440,6 +468,8 @@ def generate_step(
         kv_group_size (int): Group size for uniform KV cache quantization.
         kv_quant_scheme (str): KV cache quantization backend.
         quantized_kv_start (int): Start index for quantized KV cache.
+        serialize_kv_quantization (bool): When True, evaluate each layer's KV
+          cache immediately after quantization to prevent graph explosion OOM.
         sampler (Callable[mx.array, mx.array], optional): A sampler for sampling a
           token from a vector of log probabilities.
         logits_processors (List[Callable[[mx.array, mx.array], mx.array]], optional):
@@ -460,6 +490,7 @@ def generate_step(
         kv_group_size=kv_group_size,
         kv_bits=kv_bits,
         kv_quant_scheme=kv_quant_scheme,
+        serialize_kv_quantization=serialize_kv_quantization,
         max_kv_size=max_kv_size,
     )
 
@@ -696,16 +727,24 @@ def stream_generate(
         # Ring buffers irreparably lose historical context when overwritten. Rewinding leaves
         # a "Memory Hole" and ghost tokens that cause Softmax anomalies (hallucination loops).
         # We must invalidate the cache and force a full re-prefill to maintain mathematical integrity.
-        if prefix_len > 0 and prefix_len < len(prompt_cache_state.token_ids):
-            for c in prompt_cache_state.cache:
+        def _has_rotating_cache(entries):
+            for c in entries:
                 if type(c).__name__ in ["RotatingKVCache", "BatchRotatingKVCache"]:
-                    logging.debug(
-                        f"DEBUG CORRUPTION GUARD: Multi-Cache | SWA Ring Buffer Corruption Guard triggered. "
-                        f"Attempted rewind to token {prefix_len}, but RotatingKVCache "
-                        f"cannot be safely reversed. Forcing full re-prefill."
-                    )
-                    prefix_len = 0
-                    break
+                    return True
+                if hasattr(c, "caches") and _has_rotating_cache(c.caches):
+                    return True
+                if isinstance(c, (list, tuple)) and _has_rotating_cache(c):
+                    return True
+            return False
+
+        if prefix_len > 0 and prefix_len < len(prompt_cache_state.token_ids):
+            if _has_rotating_cache(prompt_cache_state.cache):
+                logging.debug(
+                    f"DEBUG CORRUPTION GUARD: Multi-Cache | SWA Ring Buffer Corruption Guard triggered. "
+                    f"Attempted rewind to token {prefix_len}, but RotatingKVCache "
+                    f"cannot be safely reversed. Forcing full re-prefill."
+                )
+                prefix_len = 0
 
         if prefix_len > 0 and prefix_len < input_ids.shape[1]:
             reused_prefix_len = prefix_len
@@ -757,7 +796,7 @@ def stream_generate(
 
                                 if k_arr is not None and v_arr is not None:
                                     if isinstance(k_arr, mx.array):
-                                        seq_axis = 1 if k_arr.shape[1] > k_arr.shape[2] else 2
+                                        seq_axis = _kv_seq_axis(k_arr.shape)
                                         logging.debug(f"DEBUG TRIM: Slicing {type(c).__name__} from {k_arr.shape[seq_axis]} down to {target_len}")
                                         if seq_axis == 1:
                                             setattr(c, k_attr, k_arr[:, :target_len, ...])
@@ -771,7 +810,7 @@ def stream_generate(
                                         new_k, new_v = [], []
                                         current_len = 0
                                         for k, v in zip(k_arr, v_arr):
-                                            seq_axis = 1 if k.shape[1] > k.shape[2] else 2
+                                            seq_axis = _kv_seq_axis(k.shape)
                                             chunk_len = k.shape[seq_axis]
 
                                             if current_len + chunk_len <= target_len:

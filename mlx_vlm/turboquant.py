@@ -15,6 +15,12 @@ def register_allocation_hook(hook):
     if hook not in _ALLOCATION_HOOKS:
         _ALLOCATION_HOOKS.append(hook)
 
+def unregister_allocation_hook(hook):
+    try:
+        _ALLOCATION_HOOKS.remove(hook)
+    except ValueError:
+        pass
+
 def _trigger_allocation_hooks():
     for hook in _ALLOCATION_HOOKS:
         hook()
@@ -4941,7 +4947,14 @@ class TurboQuantKVCache(_BaseCache):
                 orig_shape = f"List merged to {keys.shape}"
 
             # 3. Dynamic Step-Padding Strip
-            seq_axis = 1 if keys.shape[1] > keys.shape[2] else 2
+            # Standard MLX layout is [B, H, L, D] (axis 2). Some models use
+            # [B, L, H, D] (axis 1). Disambiguate; default to 2 when equal.
+            if keys.shape[1] > keys.shape[2]:
+                seq_axis = 1
+            elif keys.shape[2] > keys.shape[1]:
+                seq_axis = 2
+            else:
+                seq_axis = 2
             if has_offset:
                 if seq_axis == 2:
                     keys = keys[:, :, :cache_offset, :]
