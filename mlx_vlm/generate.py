@@ -266,6 +266,7 @@ def maybe_quantize_kv_cache(
     kv_bits,
     kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
     max_kv_size: Optional[int] = None,
+    serialize_kv_quantization: bool = False,
 ):
     if kv_bits is None:
         return
@@ -313,19 +314,27 @@ def maybe_quantize_kv_cache(
 
             prompt_cache[index] = quantize_entry(layer_cache)
 
-            # Serialize Graph Compilation!
-            # If this layer just breached the QUANTIZED_KV_START threshold and converted
-            # its FP16 history, evaluate it IMMEDIATELY before moving to the next layer.
-            if was_unquantized and isinstance(prompt_cache[index], TurboQuantKVCache):
+            # Serialize Graph Compilation: evaluate each layer immediately after
+            # conversion to prevent MLX from building one giant FP32 intermediate
+            # graph for all layers at once (which causes multi-GB OOM spikes).
+            if serialize_kv_quantization and was_unquantized and isinstance(prompt_cache[index], TurboQuantKVCache):
                 mx.eval(prompt_cache[index].keys, prompt_cache[index].values)
         return
 
-    mlx_maybe_quantize_kv_cache(
-        prompt_cache,
-        quantized_kv_start=quantized_kv_start,
-        kv_group_size=kv_group_size,
-        kv_bits=int(kv_bits),
-    )
+    # Uniform quantization path — replaces upstream mlx_maybe_quantize_kv_cache
+    # to safely skip RotatingKVCache (which raises NotImplementedError) and
+    # support serialized per-layer evaluation.
+    kv_bits_int = int(kv_bits)
+    for index, c in enumerate(prompt_cache):
+        if isinstance(c, cache.RotatingKVCache):
+            continue
+        if not hasattr(c, "to_quantized") or c.offset < quantized_kv_start:
+            continue
+        prompt_cache[index] = c.to_quantized(group_size=kv_group_size, bits=kv_bits_int)
+        if serialize_kv_quantization:
+            keys, values = prompt_cache[index].state
+            if keys is not None:
+                mx.eval(keys, values)
 
 
 @contextlib.contextmanager
@@ -427,6 +436,7 @@ def generate_step(
     kv_group_size: int = DEFAULT_KV_GROUP_SIZE,
     kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
     quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
+    serialize_kv_quantization: bool = False,
     sampler: Optional[Callable[[mx.array], mx.array]] = None,
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
     prefill_step_size: Optional[int] = DEFAULT_PREFILL_STEP_SIZE,
@@ -458,6 +468,8 @@ def generate_step(
         kv_group_size (int): Group size for uniform KV cache quantization.
         kv_quant_scheme (str): KV cache quantization backend.
         quantized_kv_start (int): Start index for quantized KV cache.
+        serialize_kv_quantization (bool): When True, evaluate each layer's KV
+          cache immediately after quantization to prevent graph explosion OOM.
         sampler (Callable[mx.array, mx.array], optional): A sampler for sampling a
           token from a vector of log probabilities.
         logits_processors (List[Callable[[mx.array, mx.array], mx.array]], optional):
@@ -478,6 +490,7 @@ def generate_step(
         kv_group_size=kv_group_size,
         kv_bits=kv_bits,
         kv_quant_scheme=kv_quant_scheme,
+        serialize_kv_quantization=serialize_kv_quantization,
         max_kv_size=max_kv_size,
     )
 

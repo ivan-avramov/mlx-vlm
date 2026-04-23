@@ -862,6 +862,10 @@ class ChatStreamChunk(BaseModel):
     usage: Optional[UsageStats]
 
 
+def get_serialize_kv_quantization():
+    return os.environ.get("SERIALIZE_KV_QUANTIZATION", "false").lower() == "true"
+
+
 def build_generation_kwargs(
     request: Any,
     template_kwargs: dict[str, Any],
@@ -873,6 +877,7 @@ def build_generation_kwargs(
         "kv_quant_scheme": get_kv_quant_scheme(),
         "max_kv_size": get_max_kv_size(request.model),
         "quantized_kv_start": get_quantized_kv_start(),
+        "serialize_kv_quantization": get_serialize_kv_quantization(),
         **request.generation_kwargs(),
         **template_kwargs,
     }
@@ -1851,6 +1856,14 @@ def main():
         help="Start index (of token) for the quantized KV cache.",
     )
     parser.add_argument(
+        "--serialize-kv-quantization",
+        action="store_true",
+        default=False,
+        help="Evaluate each layer's KV cache immediately after quantization "
+        "to prevent graph explosion OOM spikes at the quantization threshold. "
+        "Recommended for large models (e.g. 31B+) with long contexts.",
+    )
+    parser.add_argument(
         "--reload",
         action="store_true",
         default=False,
@@ -1891,6 +1904,7 @@ def main():
     os.environ["KV_QUANT_SCHEME"] = args.kv_quant_scheme
     os.environ["MAX_KV_SIZE"] = str(args.max_kv_size)
     os.environ["QUANTIZED_KV_START"] = str(args.quantized_kv_start)
+    os.environ["SERIALIZE_KV_QUANTIZATION"] = str(args.serialize_kv_quantization).lower()
     os.environ["LRU_MIN_FREE_RAM_PERCENT"] = str(args.lru_min_free_ram_percent)
     if args.log_file != "<stdout>":
         logging.basicConfig(
