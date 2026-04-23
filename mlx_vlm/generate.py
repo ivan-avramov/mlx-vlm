@@ -926,7 +926,7 @@ def generate(
     """
 
     if verbose:
-        print("=" * 10)
+        logging.info("=" * 10)
         files = []
         if image is not None:
             files.extend(image)
@@ -935,9 +935,9 @@ def generate(
         if kwargs.get("video") is not None:
             files.extend(kwargs.get("video"))
 
-        print(f"Files: {files}", "\n")
+        logging.info(f"Files: {files}")
 
-        print("Prompt:", prompt)
+        logging.info(f"Prompt: {prompt}")
 
     text = ""
     last_response = None
@@ -967,14 +967,14 @@ def generate(
 
     for response in stream_generate(model, processor, prompt, image, audio, **kwargs):
         if verbose:
-            print(response.text, end="", flush=True)
+            logging.info(response.text)
         text += response.text
         last_response = response
 
     if verbose:
-        print("\n" + "=" * 10)
+        logging.info("=" * 10)
         if len(text) == 0:
-            print("No text generated for this prompt")
+            logging.info("No text generated for this prompt")
             return GenerationResult(
                 text=text,
                 token=None,
@@ -986,15 +986,15 @@ def generate(
                 generation_tps=0.0,
                 peak_memory=mx.get_peak_memory() / 1e9,
             )
-        print(
+        logging.info(
             f"Prompt: {last_response.prompt_tokens} tokens, "
             f"{last_response.prompt_tps:.3f} tokens-per-sec"
         )
-        print(
+        logging.info(
             f"Generation: {last_response.generation_tokens} tokens, "
             f"{last_response.generation_tps:.3f} tokens-per-sec"
         )
-        print(f"Peak memory: {last_response.peak_memory:.3f} GB")
+        logging.info(f"Peak memory: {last_response.peak_memory:.3f} GB")
 
     return GenerationResult(
         text=text,
@@ -1456,7 +1456,7 @@ def batch_generate(
         grouped_images, grouped_indices = group_images_by_shape(processed_images)
 
         if verbose:
-            print(f"[batch_generate] Found {len(grouped_images)} unique image shapes")
+            logging.info(f"[batch_generate] Found {len(grouped_images)} unique image shapes")
     else:
         # Single image or grouping disabled - treat as one group
         shape = (
@@ -1517,15 +1517,15 @@ def batch_generate(
     total_stats.peak_memory = mx.get_peak_memory() / 1e9
 
     if verbose:
-        print(f"[batch_generate] Finished processing {len(prompts)} samples")
-        print(
+        logging.info(f"[batch_generate] Finished processing {len(prompts)} samples")
+        logging.info(
             f"[batch_generate] Prompt: {total_stats.prompt_tokens} tokens, {total_stats.prompt_tps:.3f} tokens-per-sec"
         )
-        print(
+        logging.info(
             f"[batch_generate] Generation: {total_stats.generation_tokens} tokens, "
             f"{total_stats.generation_tps:.3f} tokens-per-sec"
         )
-        print(f"[batch_generate] Peak memory: {total_stats.peak_memory:.3f} GB")
+        logging.info(f"[batch_generate] Peak memory: {total_stats.peak_memory:.3f} GB")
 
     response = BatchResponse(all_texts, total_stats)
     if track_image_sizes:
@@ -1699,7 +1699,7 @@ def main():
                 processor, config, chat, num_images=num_images, **chat_template_kwargs
             )
             response = ""
-            print("Assistant:", end="")
+            logging.info("Assistant:")
             stream_kwargs = {
                 "max_tokens": args.max_tokens,
                 "temperature": args.temperature,
@@ -1720,10 +1720,9 @@ def main():
                 **stream_kwargs,
             ):
                 response += chunk.text
-                print(chunk.text, end="")
+                logging.info(chunk.text)
 
             chat.append({"role": "assistant", "content": response})
-            print()
 
     else:
         gen_kwargs = {
@@ -1753,11 +1752,11 @@ def main():
             **gen_kwargs,
         )
         if not args.verbose:
-            print(result.text)
+            logging.info(result.text)
 
 
 if __name__ == "__main__":
-    print(
+    logging.info(
         "Calling `python -m mlx_vlm.generate ...` directly is deprecated."
         " Use `mlx_vlm generate` or `python -m mlx_vlm generate` instead."
     )

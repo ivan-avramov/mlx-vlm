@@ -4920,10 +4920,53 @@ class TurboQuantKVCache(_BaseCache):
     def from_cache(
         cls, cache, bits: float, seed: int = DEFAULT_TURBOQUANT_SEED, max_kv_size: Optional[int] = None
     ) -> "TurboQuantKVCache":
+        import logging
+        import mlx.core as mx
+
         turbo_cache = cls(bits=bits, seed=seed, max_kv_size=max_kv_size)
         keys, values = cache.state
+
         if keys is not None:
+            # 1. Capture initial state
+            is_list = isinstance(keys, (list, tuple))
+            orig_shape = [k.shape for k in keys] if is_list else keys.shape
+            has_offset = hasattr(cache, "offset")
+            cache_offset = int(cache.offset.item() if hasattr(cache.offset, "item") else cache.offset) if has_offset else -1
+
+            # 2. Safely merge ChunkedKVCache lists into a single continuous array
+            if is_list:
+                # We assume seq_axis is 2 for MLX standard (B, H, L, D)
+                keys = mx.concatenate(keys, axis=2)
+                values = mx.concatenate(values, axis=2)
+                orig_shape = f"List merged to {keys.shape}"
+
+            # 3. Dynamic Step-Padding Strip
+            seq_axis = 1 if keys.shape[1] > keys.shape[2] else 2
+            if has_offset:
+                if seq_axis == 2:
+                    keys = keys[:, :, :cache_offset, :]
+                    values = values[:, :, :cache_offset, :]
+                else:
+                    keys = keys[:, :cache_offset, ...]
+                    values = values[:, :cache_offset, ...]
+
+            new_shape = keys.shape
+
+            # 4. Check for numerical explosions before quantizing
+            mx.eval(keys, values)
+            k_max = mx.max(mx.abs(keys)).item()
+            k_isnan = mx.any(mx.isnan(keys)).item()
+
+            logging.info(
+                f"INSTRUMENTATION from_cache | Type: {type(cache).__name__} | "
+                f"Offset: {cache_offset} | Orig: {orig_shape} | "
+                f"Stripped: {new_shape} | Axis: {seq_axis} | "
+                f"Max Abs: {k_max:.4f} | Has NaNs: {k_isnan}"
+            )
+
             turbo_cache.update_and_fetch(keys, values)
+            logging.info(f"INSTRUMENTATION from_cache | Turbo Offset Post-Ingest: {turbo_cache.offset}")
+
         return turbo_cache
 
     def _ensure_codecs(self, keys: mx.array, values: mx.array):

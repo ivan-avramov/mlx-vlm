@@ -140,10 +140,12 @@ def _resolve_tool_calls(text: str, tool_parser_type=None, tool_module=None, tool
 class StreamingTranslator:
     """Consumptive buffer for reliable translation of stream tags using stateful boundary detection."""
 
-    def __init__(self):
+    def __init__(self, thinking_start_token: str = DEFAULT_THINKING_START_TOKEN, thinking_end_token: str = DEFAULT_THINKING_END_TOKEN):
         self.buffer = ""
         self.in_thought = False
         self.is_beginning = True
+        self.thinking_start_token = thinking_start_token
+        self.thinking_end_token = thinking_end_token
 
     def translate(self, text: str):
         while True:
@@ -164,20 +166,21 @@ class StreamingTranslator:
             min_idx = min(open_idx, close_idx, hallucinated_idx)
 
             if min_idx == open_idx:
-                text = text[:open_idx] + "<think>\n" + text[open_match.end() :]
+                text = f"{text[:open_idx]}{self.thinking_start_token}\n{text[open_match.end() :]}"
+
                 self.in_thought = True
             elif min_idx == hallucinated_idx:
                 idx = hallucinated_open.start()
                 match_str = text[idx:hallucinated_open.end()]
                 prefix = text[:idx]
                 if match_str.startswith('\n'):
-                    text = prefix + "\n<think>\n" + text[hallucinated_open.end() :]
+                    text = f"{prefix}\n{self.thinking_start_token}\n{text[hallucinated_open.end() :]}"
                 else:
-                    text = prefix + "<think>\n" + text[hallucinated_open.end() :]
+                    text = f"{prefix}{self.thinking_start_token}\n{text[hallucinated_open.end() :]}"
                 self.in_thought = True
             else:
                 if self.in_thought:
-                    text = text[:close_idx] + "\n</think>\n" + text[close_match.end() :]
+                    text = f"{text[:close_idx]}\n{self.thinking_end_token}\n{text[close_match.end() :]}"
                     self.in_thought = False
                 else:
                     text = text[:close_idx] + text[close_match.end() :]
@@ -217,7 +220,7 @@ class StreamingTranslator:
         chunk = self.buffer[:split_idx]
         self.buffer = self.buffer[split_idx:]
 
-        if chunk.strip() and not chunk.endswith("<think>\n"):
+        if chunk.strip() and not chunk.endswith(f"{self.thinking_start_token}\n"):
             self.is_beginning = False
 
         return chunk
@@ -228,10 +231,10 @@ class StreamingTranslator:
         if split_idx != -1:
             chunk = self.buffer[:split_idx]
 
-            has_close_tag = "</think>" in chunk
+            has_close_tag = f"{self.thinking_end_token}" in chunk
 
             if has_close_tag:
-                tag_idx = chunk.find("</think>") + len("</think>")
+                tag_idx = chunk.find(f"{self.thinking_end_token}") + len(f"{self.thinking_end_token}")
                 pre_tag = chunk[:tag_idx]
                 post_tag = chunk[tag_idx:]
 
@@ -246,7 +249,7 @@ class StreamingTranslator:
                     chunk = re.sub(r"\s*[\w\./\\]+[\.\:]?\s*$", "\n", chunk)
 
             if self.in_thought:
-                chunk += "\n</think>\n"
+                chunk += f"\n{self.thinking_end_token}\n"
                 self.in_thought = False
 
             self.buffer = self.buffer[split_idx:]
@@ -256,7 +259,7 @@ class StreamingTranslator:
     def flush(self):
         chunk = self.translate(self.buffer)
         if self.in_thought:
-            chunk += "\n</think>\n"
+            chunk += f"\n{self.thinking_end_token}\n"
             self.in_thought = False
         self.buffer = ""
         return chunk
@@ -270,7 +273,7 @@ def get_quantized_kv_bits(model: str):
     if kv_bits == 0:
         return None
     if "qat" in model:
-        print(
+        logging.warning(
             f"Model {model} is quantization aware, (Rotating)KVCache cache will not be quantized to {kv_bits} bits, use --max-kv-size [tokens] instead."
         )
         return None
@@ -290,7 +293,7 @@ def get_max_kv_size(model: str):
     if max_kv_tokens == 0:
         return None
     if get_quantized_kv_bits(model) is not None:
-        print(
+        logging.warning(
             f"Model {model} uses QuantizedKVCache cache, can't set max KV size, use --kv-bits [bits] instead."
         )
     return max_kv_tokens
@@ -307,11 +310,11 @@ async def lifespan(app):
     adapter_path = os.environ.get("PRELOAD_ADAPTER") or None
     if model_path:
         try:
-            print(f"Preloading model: {model_path}")
+            logging.info(f"Preloading model: {model_path}")
             get_cached_model(model_path, adapter_path)
         except Exception as e:
-            print(f"Failed to preload model: {e}")
-            print("Server will continue without a preloaded model.")
+            logging.error(f"Failed to preload model: {e}")
+            logging.error("Server will continue without a preloaded model.")
     yield
     unload_model_sync()
 
@@ -353,9 +356,9 @@ def load_model_resources(model_path: str, adapter_path: Optional[str]):
     Handles potential loading errors.
     """
     try:
-        print(f"Loading model from: {model_path}")
+        logging.info(f"Loading model from: {model_path}")
         if adapter_path:
-            print(f"Loading adapter from: {adapter_path}")
+            logging.info(f"Loading adapter from: {adapter_path}")
         # Use the load function from utils.py which handles path resolution and loading
         trust_remote_code = (
             os.environ.get("MLX_TRUST_REMOTE_CODE", "false").lower() == "true"
@@ -364,10 +367,10 @@ def load_model_resources(model_path: str, adapter_path: Optional[str]):
             model_path, adapter_path, trust_remote_code=trust_remote_code
         )
         config = model.config
-        print("Model and processor loaded successfully.")
+        logging.info("Model and processor loaded successfully.")
         return model, processor, config
     except Exception as e:
-        print(f"Error loading model {model_path}: {e}")
+        logging.error(f"Error loading model {model_path}: {e}")
         traceback.print_exc()  # Print detailed traceback for debugging
         raise HTTPException(status_code=500, detail=f"Failed to load model: {e}")
 
@@ -382,12 +385,12 @@ def get_cached_model(model_path: str, adapter_path: Optional[str] = None):
 
     # Return from cache if already loaded and matches the requested paths
     if model_cache.get("cache_key") == cache_key:
-        print(f"Using cached model: {model_path}, Adapter: {adapter_path}")
+        logging.info(f"Using cached model: {model_path}, Adapter: {adapter_path}")
         return model_cache["model"], model_cache["processor"], model_cache["config"]
 
     # If cache exists but doesn't match, clear it
     if model_cache:
-        print("New model request, clearing existing cache...")
+        logging.info("New model request, clearing existing cache...")
         unload_model_sync()  # Use a synchronous version for internal call
 
     # Load the model resources
@@ -413,7 +416,7 @@ def unload_model_sync():
     if not model_cache:
         return False
 
-    print(
+    logging.info(
         f"Unloading model: {model_cache.get('model_path')}, Adapter: {model_cache.get('adapter_path')}"
     )
     # Clear vision cache before dropping references
@@ -423,7 +426,7 @@ def unload_model_sync():
     # Force garbage collection
     gc.collect()
     mx.clear_cache()
-    print("Model unloaded and cache cleared.")
+    logging.info("Model unloaded and cache cleared.")
     return True
 
 
@@ -907,7 +910,7 @@ def process_tool_calls(model_output: str, tool_module, tools):
                     called_tools.append(called_tool)
                     tool_call_index += 1
                 except Exception:
-                    print(f"Invalid tool call: {call}")
+                    logging.error(f"Invalid tool call: {call}")
     return dict(calls=called_tools, remaining_text=remaining)
 
 
@@ -968,16 +971,16 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                 stream=stream
             )
             if not stream:
-                print(response.output[0].content[0].text)
-                print(response.usage)
+                logging.info(response.output[0].content[0].text)
+                logging.info(response.usage)
             else:
                 for event in response:
                     # Process different event types if needed
                     if hasattr(event, 'delta') and event.delta:
-                        print(event.delta, end="", flush=True)
+                        logging.info(event.delta)
                     elif event.type == 'response.completed':
-                        print("\n--- Usage ---")
-                        print(event.response.usage)
+                        logging.info("\n--- Usage ---")
+                        logging.info(event.response.usage)
 
         except Exception as e:
             # building a response object to match the one returned when request is successful so that it can be processed in the same way
@@ -1025,7 +1028,7 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                                     elif item["type"] == "input_image":
                                         images.append(item["image_url"])
                                     else:
-                                        print(
+                                        logging.error(
                                             f"invalid input item type: {item['type']}"
                                         )
                                         raise HTTPException(
@@ -1033,7 +1036,7 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                                             detail="Invalid input item type.",
                                         )
                                 else:
-                                    print(
+                                    logging.error(
                                         f"Invalid message content item format: {item}"
                                     )
                                     raise HTTPException(
@@ -1041,21 +1044,21 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                                         detail="Missing type in input item.",
                                     )
                         else:
-                            print("Invalid message content format.")
+                            logging.error("Invalid message content format.")
                             raise HTTPException(
                                 status_code=400, detail="Invalid input format."
                             )
                     else:
-                        print("not a ChatMessage")
+                        logging.error("not a ChatMessage")
                         raise HTTPException(
                             status_code=400, detail="Invalid input format."
                         )
             else:
-                print("neither string not list")
+                logging.error("neither string not list")
                 raise HTTPException(status_code=400, detail="Invalid input format.")
 
         else:
-            print("no input")
+            logging.error("no input")
             raise HTTPException(status_code=400, detail="Missing input.")
 
         template_kwargs = openai_request.template_kwargs()
@@ -1067,6 +1070,8 @@ async def responses_endpoint(openai_request: OpenAIRequest):
             **template_kwargs,
         )
         generation_kwargs = build_generation_kwargs(openai_request, template_kwargs)
+        thinking_start_token = generation_kwargs.get("thinking_start_token", DEFAULT_THINKING_START_TOKEN)
+        thinking_end_token = generation_kwargs.get("thinking_end_token", DEFAULT_THINKING_END_TOKEN)
 
         generated_at = datetime.now().timestamp()
         response_id = f"resp_{uuid.uuid4().hex}"
@@ -1130,7 +1135,7 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                     )
 
                     full_text = ""
-                    translator = StreamingTranslator()
+                    translator = StreamingTranslator(thinking_start_token=thinking_start_token, thinking_end_token=thinking_end_token)
                     usage_stats = {"input_tokens": 0, "output_tokens": 0}
 
                     for chunk in token_iterator:
@@ -1187,7 +1192,7 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                     yield f"event: response.completed\ndata: {ResponseCompletedEvent(type='response.completed', response=completed_response).model_dump_json()}\n\n"
 
                 except Exception as e:
-                    print(f"Error during stream generation: {e}")
+                    logging.error(f"Error during stream generation: {e}")
                     traceback.print_exc()
                     error_data = json.dumps({"error": str(e)})
                     yield f"data: {error_data}\n\n"
@@ -1195,7 +1200,7 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                 finally:
                     mx.clear_cache()
                     gc.collect()
-                    print("Stream finished, cleared cache.")
+                    logging.info("Stream finished, cleared cache.")
 
             return StreamingResponse(
                 stream_generator(),
@@ -1222,7 +1227,7 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                 # Clean up resources
                 mx.clear_cache()
                 gc.collect()
-                print("Generation finished, cleared cache.")
+                logging.info("Generation finished, cleared cache.")
 
                 response = OpenAIResponse(
                     id=response_id,
@@ -1255,7 +1260,7 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                 return response
 
             except Exception as e:
-                print(f"Error during generation: {e}")
+                logging.error(f"Error during generation: {e}")
                 traceback.print_exc()
                 mx.clear_cache()
                 gc.collect()
@@ -1266,7 +1271,7 @@ async def responses_endpoint(openai_request: OpenAIRequest):
         raise http_exc
     except Exception as e:
         # Catch unexpected errors
-        print(f"Unexpected error in /responses endpoint: {e}")
+        logging.error(f"Unexpected error in /responses endpoint: {e}")
         traceback.print_exc()
         mx.clear_cache()
         gc.collect()
@@ -1294,6 +1299,10 @@ async def chat_completions_endpoint(request: ChatRequest):
         images = []
         audio = []
         processed_messages = []
+        template_kwargs = request.template_kwargs()
+        generation_kwargs = build_generation_kwargs(request, template_kwargs)
+        thinking_start_token = generation_kwargs.get("thinking_start_token", DEFAULT_THINKING_START_TOKEN)
+        thinking_end_token = generation_kwargs.get("thinking_end_token", DEFAULT_THINKING_END_TOKEN)
 
         for message in request.messages:
             msg_dict = {"role": message.role}
@@ -1327,7 +1336,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                 content = message.content
                 if message.role == "assistant":
                     # Strip OpenWebUI thought blocks entirely to prevent token fragmentation
-                    content = re.sub(r"<think>.*?</think>\n*", "", content, flags=re.DOTALL)
+                    content = re.sub(rf"{thinking_start_token}.*?{thinking_end_token}\n*", "", content, flags=re.DOTALL)
                 msg_dict["content"] = content.strip()
 
             elif isinstance(message.content, list):
@@ -1352,7 +1361,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                             text_val = item.get("text", "")
                             if message.role == "assistant":
                                 # Strip thought blocks from multimodal history
-                                text_val = re.sub(r"<think>.*?</think>\n*", "", text_val, flags=re.DOTALL)
+                                text_val = re.sub(rf"{thinking_start_token}.*?{thinking_end_token}\n*", "", text_val, flags=re.DOTALL)
                             if text_val.strip():
                                 new_content.append(
                                     {"type": "text", "text": text_val.strip()}
@@ -1406,8 +1415,6 @@ async def chat_completions_endpoint(request: ChatRequest):
             if tool_parser_type is not None:
                 tool_module = load_tool_module(tool_parser_type)
 
-        template_kwargs = request.template_kwargs()
-
         try:
             formatted_prompt = tokenizer.apply_chat_template(
                 processed_messages,
@@ -1451,7 +1458,6 @@ async def chat_completions_endpoint(request: ChatRequest):
             model_cache["multi_cache_manager"] = manager
 
         # Universal cache application (for both stream and non-stream)
-        generation_kwargs = build_generation_kwargs(request, template_kwargs)
         manager = model_cache["multi_cache_manager"]
         generation_kwargs["prompt_cache_state"] = manager.get_or_create(current_session_id)
 
@@ -1476,7 +1482,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                     full_output_text = ""
                     request_id = f"chatcmpl-{uuid.uuid4()}"
                     is_tool_call_sequence = False
-                    translator = StreamingTranslator()
+                    translator = StreamingTranslator(thinking_start_token=thinking_start_token, thinking_end_token=thinking_end_token)
 
                     usage_stats = {
                         "input_tokens": 0,
@@ -1563,7 +1569,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                     else:
                         # Rescue the buffered text if the model started a tool sequence but failed to write valid JSON
                         if is_tool_call_sequence:
-                            final_content = StreamingTranslator().translate(tool_calls["remaining_text"])
+                            final_content = StreamingTranslator(thinking_start_token=thinking_start_token, thinking_end_token=thinking_end_token).translate(tool_calls["remaining_text"])
                         else:
                             final_content = ""
 
@@ -1648,7 +1654,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                 has_tools = len(tool_calls.get("calls", [])) > 0
 
                 if not has_tools:
-                    translator = StreamingTranslator()
+                    translator = StreamingTranslator(thinking_start_token=thinking_start_token, thinking_end_token=thinking_end_token)
                     processed_chunk = translator.feed(tool_calls["remaining_text"])
                     final_content = processed_chunk + translator.flush()
                 else:
@@ -1854,7 +1860,7 @@ def main():
     parser.add_argument(
         '--log-level',
         type=str,
-        default='INFO',
+        default='DEBUG',
         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
         help='Set the logging level (default: INFO)',
     )
@@ -1873,7 +1879,6 @@ def main():
     os.environ["MAX_KV_SIZE"] = str(args.max_kv_size)
     os.environ["QUANTIZED_KV_START"] = str(args.quantized_kv_start)
     os.environ["LRU_MIN_FREE_RAM_PERCENT"] = str(args.lru_min_free_ram_percent)
-
     if args.log_file != "<stdout>":
         logging.basicConfig(
             level=args.log_level,
@@ -1888,8 +1893,24 @@ def main():
             stream=sys.stdout
         )
 
-    logging.info(f"args: {args}")
-    logging.info(f"environment: {os.environ}")
+    logging.debug(f"Command-line arguments: {args}")
+    logging.debug(f"Environment variables: {os.environ}")
+    logging.info("Starting MLX VLM Server with the following configuration:")
+    logging.info(f"Host: {args.host}")
+    logging.info(f"Port: {args.port}")
+    logging.info(f"Model: {args.model}")
+    logging.info(f"Adapter Path: {args.adapter_path}")
+    logging.info(f"Trust Remote Code: {args.trust_remote_code}")
+    logging.info(f"Prefill Step Size: {args.prefill_step_size}")
+    logging.info(f"KV Bits: {args.kv_bits}")
+    logging.info(f"KV Group Size: {args.kv_group_size}")
+    logging.info(f"KV Quant Scheme: {args.kv_quant_scheme}")
+    logging.info(f"Max KV Size: {args.max_kv_size}")
+    logging.info(f"Quantized KV Start: {args.quantized_kv_start}")
+    logging.info(f"LRU Min Free RAM Percent: {args.lru_min_free_ram_percent}")
+    logging.info(f"Log File: {args.log_file}")
+    logging.info(f"Log Level: {args.log_level}")
+
     uvicorn.run(
         "mlx_vlm.server:app",
         host=args.host,
