@@ -590,7 +590,7 @@ class TemplateParams(FlexibleBaseModel):
             "thinking_start_token",
             "thinking_end_token",
         )
-        kwargs.setdefault("enable_thinking", False)
+        kwargs.setdefault("enable_thinking", True)
         return kwargs
 
 
