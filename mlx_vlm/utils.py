@@ -100,6 +100,72 @@ def skip_multimodal_module(path: str) -> bool:
     )
 
 
+class _TextOnlyLanguageModel(nn.Module):
+    """Wraps an mlx_lm model so its __call__ returns LanguageModelOutput.
+
+    mlx_lm models return raw logits tensors, but the mlx_vlm generation
+    pipeline expects ``outputs.logits``.
+    """
+
+    def __init__(self, lm_model: nn.Module):
+        super().__init__()
+        self._model = lm_model
+
+    @property
+    def layers(self):
+        return self._model.layers
+
+    def __call__(self, *args, **kwargs):
+        from .models.base import LanguageModelOutput
+
+        # mlx_lm models accept (input_ids, cache=...) but the VLM pipeline
+        # may also pass inputs_embeds= which text-only models don't use.
+        kwargs.pop("inputs_embeds", None)
+        kwargs.pop("n_to_process", None)
+        out = self._model(*args, **kwargs)
+        if isinstance(out, mx.array):
+            return LanguageModelOutput(logits=out)
+        return out
+
+    def make_cache(self):
+        if hasattr(self._model, "make_cache"):
+            return self._model.make_cache()
+        return None
+
+
+class _TextOnlyModelWrapper(nn.Module):
+    """Wraps an mlx_lm text-only model so it looks like a VLM to the generation pipeline.
+
+    The generation code expects ``model.language_model`` and ``model.config``.
+    For text-only models loaded via mlx_lm, the model itself IS the language
+    model, so this wrapper simply provides the expected interface.
+    """
+
+    def __init__(self, lm_model: nn.Module, config: dict):
+        super().__init__()
+        self.language_model = _TextOnlyLanguageModel(lm_model)
+        self._config = _SimpleNamespace(config)
+
+    @property
+    def config(self):
+        return self._config
+
+    def __call__(self, *args, **kwargs):
+        return self.language_model(*args, **kwargs)
+
+
+class _SimpleNamespace:
+    """Attribute-access wrapper around a dict, for model config compatibility."""
+
+    def __init__(self, d: dict):
+        self._dict = d
+        for k, v in d.items():
+            setattr(self, k, v)
+
+    def __getattr__(self, name):
+        return self._dict.get(name)
+
+
 def get_model_and_args(config: dict):
     """
     Retrieve the model object based on the configuration.
@@ -402,7 +468,28 @@ def load(
     model_path = get_model_path(
         path_or_hf_repo, force_download=force_download, revision=revision
     )
-    model = load_model(model_path, lazy, **kwargs)
+
+    # Try VLM loading first; fall back to mlx_lm for text-only models
+    try:
+        model = load_model(model_path, lazy, **kwargs)
+    except ValueError as e:
+        if "not supported" not in str(e):
+            raise
+        logging.info(
+            f"Model not found in mlx_vlm.models, falling back to mlx_lm: {e}"
+        )
+        from mlx_lm.utils import load as mlx_lm_load
+
+        lm_model, tokenizer = mlx_lm_load(
+            path_or_hf_repo,
+            adapter_path=adapter_path,
+            lazy=lazy,
+            return_config=False,
+        )
+        config = load_config(model_path)
+        model = _TextOnlyModelWrapper(lm_model, config)
+        return model, tokenizer
+
     if adapter_path is not None:
         model = apply_lora_layers(model, adapter_path)
         model.eval()
