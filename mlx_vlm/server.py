@@ -1880,13 +1880,13 @@ def main():
     parser.add_argument(
         "--log-file",
         type=str,
-        default="log_file",
+        default="<stdout>",
         help="File to write logs to.",
     )
     parser.add_argument(
         '--log-level',
         type=str,
-        default='DEBUG',
+        default='INFO',
         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
         help='Set the logging level (default: INFO)',
     )
