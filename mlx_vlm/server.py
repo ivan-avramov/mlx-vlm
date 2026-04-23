@@ -584,14 +584,25 @@ class TemplateParams(FlexibleBaseModel):
     )
 
     def template_kwargs(self) -> dict[str, Any]:
-        kwargs = self.dump_kwargs(
+        """Return kwargs safe to pass to the Jinja chat template.
+
+        Only ``enable_thinking`` belongs here. Generation-side params
+        (thinking_budget, thinking_start_token, thinking_end_token) must NOT
+        leak into the template — they would override the model's native
+        thinking tokens and break generation.
+        """
+        kwargs = self.dump_kwargs("enable_thinking")
+        kwargs.setdefault("enable_thinking", True)
+        return kwargs
+
+    def thinking_kwargs(self) -> dict[str, Any]:
+        """Return thinking-related kwargs for the generation pipeline."""
+        return self.dump_kwargs(
             "enable_thinking",
             "thinking_budget",
             "thinking_start_token",
             "thinking_end_token",
         )
-        kwargs.setdefault("enable_thinking", True)
-        return kwargs
 
 
 class OpenAIRequest(GenerationParams, TemplateParams):
@@ -880,6 +891,7 @@ def build_generation_kwargs(
         "serialize_kv_quantization": get_serialize_kv_quantization(),
         **request.generation_kwargs(),
         **template_kwargs,
+        **request.thinking_kwargs(),
     }
 
 
