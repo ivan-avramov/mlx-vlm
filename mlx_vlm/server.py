@@ -46,7 +46,7 @@ from .vision_cache import VisionFeatureCache
 import logging
 
 from collections import OrderedDict
-from .turboquant import register_allocation_hook
+from .turboquant import register_allocation_hook, unregister_allocation_hook
 from .utils import sanitize_strict_json
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
@@ -294,7 +294,7 @@ def get_max_kv_size(model: str):
         return None
     if get_quantized_kv_bits(model) is not None:
         logging.warning(
-            f"Model {model} uses QuantizedKVCache cache, can't set max KV size, use --kv-bits [bits] instead."
+            f"Model {model} uses QuantizedKVCache cache. MAX_KV_SIZE={max_kv_tokens} will be used for static pre-allocation."
         )
     return max_kv_tokens
 
@@ -422,6 +422,14 @@ def unload_model_sync():
     # Clear vision cache before dropping references
     if "vision_cache" in model_cache:
         model_cache["vision_cache"].clear()
+    # Unregister allocation hook and purge multi-cache sessions before dropping references
+    mcm = model_cache.get("multi_cache_manager")
+    if mcm is not None:
+        unregister_allocation_hook(mcm.check_and_evict)
+        for state in mcm.caches.values():
+            state.cache = None
+            state.token_ids = None
+        mcm.caches.clear()
     model_cache = {}
     # Force garbage collection
     gc.collect()
@@ -1229,6 +1237,10 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                 gc.collect()
                 logging.info("Generation finished, cleared cache.")
 
+                translator = StreamingTranslator(thinking_start_token=thinking_start_token, thinking_end_token=thinking_end_token)
+                translated_text = translator.feed(result.text) + translator.flush()
+                translated_text = sanitize_strict_json(translated_text) if translated_text else translated_text
+
                 response = OpenAIResponse(
                     id=response_id,
                     object="response",
@@ -1243,12 +1255,12 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                             "content": [
                                 {
                                     "type": "output_text",
-                                    "text": result.text,
+                                    "text": translated_text,
                                 }
                             ],
                         }
                     ],
-                    output_text=result.text,
+                    output_text=translated_text,
                     temperature=openai_request.temperature,
                     top_p=openai_request.top_p,
                     usage={
@@ -1336,7 +1348,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                 content = message.content
                 if message.role == "assistant":
                     # Strip OpenWebUI thought blocks entirely to prevent token fragmentation
-                    content = re.sub(rf"{thinking_start_token}.*?{thinking_end_token}\n*", "", content, flags=re.DOTALL)
+                    content = re.sub(rf"{re.escape(thinking_start_token)}.*?{re.escape(thinking_end_token)}\n*", "", content, flags=re.DOTALL)
                 msg_dict["content"] = content.strip()
 
             elif isinstance(message.content, list):
@@ -1361,7 +1373,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                             text_val = item.get("text", "")
                             if message.role == "assistant":
                                 # Strip thought blocks from multimodal history
-                                text_val = re.sub(rf"{thinking_start_token}.*?{thinking_end_token}\n*", "", text_val, flags=re.DOTALL)
+                                text_val = re.sub(rf"{re.escape(thinking_start_token)}.*?{re.escape(thinking_end_token)}\n*", "", text_val, flags=re.DOTALL)
                             if text_val.strip():
                                 new_content.append(
                                     {"type": "text", "text": text_val.strip()}
@@ -1495,7 +1507,7 @@ async def chat_completions_endpoint(request: ChatRequest):
 
                     for chunk in token_iterator:
                         if chunk is None or not hasattr(chunk, "text"):
-                            logging.warning("Warning: Received unexpected chunk format: '{chunk}'")
+                            logging.warning(f"Warning: Received unexpected chunk format: '{chunk}'")
                             continue
 
                         full_output_text += chunk.text
@@ -1569,7 +1581,8 @@ async def chat_completions_endpoint(request: ChatRequest):
                     else:
                         # Rescue the buffered text if the model started a tool sequence but failed to write valid JSON
                         if is_tool_call_sequence:
-                            final_content = StreamingTranslator(thinking_start_token=thinking_start_token, thinking_end_token=thinking_end_token).translate(tool_calls["remaining_text"])
+                            rescued = StreamingTranslator(thinking_start_token=thinking_start_token, thinking_end_token=thinking_end_token).translate(tool_calls["remaining_text"])
+                            final_content = sanitize_strict_json(rescued) if rescued else ""
                         else:
                             final_content = ""
 

@@ -49,6 +49,24 @@ DEFAULT_QUANTIZED_KV_START = 5000
 DEFAULT_PREFILL_STEP_SIZE = 2048
 
 
+def _kv_seq_axis(shape) -> int:
+    """Return the sequence-length axis for a KV cache tensor.
+
+    MLX convention is [B, H, L, D] (axis 2).  Some models use [B, L, H, D]
+    (axis 1).  We disambiguate by checking ndim and falling back to 2 when the
+    two middle dims are equal (which is the common MLX layout).
+    """
+    if len(shape) < 3:
+        return 1
+    # Unambiguous cases
+    if shape[1] > shape[2]:
+        return 1
+    if shape[2] > shape[1]:
+        return 2
+    # Equal dims — default to the standard MLX layout [B, H, L, D]
+    return 2
+
+
 def parse_arguments():
     parser = argparse.ArgumentParser(
         description="Generate text from an image using a model."
@@ -696,16 +714,24 @@ def stream_generate(
         # Ring buffers irreparably lose historical context when overwritten. Rewinding leaves
         # a "Memory Hole" and ghost tokens that cause Softmax anomalies (hallucination loops).
         # We must invalidate the cache and force a full re-prefill to maintain mathematical integrity.
-        if prefix_len > 0 and prefix_len < len(prompt_cache_state.token_ids):
-            for c in prompt_cache_state.cache:
+        def _has_rotating_cache(entries):
+            for c in entries:
                 if type(c).__name__ in ["RotatingKVCache", "BatchRotatingKVCache"]:
-                    logging.debug(
-                        f"DEBUG CORRUPTION GUARD: Multi-Cache | SWA Ring Buffer Corruption Guard triggered. "
-                        f"Attempted rewind to token {prefix_len}, but RotatingKVCache "
-                        f"cannot be safely reversed. Forcing full re-prefill."
-                    )
-                    prefix_len = 0
-                    break
+                    return True
+                if hasattr(c, "caches") and _has_rotating_cache(c.caches):
+                    return True
+                if isinstance(c, (list, tuple)) and _has_rotating_cache(c):
+                    return True
+            return False
+
+        if prefix_len > 0 and prefix_len < len(prompt_cache_state.token_ids):
+            if _has_rotating_cache(prompt_cache_state.cache):
+                logging.debug(
+                    f"DEBUG CORRUPTION GUARD: Multi-Cache | SWA Ring Buffer Corruption Guard triggered. "
+                    f"Attempted rewind to token {prefix_len}, but RotatingKVCache "
+                    f"cannot be safely reversed. Forcing full re-prefill."
+                )
+                prefix_len = 0
 
         if prefix_len > 0 and prefix_len < input_ids.shape[1]:
             reused_prefix_len = prefix_len
@@ -757,7 +783,7 @@ def stream_generate(
 
                                 if k_arr is not None and v_arr is not None:
                                     if isinstance(k_arr, mx.array):
-                                        seq_axis = 1 if k_arr.shape[1] > k_arr.shape[2] else 2
+                                        seq_axis = _kv_seq_axis(k_arr.shape)
                                         logging.debug(f"DEBUG TRIM: Slicing {type(c).__name__} from {k_arr.shape[seq_axis]} down to {target_len}")
                                         if seq_axis == 1:
                                             setattr(c, k_attr, k_arr[:, :target_len, ...])
@@ -771,7 +797,7 @@ def stream_generate(
                                         new_k, new_v = [], []
                                         current_len = 0
                                         for k, v in zip(k_arr, v_arr):
-                                            seq_axis = 1 if k.shape[1] > k.shape[2] else 2
+                                            seq_axis = _kv_seq_axis(k.shape)
                                             chunk_len = k.shape[seq_axis]
 
                                             if current_len + chunk_len <= target_len:
