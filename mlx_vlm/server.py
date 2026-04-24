@@ -253,6 +253,19 @@ class ResponseGenerator:
             elif config.eos_token_id is not None:
                 stop_tokens.add(config.eos_token_id)
 
+        # Some model configs only list <eos> but omit chat-template stop
+        # tokens like <end_of_turn>. Resolve them from the tokenizer's vocab.
+        tokenizer = (
+            processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        )
+        _chat_stop_tokens = ["<end_of_turn>", "<|endoftext|>", "<|im_end|>"]
+        if hasattr(tokenizer, "convert_tokens_to_ids"):
+            for tok in _chat_stop_tokens:
+                tid = tokenizer.convert_tokens_to_ids(tok)
+                unk = getattr(tokenizer, "unk_token_id", None)
+                if tid is not None and tid != unk:
+                    stop_tokens.add(tid)
+
         draft_model = None
         draft_model_path = os.environ.get("MLX_VLM_DRAFT_MODEL")
         if draft_model_path:
