@@ -515,6 +515,17 @@ def load(
         # to be the callable HF tokenizer.  Expose it explicitly.
         tokenizer.tokenizer = tokenizer._tokenizer
 
+        # Patch the detokenizer's add_token to accept the skip_special_token_ids
+        # kwarg that the mlx_vlm generation pipeline passes.  mlx_lm detokenizers
+        # don't have this parameter.
+        _detok = tokenizer.detokenizer
+        _orig_add_token = _detok.add_token
+        def _patched_add_token(token, skip_special_token_ids=None):
+            if skip_special_token_ids and token in skip_special_token_ids:
+                return
+            _orig_add_token(token)
+        _detok.add_token = _patched_add_token
+
         # Attach StoppingCriteria so generate() can call
         # tokenizer.stopping_criteria.reset(...)
         eos_token_id = config.get("eos_token_id", None)
