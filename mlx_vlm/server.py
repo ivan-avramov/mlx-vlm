@@ -119,7 +119,7 @@ class GenerationArguments:
     seed: Optional[int] = None
     repetition_penalty: Optional[float] = None
     logit_bias: Optional[dict] = None
-    enable_thinking: bool = True
+    enable_thinking: bool = False
     thinking_budget: Optional[int] = None
     thinking_start_token: Optional[str] = None
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None
@@ -837,7 +837,7 @@ def _build_gen_args(request, processor=None) -> GenerationArguments:
         min_p=getattr(request, "min_p", 0.0),
         repetition_penalty=getattr(request, "repetition_penalty", None),
         logit_bias=logit_bias,
-        enable_thinking=getattr(request, "enable_thinking", True),
+        enable_thinking=getattr(request, "enable_thinking", False),
         thinking_budget=getattr(request, "thinking_budget", None),
         thinking_start_token=getattr(request, "thinking_start_token", None),
     )
@@ -1250,7 +1250,7 @@ class OpenAIRequest(FlexibleBaseModel):
     min_p: float = Field(0.0, description="Min-p sampling.")
     repetition_penalty: Optional[float] = Field(None, description="Repetition penalty.")
     logit_bias: Optional[Any] = Field(None, description="Logit bias dict.")
-    enable_thinking: bool = Field(True, description="Enable thinking mode.")
+    enable_thinking: bool = Field(False, description="Enable thinking mode.")
     thinking_budget: Optional[int] = Field(None, description="Max thinking tokens.")
     thinking_start_token: Optional[str] = Field(
         None, description="Thinking start token."
@@ -1443,7 +1443,7 @@ class VLMRequest(FlexibleBaseModel):
     seed: int = Field(DEFAULT_SEED, description="Seed for random generation.")
     repetition_penalty: Optional[float] = Field(None, description="Repetition penalty.")
     logit_bias: Optional[Any] = Field(None, description="Logit bias dict.")
-    enable_thinking: bool = Field(True, description="Enable thinking mode.")
+    enable_thinking: bool = Field(False, description="Enable thinking mode.")
     thinking_budget: Optional[int] = Field(None, description="Max thinking tokens.")
     thinking_start_token: Optional[str] = Field(
         None, description="Thinking start token."
@@ -2062,6 +2062,21 @@ async def chat_completions_endpoint(request: ChatRequest):
                 msg["content"] = text_content
             else:
                 msg["content"] = message.content
+
+            # Strip thinking blocks from previous assistant messages to prevent
+            # token bloat from accumulated thought content in multi-turn chats.
+            if message.role == "assistant" and isinstance(msg["content"], str):
+                content = msg["content"]
+                # Gemma format: <|channel>thought...<channel|>
+                content = re.sub(
+                    r"<\|channel>thought.*?<channel\|>\n*",
+                    "",
+                    content,
+                    flags=re.DOTALL,
+                )
+                # Generic format: <think>...</think>
+                content = re.sub(r"<think>.*?</think>\n*", "", content, flags=re.DOTALL)
+                msg["content"] = content.strip()
 
             # Preserve tool-calling metadata.
             # Ensure arguments are dicts (not JSON strings) for Jinja templates

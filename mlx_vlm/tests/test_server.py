@@ -142,7 +142,7 @@ class TestResponseGenerator:
         args = server.GenerationArguments()
         assert args.max_tokens == server.DEFAULT_MAX_TOKENS
         assert args.temperature == server.DEFAULT_TEMPERATURE
-        assert args.enable_thinking is True
+        assert args.enable_thinking is False
         assert args.logit_bias is None
 
     def test_generate_arguments_to_generate_kwargs(self):
@@ -215,7 +215,7 @@ class TestResponseGenerator:
         )
         args = server._build_gen_args(req)
         assert args.max_tokens == 256
-        assert args.enable_thinking is True
+        assert args.enable_thinking is True  # explicitly passed True
 
     def test_extract_chat_response_format_json_schema(self):
         req = SimpleNamespace(
