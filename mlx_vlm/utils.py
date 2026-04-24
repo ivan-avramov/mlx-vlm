@@ -489,8 +489,14 @@ def load(
         config = load_config(model_path)
         model = _TextOnlyModelWrapper(lm_model, config)
 
-        # Attach StoppingCriteria and detokenizer so the generation pipeline
-        # works the same as for VLM-loaded models.
+        # The mlx_lm TokenizerWrapper delegates attribute access to the inner
+        # HF tokenizer via __getattr__, but __call__ is a special method and
+        # won't be intercepted.  The VLM pipeline expects processor.tokenizer
+        # to be the callable HF tokenizer.  Expose it explicitly.
+        tokenizer.tokenizer = tokenizer._tokenizer
+
+        # Attach StoppingCriteria so generate() can call
+        # tokenizer.stopping_criteria.reset(...)
         eos_token_id = config.get("eos_token_id", None)
         eos_ids = eos_token_id if isinstance(eos_token_id, list) else [eos_token_id] if eos_token_id is not None else []
         tokenizer.stopping_criteria = StoppingCriteria(eos_ids, tokenizer)
