@@ -11,6 +11,8 @@ from pathlib import Path
 from textwrap import dedent
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import json_repair
+
 _LOG_NAME = os.environ.get("MLX_VLM_LOG_NAME", "mlx_vlm")
 logger = logging.getLogger(f"{_LOG_NAME}.utils")
 
@@ -1854,26 +1856,27 @@ def print_array_report(t: mx.array, label: Optional[str]) -> dict:
 
 
 def _escape_math_block(match: re.Match) -> str:
-    """Double-escape backslashes in math blocks to prevent JSON corruption."""
+    # Double-escape any backslash not followed by another backslash or quote
     return re.sub(r'(?<!\\)\\(?!\\|")', r"\\\\", match.group(0))
 
 
 def sanitize_strict_json(text: str) -> str:
-    """Repair model-generated JSON, pre-escaping math blocks.
-
-    Returns the original text untouched if it doesn't look like JSON.
-    """
-    import json_repair
-
+    logger.debug("Sanitizing text for strict JSON parsing. Original Text: %s", text)
     text_stripped = text.strip()
 
+    # Detect intent: is this meant to be JSON?
     if text_stripped.startswith("```json"):
+        # Markdown JSON block — strip wrapper
         inner = text_stripped.strip("`").removeprefix("json").strip()
     elif text_stripped.startswith(("{", "[")):
+        # Raw JSON object or array
         inner = text_stripped
     else:
-        return text
+        logger.debug("Text does not appear to be JSON. Returning original text")
+        return text  # Not JSON-intended — pass through untouched
 
+    # Pre-escape math blocks BEFORE json_repair sees them,
+    # otherwise valid JSON escapes like \f, \b, \n silently destroy LaTeX
     math_block_pattern = (
         r"\$\$[\s\S]*?\$\$|\$[^\$]*?\$|\\\[[\s\S]*?\\\]|\\\([\s\S]*?\\\)"
     )
