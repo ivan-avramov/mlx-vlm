@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 from functools import lru_cache
 from typing import NamedTuple, Optional
@@ -7,6 +8,26 @@ from typing import NamedTuple, Optional
 import mlx.core as mx
 import numpy as np
 from mlx_lm.models.cache import _BaseCache, create_attention_mask
+
+_ALLOCATION_HOOKS = []
+
+
+def register_allocation_hook(hook):
+    if hook not in _ALLOCATION_HOOKS:
+        _ALLOCATION_HOOKS.append(hook)
+
+
+def unregister_allocation_hook(hook):
+    try:
+        _ALLOCATION_HOOKS.remove(hook)
+    except ValueError:
+        pass
+
+
+def _trigger_allocation_hooks():
+    for hook in _ALLOCATION_HOOKS:
+        hook()
+
 
 DEFAULT_TURBOQUANT_SEED = 0
 _EPS = 1e-6
@@ -4111,8 +4132,20 @@ def _reserve_state_capacity(state, used: int, needed: int, step: int):
     capacity = _state_length(state)
     if capacity >= needed:
         return state
-    # Round up to next step boundary — avoids 2x growth spikes
-    new_capacity = ((needed + step - 1) // step) * step
+
+    # Calculate arithmetic step growth
+    step_capacity = ((needed + step - 1) // step) * step
+
+    # Calculate geometric 1.25x growth (prevents O(N^2) reallocation
+    # thrashing at large contexts)
+    geometric_capacity = int(capacity * 1.25)
+
+    # Use whichever is larger to scale aggressively when the cache gets huge
+    new_capacity = max(step_capacity, geometric_capacity)
+    logging.debug("Reallocating old:%d, new:%d", capacity, new_capacity)
+
+    _trigger_allocation_hooks()
+
     grown = _allocate_state_like(state, new_capacity)
     if used > 0:
         _write_state(grown, _slice_state(state, used), 0)
@@ -4922,9 +4955,15 @@ class TurboQuantKVCache(_BaseCache):
     prefill_query_block_size = 16
     cache_step = 256
 
-    def __init__(self, bits: float, seed: int = DEFAULT_TURBOQUANT_SEED):
+    def __init__(
+        self,
+        bits: float,
+        seed: int = DEFAULT_TURBOQUANT_SEED,
+        max_kv_size: Optional[int] = None,
+    ):
         self.bits = _validate_bits(bits)
         self.seed = seed
+        self.max_kv_size = max_kv_size
         self.offset = 0
         self.keys = None
         self.values = None
@@ -4937,11 +4976,42 @@ class TurboQuantKVCache(_BaseCache):
 
     @classmethod
     def from_cache(
-        cls, cache, bits: float, seed: int = DEFAULT_TURBOQUANT_SEED
+        cls,
+        cache,
+        bits: float,
+        seed: int = DEFAULT_TURBOQUANT_SEED,
+        max_kv_size: Optional[int] = None,
     ) -> "TurboQuantKVCache":
-        turbo_cache = cls(bits=bits, seed=seed)
+        turbo_cache = cls(bits=bits, seed=seed, max_kv_size=max_kv_size)
+
+        # Handle ChunkedKVCache (list-based KV) by merging into continuous array
         keys, values = cache.state
+        cache_offset = getattr(cache, "offset", 0)
+
         if keys is not None:
+            if isinstance(keys, list):
+                keys = mx.concatenate(keys, axis=2)
+                values = mx.concatenate(values, axis=2)
+
+            # Strip step-padding: slice to actual offset
+            if cache_offset > 0 and keys.shape[2] > cache_offset:
+                keys = keys[:, :, :cache_offset, :]
+                values = values[:, :, :cache_offset, :]
+
+            mx.eval(keys, values)
+
+            # Numerical validation
+            k_max = mx.max(mx.abs(keys)).item()
+            v_max = mx.max(mx.abs(values)).item()
+            logging.debug(
+                "TurboQuantKVCache.from_cache | offset=%d shape=%s "
+                "k_max=%.4f v_max=%.4f",
+                cache_offset,
+                keys.shape,
+                k_max,
+                v_max,
+            )
+
             turbo_cache.update_and_fetch(keys, values)
         return turbo_cache
 
@@ -5030,8 +5100,12 @@ class TurboQuantKVCache(_BaseCache):
 
         new_end = self.offset + keys.shape[2]
         if self.keys is None:
-            self.keys = _allocate_state_like(new_keys, new_end)
-            self.values = _allocate_state_like(new_values, new_end)
+            _trigger_allocation_hooks()
+            # Pre-allocate to max_kv_size if set, to avoid late-stage
+            # double-buffer reallocation spikes
+            initial_alloc = max(new_end, self.max_kv_size or 0)
+            self.keys = _allocate_state_like(new_keys, initial_alloc)
+            self.values = _allocate_state_like(new_values, initial_alloc)
         else:
             self.keys = _reserve_state_capacity(
                 self.keys, self.offset, new_end, self.cache_step
