@@ -652,6 +652,29 @@ def stream_generate(
     logging.info(f"kwargs stream_generate: {kwargs}")
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
 
+    # Ensure stopping criteria reflects the model's EOS token IDs.
+    # generate() does this before calling us, but direct callers (e.g. the
+    # server) skip generate() and would otherwise use stale criteria.
+    if hasattr(tokenizer, "stopping_criteria"):
+        eos_tokens = kwargs.pop("eos_tokens", None)
+        if eos_tokens is not None:
+            tokenizer.stopping_criteria.add_eos_token_ids(eos_tokens)
+        else:
+            tokenizer.stopping_criteria.reset(model.config.eos_token_id)
+
+            # Some model configs only list <eos> but omit chat-template stop
+            # tokens like <end_of_turn>.  Resolve them from the tokenizer's
+            # vocab and merge so generation stops at the right place.
+            _chat_stop_tokens = ["<end_of_turn>", "<|endoftext|>", "<|im_end|>"]
+            if hasattr(tokenizer, "convert_tokens_to_ids"):
+                for tok in _chat_stop_tokens:
+                    tid = tokenizer.convert_tokens_to_ids(tok)
+                    # convert_tokens_to_ids returns unk_token_id for unknown tokens
+                    unk = getattr(tokenizer, "unk_token_id", None)
+                    if tid is not None and tid != unk and tid not in tokenizer.stopping_criteria.eos_token_ids:
+                        tokenizer.stopping_criteria.eos_token_ids.append(tid)
+
+
     # Set up thinking budget criteria if requested
     thinking_budget = kwargs.pop("thinking_budget", None)
     thinking_end_token = kwargs.pop("thinking_end_token", DEFAULT_THINKING_END_TOKEN)
@@ -724,25 +747,35 @@ def stream_generate(
         prefix_len = prompt_cache_state.find_prefix_length(full_input_ids_list)
 
         # SWA / RotatingKVCache Corruption Guard
-        # Ring buffers irreparably lose historical context when overwritten. Rewinding leaves
-        # a "Memory Hole" and ghost tokens that cause Softmax anomalies (hallucination loops).
-        # We must invalidate the cache and force a full re-prefill to maintain mathematical integrity.
-        def _has_rotating_cache(entries):
+        # Ring buffers lose historical context once they wrap (offset > max_size).
+        # Rewinding into the overwritten region creates a "Memory Hole" and ghost
+        # tokens that cause Softmax anomalies (hallucination loops).  However,
+        # if the buffer hasn't wrapped, all positions are still valid and a
+        # rewind is safe — just trim the offset.
+        def _rotating_rewind_safe(entries, target_len):
+            """Return True if every RotatingKVCache can be safely rewound to target_len."""
             for c in entries:
-                if type(c).__name__ in ["RotatingKVCache", "BatchRotatingKVCache"]:
-                    return True
-                if hasattr(c, "caches") and _has_rotating_cache(c.caches):
-                    return True
-                if isinstance(c, (list, tuple)) and _has_rotating_cache(c):
-                    return True
-            return False
+                name = type(c).__name__
+                if name in ("RotatingKVCache", "BatchRotatingKVCache"):
+                    offset = int(c.offset.item() if hasattr(c.offset, "item") else c.offset)
+                    max_size = getattr(c, "max_size", None)
+                    if max_size is not None and offset > max_size:
+                        # Buffer has wrapped — data before (offset - max_size) is gone
+                        if target_len < (offset - max_size):
+                            return False
+                elif hasattr(c, "caches"):
+                    if not _rotating_rewind_safe(c.caches, target_len):
+                        return False
+                elif isinstance(c, (list, tuple)):
+                    if not _rotating_rewind_safe(c, target_len):
+                        return False
+            return True
 
         if prefix_len > 0 and prefix_len < len(prompt_cache_state.token_ids):
-            if _has_rotating_cache(prompt_cache_state.cache):
+            if not _rotating_rewind_safe(prompt_cache_state.cache, prefix_len):
                 logging.debug(
-                    f"DEBUG CORRUPTION GUARD: Multi-Cache | SWA Ring Buffer Corruption Guard triggered. "
-                    f"Attempted rewind to token {prefix_len}, but RotatingKVCache "
-                    f"cannot be safely reversed. Forcing full re-prefill."
+                    f"SWA Ring Buffer Corruption Guard: rewind to token {prefix_len} "
+                    f"is in the overwritten region. Forcing full re-prefill."
                 )
                 prefix_len = 0
 

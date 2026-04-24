@@ -592,7 +592,7 @@ class TemplateParams(FlexibleBaseModel):
         thinking tokens and break generation.
         """
         kwargs = self.dump_kwargs("enable_thinking")
-        kwargs.setdefault("enable_thinking", True)
+        kwargs.setdefault("enable_thinking", False)
         return kwargs
 
     def thinking_kwargs(self) -> dict[str, Any]:
@@ -1404,23 +1404,6 @@ async def chat_completions_endpoint(request: ChatRequest):
                     msg_dict["content"] = new_content
 
             processed_messages.append(msg_dict)
-
-        # --- GHOST PROMPT MATH GUARD ---
-        math_guard = "Enclose inline math in \\( and \\). Enclose display math in \\[ and \\] on their own lines."
-        has_system_prompt = False
-
-        for msg in processed_messages:
-            if msg.get("role") == "system":
-                # Ensure content is a string before appending (handles multimodal lists)
-                if isinstance(msg["content"], str):
-                    msg["content"] += f"\n{math_guard}"
-                elif isinstance(msg["content"], list):
-                    msg["content"].append({"type": "text", "text": f"\n{math_guard}"})
-                has_system_prompt = True
-                break
-
-        if not has_system_prompt:
-            processed_messages.insert(0, {"role": "system", "content": math_guard})
 
         tools = None
         if hasattr(request, "tools") and request.tools:
