@@ -488,6 +488,13 @@ def load(
         )
         config = load_config(model_path)
         model = _TextOnlyModelWrapper(lm_model, config)
+
+        # Attach StoppingCriteria and detokenizer so the generation pipeline
+        # works the same as for VLM-loaded models.
+        eos_token_id = config.get("eos_token_id", None)
+        eos_ids = eos_token_id if isinstance(eos_token_id, list) else [eos_token_id] if eos_token_id is not None else []
+        tokenizer.stopping_criteria = StoppingCriteria(eos_ids, tokenizer)
+
         return model, tokenizer
 
     if adapter_path is not None:
