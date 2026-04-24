@@ -136,9 +136,9 @@ class _TextOnlyLanguageModel(nn.Module):
 class _TextOnlyModelWrapper(nn.Module):
     """Wraps an mlx_lm text-only model so it looks like a VLM to the generation pipeline.
 
-    The generation code expects ``model.language_model`` and ``model.config``.
-    For text-only models loaded via mlx_lm, the model itself IS the language
-    model, so this wrapper simply provides the expected interface.
+    The generation code expects ``model.language_model``, ``model.config``,
+    and ``model.get_input_embeddings()``.  For text-only models loaded via
+    mlx_lm, this wrapper provides the expected interface.
     """
 
     def __init__(self, lm_model: nn.Module, config: dict):
@@ -146,9 +146,29 @@ class _TextOnlyModelWrapper(nn.Module):
         self.language_model = _TextOnlyLanguageModel(lm_model)
         self._config = _SimpleNamespace(config)
 
+        # Locate the embedding layer for get_input_embeddings.
+        # mlx_lm models typically use model.model.embed_tokens.
+        if hasattr(lm_model, "model") and hasattr(lm_model.model, "embed_tokens"):
+            self._embed_tokens = lm_model.model.embed_tokens
+            self._embed_scale = getattr(lm_model.model, "embed_scale", None)
+        elif hasattr(lm_model, "embed_tokens"):
+            self._embed_tokens = lm_model.embed_tokens
+            self._embed_scale = getattr(lm_model, "embed_scale", None)
+        else:
+            self._embed_tokens = None
+            self._embed_scale = None
+
     @property
     def config(self):
         return self._config
+
+    def get_input_embeddings(self, input_ids, pixel_values=None, **kwargs):
+        from .models.base import InputEmbeddingsFeatures
+
+        inputs_embeds = self._embed_tokens(input_ids)
+        if self._embed_scale is not None:
+            inputs_embeds = inputs_embeds * self._embed_scale
+        return InputEmbeddingsFeatures(inputs_embeds=inputs_embeds)
 
     def __call__(self, *args, **kwargs):
         return self.language_model(*args, **kwargs)
