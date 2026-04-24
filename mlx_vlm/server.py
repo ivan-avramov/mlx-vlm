@@ -49,7 +49,7 @@ from .prompt_utils import apply_chat_template
 from .sample_utils import top_p_sampling
 from .structured import build_json_schema_logits_processor
 from .tool_parsers import _infer_tool_parser, load_tool_module
-from .utils import load, prepare_inputs
+from .utils import load, prepare_inputs, sanitize_strict_json
 from .version import __version__
 from .vision_cache import VisionFeatureCache
 
@@ -1969,6 +1969,7 @@ async def responses_endpoint(request: Request):
                 gc.collect()
 
                 reasoning, content = _split_thinking(full_text)
+                content = sanitize_strict_json(content) if content else content
 
                 response = OpenAIResponse(
                     id=response_id,
@@ -2523,6 +2524,8 @@ async def chat_completions_endpoint(request: ChatRequest):
                             for tid, lp, top_lps in collected_logprobs
                         ]
                     )
+
+                content = sanitize_strict_json(content) if content else content
 
                 choices = [
                     ChatChoice(
