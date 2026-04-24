@@ -4,6 +4,7 @@ import inspect
 import json
 import logging
 import math
+import re
 from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
@@ -100,6 +101,91 @@ def skip_multimodal_module(path: str) -> bool:
         "multi_modal_projector",
     )
     return any(module in path for module in multimodal_modules)
+
+
+class _TextOnlyLanguageModel(nn.Module):
+    """Wraps an mlx_lm model so its __call__ returns LanguageModelOutput.
+
+    mlx_lm models return raw logits tensors, but the mlx_vlm generation
+    pipeline expects ``outputs.logits``.
+    """
+
+    def __init__(self, lm_model: nn.Module):
+        super().__init__()
+        self._model = lm_model
+
+    @property
+    def layers(self):
+        return self._model.layers
+
+    def __call__(self, *args, **kwargs):
+        from .models.base import LanguageModelOutput
+
+        # Only pass kwargs the underlying mlx_lm model accepts
+        # (typically: inputs, cache, input_embeddings).
+        # Strip all VLM-specific extras to avoid TypeError.
+        sig = inspect.signature(self._model.__call__)
+        valid = set(sig.parameters.keys())
+        filtered = {k: v for k, v in kwargs.items() if k in valid}
+        out = self._model(*args, **filtered)
+        if isinstance(out, mx.array):
+            return LanguageModelOutput(logits=out)
+        return out
+
+    def make_cache(self):
+        if hasattr(self._model, "make_cache"):
+            return self._model.make_cache()
+        return None
+
+
+class _TextOnlyModelWrapper(nn.Module):
+    """Wraps an mlx_lm text-only model so it looks like a VLM.
+
+    The generation code expects ``model.language_model``, ``model.config``,
+    and ``model.get_input_embeddings()``.
+    """
+
+    def __init__(self, lm_model: nn.Module, config: dict):
+        super().__init__()
+        self.language_model = _TextOnlyLanguageModel(lm_model)
+        self._config = _SimpleNamespace(config)
+
+        if hasattr(lm_model, "model") and hasattr(lm_model.model, "embed_tokens"):
+            self._embed_tokens = lm_model.model.embed_tokens
+            self._embed_scale = getattr(lm_model.model, "embed_scale", None)
+        elif hasattr(lm_model, "embed_tokens"):
+            self._embed_tokens = lm_model.embed_tokens
+            self._embed_scale = getattr(lm_model, "embed_scale", None)
+        else:
+            self._embed_tokens = None
+            self._embed_scale = None
+
+    @property
+    def config(self):
+        return self._config
+
+    def get_input_embeddings(self, input_ids, pixel_values=None, **kwargs):
+        from .models.base import InputEmbeddingsFeatures
+
+        inputs_embeds = self._embed_tokens(input_ids)
+        if self._embed_scale is not None:
+            inputs_embeds = inputs_embeds * self._embed_scale
+        return InputEmbeddingsFeatures(inputs_embeds=inputs_embeds)
+
+    def __call__(self, *args, **kwargs):
+        return self.language_model(*args, **kwargs)
+
+
+class _SimpleNamespace:
+    """Attribute-access wrapper around a dict, for model config compatibility."""
+
+    def __init__(self, d: dict):
+        self._dict = d
+        for k, v in d.items():
+            setattr(self, k, v)
+
+    def __getattr__(self, name):
+        return self._dict.get(name)
 
 
 def get_model_and_args(config: dict):
@@ -409,7 +495,56 @@ def load(
     model_path = get_model_path(
         path_or_hf_repo, force_download=force_download, revision=revision
     )
-    model = load_model(model_path, lazy, **kwargs)
+
+    # Try VLM loading first; fall back to mlx_lm for text-only models
+    try:
+        model = load_model(model_path, lazy, **kwargs)
+    except ValueError as e:
+        if "not supported" not in str(e):
+            raise
+        logging.info("Model not found in mlx_vlm.models, falling back to mlx_lm: %s", e)
+        from mlx_lm.utils import load as mlx_lm_load
+
+        lm_model, tokenizer = mlx_lm_load(
+            path_or_hf_repo,
+            adapter_path=adapter_path,
+            lazy=lazy,
+            return_config=False,
+        )
+        config = load_config(model_path)
+        model = _TextOnlyModelWrapper(lm_model, config)
+
+        # Expose inner HF tokenizer as .tokenizer for VLM pipeline compat
+        tokenizer.tokenizer = tokenizer._tokenizer
+
+        # Patch detokenizer to accept skip_special_token_ids kwarg
+        _orig_detok_class = tokenizer._detokenizer_class
+
+        def _compat_detokenizer_factory(tok_ref):
+            instance = _orig_detok_class(tok_ref)
+            _orig_add = instance.add_token
+
+            def _patched_add(token, skip_special_token_ids=None):
+                if skip_special_token_ids and token in skip_special_token_ids:
+                    return
+                _orig_add(token)
+
+            instance.add_token = _patched_add
+            return instance
+
+        tokenizer._detokenizer_class = _compat_detokenizer_factory
+
+        # Attach StoppingCriteria for generate() compat
+        eos_token_id = config.get("eos_token_id", None)
+        eos_ids = (
+            eos_token_id
+            if isinstance(eos_token_id, list)
+            else [eos_token_id] if eos_token_id is not None else []
+        )
+        tokenizer.stopping_criteria = StoppingCriteria(eos_ids, tokenizer)
+
+        return model, tokenizer
+
     if adapter_path is not None:
         model = apply_lora_layers(model, adapter_path)
         model.eval()
@@ -1669,3 +1804,32 @@ def print_array_report(t: mx.array, label: Optional[str]) -> dict:
             print(f" '{key}': {repr(value)},")
     print("}")
     return report
+
+
+def _escape_math_block(match: re.Match) -> str:
+    """Double-escape backslashes in math blocks to prevent JSON corruption."""
+    return re.sub(r'(?<!\\)\\(?!\\|")', r"\\\\", match.group(0))
+
+
+def sanitize_strict_json(text: str) -> str:
+    """Repair model-generated JSON, pre-escaping math blocks.
+
+    Returns the original text untouched if it doesn't look like JSON.
+    """
+    import json_repair
+
+    text_stripped = text.strip()
+
+    if text_stripped.startswith("```json"):
+        inner = text_stripped.strip("`").removeprefix("json").strip()
+    elif text_stripped.startswith(("{", "[")):
+        inner = text_stripped
+    else:
+        return text
+
+    math_block_pattern = (
+        r"\$\$[\s\S]*?\$\$|\$[^\$]*?\$|\\\[[\s\S]*?\\\]|\\\([\s\S]*?\\\)"
+    )
+    math_escaped = re.sub(math_block_pattern, _escape_math_block, inner)
+
+    return json_repair.repair_json(math_escaped)

@@ -195,8 +195,10 @@ class MessageFormatter:
     def __init__(self, model_name: str):
         self.model_name = model_name.lower()
         self.format_type = MODEL_CONFIG.get(self.model_name)
+        # Unknown models (e.g. text-only models loaded via mlx_lm fallback)
+        # get plain text formatting — no image/audio tokens to insert.
         if not self.format_type:
-            raise ValueError(f"Unsupported model: {model_name}")
+            self.format_type = None
 
     def format_message(
         self,
@@ -271,6 +273,9 @@ class MessageFormatter:
         }
 
         formatter = formatter_map.get(self.format_type)
+        if formatter is None:
+            # Unknown model type — return plain text message
+            return {"role": role, "content": prompt}
         return formatter(
             prompt,
             role,
