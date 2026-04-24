@@ -517,15 +517,19 @@ def load(
 
         # The mlx_lm detokenizer is recreated on every property access (it's a
         # @property that calls _detokenizer_class(self)).  Replace the class
-        # with a wrapper that accepts the skip_special_token_ids kwarg that
-        # the mlx_vlm generation pipeline passes to add_token().
-        _orig_class = tokenizer._detokenizer_class
-        class _CompatDetokenizer(_orig_class):
-            def add_token(self, token, skip_special_token_ids=None):
+        # with a factory that patches each new instance's add_token to accept
+        # the skip_special_token_ids kwarg the mlx_vlm pipeline passes.
+        _orig_detok_class = tokenizer._detokenizer_class
+        def _compat_detokenizer_factory(tok_ref):
+            instance = _orig_detok_class(tok_ref)
+            _orig_add = instance.add_token
+            def _patched_add(token, skip_special_token_ids=None):
                 if skip_special_token_ids and token in skip_special_token_ids:
                     return
-                super().add_token(token)
-        tokenizer._detokenizer_class = _CompatDetokenizer
+                _orig_add(token)
+            instance.add_token = _patched_add
+            return instance
+        tokenizer._detokenizer_class = _compat_detokenizer_factory
 
         # Attach StoppingCriteria so generate() can call
         # tokenizer.stopping_criteria.reset(...)
