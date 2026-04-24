@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -2215,7 +2216,8 @@ async def chat_completions_endpoint(request: ChatRequest):
                                 )
 
                                 logger.debug(
-                                    "  TRACE streaming delta: %s", _truncate(str(chunk_data))
+                                    "  TRACE streaming delta: %s",
+                                    _truncate(str(chunk_data)),
                                 )
                                 yield f"data: {chunk_data.model_dump_json()}\n\n"
 
@@ -2682,10 +2684,11 @@ def main():
         help="Set the logging level. Env: MLX_VLM_LOG_LEVEL (default: INFO).",
     )
     parser.add_argument(
-        "--log-name",
+        "--log-file",
         type=str,
         default=None,
-        help="Set the base logger name. Env: MLX_VLM_LOG_NAME (default: mlx_vlm).",
+        help="Log output destination. Use '<stdout>' for stdout, or a file path. "
+        "Env: MLX_VLM_LOG_FILE (default: <stdout>).",
     )
     args = parser.parse_args()
     if args.trust_remote_code:
@@ -2715,14 +2718,20 @@ def main():
     # Configure logging — CLI args override env vars, env vars override defaults
     log_level_str = args.log_level or os.environ.get("MLX_VLM_LOG_LEVEL", "INFO")
     log_level = getattr(logging, log_level_str.upper(), logging.INFO)
-    log_name = args.log_name or os.environ.get("MLX_VLM_LOG_NAME", "mlx_vlm")
+    log_file = args.log_file or os.environ.get("MLX_VLM_LOG_FILE", "<stdout>")
 
-    logging.basicConfig(
-        level=log_level,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    )
+    log_kwargs = {
+        "level": log_level,
+        "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    }
+    if log_file == "<stdout>":
+        log_kwargs["stream"] = sys.stdout
+    else:
+        log_kwargs["filename"] = log_file
+
+    logging.basicConfig(**log_kwargs)
     # Set level on the base logger so all mlx_vlm.* loggers inherit it
-    logging.getLogger(log_name).setLevel(log_level)
+    logging.getLogger(_LOG_NAME).setLevel(log_level)
     logger.setLevel(log_level)
 
     logger.debug("Command-line arguments: %s", args)

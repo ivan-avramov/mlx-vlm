@@ -5,6 +5,7 @@ import functools
 import json
 import logging
 import os
+import sys
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -2636,12 +2637,19 @@ def main():
     # Configure logging — env vars provide defaults
     log_level_str = os.environ.get("MLX_VLM_LOG_LEVEL", "INFO")
     log_level = getattr(logging, log_level_str.upper(), logging.INFO)
-    log_name = os.environ.get("MLX_VLM_LOG_NAME", "mlx_vlm")
-    logging.basicConfig(
-        level=log_level,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    )
-    logging.getLogger(log_name).setLevel(log_level)
+    log_file = os.environ.get("MLX_VLM_LOG_FILE", "<stdout>")
+
+    log_kwargs = {
+        "level": log_level,
+        "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    }
+    if log_file == "<stdout>":
+        log_kwargs["stream"] = sys.stdout
+    else:
+        log_kwargs["filename"] = log_file
+
+    logging.basicConfig(**log_kwargs)
+    logging.getLogger(_LOG_NAME).setLevel(log_level)
 
     if isinstance(args.image, str):
         args.image = [args.image]
