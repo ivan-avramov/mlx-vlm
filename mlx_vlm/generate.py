@@ -4,11 +4,16 @@ import contextlib
 import functools
 import json
 import logging
+import os
+import sys
 import time
 import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
+
+_LOG_NAME = os.environ.get("MLX_VLM_LOG_NAME", "mlx_vlm")
+logger = logging.getLogger(f"{_LOG_NAME}.generate")
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -396,11 +401,13 @@ def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
     if model_bytes > 0.9 * max_rec_size:
         model_mb = model_bytes // 2**20
         max_rec_mb = max_rec_size // 2**20
-        print(
-            f"[WARNING] Generating with a model that requires {model_mb} MB "
-            f"which is close to the maximum recommended size of {max_rec_mb} "
+        logger.warning(
+            "Generating with a model that requires %d MB "
+            "which is close to the maximum recommended size of %d "
             "MB. This can be slow. See the documentation for possible work-arounds: "
-            "https://github.com/ml-explore/mlx-lm/tree/main#large-models"
+            "https://github.com/ml-explore/mlx-lm/tree/main#large-models",
+            model_mb,
+            max_rec_mb,
         )
     old_limit = mx.set_wired_limit(max_rec_size)
     try:
@@ -1174,7 +1181,7 @@ def stream_generate(
 
         if prefix_len > 0 and prefix_len < len(prompt_cache_state.token_ids):
             if not _rotating_rewind_safe(prompt_cache_state.cache, prefix_len):
-                logging.debug(
+                logger.debug(
                     "SWA Ring Buffer Corruption Guard: rewind to token %d "
                     "is in the overwritten region. Forcing full re-prefill.",
                     prefix_len,
@@ -1304,7 +1311,7 @@ def stream_generate(
             kwargs["prompt_cache"] = kv_cache
 
     if prompt_cache_state is not None:
-        logging.info(
+        logger.info(
             "Prefix Cache Telemetry | Total Prompt: %d | Skipped Context: %d "
             "| Prompt Delta: %d",
             original_prompt_length,
@@ -1431,7 +1438,7 @@ def generate(
     """
 
     if verbose:
-        print("=" * 10)
+        logger.info("=" * 10)
         files = []
         if image is not None:
             files.extend(image)
@@ -1440,9 +1447,9 @@ def generate(
         if video is not None:
             files.extend(video if isinstance(video, list) else [video])
 
-        print(f"Files: {files}", "\n")
+        logger.info("Files: %s", files)
 
-        print("Prompt:", prompt)
+        logger.info("Prompt: %s", prompt)
 
     text = ""
     last_response = None
@@ -1479,9 +1486,9 @@ def generate(
         last_response = response
 
     if verbose:
-        print("\n" + "=" * 10)
+        logger.info("=" * 10)
         if len(text) == 0:
-            print("No text generated for this prompt")
+            logger.warning("No text generated for this prompt")
             return GenerationResult(
                 text=text,
                 token=None,
@@ -1493,15 +1500,17 @@ def generate(
                 generation_tps=0.0,
                 peak_memory=mx.get_peak_memory() / 1e9,
             )
-        print(
-            f"Prompt: {last_response.prompt_tokens} tokens, "
-            f"{last_response.prompt_tps:.3f} tokens-per-sec"
+        logger.info(
+            "Prompt: %d tokens, %.3f tokens-per-sec",
+            last_response.prompt_tokens,
+            last_response.prompt_tps,
         )
-        print(
-            f"Generation: {last_response.generation_tokens} tokens, "
-            f"{last_response.generation_tps:.3f} tokens-per-sec"
+        logger.info(
+            "Generation: %d tokens, %.3f tokens-per-sec",
+            last_response.generation_tokens,
+            last_response.generation_tps,
         )
-        print(f"Peak memory: {last_response.peak_memory:.3f} GB")
+        logger.info("Peak memory: %.3f GB", last_response.peak_memory)
 
     return GenerationResult(
         text=text,
@@ -2509,7 +2518,9 @@ def batch_generate(
         grouped_images, grouped_indices = group_images_by_shape(processed_images)
 
         if verbose:
-            print(f"[batch_generate] Found {len(grouped_images)} unique image shapes")
+            logger.info(
+                "[batch_generate] Found %d unique image shapes", len(grouped_images)
+            )
     else:
         # Single image or grouping disabled - treat as one group
         shape = (
@@ -2580,15 +2591,18 @@ def batch_generate(
     total_stats.peak_memory = mx.get_peak_memory() / 1e9
 
     if verbose:
-        print(f"[batch_generate] Finished processing {len(prompts)} samples")
-        print(
-            f"[batch_generate] Prompt: {total_stats.prompt_tokens} tokens, {total_stats.prompt_tps:.3f} tokens-per-sec"
+        logger.info("[batch_generate] Finished processing %d samples", len(prompts))
+        logger.info(
+            "[batch_generate] Prompt: %d tokens, %.3f tokens-per-sec",
+            total_stats.prompt_tokens,
+            total_stats.prompt_tps,
         )
-        print(
-            f"[batch_generate] Generation: {total_stats.generation_tokens} tokens, "
-            f"{total_stats.generation_tps:.3f} tokens-per-sec"
+        logger.info(
+            "[batch_generate] Generation: %d tokens, %.3f tokens-per-sec",
+            total_stats.generation_tokens,
+            total_stats.generation_tps,
         )
-        print(f"[batch_generate] Peak memory: {total_stats.peak_memory:.3f} GB")
+        logger.info("[batch_generate] Peak memory: %.3f GB", total_stats.peak_memory)
 
     response = BatchResponse(all_texts, total_stats)
     if track_image_sizes:
@@ -2730,6 +2744,24 @@ def _generate_batch(
 
 def main():
     args = parse_arguments()
+
+    # Configure logging — env vars provide defaults
+    log_level_str = os.environ.get("MLX_VLM_LOG_LEVEL", "INFO")
+    log_level = getattr(logging, log_level_str.upper(), logging.INFO)
+    log_file = os.environ.get("MLX_VLM_LOG_FILE", "<stdout>")
+
+    log_kwargs = {
+        "level": log_level,
+        "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    }
+    if log_file == "<stdout>":
+        log_kwargs["stream"] = sys.stdout
+    else:
+        log_kwargs["filename"] = log_file
+
+    logging.basicConfig(**log_kwargs)
+    logging.getLogger(_LOG_NAME).setLevel(log_level)
+
     if isinstance(args.image, str):
         args.image = [args.image]
     if isinstance(args.audio, str):
@@ -2750,7 +2782,7 @@ def main():
     if args.draft_model is not None:
         from .speculative.drafters import load_drafter
 
-        print(f"Loading drafter ({args.draft_kind}): {args.draft_model}")
+        logger.info("Loading drafter (%s): %s", args.draft_kind, args.draft_model)
         draft_model = load_drafter(args.draft_model, kind=args.draft_kind)
 
     prompt = args.prompt
@@ -2884,13 +2916,15 @@ def main():
             lens = getattr(draft_model, "accept_lens", None) or []
             if lens:
                 mean_accept = round(sum(lens) / len(lens), 2)
-                print(
-                    f"Speculative decoding: {mean_accept} accepted tokens over {len(lens)} rounds"
+                logger.info(
+                    "Speculative decoding: %s accepted tokens over %d rounds",
+                    mean_accept,
+                    len(lens),
                 )
 
 
 if __name__ == "__main__":
-    print(
+    logger.warning(
         "Calling `python -m mlx_vlm.generate ...` directly is deprecated."
         " Use `mlx_vlm generate` or `python -m mlx_vlm generate` instead."
     )
