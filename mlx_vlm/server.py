@@ -1892,13 +1892,13 @@ def main():
     parser.add_argument(
         "--log-file",
         type=str,
-        default="<stdout>",
+        default=os.environ.get('MLX_VLM_LOG_FILE', "<stdout>"),
         help="File to write logs to.",
     )
     parser.add_argument(
         '--log-level',
         type=str,
-        default='INFO',
+        default=os.environ.get('MLX_VLM_LOG_LEVEL', 'INFO'),
         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
         help='Set the logging level (default: INFO)',
     )
