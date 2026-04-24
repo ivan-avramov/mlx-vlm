@@ -6,7 +6,6 @@ import logging
 import os
 import re
 import time
-import traceback
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -16,7 +15,8 @@ from queue import Queue
 from threading import Event, Lock, Thread
 from typing import Any, Callable, Iterator, List, Literal, Optional, Tuple, Union
 
-logger = logging.getLogger("mlx_vlm.server")
+_LOG_NAME = os.environ.get("MLX_VLM_LOG_NAME", "mlx_vlm")
+logger = logging.getLogger(f"{_LOG_NAME}.server")
 
 import mlx.core as mx
 import uvicorn
@@ -53,6 +53,16 @@ from .vision_cache import VisionFeatureCache
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
+DEBUG_PREVIEW_CHARS = 200
+
+
+def _truncate(text: str) -> str:
+    """Truncate text for debug logging, showing head and tail."""
+    if len(text) <= DEBUG_PREVIEW_CHARS * 2:
+        return text
+    return (
+        text[:DEBUG_PREVIEW_CHARS] + "<...truncated...>" + text[-DEBUG_PREVIEW_CHARS:]
+    )
 
 
 def get_prefill_step_size():
@@ -64,7 +74,9 @@ def get_quantized_kv_bits(model: str):
     if kv_bits == 0:
         return None
     if "qat" in model:
-        print(f"Model {model} is quantization aware, KV cache will not be quantized.")
+        logger.info(
+            "Model %s is quantization aware, KV cache will not be quantized.", model
+        )
         return None
     return kv_bits
 
@@ -82,7 +94,7 @@ def get_max_kv_size(model: str):
     if max_kv_tokens == 0:
         return None
     if get_quantized_kv_bits(model) is not None:
-        print(f"Model {model} uses QuantizedKVCache, can't set max KV size.")
+        logger.warning("Model %s uses QuantizedKVCache, can't set max KV size.", model)
         return None
     return max_kv_tokens
 
@@ -268,9 +280,11 @@ class ResponseGenerator:
             from .speculative.drafters import load_drafter
 
             draft_kind = os.environ.get("MLX_VLM_DRAFT_KIND", "dflash")
-            print(f"Loading speculative drafter ({draft_kind}): {draft_model_path}")
+            logger.info(
+                "Loading speculative drafter (%s): %s", draft_kind, draft_model_path
+            )
             draft_model = load_drafter(draft_model_path, kind=draft_kind)
-            print("Drafter ready — speculative decoding enabled.")
+            logger.info("Drafter ready — speculative decoding enabled.")
 
         self.model = model
         self.processor = processor
@@ -402,8 +416,9 @@ class ResponseGenerator:
         except Exception as e:
             self._load_error = e
             self._ready.set()
-            print(f"Error loading model in generation thread: {e}")
-            traceback.print_exc()
+            logger.error(
+                "Error loading model in generation thread: %s", e, exc_info=True
+            )
             return
 
         self._ready.set()
@@ -516,8 +531,7 @@ class ResponseGenerator:
                 self._step(batch_gen, active)
 
             except Exception as e:
-                print(f"Error in generation thread: {e}")
-                traceback.print_exc()
+                logger.error("Error in generation thread: %s", e, exc_info=True)
 
     def _run_speculative(self):
         """GPU thread loop with DFlash speculative decoding.
@@ -683,7 +697,7 @@ class ResponseGenerator:
                 al = drafter.accept_lens
                 if al:
                     mean_a = sum(al) / len(al)
-                    print(
+                    logger.debug(
                         f"[DFlash] batch={B} tokens={sum(len(token_lists[u]) for u in uids)} "
                         f"accept={mean_a:.2f} rounds={len(al)}"
                     )
@@ -703,8 +717,9 @@ class ResponseGenerator:
                         rqueues[uid].put(None)
 
             except Exception as e:
-                print(f"Error in speculative generation thread: {e}")
-                traceback.print_exc()
+                logger.error(
+                    "Error in speculative generation thread: %s", e, exc_info=True
+                )
 
     def _step(self, batch_gen, active, gen_kwargs=None):
         """One batch generation step: prefill + decode."""
@@ -821,7 +836,7 @@ def process_tool_calls(model_output: str, tool_module, tools):
                         }
                     )
                 except Exception:
-                    print(f"Invalid tool call: {call}")
+                    logger.warning("Invalid tool call: %s", call)
     return dict(calls=called_tools, remaining_text=remaining)
 
 
@@ -973,9 +988,9 @@ def load_model_resources(model_path: str, adapter_path: Optional[str]):
     Handles potential loading errors.
     """
     try:
-        print(f"Loading model from: {model_path}")
+        logger.info("Loading model from: %s", model_path)
         if adapter_path:
-            print(f"Loading adapter from: {adapter_path}")
+            logger.info("Loading adapter from: %s", adapter_path)
         # Use the load function from utils.py which handles path resolution and loading
         trust_remote_code = (
             os.environ.get("MLX_TRUST_REMOTE_CODE", "false").lower() == "true"
@@ -984,11 +999,10 @@ def load_model_resources(model_path: str, adapter_path: Optional[str]):
             model_path, adapter_path, trust_remote_code=trust_remote_code
         )
         config = model.config
-        print("Model and processor loaded successfully.")
+        logger.info("Model and processor loaded successfully.")
         return model, processor, config
     except Exception as e:
-        print(f"Error loading model {model_path}: {e}")
-        traceback.print_exc()  # Print detailed traceback for debugging
+        logger.error("Error loading model %s: %s", model_path, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to load model: {e}")
 
 
@@ -1010,12 +1024,12 @@ def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
 
     # Return from cache if already loaded and matches the requested paths
     if model_cache.get("cache_key") == cache_key:
-        print(f"Using cached model: {model_path}, Adapter: {adapter_path}")
+        logger.info("Using cached model: %s, Adapter: %s", model_path, adapter_path)
         return model_cache["model"], model_cache["processor"], model_cache["config"]
 
     # If cache exists but doesn't match, clear it
     if model_cache:
-        print("New model request, clearing existing cache...")
+        logger.info("New model request, clearing existing cache...")
         unload_model_sync()  # Use a synchronous version for internal call
 
     vision_cache_size = int(os.environ.get("MLX_VLM_VISION_CACHE_SIZE", "20"))
@@ -1064,13 +1078,15 @@ def unload_model_sync():
     if not model_cache:
         return False
 
-    print(
-        f"Unloading model: {model_cache.get('model_path')}, Adapter: {model_cache.get('adapter_path')}"
+    logger.info(
+        "Unloading model: %s, Adapter: %s",
+        model_cache.get("model_path"),
+        model_cache.get("adapter_path"),
     )
 
     # Stop the ResponseGenerator if running
     if response_generator is not None:
-        print("Stopping ResponseGenerator...")
+        logger.info("Stopping ResponseGenerator...")
         response_generator.stop_and_join()
         response_generator = None
 
@@ -1081,7 +1097,7 @@ def unload_model_sync():
     # Force garbage collection
     gc.collect()
     mx.clear_cache()
-    print("Model unloaded and cache cleared.")
+    logger.info("Model unloaded and cache cleared.")
     return True
 
 
@@ -1616,37 +1632,37 @@ async def responses_endpoint(request: Request):
                                     elif item["type"] == "input_image":
                                         images.append(item["image_url"])
                                     else:
-                                        print(
-                                            f"invalid input item type: {item['type']}"
+                                        logger.warning(
+                                            "invalid input item type: %s", item["type"]
                                         )
                                         raise HTTPException(
                                             status_code=400,
                                             detail="Invalid input item type.",
                                         )
                                 else:
-                                    print(
-                                        f"Invalid message content item format: {item}"
+                                    logger.warning(
+                                        "Invalid message content item format: %s", item
                                     )
                                     raise HTTPException(
                                         status_code=400,
                                         detail="Missing type in input item.",
                                     )
                         else:
-                            print("Invalid message content format.")
+                            logger.warning("Invalid message content format.")
                             raise HTTPException(
                                 status_code=400, detail="Invalid input format."
                             )
                     else:
-                        print("not a ChatMessage")
+                        logger.warning("Input item is not a ChatMessage")
                         raise HTTPException(
                             status_code=400, detail="Invalid input format."
                         )
             else:
-                print("neither string not list")
+                logger.warning("Input is neither string nor list")
                 raise HTTPException(status_code=400, detail="Invalid input format.")
 
         else:
-            print("no input")
+            logger.warning("No input provided in request")
             raise HTTPException(status_code=400, detail="Missing input.")
 
         gen_args = _build_gen_args(openai_request)
@@ -1667,6 +1683,8 @@ async def responses_endpoint(request: Request):
             gen_args.temperature,
             openai_request.stream,
         )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("  TRACE formatted prompt: %s", _truncate(formatted_prompt))
 
         generated_at = datetime.now().timestamp()
         response_id = f"resp_{uuid.uuid4().hex}"
@@ -1812,8 +1830,7 @@ async def responses_endpoint(request: Request):
                     yield f"event: response.completed\ndata: {ResponseCompletedEvent(type='response.completed', response=completed_response).model_dump_json()}\n\n"
 
                 except Exception as e:
-                    print(f"Error during stream generation: {e}")
-                    traceback.print_exc()
+                    logger.error("Error during stream generation: %s", e, exc_info=True)
                     error_data = json.dumps({"error": str(e)})
                     yield f"data: {error_data}\n\n"
 
@@ -1825,7 +1842,7 @@ async def responses_endpoint(request: Request):
                             pass
                     mx.clear_cache()
                     gc.collect()
-                    print("Stream finished, cleared cache.")
+                    logger.debug("Stream finished, cleared cache.")
 
             return StreamingResponse(
                 stream_generator(),
@@ -1919,17 +1936,12 @@ async def responses_endpoint(request: Request):
                     elapsed,
                 )
                 if logger.isEnabledFor(logging.DEBUG):
-                    resp_text = content or ""
-                    logger.debug(
-                        "  response: %s",
-                        resp_text[:200] + ("..." if len(resp_text) > 200 else ""),
-                    )
+                    logger.debug("  TRACE response: %s", _truncate(content or ""))
 
                 return response
 
             except Exception as e:
-                print(f"Error during generation: {e}")
-                traceback.print_exc()
+                logger.error("Error during generation: %s", e, exc_info=True)
                 mx.clear_cache()
                 gc.collect()
                 raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
@@ -1937,8 +1949,7 @@ async def responses_endpoint(request: Request):
     except HTTPException as http_exc:
         raise http_exc
     except Exception as e:
-        print(f"Unexpected error in /responses endpoint: {e}")
-        traceback.print_exc()
+        logger.error("Unexpected error in /responses endpoint: %s", e, exc_info=True)
         mx.clear_cache()
         gc.collect()
         raise HTTPException(
@@ -2042,6 +2053,7 @@ async def chat_completions_endpoint(request: ChatRequest):
             if message.name is not None:
                 msg["name"] = message.name
 
+            logger.debug("  TRACE msg: (%s)", _truncate(str(message.content)))
             processed_messages.append(msg)
 
         # Detect tool parser from chat template
@@ -2078,6 +2090,8 @@ async def chat_completions_endpoint(request: ChatRequest):
             gen_args.temperature,
             request.stream,
         )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("  TRACE formatted prompt: %s", _truncate(formatted_prompt))
 
         if request.stream:
             # Streaming response using ResponseGenerator for continuous batching
@@ -2200,6 +2214,9 @@ async def chat_completions_endpoint(request: ChatRequest):
                                     choices=choices,
                                 )
 
+                                logger.debug(
+                                    "  TRACE streaming delta: %s", _truncate(str(chunk_data))
+                                )
                                 yield f"data: {chunk_data.model_dump_json()}\n\n"
 
                             if token.finish_reason:
@@ -2223,6 +2240,10 @@ async def chat_completions_endpoint(request: ChatRequest):
                                     created=int(time.time()),
                                     model=request.model,
                                     choices=choices,
+                                )
+                                logger.debug(
+                                    "  TRACE streaming final (tool_calls): %s",
+                                    _truncate(str(chunk_data)),
                                 )
                                 yield f"data: {chunk_data.model_dump_json()}\n\n"
                     else:
@@ -2282,8 +2303,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                     )
 
                 except Exception as e:
-                    print(f"Error during stream generation: {e}")
-                    traceback.print_exc()
+                    logger.error("Error during stream generation: %s", e, exc_info=True)
                     error_data = json.dumps({"error": str(e)})
                     yield f"data: {error_data}\n\n"
 
@@ -2296,7 +2316,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                             pass
                     mx.clear_cache()
                     gc.collect()
-                    print("Stream finished, cleared cache.")
+                    logger.debug("Stream finished, cleared cache.")
 
             return StreamingResponse(
                 stream_generator(),
@@ -2456,17 +2476,12 @@ async def chat_completions_endpoint(request: ChatRequest):
                     peak_memory,
                 )
                 if logger.isEnabledFor(logging.DEBUG):
-                    resp_text = content or ""
-                    logger.debug(
-                        "  response: %s",
-                        resp_text[:200] + ("..." if len(resp_text) > 200 else ""),
-                    )
+                    logger.debug("  TRACE response: %s", _truncate(content or ""))
 
                 return result
 
             except Exception as e:
-                print(f"Error during generation: {e}")
-                traceback.print_exc()
+                logger.error("Error during generation: %s", e, exc_info=True)
                 mx.clear_cache()
                 gc.collect()
                 raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
@@ -2476,8 +2491,7 @@ async def chat_completions_endpoint(request: ChatRequest):
         raise http_exc
     except Exception as e:
         # Catch unexpected errors
-        print(f"Unexpected error in /generate endpoint: {e}")
-        traceback.print_exc()
+        logger.error("Unexpected error in /generate endpoint: %s", e, exc_info=True)
         mx.clear_cache()
         gc.collect()
         raise HTTPException(
@@ -2663,9 +2677,15 @@ def main():
     parser.add_argument(
         "--log-level",
         type=str,
-        default="INFO",
+        default=None,
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-        help="Set the logging level (default: INFO).",
+        help="Set the logging level. Env: MLX_VLM_LOG_LEVEL (default: INFO).",
+    )
+    parser.add_argument(
+        "--log-name",
+        type=str,
+        default=None,
+        help="Set the base logger name. Env: MLX_VLM_LOG_NAME (default: mlx_vlm).",
     )
     args = parser.parse_args()
     if args.trust_remote_code:
@@ -2692,13 +2712,23 @@ def main():
     if args.top_logprobs_k is not None:
         os.environ["TOP_LOGPROBS_K"] = str(args.top_logprobs_k)
 
-    # Configure logging
-    log_level = getattr(logging, args.log_level.upper(), logging.INFO)
+    # Configure logging — CLI args override env vars, env vars override defaults
+    log_level_str = args.log_level or os.environ.get("MLX_VLM_LOG_LEVEL", "INFO")
+    log_level = getattr(logging, log_level_str.upper(), logging.INFO)
+    log_name = args.log_name or os.environ.get("MLX_VLM_LOG_NAME", "mlx_vlm")
+
     logging.basicConfig(
         level=log_level,
-        format="%(asctime)s - %(levelname)s - %(message)s",
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
+    # Set level on the base logger so all mlx_vlm.* loggers inherit it
+    logging.getLogger(log_name).setLevel(log_level)
     logger.setLevel(log_level)
+
+    logger.debug("Command-line arguments: %s", args)
+    logger.info("Starting MLX VLM Server")
+    logger.info("Host: %s, Port: %s", args.host, args.port)
+    logger.info("Model: %s, Adapter: %s", args.model, args.adapter_path)
 
     uvicorn.run(
         "mlx_vlm.server:app",

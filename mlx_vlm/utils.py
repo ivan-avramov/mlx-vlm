@@ -4,11 +4,15 @@ import inspect
 import json
 import logging
 import math
+import os
 import re
 from io import BytesIO
 from pathlib import Path
 from textwrap import dedent
 from typing import Any, Dict, List, Optional, Tuple, Union
+
+_LOG_NAME = os.environ.get("MLX_VLM_LOG_NAME", "mlx_vlm")
+logger = logging.getLogger(f"{_LOG_NAME}.utils")
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -215,7 +219,7 @@ def get_model_and_args(config: dict):
             continue
 
     msg = f"Model type {model_type} not supported. Error: {last_err}"
-    logging.error(msg)
+    logger.error(msg)
     raise ValueError(msg)
 
 
@@ -286,7 +290,7 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
     ]
 
     if not weight_files:
-        logging.error(f"No safetensors found in {model_path}")
+        logger.error("No safetensors found in %s", model_path)
         message = f"""
 No safetensors found in {model_path}
 Create safetensors using the following code:
@@ -371,7 +375,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             elif quant_method == "mxfp4":
                 quantization = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
             elif quant_method in ("awq", "gptq", "bitnet"):
-                logging.warning(
+                logger.warning(
                     "Quantization method %s is not supported in mlx_vlm.load_model()",
                     quant_method,
                 )
@@ -499,7 +503,7 @@ def load(
     except ValueError as e:
         if "not supported" not in str(e):
             raise
-        logging.info("Model not found in mlx_vlm.models, falling back to mlx_lm: %s", e)
+        logger.info("Model not found in mlx_vlm.models, falling back to mlx_lm: %s", e)
         from mlx_lm.utils import load as mlx_lm_load
 
         lm_model, tokenizer = mlx_lm_load(
@@ -602,7 +606,7 @@ def sharded_load(
             raise ValueError("The model does not support pipeline parallelism")
         inner.pipeline(pipeline_group)
 
-    print("Materializing")
+    logger.info("Materializing")
     mx.eval(model.language_model.parameters())
     model.eval()
 
@@ -822,7 +826,9 @@ def upload_to_hub(path: str, upload_repo: str):
         repo_id=upload_repo,
         repo_type="model",
     )
-    print(f"Upload successful, go to https://huggingface.co/{upload_repo} for details.")
+    logger.info(
+        "Upload successful, go to https://huggingface.co/%s for details.", upload_repo
+    )
 
 
 def apply_repetition_penalty(logits: mx.array, generated_tokens: Any, penalty: float):
@@ -1479,8 +1485,8 @@ def prepare_inputs(
         )
 
         if len(audio) > 1:
-            print(
-                "\033[33mWarning\033[0m: Single prompt with multiple audio files is not supported yet. Using the first audio file.\n"
+            logger.warning(
+                "Single prompt with multiple audio files is not supported yet. Using the first audio file."
             )
             audio = audio[:1]
 
@@ -1835,14 +1841,15 @@ def print_array_report(t: mx.array, label: Optional[str]) -> dict:
         "label": label if label else "array",
     }
 
-    # Print each field, handling 'value' specially
-    print("{")
+    # Log each field, handling 'value' specially
+    lines = ["{"]
     for key, value in report.items():
         if key == "value":
-            print(f" '{key}': {value},")  # No quotes around value
+            lines.append(f" '{key}': {value},")
         else:
-            print(f" '{key}': {repr(value)},")
-    print("}")
+            lines.append(f" '{key}': {repr(value)},")
+    lines.append("}")
+    logger.debug("\n".join(lines))
     return report
 
 
