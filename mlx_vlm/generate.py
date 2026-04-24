@@ -3,6 +3,7 @@ import codecs
 import contextlib
 import functools
 import json
+import logging
 import time
 import warnings
 from collections.abc import Sequence
@@ -12,7 +13,6 @@ from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_reduce
-from mlx_lm.generate import maybe_quantize_kv_cache as mlx_maybe_quantize_kv_cache
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from tqdm import tqdm
 from transformers import PreTrainedTokenizer
@@ -48,6 +48,24 @@ DEFAULT_THINKING_START_TOKEN = "<think>"
 DEFAULT_THINKING_END_TOKEN = "</think>"
 DEFAULT_QUANTIZED_KV_START = 5000
 DEFAULT_PREFILL_STEP_SIZE = 2048
+
+
+def _kv_seq_axis(shape) -> int:
+    """Return the sequence-length axis for a KV cache tensor.
+
+    MLX convention is [B, H, L, D] (axis 2).  Some models use [B, L, H, D]
+    (axis 1).  We disambiguate by checking ndim and falling back to 2 when the
+    two middle dims are equal (which is the common MLX layout).
+    """
+    if len(shape) < 3:
+        return 1
+    # Unambiguous cases
+    if shape[1] > shape[2]:
+        return 1
+    if shape[2] > shape[1]:
+        return 2
+    # Equal dims — default to the standard MLX layout [B, H, L, D]
+    return 2
 
 
 def parse_arguments():
@@ -279,6 +297,8 @@ def maybe_quantize_kv_cache(
     kv_group_size,
     kv_bits,
     kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
+    max_kv_size: Optional[int] = None,
+    serialize_kv_quantization: bool = False,
 ):
     if kv_bits is None:
         return
@@ -290,13 +310,19 @@ def maybe_quantize_kv_cache(
                 return entry
             if isinstance(entry, cache.RotatingKVCache):
                 return entry
-            if isinstance(entry, cache.KVCache):
-                if entry.offset == 0:
+            # Support SimpleKVCache and ChunkedKVCache in addition to KVCache
+            if isinstance(
+                entry, (cache.KVCache, cache.SimpleKVCache, cache.ChunkedKVCache)
+            ):
+                current_offset = getattr(entry, "offset", 0)
+                if current_offset == 0:
                     # Empty: replace so update_and_fetch quantizes on the fly
-                    return TurboQuantKVCache(bits=kv_bits)
-                if entry.offset < quantized_kv_start:
+                    return TurboQuantKVCache(bits=kv_bits, max_kv_size=max_kv_size)
+                if current_offset < quantized_kv_start:
                     return entry
-                return TurboQuantKVCache.from_cache(entry, bits=kv_bits)
+                return TurboQuantKVCache.from_cache(
+                    entry, bits=kv_bits, max_kv_size=max_kv_size
+                )
             if isinstance(entry, cache.CacheList):
                 entry.caches = [quantize_entry(sub_entry) for sub_entry in entry.caches]
                 return entry
@@ -314,15 +340,40 @@ def maybe_quantize_kv_cache(
         for index, layer_cache in enumerate(prompt_cache):
             if index == last_idx:
                 continue
+
+            # Check if this layer is currently unquantized
+            was_unquantized = isinstance(
+                layer_cache,
+                (cache.KVCache, cache.SimpleKVCache, cache.ChunkedKVCache),
+            )
+
             prompt_cache[index] = quantize_entry(layer_cache)
+
+            # Serialize Graph Compilation: evaluate each layer immediately after
+            # conversion to prevent MLX from building one giant FP32 intermediate
+            # graph for all layers at once (which causes multi-GB OOM spikes).
+            if (
+                serialize_kv_quantization
+                and was_unquantized
+                and isinstance(prompt_cache[index], TurboQuantKVCache)
+            ):
+                mx.eval(prompt_cache[index].keys, prompt_cache[index].values)
         return
 
-    mlx_maybe_quantize_kv_cache(
-        prompt_cache,
-        quantized_kv_start=quantized_kv_start,
-        kv_group_size=kv_group_size,
-        kv_bits=int(kv_bits),
-    )
+    # Uniform quantization path — replaces upstream mlx_maybe_quantize_kv_cache
+    # to safely skip RotatingKVCache (which raises NotImplementedError) and
+    # support serialized per-layer evaluation.
+    kv_bits_int = int(kv_bits)
+    for index, c in enumerate(prompt_cache):
+        if isinstance(c, cache.RotatingKVCache):
+            continue
+        if not hasattr(c, "to_quantized") or c.offset < quantized_kv_start:
+            continue
+        prompt_cache[index] = c.to_quantized(group_size=kv_group_size, bits=kv_bits_int)
+        if serialize_kv_quantization:
+            keys, values = prompt_cache[index].state
+            if keys is not None:
+                mx.eval(keys, values)
 
 
 @contextlib.contextmanager
@@ -775,12 +826,15 @@ def generate_step(
           one token and a vector of log probabilities.
     """
 
+    serialize_kv_quantization = kwargs.pop("serialize_kv_quantization", False)
     quantize_cache_fn = functools.partial(
         maybe_quantize_kv_cache,
         quantized_kv_start=quantized_kv_start,
         kv_group_size=kv_group_size,
         kv_bits=kv_bits,
         kv_quant_scheme=kv_quant_scheme,
+        max_kv_size=max_kv_size,
+        serialize_kv_quantization=serialize_kv_quantization,
     )
 
     if sampler is None:
@@ -993,6 +1047,32 @@ def stream_generate(
     """
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
 
+    # Ensure stopping criteria reflects the model's EOS token IDs.
+    # generate() does this before calling us, but direct callers (e.g. the
+    # server) skip generate() and would otherwise use stale criteria.
+    if hasattr(tokenizer, "stopping_criteria"):
+        eos_tokens = kwargs.pop("eos_tokens", None)
+        if eos_tokens is not None:
+            tokenizer.stopping_criteria.add_eos_token_ids(eos_tokens)
+        else:
+            tokenizer.stopping_criteria.reset(model.config.eos_token_id)
+
+            # Some model configs only list <eos> but omit chat-template stop
+            # tokens like <end_of_turn>.  Resolve them from the tokenizer's
+            # vocab and merge so generation stops at the right place.
+            _chat_stop_tokens = ["<end_of_turn>", "<|endoftext|>", "<|im_end|>"]
+            if hasattr(tokenizer, "convert_tokens_to_ids"):
+                for tok in _chat_stop_tokens:
+                    tid = tokenizer.convert_tokens_to_ids(tok)
+                    # convert_tokens_to_ids returns unk_token_id for unknown tokens
+                    unk = getattr(tokenizer, "unk_token_id", None)
+                    if (
+                        tid is not None
+                        and tid != unk
+                        and tid not in tokenizer.stopping_criteria.eos_token_ids
+                    ):
+                        tokenizer.stopping_criteria.eos_token_ids.append(tid)
+
     # Set up thinking budget criteria if requested
     thinking_budget = kwargs.pop("thinking_budget", None)
     thinking_end_token = kwargs.pop("thinking_end_token", DEFAULT_THINKING_END_TOKEN)
@@ -1059,10 +1139,48 @@ def stream_generate(
     # Prompt cache reuse: skip common prefix from previous turn
     prompt_cache_state = kwargs.pop("prompt_cache_state", None)
     reused_prefix_len = 0
+    original_prompt_length = input_ids.size
     full_input_ids_list = input_ids.flatten().tolist()
 
     if prompt_cache_state is not None and prompt_cache_state.cache is not None:
         prefix_len = prompt_cache_state.find_prefix_length(full_input_ids_list)
+
+        # SWA / RotatingKVCache Corruption Guard
+        # Ring buffers lose historical context once they wrap (offset > max_size).
+        # Rewinding into the overwritten region creates a "Memory Hole" and ghost
+        # tokens that cause Softmax anomalies (hallucination loops).  However,
+        # if the buffer hasn't wrapped, all positions are still valid and a
+        # rewind is safe — just trim the offset.
+        def _rotating_rewind_safe(entries, target_len):
+            """Return True if every RotatingKVCache can safely rewind to target_len."""
+            for c in entries:
+                name = type(c).__name__
+                if name in ("RotatingKVCache", "BatchRotatingKVCache"):
+                    offset = int(
+                        c.offset.item() if hasattr(c.offset, "item") else c.offset
+                    )
+                    max_size = getattr(c, "max_size", None)
+                    if max_size is not None and offset > max_size:
+                        # Buffer has wrapped — data before (offset - max_size) is gone
+                        if target_len < (offset - max_size):
+                            return False
+                elif hasattr(c, "caches"):
+                    if not _rotating_rewind_safe(c.caches, target_len):
+                        return False
+                elif isinstance(c, (list, tuple)):
+                    if not _rotating_rewind_safe(c, target_len):
+                        return False
+            return True
+
+        if prefix_len > 0 and prefix_len < len(prompt_cache_state.token_ids):
+            if not _rotating_rewind_safe(prompt_cache_state.cache, prefix_len):
+                logging.debug(
+                    "SWA Ring Buffer Corruption Guard: rewind to token %d "
+                    "is in the overwritten region. Forcing full re-prefill.",
+                    prefix_len,
+                )
+                prefix_len = 0
+
         if prefix_len > 0 and prefix_len < input_ids.shape[1]:
             reused_prefix_len = prefix_len
             # Trim to only new tokens
@@ -1078,16 +1196,121 @@ def stream_generate(
                 kwargs.pop("cached_image_features", None)
             # Reuse the saved KV cache (trimmed to prefix length)
             kv_cache = prompt_cache_state.cache
-            # Trim cache to prefix_len in case it includes generated tokens
+
+            # Recursive cache trimming that handles nested structures,
+            # seq-axis variation, and physical slicing with mx.eval.
+            def _trim_cache(c, target_len):
+                if isinstance(c, (list, tuple)):
+                    for sub_c in c:
+                        _trim_cache(sub_c, target_len)
+                elif hasattr(c, "caches"):
+                    for sub_c in c.caches:
+                        _trim_cache(sub_c, target_len)
+                elif hasattr(c, "offset"):
+                    current_offset = int(
+                        c.offset.item() if hasattr(c.offset, "item") else c.offset
+                    )
+
+                    if current_offset > target_len:
+                        # Update MLX native state pointers
+                        if hasattr(c, "trim"):
+                            c.trim(current_offset - target_len)
+                        elif hasattr(c, "truncate"):
+                            c.truncate(target_len)
+                        else:
+                            c.offset = target_len
+
+                        # Physical slice for standard caches to strip ghost
+                        # tokens and step-padding (prevents RoPE desync).
+                        # Static caches (TurboQuant, Rotating) manage their own
+                        # internal structures via trim/truncate above.
+                        if type(c).__name__ not in (
+                            "TurboQuantKVCache",
+                            "RotatingKVCache",
+                            "BatchRotatingKVCache",
+                        ):
+                            k_attr = (
+                                "keys"
+                                if hasattr(c, "keys")
+                                else "k" if hasattr(c, "k") else None
+                            )
+                            v_attr = (
+                                "values"
+                                if hasattr(c, "values")
+                                else "v" if hasattr(c, "v") else None
+                            )
+
+                            if k_attr and v_attr:
+                                k_arr = getattr(c, k_attr)
+                                v_arr = getattr(c, v_attr)
+
+                                if k_arr is not None and v_arr is not None:
+                                    if isinstance(k_arr, mx.array):
+                                        seq_axis = _kv_seq_axis(k_arr.shape)
+                                        if seq_axis == 1:
+                                            setattr(
+                                                c,
+                                                k_attr,
+                                                k_arr[:, :target_len, ...],
+                                            )
+                                            setattr(
+                                                c,
+                                                v_attr,
+                                                v_arr[:, :target_len, ...],
+                                            )
+                                        else:
+                                            setattr(
+                                                c,
+                                                k_attr,
+                                                k_arr[:, :, :target_len, ...],
+                                            )
+                                            setattr(
+                                                c,
+                                                v_attr,
+                                                v_arr[:, :, :target_len, ...],
+                                            )
+
+                                    elif isinstance(k_arr, list):
+                                        # ChunkedKVCache list slicing
+                                        new_k, new_v = [], []
+                                        current_len = 0
+                                        for k, v in zip(k_arr, v_arr):
+                                            seq_axis = _kv_seq_axis(k.shape)
+                                            chunk_len = k.shape[seq_axis]
+                                            if current_len + chunk_len <= target_len:
+                                                new_k.append(k)
+                                                new_v.append(v)
+                                                current_len += chunk_len
+                                            elif current_len < target_len:
+                                                sl = target_len - current_len
+                                                if seq_axis == 1:
+                                                    new_k.append(k[:, :sl, ...])
+                                                    new_v.append(v[:, :sl, ...])
+                                                else:
+                                                    new_k.append(k[:, :, :sl, ...])
+                                                    new_v.append(v[:, :, :sl, ...])
+                                                break
+                                            else:
+                                                break
+                                        setattr(c, k_attr, new_k)
+                                        setattr(c, v_attr, new_v)
+
+                                    # Force execution to clean graph
+                                    mx.eval(getattr(c, k_attr), getattr(c, v_attr))
+
             for c in kv_cache:
-                if hasattr(c, "keys") and c.keys is not None:
-                    cached_len = c.keys.shape[2]
-                    if cached_len > prefix_len:
-                        c.keys = c.keys[:, :, :prefix_len, :]
-                        c.values = c.values[:, :, :prefix_len, :]
-                        if hasattr(c, "offset"):
-                            c.offset = prefix_len
+                _trim_cache(c, prefix_len)
+
             kwargs["prompt_cache"] = kv_cache
+
+    if prompt_cache_state is not None:
+        logging.info(
+            "Prefix Cache Telemetry | Total Prompt: %d | Skipped Context: %d "
+            "| Prompt Delta: %d",
+            original_prompt_length,
+            reused_prefix_len,
+            input_ids.size,
+        )
 
     if thinking_budget is not None:
         thinking_start_token_id = tokenizer.encode(
