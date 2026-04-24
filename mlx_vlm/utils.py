@@ -118,9 +118,13 @@ class _TextOnlyLanguageModel(nn.Module):
     def __call__(self, *args, **kwargs):
         from .models.base import LanguageModelOutput
 
-        kwargs.pop("inputs_embeds", None)
-        kwargs.pop("n_to_process", None)
-        out = self._model(*args, **kwargs)
+        # Only pass kwargs the underlying mlx_lm model accepts
+        # (typically: inputs, cache, input_embeddings).
+        # Strip all VLM-specific extras to avoid TypeError.
+        sig = inspect.signature(self._model.__call__)
+        valid = set(sig.parameters.keys())
+        filtered = {k: v for k, v in kwargs.items() if k in valid}
+        out = self._model(*args, **filtered)
         if isinstance(out, mx.array):
             return LanguageModelOutput(logits=out)
         return out
