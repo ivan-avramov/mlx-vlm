@@ -55,6 +55,11 @@ from .vision_cache import VisionFeatureCache
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
 DEBUG_PREVIEW_CHARS = 200
+THINKING_BUDGET_RATIO = 0.80  # auto-budget: 80% of max_tokens for thinking
+THINKING_TRUNCATION_MSG = (
+    "[Thinking used the entire token budget without producing a visible "
+    "response. Try increasing max_tokens or setting a lower thinking_budget.]"
+)
 
 
 def _truncate(text: str) -> str:
@@ -902,6 +907,34 @@ def _split_thinking(text: str) -> Tuple[Optional[str], str]:
     return None, text
 
 
+def _detect_thinking_format(prompt: str) -> Optional[str]:
+    """Detect thinking model format from the formatted prompt.
+
+    Returns "gemma", "generic", or None.
+    """
+    if "<|think|>" in prompt or "<|channel>thought" in prompt:
+        return "gemma"
+    if "<think>" in prompt:
+        return "generic"
+    return None
+
+
+def _compute_thinking_budget(
+    max_tokens: int,
+    client_budget: Optional[int],
+    thinking_format: Optional[str],
+) -> Optional[int]:
+    """Compute effective server-side thinking budget.
+
+    Returns the token budget for thinking, or None if no enforcement needed.
+    """
+    if thinking_format is None:
+        return None
+    if client_budget is not None:
+        return client_budget
+    return int(max_tokens * THINKING_BUDGET_RATIO)
+
+
 def _decode_token(tokenizer, token_id: int) -> Tuple[str, Optional[List[int]]]:
     """Decode a single token id to its string + UTF-8 bytes."""
     try:
@@ -1687,6 +1720,9 @@ async def responses_endpoint(request: Request):
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("  TRACE formatted prompt: %s", _truncate(formatted_prompt))
 
+        # Server-side thinking format detection for truncation indicator
+        thinking_format = _detect_thinking_format(formatted_prompt)
+
         generated_at = datetime.now().timestamp()
         response_id = f"resp_{uuid.uuid4().hex}"
         message_id = f"msg_{uuid.uuid4().hex}"
@@ -1795,6 +1831,12 @@ async def responses_endpoint(request: Request):
 
                     # Split thinking from content for final events
                     _, clean_text = _split_thinking(full_text)
+                    if (
+                        thinking_format is not None
+                        and not clean_text
+                        and full_text.strip()
+                    ):
+                        clean_text = THINKING_TRUNCATION_MSG
 
                     # Send response.output_text.done event (to match the openai pipeline)
                     yield f"event: response.output_text.done\ndata: {ResponseOutputTextDoneEvent(type='response.output_text.done', item_id=message_id, output_index=0, content_index=0, text=clean_text).model_dump_json()}\n\n"
@@ -1897,6 +1939,8 @@ async def responses_endpoint(request: Request):
                 gc.collect()
 
                 reasoning, content = _split_thinking(full_text)
+                if thinking_format is not None and not content and reasoning:
+                    content = THINKING_TRUNCATION_MSG
                 content = sanitize_strict_json(content) if content else content
 
                 response = OpenAIResponse(
@@ -2095,6 +2139,19 @@ async def chat_completions_endpoint(request: ChatRequest):
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("  TRACE formatted prompt: %s", _truncate(formatted_prompt))
 
+        # Server-side thinking budget enforcement
+        thinking_format = _detect_thinking_format(formatted_prompt)
+        thinking_budget = _compute_thinking_budget(
+            gen_args.max_tokens, gen_args.thinking_budget, thinking_format
+        )
+        if thinking_budget is not None:
+            logger.debug(
+                "  Thinking budget: %d tokens (format=%s, explicit=%s)",
+                thinking_budget,
+                thinking_format,
+                gen_args.thinking_budget is not None,
+            )
+
         if request.stream:
             # Streaming response using ResponseGenerator for continuous batching
             async def stream_generator():
@@ -2119,6 +2176,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                         in_thinking = False
                         accumulated = ""
                         full_output = ""  # raw output for tool call parsing
+                        thinking_tokens = 0  # server-side thinking token count
                         # Track tool-call state to suppress markup from content
                         in_tool_call = False
                         tc_start = tool_module.tool_call_start if tool_module else None
@@ -2156,6 +2214,40 @@ async def chat_completions_endpoint(request: ChatRequest):
                                 accumulated = ""
                                 # Don't emit closing tag tokens
                             elif in_thinking:
+                                thinking_tokens += 1
+                                if (
+                                    thinking_budget is not None
+                                    and thinking_tokens > thinking_budget
+                                ):
+                                    logger.warning(
+                                        "Thinking budget exceeded (%d/%d tokens). "
+                                        "Emitting truncation indicator.",
+                                        thinking_tokens,
+                                        thinking_budget,
+                                    )
+                                    trunc_choices = [
+                                        ChatStreamChoice(
+                                            finish_reason="length",
+                                            delta=ChatMessage(
+                                                role="assistant",
+                                                content=THINKING_TRUNCATION_MSG,
+                                            ),
+                                        )
+                                    ]
+                                    trunc_chunk = ChatStreamChunk(
+                                        id=request_id,
+                                        created=int(time.time()),
+                                        model=request.model,
+                                        usage={
+                                            "prompt_tokens": ctx.prompt_tokens,
+                                            "completion_tokens": output_tokens,
+                                            "total_tokens": ctx.prompt_tokens
+                                            + output_tokens,
+                                        },
+                                        choices=trunc_choices,
+                                    )
+                                    yield f"data: {trunc_chunk.model_dump_json()}\n\n"
+                                    break
                                 delta_reasoning = token.text
                             elif not in_thinking and (
                                 "<|channel>" in accumulated or "<think" in accumulated
@@ -2223,6 +2315,33 @@ async def chat_completions_endpoint(request: ChatRequest):
                                 yield f"data: {chunk_data.model_dump_json()}\n\n"
 
                             if token.finish_reason:
+                                if in_thinking and token.finish_reason == "length":
+                                    logger.warning(
+                                        "Generation hit max_tokens while in "
+                                        "thinking. Emitting truncation indicator."
+                                    )
+                                    trunc_choices = [
+                                        ChatStreamChoice(
+                                            finish_reason="length",
+                                            delta=ChatMessage(
+                                                role="assistant",
+                                                content=THINKING_TRUNCATION_MSG,
+                                            ),
+                                        )
+                                    ]
+                                    trunc_chunk = ChatStreamChunk(
+                                        id=request_id,
+                                        created=int(time.time()),
+                                        model=request.model,
+                                        usage={
+                                            "prompt_tokens": ctx.prompt_tokens,
+                                            "completion_tokens": output_tokens,
+                                            "total_tokens": ctx.prompt_tokens
+                                            + output_tokens,
+                                        },
+                                        choices=trunc_choices,
+                                    )
+                                    yield f"data: {trunc_chunk.model_dump_json()}\n\n"
                                 break
 
                         # Parse tool calls from full output and emit final chunk
@@ -2396,6 +2515,8 @@ async def chat_completions_endpoint(request: ChatRequest):
                 gc.collect()
 
                 reasoning, content = _split_thinking(full_text)
+                if thinking_format is not None and not content and reasoning:
+                    content = THINKING_TRUNCATION_MSG
 
                 # Count raw generated tokens minus thinking tag tokens
                 completion_tokens = output_tokens - _count_thinking_tag_tokens(
