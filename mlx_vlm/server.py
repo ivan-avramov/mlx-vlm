@@ -54,7 +54,7 @@ from .vision_cache import VisionFeatureCache
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
-DEBUG_PREVIEW_CHARS = 200
+DEBUG_PREVIEW_CHARS = 2000
 THINKING_BUDGET_RATIO = 0.80  # auto-budget: 80% of max_tokens for thinking
 THINKING_TRUNCATION_MSG = (
     "[Thinking used the entire token budget without producing a visible "
