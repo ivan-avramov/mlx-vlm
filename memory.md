@@ -63,6 +63,11 @@ While `mlx-lm` works fine out of the box for text-only Gemma 4, we explicitly bu
 * **The Problem:** Caches could scale geometrically mid-prefill. Request-boundary eviction was unsafe, as massive context growth could hit the VRAM ceiling and OOM crash before the manager regained control.
 * **The Fix:** Injected `_trigger_allocation_hooks()` directly into `turboquant._reserve_state_capacity`. The Metal allocator now calls back to the Python memory manager to halt the thread and purge dormant LRU sessions on demand to satisfy contiguous memory requests. An `unregister_allocation_hook()` function was added to allow clean teardown on model unload.
 
+**13a. Hybrid-Cache Rewind Guard for non-trimmable caches (generate.py — uncommitted as of 2026-04-28)**
+* **The Problem:** Models with non-trimmable cache layers (Qwen 3.5 / 3.6 GatedDeltaNet uses `ArraysCache` for recurrent state, which advances monotonically with no rewind primitive) silently corrupt on chat-rewind / regenerate. The fork's `_trim_cache` (generate.py:1208) only handles caches with an `offset` attribute — `ArraysCache.is_trimmable()` returns `False` and has no `offset`, so it gets silently skipped. Consequence: KV layers correctly trim to the new prefix length; DeltaNet state retains advancement past the rewind point; generation drifts (no crash, just wrong outputs). Upstream `mlx_lm.can_trim_prompt_cache` correctly refuses this case via `all(c.is_trimmable() for c in cache)`, but the fork's custom trimmer bypasses that check.
+* **The Fix:** Added a `_has_non_trimmable()` recursive guard at generate.py:1190 that runs before partial-prefix reuse. When ANY cache layer reports `is_trimmable() == False`, force `prefix_len = 0` (full re-prefill). Conservative — loses prefix-cache reuse on hybrid models when rewinding, but preserves correctness. Generic enough to cover any future cache type that joins the non-trimmable family (Mamba, RWKV-like, etc.) — the gate uses the canonical mlx_lm `is_trimmable()` API rather than checking `ArraysCache` specifically.
+* **Validation:** Tested against `unsloth/Qwen3.6-27B-UD-MLX-6bit` — the model loads via existing `qwen3_5` adapter (Qwen 3.6's `config.json` declares `model_type: "qwen3_5"`), uses the same hybrid 3-DeltaNet/1-attention pattern (`full_attention_interval=4`), and now rewinds safely.
+
 **13. RoPE Desync, Step-Padding, and the SWA Ring Buffer Rewind (generate.py)**
 * **The Problem:** Rewinding context during a chat branch caused severe hallucination loops. Padded standard caches (inflated by `PREFILL_STEP_SIZE`) bypassed shape-based slice checks, leaving ghost tokens. Worse, Gemma 3/4 uses Sliding Window Attention (`RotatingKVCache`). Rewinding into the overwritten region of a wrapped ring buffer creates a "Memory Hole", causing uniform probability anomalies during Softmax.
 * **The Fix:** Implemented a type-aware "Smart Rewind". For SWA ring buffers, a `_rotating_rewind_safe()` check determines whether the rewind target is still within the buffer's valid data range (`offset <= max_size` means the buffer hasn't wrapped, so all positions are valid). Only if the target is in the overwritten region (`target < offset - max_size`) is the cache dropped and a full re-prefill forced. For typical multi-turn conversations under the window size (1024 for Gemma 3, 512 for Gemma 4), the rewind is always safe and prefix cache reuse works across turns. For standard dynamic caches, the arrays are unconditionally physically sliced using `_kv_seq_axis()` to strip both ghost tokens and step-padding, ensuring RoPE indices remain perfectly aligned.
@@ -87,6 +92,143 @@ While `mlx-lm` works fine out of the box for text-only Gemma 4, we explicitly bu
 * **The Problem:** `TemplateParams.template_kwargs()` defaulted `enable_thinking` to `True`, passing it to `tokenizer.apply_chat_template()` for every request. Models not trained with thinking tokens (e.g., Gemma 3 1B) received `<think>` in their prompt and hallucinated. Every other code path in the project (CLI, chat.py, generate.py) defaulted to `False`.
 * **The Fix:** Changed `kwargs.setdefault("enable_thinking", True)` to `False`. Users can still send `"enable_thinking": true` explicitly for models that support it.
 
+**19. Chat Stop Tokens in the Batch Path (server.py — commit `e039083`)**
+* **The Problem:** The `ResponseGenerator`/`BatchGenerator` path bypasses `stream_generate()` and uses `stop_tokens` derived from `config.eos_token_id` directly. The fix in #17 only patched `stream_generate()`, so models like gemma-3-1b that list only `<eos>` (ID 1) but omit `<end_of_turn>` (ID 107) ran past the response boundary on the batch path.
+* **The Fix:** Resolve chat-template stop tokens (`<end_of_turn>`, `<|im_end|>`, `<|endoftext|>`) from the tokenizer vocab inside `get_cached_model()` and merge them into the batch-path `stop_tokens`, mirroring the streaming-path behavior.
+
+**20. Text-Only Model Support (utils.py & prompt_utils.py — commits `e3f2157`, `a75f1db`, `9457990`; follow-up fixes uncommitted as of 2026-04-28)**
+* **The Problem:** Pure text models like `gemma3_text` and Qwen 2.5 Instruct aren't VLMs — they have no vision tower and aren't in `MODEL_CONFIG`. Loading them through mlx-vlm's normal path raised `ValueError "not supported"`, and `MessageFormatter` raised `ValueError` for unknown model types.
+* **The Fix:** Added `_TextOnlyLanguageModel`, `_TextOnlyModelWrapper`, and `_SimpleNamespace` wrappers in `utils.py` that adapt mlx_lm text models to the VLM interface. `load()` catches the unsupported-model `ValueError` and falls back to `mlx_lm.utils.load` with tokenizer compatibility patches. `_TextOnlyLanguageModel` inspects the model's `__call__` signature and only forwards accepted kwargs, stripping VLM-specific extras like `attention_mask_4d`. `MessageFormatter` (prompt_utils.py) now falls back to plain text formatting for unknown model types instead of raising — there are no image/audio tokens to insert anyway.
+* **Follow-up fix #1 — `make_cache` contract violation (utils.py, uncommitted 2026-04-28):** The original `_TextOnlyLanguageModel.make_cache()` returned `None` when the underlying mlx_lm model didn't implement `make_cache` (e.g., Qwen 2.5, which uses external `make_prompt_cache` instead). But `generate._make_cache()` (generate.py:1630) does `hasattr(model, "make_cache")` to decide between calling it and falling back to building default `KVCache` objects from `model.layers`. The wrapper always answered `True` to `hasattr`, the fallback never ran, and `len(None)` blew up at generate.py:1632 with `TypeError: object of type 'NoneType' has no len()`. **Fix:** in `_TextOnlyLanguageModel.__init__`, conditionally bind `self.make_cache = lm_model.make_cache` *only* when the underlying model has it. `nn.Module.__setattr__` accepts bound-method assignment cleanly, so `hasattr` correctly reports whether there's a real implementation to forward to. mlx_lm models without `make_cache` now take the proper fallback path. Verified with `mlx-community/Qwen2.5-1.5B-Instruct-4bit` — loads in 1 GB peak, responds in <0.4s.
+* **Follow-up fix #2 — Misleading log severity (utils.py:227, uncommitted 2026-04-28):** `get_model_and_args()` logged `ERROR` and raised `ValueError` when the model wasn't in `mlx_vlm.models` or `mlx_vlm.speculative.drafters`, but every known caller funnels through `load()` which catches the ValueError and falls back to mlx_lm. The ERROR was therefore always premature noise during the normal text-model loading path. **Fix:** demoted to `logger.warning(...)` with a clearer message that names both packages tried and notes the caller may fall back. The "not supported" phrase in the message body is load-bearing — `load()` greps for it to decide whether to invoke the fallback — so it stayed.
+
+**21. Strict JSON Output Sanitization — Non-Streaming Endpoints Only (utils.py & server.py — commits `e3f2157`, `cbe1ac8`)**
+* **The Problem:** When a model is asked to emit raw JSON (especially with embedded LaTeX math), `json_repair`'s default behavior treats valid JSON escapes like `\f`, `\b`, `\n` as control characters and silently destroys the math content. Plain-prose responses must not be touched.
+* **The Fix:** `sanitize_strict_json(text)` in `utils.py` first detects intent — only acts if the text starts with `{`, `[`, or `` ```json ``. For non-JSON output it returns the input untouched. For JSON-intended output, it pre-escapes math blocks (`$$…$$`, `$…$`, `\[…\]`, `\(…\)`) by double-escaping any backslash not already followed by a backslash or quote, then runs `json_repair`. Wired into the non-streaming `/v1/chat/completions` (server.py:2573) and `/v1/responses` (server.py:1944) endpoints. **The streaming path is intentionally NOT sanitized** — token-by-token deltas can't be repaired without a buffering rewrite, and streaming users shouldn't be paying that latency cost. This means streamed code blocks pass through verbatim (relevant context for the code-fence findings below).
+
+**22. Server-Side Thinking Budget Enforcement (server.py — commit `ffad5df`)**
+* **The Problem:** Reasoning models can enter self-reverification loops on multi-constraint prompts (see "Model Behavior Findings" below). With no hard cap, a single request can burn 80K+ thinking tokens before producing any visible output.
+* **The Fix:** `_compute_thinking_budget()` (server.py:935) returns `0.80 × max_tokens` when a thinking format is detected (`<|channel>thought` for Gemma, `<think>` for generic), or honors an explicit `thinking_budget` field on the request. The streaming loop at server.py:2218 increments `thinking_tokens` while `in_thinking` is true; once it exceeds the budget, the server emits `THINKING_TRUNCATION_MSG` with `finish_reason="length"` and breaks the stream. `THINKING_BUDGET_RATIO` is the constant at server.py:58. Format detection lives in `_detect_thinking_format()` (server.py:910).
+
+**23. Structured Logging & `--log-file` Flag (server.py, generate.py, utils.py — commits `119d0b9`, `170c30f`)**
+* **The Problem:** Diagnostic output was a mix of `print()` calls and ad-hoc `logging.info` blocks. No way to redirect to a file, no consistent module loggers, no preview-truncation for long prompts (which spammed terminals at 6K+ tokens).
+* **The Fix:** Replaced all `print()` with `logger.info/warning/error/debug` across server, generate, and utils. Module loggers derive from `MLX_VLM_LOG_NAME` (default `mlx_vlm`); `MLX_VLM_LOG_LEVEL` env var and `--log-name` CLI arg control verbosity. Added `DEBUG_PREVIEW_CHARS` constant and `_truncate()` helper for head+tail previews of long prompts/responses. `traceback` import dropped in favor of `exc_info=True` on `logger.error`. The `--log-file PATH` flag (default: `<stdout>`) lets ops redirect to file or journald cleanly. Supersedes the original ad-hoc telemetry pipeline mentioned in #10.
+
+**24. OpenWebUI Advanced Params End-to-End Plumbing (server.py)**
+* **The Problem:** OpenWebUI v0.9.2 forwards Advanced Params and Custom Parameters verbatim to OpenAI-compatible endpoints (no allowlist filter on the OpenAI router), but several knobs the user expected to work were silently dropped server-side:
+  - **`repeat_penalty`** — OpenWebUI's native UI slider uses the Ollama-style name. The server only read `repetition_penalty`. The slider was theater.
+  - **`seed`** — declared on `VLMRequest` with default `DEFAULT_SEED=0` and never plumbed into `_build_gen_args` or applied to the sampler. Worse, the non-None default meant every request was implicitly "seeded with 0", which would have eliminated variance if the seed had been wired up.
+  - Other knobs (`thinking_budget`, `thinking_start_token`, `repetition_penalty` proper) worked end-to-end but were not surfaced in the OpenWebUI UI — required manual Custom Parameters JSON.
+* **The Fix (server.py):**
+  - `_build_gen_args` (server.py:863): accept `repeat_penalty` as an alias for `repetition_penalty` so OpenWebUI's native slider works without Custom Params. One-liner: `repetition_penalty = getattr(request, "repetition_penalty", None) or getattr(request, "repeat_penalty", None)`.
+  - `_build_gen_args` (server.py:869): plumb `seed=getattr(request, "seed", None)` through into `GenerationArguments`.
+  - `_make_sampler` (server.py:377): when `args.seed is not None`, call `mx.random.seed(args.seed)` once at sampler construction time. Comment documents the caveat — MLX PRNG is process-global, so under continuous batching this is best-effort determinism (interleaved batches share state).
+  - `VLMRequest.seed` (server.py:1448): changed from `int = Field(DEFAULT_SEED)` to `Optional[int] = Field(None)` so omitted seed means "don't reseed" instead of "reseed to 0 every time". Removed the now-unused `DEFAULT_SEED` import.
+* **The Fix (`openwebui/` filter family):** Seven Filter Functions, each a self-contained file. Toggle them on/off per-chat in the chat tools menu. Mutual-exclusion enforced via shared body markers — second filter to detect a conflicting marker raises `ValueError` with a clear message.
+
+  | File | Title in OpenWebUI | Sets marker | Errors on |
+  |---|---|---|---|
+  | `thinking.py` | Thinking | `_mlx_thinking_active` | `_mlx_advanced_active` |
+  | `advanced.py` | Advanced Params | `_mlx_advanced_active` | any other marker |
+  | `profile_strict.py` | Profile · Strict | `_mlx_active_profile` | another profile, or advanced |
+  | `profile_explore.py` | Profile · Explore | same | same |
+  | `profile_math.py` | Profile · Math | same | same |
+  | `profile_casual.py` | Profile · Casual | same | same |
+  | `profile_creative.py` | Profile · Creative | same | same |
+
+  **Compatibility matrix:** Thinking + Profile = OK. Profile + Profile = error. Advanced + anything else = error (Advanced is "manual mode" and refuses to coexist).
+
+* **Family-aware profile params (added 2026-04-28).** Each profile detects the model family from the request's `model` id and applies family-correct params. Detection is most-specific-first substring match; community/quantizer prefix (`mlx-community/`, `unsloth/`, `lmstudio-community/`, etc.) is stripped before matching, since UD/dynamic vs uniform quantization does not change recommended sampling params per Unsloth and upstream docs.
+
+  Supported families per profile (researched against official model cards and `generation_config.json` files):
+  - **Gemma 4 / 3** — uses `repetition_penalty` for loop mitigation; cap at 1.10 (formatting fidelity degrades above)
+  - **Qwen 3.x / 3.5 / 3.6** — uses `presence_penalty` (Qwen team explicitly forbids `repetition_penalty != 1.0`; causes language mixing); separate `qwen3_moe` entry for the 35B-A3B MoE variant
+  - **Qwen 2.5** (incl. Coder, VL) — distinct from 3.x: ALLOWS `repetition_penalty=1.05`. Detection table matches `qwen2.5` strictly before falling through to a generic `qwen` rule.
+  - **Llama 3.x** (3.1/3.2/3.3 share params) — uses `frequency_penalty`; do NOT set `top_k`
+  - **DeepSeek R1** — temperature bounded to 0.5–0.7 (R1 produces endless repetition outside that range); deliberately excluded from Creative profile
+  - **DeepSeek V3** — supports `<think>` opt-in; tools available
+  - **Mistral Small 3.x** — temperature ceiling at 0.7 (officially tuned for 0.15); profiles cap accordingly
+
+  Unrecognized families error with: *"model X is from an unrecognized family. Use the Advanced Params filter, or add this family to the profile's `_FAMILY_DETECTION` and `_PARAMS_BY_FAMILY` tables."* The user's "Qwen attempting to set pinned values" concern is now structurally impossible — profiles never write `repetition_penalty` on Qwen 3.x families because their `_PARAMS_BY_FAMILY[qwen3]` entry uses `presence_penalty` instead.
+
+* **Profile semantics — meaningfully tuned per workflow:**
+  - **Strict** — implementation under constraints; loop-mitigation profile. Low temp, family-correct repetition control, capped thinking budget.
+  - **Explore** — design brainstorming, architectural research, tech-doc writing. Higher temp, mild repetition control, large thinking budget.
+  - **Math** — calculus, proofs, formal logic. Low temp, NO repetition penalty (math benefits from re-stating equations), highest thinking budget.
+  - **Casual** — quick everyday Q&A. Optimized for snappy responses, low max_tokens, no thinking_budget set (defers to Thinking filter).
+  - **Creative** — essays, fiction, non-technical writing. High temp, widened top_p, model-family-specific ceiling enforcement (Mistral capped at 0.7, R1 excluded entirely).
+
+* **Advanced filter footgun warnings (in `advanced.py` docstring):** Qwen 3.x rep_penalty pin = 1.0; Qwen 3.x temperature must be > 0; Gemma rep_pen ceiling = 1.10; DeepSeek R1 temperature range 0.5–0.7; Mistral Small temperature ceiling 0.7; Llama do not set `top_k`. These document the known model-creator-mandated constraints — the Advanced filter doesn't enforce them (it's manual mode and lets the user experiment), but the docstring lists them so users know what to avoid.
+
+* **UserValves only on Thinking and Advanced filters.** Profile filters intentionally have no UserValves — their params are baked, deterministic per family. If a user wants to tweak a single knob within a profile, they switch to Advanced (which is incompatible with profiles by design — that mutual-exclusion is the feature, not a bug).
+
+* **Bootstrap script (per-model OpenWebUI Advanced Params) should bake:**
+  - `top_k` per family (Gemma 4: 64, Qwen: 20)
+  - `repetition_penalty=1.0` for Qwen 3.x (defense in depth even though profiles auto-route)
+  - Reasoning Tags (`<|channel>thought` / `<channel|>` for Gemma 4, `<think>` / `</think>` for Qwen 3.x and DeepSeek)
+  - Native tools enable/disable per family
+  - Context window cap (max_kv_size)
+  Leave `temperature`, `top_p`, `max_tokens`, `thinking_budget`, repetition controls UNSET in per-model defaults — those are governed by the per-chat profile/thinking/advanced toggles.
+
+* **Penalty plumbing — full streaming-path fix (uncommitted as of 2026-04-28):** Until this fix, `repetition_penalty` was plumbed only through the legacy non-streaming `generate()` path; the streaming/batched path (which OpenWebUI almost always uses) silently dropped it. `BatchGenerator` only accepted a `sampler` callable — `GenerationBatch._step` called `self.sampler(logprobs)` with no logits-processor chain. So the user's profile filters and OpenWebUI's `repeat_penalty` slider have been theater on streaming requests up to this point. Adding `presence_penalty` and `frequency_penalty` via the same plumbing would have been more theater. The fix:
+  - `GenerationArguments` (server.py:127): added `presence_penalty`, `frequency_penalty` fields; `to_generate_kwargs` emits them when set.
+  - `_build_gen_args` (server.py:864): extracts them from the request.
+  - `VLMRequest` (server.py:1467): added Pydantic Field declarations with descriptions noting Qwen 3.x's required `presence_penalty` and Llama's `frequency_penalty`.
+  - `generate_step` (generate.py:766): added `presence_penalty`, `presence_context_size`, `frequency_penalty`, `frequency_context_size` params; forwards them to `make_logits_processors` (mlx_lm already supports all 7 args, the fork was just calling with 3 of them).
+  - `GenerationBatch` (generate.py:1751): added `logits_processors` param; tracks per-sequence rolling token history (`_histories`, capped at `_PENALTY_HISTORY_SIZE=64`); applies processors per-row in `_step` by slicing `logprobs[i:i+1]` and passing the i-th sequence's history. Necessary because mlx_lm's processors are written for single-sequence inputs (`logits[:, tokens]` indexes the same tokens across all batch rows). `extend()` and `filter()` updated to maintain `_histories` correctly when sequences are inserted/removed mid-batch. `empty()` accepts `logits_processors`.
+  - `BatchGenerator` (generate.py:2215): added `logits_processors` param; forwards to `GenerationBatch.empty` and to `PromptProcessingBatch.generate` at both transition sites.
+  - `PromptProcessingBatch.generate` (generate.py:2147): forwards `logits_processors` to the new `GenerationBatch` it creates.
+  - Server `_run` (server.py:507): builds processors via new `_make_logits_processors(args)` helper that calls `mlx_lm.sample_utils.make_logits_processors` with all four penalty/bias args. Returns `[]` when nothing is configured so the per-row processor loop is skipped entirely.
+  - Server `_make_logits_processors` (server.py): mirrors `_make_sampler` — same continuous-batching caveat applies (processors are constructed from the FIRST request's args and shared across the active batch). Acceptable for single-user OpenWebUI workloads.
+* **Verified end-to-end:** Smoke tests confirm `make_logits_processors` returns the right number of processors for each penalty config (0 if none, 1 for Qwen presence-only, 3 for full Gemma/Llama setup) and applies penalties correctly (e.g., presence_penalty=1.5 subtracts 1.5 from logits of tokens already in history). All schema fields, kwargs, and call sites verified via Python introspection.
+
+---
+
+**Pipeline Configuration**
+
+**Primary model:** Gemma 4 31B 6-bit quantization. Chosen over 4-bit because the workload is autonomous agentic coding — lossless reasoning, strict JSON adherence, and rigid syntactic logic outweigh the 4-bit model's larger context window. 6-bit gives 128k context; 4-bit gives 256k but degrades reasoning quality. Lightweight task routing also tested with Gemma 3 1B 4-bit.
+
+**Key runtime parameters:**
+- `PREFILL_STEP_SIZE=512` — sweet spot. 2048 OOMs (9.3 GB activation spike), 128 crashes Metal driver.
+- `MAX_KV_SIZE=131072` — static pre-allocation avoids late-stage reallocation spikes (see #8).
+- `QUANTIZED_KV_START=5000` — threshold for FP16 → 4-bit migration (see #6, #7).
+- `enable_thinking` defaults to `False` in server (see #18) — only enable explicitly for models trained with thinking tokens.
+- `--kv-quant-scheme=uniform --kv-bits=8` — preferred over `turboquant` for multi-step symbolic reasoning (see TurboQuant Investigation below).
+
+**OpenWebUI integration constraints:**
+- Task models (titles, tags, autocomplete) must be routed to a separate lightweight model (e.g., 2B) to avoid blocking the main reasoning worker on Uvicorn's single worker queue (see #14).
+- Images come as `image_url` from OpenWebUI but Gemma's jinja expects `image` (see #3).
+- Think blocks use `<think>` (OpenWebUI) not `<|channel>thought` (Gemma native); StreamingTranslator handles the translation (see #2).
+- Math rendering: users who need KaTeX-compatible delimiters should include formatting instructions in their own system prompt — the server no longer injects this automatically (see #16).
+
+---
+
+**Model Behavior Findings (Gemma 4 + multi-constraint prompts, 2026-04-27)**
+
+These are NOT mlx-vlm bugs — they are model behaviors that users of this fork need to know about, because the symptoms can look like server bugs. The streaming pipeline does not strip code fences (server.py emits `token.text` directly as `delta_content` at server.py:2257); whatever the UI sees is what the model produced.
+
+**A. Code-fence dropping is variant-dependent.**
+On the 12-constraint prime-filter test, the model would generate properly indented Python in its reasoning trace using ```python fences, then emit the *final* answer as bare unfenced code. In OpenWebUI this renders as collapsed paragraph text (markdown strips leading whitespace), looking truncated. Cause: the model commits to *"I will provide just the code"* inside its reasoning; by the time the final answer streams, the system-prompt instruction is thousands of tokens behind. High temperature compounds the variance.
+
+| variant | mitigation result |
+|---|---|
+| `mlx-community/gemma-4-26b-a4b-it-8bit` | temp ≤ 0.7 + strict directive (*"Every code snippet, including single lines, MUST be enclosed in triple-backtick fences with a language tag. Bare unfenced code is invalid output."*) — **reliable** |
+| Gemma 4 31B 4-bit UD (unsloth) | same fix is **intermittent** — first run produced incomplete code block, second run on the same prompt worked. The 4-bit UD quantization lowers format reliability so failures still surface stochastically even at temp 0.7. If reliability matters, lower temp further (0.3–0.5) or prefer the 26B-8bit variant. |
+
+**B. Self-reverification thinking loop on multi-constraint prompts.**
+On prompts with 10+ independent constraints, Gemma 4 reasoning can enter a runaway loop: *"One last thing: did I cover constraint N?"*, *"Wait, let me re-verify…"*. Each occurrence of the phrase increases the next occurrence's probability (induction-head dynamics), so the loop self-reinforces. Observed exceeding 80K thinking tokens with no convergence on both 26B-8bit and 31B-4bit-UD.
+
+**Mitigation recipe — send all four together:**
+
+| knob | value | role |
+|---|---|---|
+| `temperature` | 0.3–0.5 | suppresses the recheck branch entirely |
+| `repetition_penalty` | 1.08–1.15 | down-weights "one last thing" / "wait" before they snowball |
+| `thinking_budget` | 8000–12000 | hard cap, overrides 80%-of-max formula at server.py:935 (see #22) |
+| `max_tokens` | 16384 | cap on total work; auto-budget then ~13K |
+
+`repetition_penalty` is the highest-leverage knob — it directly attacks the loop pattern. The server already exposes both `repetition_penalty` and `logit_bias` (server.py:137-138, server.py:863-864); they're unset by default. OpenWebUI surfaces `repetition_penalty` in Advanced Params per model. If you need a server-side default rather than per-request, patch around server.py:863 to default `repetition_penalty` to ~1.10 for Gemma family models.
+
 ---
 
 **TurboQuant Investigation: KV Cache Quantization and Gemma 4 Reasoning Degradation**
@@ -109,3 +251,42 @@ While `mlx-lm` works fine out of the box for text-only Gemma 4, we explicitly bu
 **Required Code Fix for Uniform Path:** The upstream `mlx_maybe_quantize_kv_cache` from `mlx_lm` calls `c.to_quantized()` on all caches that cross the threshold, including `RotatingKVCache` which raises `NotImplementedError`. Since Gemma 4's SWA layers have a continuously-incrementing offset (doesn't wrap), they cross 5000 and crash. Fixed by replacing the upstream call with an inline loop that explicitly skips `RotatingKVCache`.
 
 **TurboQuant is still valid** for models that don't require high-precision multi-step reasoning (summarization, simple Q&A), where fused Metal kernel speed matters more than mathematical accuracy.
+
+---
+
+**Dependencies**
+
+- **`mlx>=0.31.2`** (commit `96bf370`): `uv.lock` was bumped because upstream now requires `mx.new_thread_local_stream()`, which lands in 0.31.2. The lockfile previously pinned 0.31.1.
+
+---
+
+**Change Log Over Upstream**
+
+Refresh authoritative commit list with `git log --pretty=format:"%h|%ad|%s" --date=short upstream..HEAD`.
+
+**Upstream base:** `0f903f9` *Fix Gemma 4 LoRA training: vision backward NaN + audio_tower freeze leak (#1052)*
+
+**Local commits over upstream** (oldest → newest, as of 2026-04-27):
+
+| commit | date | purpose | section |
+|---|---|---|---|
+| `f34d678` | 2026-04-24 | port: generation pipeline fixes (EOS reset, SWA corruption guard, smart KV-cache rewind) | #6, #13, #17 |
+| `44524b5` | 2026-04-24 | port: TurboQuant enhancements (allocation hooks, geometric growth, from_cache) | #8, #12 |
+| `e3f2157` | 2026-04-24 | port: text-only model support and JSON sanitization (initial) | #20, #21 |
+| `ac19dae` | 2026-04-24 | port: server fixes (`enable_thinking` default → False, thinking-tag strip) | #18 |
+| `9457990` | 2026-04-24 | fix: handle unknown model types in MessageFormatter for text-only models | #20 |
+| `a75f1db` | 2026-04-24 | fix: text-only model compat (kwarg filtering, unknown model types) | #20 |
+| `e039083` | 2026-04-24 | fix: merge chat stop tokens into server's batch-path `stop_tokens` | #19 |
+| `96bf370` | 2026-04-24 | chore: update `uv.lock` for `mlx>=0.31.2` | Dependencies |
+| `119d0b9` | 2026-04-24 | refactor: convert `print` statements to structured logging across server, generate, utils | #23 |
+| `170c30f` | 2026-04-24 | logs configured via `--log-file` with `<stdout>` default | #23 |
+| `cbe1ac8` | 2026-04-24 | add back strict JSON output sanitization (`sanitize_strict_json`, non-streaming endpoints only) | #21 |
+| `ffad5df` | 2026-04-25 | add thinking budget enforcement (auto = 80% × max_tokens, override via `thinking_budget`) | #22 |
+| `59c7843` | 2026-04-27 | bump debug preview size | #23 |
+| *(uncommitted)* | 2026-04-27 | OpenWebUI advanced params: server seed plumbing + `repeat_penalty` alias + `openwebui/` filter file | #24 |
+| *(uncommitted)* | 2026-04-28 | Text-only model fixes: `_TextOnlyLanguageModel.make_cache` only present when underlying has it; `get_model_and_args` log demoted from ERROR to WARNING (recoverable via mlx_lm fallback) | #20 |
+| *(uncommitted)* | 2026-04-28 | OpenWebUI filter family redesign: split single `mlx_vlm_advanced_params_filter.py` into `thinking.py` + `advanced.py` + 5 family-aware profile filters (Strict/Explore/Math/Casual/Creative) with mutual-exclusion via body markers and per-family param routing for Gemma 4/3, Qwen 3.x/2.5, Llama 3.x, DeepSeek R1/V3, Mistral Small 3.x | #24 |
+| *(uncommitted)* | 2026-04-28 | Hybrid-cache rewind guard: force full re-prefill when any cache layer reports `is_trimmable()==False` (covers Qwen 3.5/3.6 GatedDeltaNet's ArraysCache; prevents silent state drift on chat-rewind) | #13a |
+| *(uncommitted)* | 2026-04-28 | Penalty plumbing — full streaming-path fix: added `presence_penalty` + `frequency_penalty` to GenerationArguments / VLMRequest / generate_step; wired logits_processors through BatchGenerator and GenerationBatch with per-sequence token history. Fixes long-standing bug where `repetition_penalty` was silently dropped on the streaming/batched path | #24 |
+
+Sections #1–#16 (the pre-port architecture work — StreamingTranslator, MultiCacheManager, prefill-step tuning, RoPE desync fix, ghost-prompt removal, etc.) predate the current `upstream` branch tip and are not individually itemized in this commit table; they're reflected in the cumulative diff `git diff upstream..HEAD`.

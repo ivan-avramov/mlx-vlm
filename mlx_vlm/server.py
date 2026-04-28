@@ -35,7 +35,6 @@ from .generate import (
     DEFAULT_MODEL_PATH,
     DEFAULT_PREFILL_STEP_SIZE,
     DEFAULT_QUANTIZED_KV_START,
-    DEFAULT_SEED,
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,
     BatchGenerator,
@@ -136,6 +135,8 @@ class GenerationArguments:
     min_p: float = 0.0
     seed: Optional[int] = None
     repetition_penalty: Optional[float] = None
+    presence_penalty: Optional[float] = None
+    frequency_penalty: Optional[float] = None
     logit_bias: Optional[dict] = None
     enable_thinking: bool = False
     thinking_budget: Optional[int] = None
@@ -154,6 +155,10 @@ class GenerationArguments:
         }
         if self.repetition_penalty is not None:
             kw["repetition_penalty"] = self.repetition_penalty
+        if self.presence_penalty is not None:
+            kw["presence_penalty"] = self.presence_penalty
+        if self.frequency_penalty is not None:
+            kw["frequency_penalty"] = self.frequency_penalty
         if self.logit_bias is not None:
             kw["logit_bias"] = self.logit_bias
         if self.thinking_budget is not None:
@@ -386,6 +391,14 @@ class ResponseGenerator:
         if args.temperature == 0:
             return None
 
+        # Apply per-request seed once at sampler construction time. The MLX
+        # PRNG is process-global, so under continuous batching this is
+        # best-effort determinism — interleaved batches share state and a
+        # single seed cannot guarantee bit-exact reproducibility across
+        # concurrent requests.
+        if args.seed is not None:
+            mx.random.seed(args.seed)
+
         def sampler(logprobs: mx.array) -> mx.array:
             if args.top_p > 0 and args.top_p < 1.0:
                 return top_p_sampling(logprobs, args.top_p, args.temperature)
@@ -393,6 +406,32 @@ class ResponseGenerator:
                 return mx.random.categorical(logprobs * (1 / args.temperature))
 
         return sampler
+
+    def _make_logits_processors(self, args: GenerationArguments) -> list:
+        """Build mlx_lm logits processors from request args.
+
+        Returns an empty list when no penalty / logit_bias is configured;
+        BatchGenerator then skips the per-row processor loop entirely.
+        Same continuous-batching caveat as _make_sampler — processors are
+        constructed from the FIRST request's args and shared across the
+        active batch. Per-request differentiation works for non-overlapping
+        requests, which is the common case for single-user OpenWebUI.
+        """
+        from mlx_lm.sample_utils import make_logits_processors
+
+        if (
+            args.repetition_penalty is None
+            and args.presence_penalty is None
+            and args.frequency_penalty is None
+            and not args.logit_bias
+        ):
+            return []
+        return make_logits_processors(
+            logit_bias=args.logit_bias,
+            repetition_penalty=args.repetition_penalty,
+            presence_penalty=args.presence_penalty,
+            frequency_penalty=args.frequency_penalty,
+        )
 
     def _gpu_embed(self, raw_inputs: dict, images=None) -> Tuple[mx.array, dict]:
         """GPU-only: run vision encoder if needed. Must run on GPU thread."""
@@ -500,6 +539,7 @@ class ResponseGenerator:
                             self.processor,
                             stop_tokens=self.stop_tokens,
                             sampler=self._make_sampler(args),
+                            logits_processors=self._make_logits_processors(args),
                             kv_bits=self.kv_bits,
                             kv_group_size=self.kv_group_size,
                             kv_quant_scheme=self.kv_quant_scheme,
@@ -863,13 +903,22 @@ def _build_gen_args(request, processor=None) -> GenerationArguments:
     logit_bias = getattr(request, "logit_bias", None)
     if logit_bias is not None and isinstance(logit_bias, dict):
         logit_bias = {int(k): v for k, v in logit_bias.items()}
+    # Accept Ollama-style `repeat_penalty` as an alias for `repetition_penalty`.
+    # OpenWebUI's Advanced Params slider uses the Ollama name on every endpoint,
+    # so without this alias the UI knob is silently dropped on OpenAI targets.
+    repetition_penalty = getattr(request, "repetition_penalty", None) or getattr(
+        request, "repeat_penalty", None
+    )
     args = GenerationArguments(
         max_tokens=max_tokens,
         temperature=getattr(request, "temperature", DEFAULT_TEMPERATURE),
         top_p=getattr(request, "top_p", DEFAULT_TOP_P),
         top_k=getattr(request, "top_k", 0),
         min_p=getattr(request, "min_p", 0.0),
-        repetition_penalty=getattr(request, "repetition_penalty", None),
+        seed=getattr(request, "seed", None),
+        repetition_penalty=repetition_penalty,
+        presence_penalty=getattr(request, "presence_penalty", None),
+        frequency_penalty=getattr(request, "frequency_penalty", None),
         logit_bias=logit_bias,
         enable_thinking=getattr(request, "enable_thinking", False),
         thinking_budget=getattr(request, "thinking_budget", None),
@@ -1312,6 +1361,22 @@ class OpenAIRequest(FlexibleBaseModel):
     top_k: int = Field(0, description="Top-k sampling.")
     min_p: float = Field(0.0, description="Min-p sampling.")
     repetition_penalty: Optional[float] = Field(None, description="Repetition penalty.")
+    presence_penalty: Optional[float] = Field(
+        None,
+        description=(
+            "Additive presence penalty. Subtracts the value from the logit "
+            "of any token seen in the recent context. Required for Qwen 3.x "
+            "(which forbids repetition_penalty != 1.0). Range typically 0.0-2.0."
+        ),
+    )
+    frequency_penalty: Optional[float] = Field(
+        None,
+        description=(
+            "Additive frequency penalty. Subtracts the value times the count "
+            "of each token in the recent context. Sanctioned for Llama 3.x. "
+            "Range typically 0.0-2.0."
+        ),
+    )
     logit_bias: Optional[Any] = Field(None, description="Logit bias dict.")
     enable_thinking: bool = Field(False, description="Enable thinking mode.")
     thinking_budget: Optional[int] = Field(None, description="Max thinking tokens.")
@@ -1503,8 +1568,27 @@ class VLMRequest(FlexibleBaseModel):
     top_p: float = Field(DEFAULT_TOP_P, description="Top-p sampling.")
     top_k: int = Field(0, description="Top-k sampling.")
     min_p: float = Field(0.0, description="Min-p sampling.")
-    seed: int = Field(DEFAULT_SEED, description="Seed for random generation.")
+    seed: Optional[int] = Field(
+        None,
+        description="Seed for random generation. Omit to use a fresh PRNG state.",
+    )
     repetition_penalty: Optional[float] = Field(None, description="Repetition penalty.")
+    presence_penalty: Optional[float] = Field(
+        None,
+        description=(
+            "Additive presence penalty. Subtracts the value from the logit "
+            "of any token seen in the recent context. Required for Qwen 3.x "
+            "(which forbids repetition_penalty != 1.0). Range typically 0.0-2.0."
+        ),
+    )
+    frequency_penalty: Optional[float] = Field(
+        None,
+        description=(
+            "Additive frequency penalty. Subtracts the value times the count "
+            "of each token in the recent context. Sanctioned for Llama 3.x. "
+            "Range typically 0.0-2.0."
+        ),
+    )
     logit_bias: Optional[Any] = Field(None, description="Logit bias dict.")
     enable_thinking: bool = Field(False, description="Enable thinking mode.")
     thinking_budget: Optional[int] = Field(None, description="Max thinking tokens.")

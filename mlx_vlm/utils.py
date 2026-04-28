@@ -119,6 +119,15 @@ class _TextOnlyLanguageModel(nn.Module):
     def __init__(self, lm_model: nn.Module):
         super().__init__()
         self._model = lm_model
+        # Only expose make_cache if the underlying mlx_lm model implements it.
+        # generate._make_cache() uses hasattr(model, "make_cache") to decide
+        # between calling it and falling back to building default KVCaches from
+        # model.layers. If we always defined a method here (even one returning
+        # None), hasattr would pass, the fallback would never run, and the
+        # caller would crash on len(None). Conditional assignment preserves
+        # the contract: present iff the underlying model implements it.
+        if hasattr(lm_model, "make_cache"):
+            self.make_cache = lm_model.make_cache
 
     @property
     def layers(self):
@@ -137,11 +146,6 @@ class _TextOnlyLanguageModel(nn.Module):
         if isinstance(out, mx.array):
             return LanguageModelOutput(logits=out)
         return out
-
-    def make_cache(self):
-        if hasattr(self._model, "make_cache"):
-            return self._model.make_cache()
-        return None
 
 
 class _TextOnlyModelWrapper(nn.Module):
@@ -223,8 +227,18 @@ def get_model_and_args(config: dict):
             last_err = e
             continue
 
-    msg = f"Model type {model_type} not supported. Error: {last_err}"
-    logger.error(msg)
+    # Both mlx_vlm.models.{model_type} and the speculative drafter package
+    # failed to import. The caller (load()) will catch this and may fall
+    # back to mlx_lm for text-only models, so this is a warning rather than
+    # an error — only blocks if no fallback path exists. The "not supported"
+    # phrase is load-bearing: load() greps for it to decide whether to
+    # fall back.
+    msg = (
+        f"Model type {model_type} not supported in mlx_vlm.models or "
+        f"mlx_vlm.speculative.drafters; caller may fall back to mlx_lm. "
+        f"Last import error: {last_err}"
+    )
+    logger.warning(msg)
     raise ValueError(msg)
 
 

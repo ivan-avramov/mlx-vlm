@@ -766,6 +766,10 @@ def generate_step(
     temperature: float = DEFAULT_TEMPERATURE,
     repetition_penalty: Optional[float] = None,
     repetition_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE,
+    presence_penalty: Optional[float] = None,
+    presence_context_size: Optional[int] = 20,
+    frequency_penalty: Optional[float] = None,
+    frequency_context_size: Optional[int] = 20,
     top_p: float = DEFAULT_TOP_P,
     min_p: float = DEFAULT_MIN_P,
     top_k: int = DEFAULT_TOP_K,
@@ -853,7 +857,13 @@ def generate_step(
         )
 
     processors = make_logits_processors(
-        logit_bias, repetition_penalty, repetition_context_size
+        logit_bias,
+        repetition_penalty,
+        repetition_context_size,
+        presence_penalty,
+        presence_context_size,
+        frequency_penalty,
+        frequency_context_size,
     )
     if logits_processors is not None:
         processors.extend(logits_processors)
@@ -1185,6 +1195,36 @@ def stream_generate(
                     "SWA Ring Buffer Corruption Guard: rewind to token %d "
                     "is in the overwritten region. Forcing full re-prefill.",
                     prefix_len,
+                )
+                prefix_len = 0
+
+        # Hybrid-Cache Rewind Guard
+        # Models with non-trimmable layers (e.g. Qwen 3.5 / 3.6 GatedDeltaNet
+        # uses ArraysCache for recurrent state, which advances monotonically
+        # with no rewind primitive). _trim_cache below only handles caches
+        # with an offset attribute, so non-trimmable caches would silently
+        # retain state past the rewind point — KV layers shrink correctly,
+        # DeltaNet state does not, generation drifts. Force a full re-prefill
+        # when ANY cache reports is_trimmable() == False. Conservative: loses
+        # prefix-cache reuse on hybrid models, but preserves correctness.
+        def _has_non_trimmable(entries):
+            for c in entries:
+                if hasattr(c, "is_trimmable") and not c.is_trimmable():
+                    return True
+                if hasattr(c, "caches"):
+                    if _has_non_trimmable(c.caches):
+                        return True
+                elif isinstance(c, (list, tuple)):
+                    if _has_non_trimmable(c):
+                        return True
+            return False
+
+        if prefix_len > 0 and prefix_len < len(prompt_cache_state.token_ids):
+            if _has_non_trimmable(prompt_cache_state.cache):
+                logger.debug(
+                    "Hybrid-Cache Rewind Guard: prompt cache contains "
+                    "non-trimmable layers (e.g. DeltaNet state). Forcing "
+                    "full re-prefill to avoid silent state drift."
                 )
                 prefix_len = 0
 
@@ -1709,6 +1749,11 @@ class GenerationBatch:
         finish_reason: Optional[str]
         top_logprobs: Optional[List[Tuple[int, float]]] = None
 
+    # Maximum per-sequence token-history window for logits processors.
+    # Covers all of mlx_lm's penalty processors (default context_size=20)
+    # with comfortable headroom; keeps the rolling buffer cheap.
+    _PENALTY_HISTORY_SIZE = 64
+
     def __init__(
         self,
         model: nn.Module,
@@ -1737,6 +1782,19 @@ class GenerationBatch:
         self.logits_processors = logits_processors or []
         self.token_context = [list(ctx) for ctx in (token_context or [])]
 
+        # Logits processors (e.g. repetition / presence / frequency penalty,
+        # logit bias). mlx_lm's processors are written for single-sequence
+        # generation — they take (tokens, logits) and use logits[:, tokens].
+        # In continuous batching, each sequence has its own token history,
+        # so we apply processors per-row in _step rather than across the
+        # whole batch. _histories[i] is the rolling token buffer for the
+        # i-th sequence (Python list of ints, capped at _PENALTY_HISTORY_SIZE).
+        self.logits_processors = logits_processors or []
+        if self.logits_processors:
+            self._histories: List[List[int]] = [[] for _ in uids]
+        else:
+            self._histories = None
+
         self._current_tokens = None
         self._current_lps = None
         self._next_tokens = inputs
@@ -1759,6 +1817,22 @@ class GenerationBatch:
         fwd_kwargs = {}
         if self._rope_deltas is not None:
             fwd_kwargs["rope_deltas"] = self._rope_deltas
+
+        # Append the current input tokens to per-sequence histories before
+        # the forward pass. `inputs` here is whatever was sampled in the
+        # previous step (or the initial seed token on the very first call).
+        # mlx_lm's penalty processors slice `tokens[-context_size:]` so an
+        # extra leading token has negligible semantic effect; tracking it
+        # uniformly avoids the off-by-one bookkeeping of "is this the first
+        # step" for sequences inserted mid-batch via extend().
+        if self.logits_processors and self._histories is not None:
+            inputs_list = inputs.tolist()
+            for i, tok in enumerate(inputs_list):
+                self._histories[i].append(int(tok))
+                if len(self._histories[i]) > self._PENALTY_HISTORY_SIZE:
+                    self._histories[i] = self._histories[i][
+                        -self._PENALTY_HISTORY_SIZE :
+                    ]
 
         output = self._language_model(
             inputs[:, None], cache=self.prompt_cache, **fwd_kwargs
@@ -1790,6 +1864,23 @@ class GenerationBatch:
             logits = mx.concatenate(processed_logits, axis=0)
 
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+
+        # Apply logits processors per-sequence. Upstream processors are
+        # written for single-sequence inputs (`logits[:, tokens]` indexes
+        # the same tokens across all batch rows), so we slice each row
+        # and apply with that sequence's own token history. Modified rows
+        # are stacked back into a single tensor for sampling.
+        if self.logits_processors and self._histories is not None:
+            modified_rows = []
+            for i, history in enumerate(self._histories):
+                row = logprobs[i : i + 1]
+                if history:
+                    hist = mx.array(history, dtype=mx.int32)
+                    for processor in self.logits_processors:
+                        row = processor(hist, row)
+                modified_rows.append(row)
+            logprobs = mx.concatenate(modified_rows, axis=0)
+
         sampled = self.sampler(logprobs)
 
         self._next_tokens = sampled
@@ -1844,6 +1935,19 @@ class GenerationBatch:
         self.token_context.extend(other.token_context)
         self.logits_processors.extend(other.logits_processors)
 
+        # Per-sequence token histories. New sequences start with an empty
+        # history regardless of what the joining batch had — they're brand
+        # new from the caller's perspective. logits_processors stays the
+        # one this batch was constructed with (matches the existing
+        # "first request's sampler wins" semantics — there's no per-request
+        # processor support in continuous batching today).
+        if self._histories is not None:
+            self._histories.extend([] for _ in other.uids)
+        elif other._histories is not None:
+            # Adopt the other batch's histories if we don't have any yet.
+            self._histories = list(other._histories)
+            self.logits_processors = other.logits_processors
+
         if self._current_tokens is None:
             self._current_tokens = other._current_tokens
             self._current_lps = other._current_lps
@@ -1895,6 +1999,11 @@ class GenerationBatch:
             self.token_context = [self.token_context[idx] for idx in keep]
         if self.logits_processors:
             self.logits_processors = [self.logits_processors[idx] for idx in keep]
+
+        if self._histories is not None:
+            self._histories = (
+                [self._histories[idx] for idx in keep] if keep else []
+            )
 
         if not keep:
             self.prompt_cache.clear()
@@ -1964,7 +2073,15 @@ class GenerationBatch:
 
     @classmethod
     def empty(
-        cls, model, sampler, stop_criteria, compute_logprobs=True, top_logprobs_k=0
+        cls,
+        model,
+        sampler,
+        stop_criteria,
+        compute_logprobs=True,
+        top_logprobs_k=0,
+        logits_processors: Optional[
+            List[Callable[[mx.array, mx.array], mx.array]]
+        ] = None,
     ):
         """Create an empty generation batch."""
         batch = cls.__new__(cls)
@@ -1980,6 +2097,7 @@ class GenerationBatch:
         batch.top_logprobs_k = top_logprobs_k
         batch.token_context = []
         batch.logits_processors = []
+        batch._histories = [] if batch.logits_processors else None
         batch._current_tokens = None
         batch._current_lps = None
         batch._next_tokens = None
@@ -2072,7 +2190,14 @@ class PromptProcessingBatch:
         return n
 
     def generate(
-        self, sampler, stop_criteria, compute_logprobs=True, top_logprobs_k=0
+        self,
+        sampler,
+        stop_criteria,
+        compute_logprobs=True,
+        top_logprobs_k=0,
+        logits_processors: Optional[
+            List[Callable[[mx.array, mx.array], mx.array]]
+        ] = None,
     ) -> GenerationBatch:
         """Process final tokens and transition to GenerationBatch."""
         output = self.model(
@@ -2178,6 +2303,9 @@ class BatchGenerator:
             List[Callable[[mx.array, mx.array], mx.array]]
         ] = None,
         stream=None,
+        logits_processors: Optional[
+            List[Callable[[mx.array, mx.array], mx.array]]
+        ] = None,
     ):
         self.model = model
         self.max_tokens = max_tokens
@@ -2193,6 +2321,13 @@ class BatchGenerator:
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
         self.sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+        # Logits processors (repetition/presence/frequency penalty, logit
+        # bias). Applied per-sequence in GenerationBatch._step using each
+        # sequence's own token history. Limitation: same as `sampler` —
+        # processors are constructed once per BatchGenerator from the first
+        # request's args. Subsequent requests added to the active batch
+        # share these processors. Acceptable for single-user OpenWebUI use.
+        self.logits_processors = logits_processors or []
         self.uid_count = 0
         self.prefill_step_size = prefill_step_size
         self.prefill_batch_size = prefill_batch_size
@@ -2208,6 +2343,7 @@ class BatchGenerator:
             self.tokenizer.stopping_criteria,
             compute_logprobs=self.compute_logprobs,
             top_logprobs_k=self.top_logprobs_k,
+            logits_processors=self.logits_processors,
         )
         self._prompt_batch: Optional[PromptProcessingBatch] = None
         self._unprocessed_sequences = []
@@ -2352,6 +2488,7 @@ class BatchGenerator:
                 self.tokenizer.stopping_criteria,
                 compute_logprobs=self.compute_logprobs,
                 top_logprobs_k=self.top_logprobs_k,
+                logits_processors=self.logits_processors,
             )
             self._prompt_time_counter += time.perf_counter() - tic
             self._generation_batch.extend(gen_batch)
