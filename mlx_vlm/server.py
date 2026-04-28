@@ -35,7 +35,6 @@ from .generate import (
     DEFAULT_MODEL_PATH,
     DEFAULT_PREFILL_STEP_SIZE,
     DEFAULT_QUANTIZED_KV_START,
-    DEFAULT_SEED,
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,
     BatchGenerator,
@@ -377,6 +376,14 @@ class ResponseGenerator:
     def _make_sampler(self, args: GenerationArguments) -> Optional[Callable]:
         if args.temperature == 0:
             return None
+
+        # Apply per-request seed once at sampler construction time. The MLX
+        # PRNG is process-global, so under continuous batching this is
+        # best-effort determinism — interleaved batches share state and a
+        # single seed cannot guarantee bit-exact reproducibility across
+        # concurrent requests.
+        if args.seed is not None:
+            mx.random.seed(args.seed)
 
         def sampler(logprobs: mx.array) -> mx.array:
             if args.top_p > 0 and args.top_p < 1.0:
@@ -854,13 +861,20 @@ def _build_gen_args(request) -> GenerationArguments:
     logit_bias = getattr(request, "logit_bias", None)
     if logit_bias is not None and isinstance(logit_bias, dict):
         logit_bias = {int(k): v for k, v in logit_bias.items()}
+    # Accept Ollama-style `repeat_penalty` as an alias for `repetition_penalty`.
+    # OpenWebUI's Advanced Params slider uses the Ollama name on every endpoint,
+    # so without this alias the UI knob is silently dropped on OpenAI targets.
+    repetition_penalty = getattr(request, "repetition_penalty", None) or getattr(
+        request, "repeat_penalty", None
+    )
     return GenerationArguments(
         max_tokens=max_tokens,
         temperature=getattr(request, "temperature", DEFAULT_TEMPERATURE),
         top_p=getattr(request, "top_p", DEFAULT_TOP_P),
         top_k=getattr(request, "top_k", 0),
         min_p=getattr(request, "min_p", 0.0),
-        repetition_penalty=getattr(request, "repetition_penalty", None),
+        seed=getattr(request, "seed", None),
+        repetition_penalty=repetition_penalty,
         logit_bias=logit_bias,
         enable_thinking=getattr(request, "enable_thinking", False),
         thinking_budget=getattr(request, "thinking_budget", None),
@@ -1438,7 +1452,10 @@ class VLMRequest(FlexibleBaseModel):
     top_p: float = Field(DEFAULT_TOP_P, description="Top-p sampling.")
     top_k: int = Field(0, description="Top-k sampling.")
     min_p: float = Field(0.0, description="Min-p sampling.")
-    seed: int = Field(DEFAULT_SEED, description="Seed for random generation.")
+    seed: Optional[int] = Field(
+        None,
+        description="Seed for random generation. Omit to use a fresh PRNG state.",
+    )
     repetition_penalty: Optional[float] = Field(None, description="Repetition penalty.")
     logit_bias: Optional[Any] = Field(None, description="Logit bias dict.")
     enable_thinking: bool = Field(False, description="Enable thinking mode.")

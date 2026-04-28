@@ -107,6 +107,25 @@ While `mlx-lm` works fine out of the box for text-only Gemma 4, we explicitly bu
 * **The Problem:** Diagnostic output was a mix of `print()` calls and ad-hoc `logging.info` blocks. No way to redirect to a file, no consistent module loggers, no preview-truncation for long prompts (which spammed terminals at 6K+ tokens).
 * **The Fix:** Replaced all `print()` with `logger.info/warning/error/debug` across server, generate, and utils. Module loggers derive from `MLX_VLM_LOG_NAME` (default `mlx_vlm`); `MLX_VLM_LOG_LEVEL` env var and `--log-name` CLI arg control verbosity. Added `DEBUG_PREVIEW_CHARS` constant and `_truncate()` helper for head+tail previews of long prompts/responses. `traceback` import dropped in favor of `exc_info=True` on `logger.error`. The `--log-file PATH` flag (default: `<stdout>`) lets ops redirect to file or journald cleanly. Supersedes the original ad-hoc telemetry pipeline mentioned in #10.
 
+**24. OpenWebUI Advanced Params End-to-End Plumbing (server.py)**
+* **The Problem:** OpenWebUI v0.9.2 forwards Advanced Params and Custom Parameters verbatim to OpenAI-compatible endpoints (no allowlist filter on the OpenAI router), but several knobs the user expected to work were silently dropped server-side:
+  - **`repeat_penalty`** — OpenWebUI's native UI slider uses the Ollama-style name. The server only read `repetition_penalty`. The slider was theater.
+  - **`seed`** — declared on `VLMRequest` with default `DEFAULT_SEED=0` and never plumbed into `_build_gen_args` or applied to the sampler. Worse, the non-None default meant every request was implicitly "seeded with 0", which would have eliminated variance if the seed had been wired up.
+  - Other knobs (`thinking_budget`, `thinking_start_token`, `repetition_penalty` proper) worked end-to-end but were not surfaced in the OpenWebUI UI — required manual Custom Parameters JSON.
+* **The Fix (server.py):**
+  - `_build_gen_args` (server.py:863): accept `repeat_penalty` as an alias for `repetition_penalty` so OpenWebUI's native slider works without Custom Params. One-liner: `repetition_penalty = getattr(request, "repetition_penalty", None) or getattr(request, "repeat_penalty", None)`.
+  - `_build_gen_args` (server.py:869): plumb `seed=getattr(request, "seed", None)` through into `GenerationArguments`.
+  - `_make_sampler` (server.py:377): when `args.seed is not None`, call `mx.random.seed(args.seed)` once at sampler construction time. Comment documents the caveat — MLX PRNG is process-global, so under continuous batching this is best-effort determinism (interleaved batches share state).
+  - `VLMRequest.seed` (server.py:1448): changed from `int = Field(DEFAULT_SEED)` to `Optional[int] = Field(None)` so omitted seed means "don't reseed" instead of "reseed to 0 every time". Removed the now-unused `DEFAULT_SEED` import.
+* **The Fix (`openwebui/mlx_vlm_advanced_params_filter.py`):** Single OpenWebUI Filter function exposing all server-supported knobs as **UserValves** (settable per-chat in the UI):
+  - Thinking: `enable_thinking`, `thinking_budget`, `thinking_start_token`
+  - Sampling: `temperature`, `top_p`, `top_k`, `min_p`, `max_tokens`, `seed`
+  - Repetition: `repetition_penalty` (description points at 1.08–1.15 as the loop-mitigation knob)
+  - Admin Valves: `enabled` master switch + optional `target_model_substring` gate so the filter can be attached globally without affecting non-mlx-vlm models.
+  - `inlet()` uses `body.setdefault(key, value)` so per-model **Custom Parameters** JSON always wins over per-chat valves — the filter overrides defaults but never clobbers explicit pins. Drops `None` values entirely.
+  - Install: OpenWebUI → Admin → Functions → Add → paste the file. Attach to mlx-vlm models. Users adjust per-chat from the message settings UI.
+* **Knobs intentionally left unplumbed:** `frequency_penalty`, `presence_penalty`, runtime `stop` strings, all Ollama-only knobs (`mirostat*`, `repeat_last_n`, `num_ctx`, `format`, `think`, etc.). OpenWebUI sends them but the underlying `generate_step` doesn't support them; adding stubs would mislead users into thinking they have effect.
+
 ---
 
 **Pipeline Configuration**
@@ -208,5 +227,6 @@ Refresh authoritative commit list with `git log --pretty=format:"%h|%ad|%s" --da
 | `cbe1ac8` | 2026-04-24 | add back strict JSON output sanitization (`sanitize_strict_json`, non-streaming endpoints only) | #21 |
 | `ffad5df` | 2026-04-25 | add thinking budget enforcement (auto = 80% × max_tokens, override via `thinking_budget`) | #22 |
 | `59c7843` | 2026-04-27 | bump debug preview size | #23 |
+| *(uncommitted)* | 2026-04-27 | OpenWebUI advanced params: server seed plumbing + `repeat_penalty` alias + `openwebui/` filter file | #24 |
 
 Sections #1–#16 (the pre-port architecture work — StreamingTranslator, MultiCacheManager, prefill-step tuning, RoPE desync fix, ghost-prompt removal, etc.) predate the current `upstream` branch tip and are not individually itemized in this commit table; they're reflected in the cumulative diff `git diff upstream..HEAD`.
