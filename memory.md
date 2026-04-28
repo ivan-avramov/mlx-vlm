@@ -117,12 +117,13 @@ While `mlx-lm` works fine out of the box for text-only Gemma 4, we explicitly bu
   - `_build_gen_args` (server.py:869): plumb `seed=getattr(request, "seed", None)` through into `GenerationArguments`.
   - `_make_sampler` (server.py:377): when `args.seed is not None`, call `mx.random.seed(args.seed)` once at sampler construction time. Comment documents the caveat — MLX PRNG is process-global, so under continuous batching this is best-effort determinism (interleaved batches share state).
   - `VLMRequest.seed` (server.py:1448): changed from `int = Field(DEFAULT_SEED)` to `Optional[int] = Field(None)` so omitted seed means "don't reseed" instead of "reseed to 0 every time". Removed the now-unused `DEFAULT_SEED` import.
-* **The Fix (`openwebui/mlx_vlm_advanced_params_filter.py`):** Single OpenWebUI Filter function exposing all server-supported knobs as **UserValves** (settable per-chat in the UI):
+* **The Fix (`openwebui/mlx_vlm_advanced_params_filter.py`, v0.2.0):** Single OpenWebUI Filter function exposing all server-supported knobs as **UserValves** (settable per-chat in the UI):
   - Thinking: `enable_thinking`, `thinking_budget`, `thinking_start_token`
   - Sampling: `temperature`, `top_p`, `top_k`, `min_p`, `max_tokens`, `seed`
   - Repetition: `repetition_penalty` (description points at 1.08–1.15 as the loop-mitigation knob)
+  - Meta: `unset_fields` (comma-separated parameter names to strip from the outbound body, so the server falls back to its own default — use to disable a value pinned by the model's Advanced/Custom Params)
   - Admin Valves: `enabled` master switch + optional `target_model_substring` gate so the filter can be attached globally without affecting non-mlx-vlm models.
-  - `inlet()` uses `body.setdefault(key, value)` so per-model **Custom Parameters** JSON always wins over per-chat valves — the filter overrides defaults but never clobbers explicit pins. Drops `None` values entirely.
+  - `inlet()` semantics: any non-None UserValve **overrides** what the model's Advanced/Custom Params set (`body[key] = value`, not `setdefault`). `unset_fields` is processed BEFORE the override pass and strips named keys (plus their aliases — `repetition_penalty`/`repeat_penalty` are treated as one group). A field appearing in both `unset_fields` AND as a non-None valve still ends up set, with the user's value. Meta valves (currently just `unset_fields`) are excluded from the override pass.
   - Install: OpenWebUI → Admin → Functions → Add → paste the file. Attach to mlx-vlm models. Users adjust per-chat from the message settings UI.
 * **Knobs intentionally left unplumbed:** `frequency_penalty`, `presence_penalty`, runtime `stop` strings, all Ollama-only knobs (`mirostat*`, `repeat_last_n`, `num_ctx`, `format`, `think`, etc.). OpenWebUI sends them but the underlying `generate_step` doesn't support them; adding stubs would mislead users into thinking they have effect.
 

@@ -1,7 +1,7 @@
 """
 title: MLX-VLM Advanced Params
 author: ivan-avramov
-version: 0.1.0
+version: 0.2.0
 required_open_webui_version: 0.9.2
 description: |
   Per-chat advanced parameter overrides for the local mlx-vlm server.
@@ -15,9 +15,16 @@ description: |
     - repetition_penalty (also accepted as repeat_penalty alias)
     - logit_bias
 
-  Anything left at None / empty is NOT injected, so the server's defaults
-  (or the model's Custom Parameters) keep applying. This filter only
-  *overrides* — it never silently sets a value the user didn't ask for.
+  Semantics:
+    - Any UserValve set to a non-None value is injected into the outbound
+      request body, OVERRIDING anything the model's Advanced Params or
+      Custom Parameters set for that key.
+    - UserValves left at None are passthrough — the model's existing
+      values (if any) reach the server unchanged.
+    - The `unset_fields` valve takes a comma-separated list of parameter
+      names to strip entirely from the outbound body, so the server falls
+      back to its own defaults. Use this when the model's Advanced Params
+      pinned a value you don't want sent for this chat.
 """
 
 from typing import Optional
@@ -110,6 +117,28 @@ class Filter:
             le=2.0,
         )
 
+        # --- Strip parameters entirely (server falls back to its own default) ---
+        unset_fields: str = Field(
+            "",
+            description=(
+                "Comma-separated parameter names to REMOVE from the outbound "
+                "request before send. Use this to disable a value the model's "
+                "Advanced Params or Custom Parameters pinned, so the server "
+                "falls back to its own default. Example: 'temperature,top_p'. "
+                "Names match the request keys: temperature, top_p, top_k, "
+                "min_p, max_tokens, seed, repetition_penalty, repeat_penalty, "
+                "enable_thinking, thinking_budget, thinking_start_token, "
+                "frequency_penalty, presence_penalty, stop, logit_bias."
+            ),
+        )
+
+    # Names of UserValves that are meta-controls, not request-body fields.
+    _META_VALVES = frozenset({"unset_fields"})
+
+    # Repetition-penalty has two valid wire names. When the user unsets one,
+    # strip both so the server doesn't pick up a stale alias.
+    _ALIAS_GROUPS = (frozenset({"repetition_penalty", "repeat_penalty"}),)
+
     def __init__(self):
         self.valves = self.Valves()
 
@@ -117,9 +146,9 @@ class Filter:
         """Mutate the outbound chat-completion body before it hits the server.
 
         OpenWebUI calls inlet() with the request body and the current user
-        context. We copy each non-None UserValve into the body. Existing
-        keys take precedence — so if the user set something via the model's
-        Custom Parameters JSON, this filter won't clobber it.
+        context. UserValves override anything the model's Advanced Params or
+        Custom Parameters already set; `unset_fields` strips named keys from
+        the body entirely so the server falls back to its own defaults.
         """
         if not self.valves.enabled:
             return body
@@ -140,7 +169,8 @@ class Filter:
             return body
 
         # Normalize to a dict regardless of whether OpenWebUI hands us a
-        # Pydantic instance or a plain dict.
+        # Pydantic instance or a plain dict. exclude_none=True drops fields
+        # the user left unset (passthrough).
         if hasattr(user_valves, "model_dump"):
             overrides = user_valves.model_dump(exclude_none=True)
         elif hasattr(user_valves, "dict"):
@@ -150,8 +180,27 @@ class Filter:
         else:
             return body
 
-        # Don't overwrite values the user already pinned via Custom Params.
+        # Step 1: strip fields the user explicitly named. Done first so a
+        # field listed in unset_fields AND set as a UserValve still ends up
+        # set (the override pass below will re-add it with the user's value).
+        unset_raw = overrides.get("unset_fields", "") or ""
+        unset_names = {
+            name.strip().lower() for name in unset_raw.split(",") if name.strip()
+        }
+        for name in unset_names:
+            body.pop(name, None)
+            # Strip alias counterparts so a stale wire name doesn't survive.
+            for group in self._ALIAS_GROUPS:
+                if name in group:
+                    for alias in group:
+                        body.pop(alias, None)
+
+        # Step 2: override body with each non-None UserValve. Skip meta
+        # valves (e.g. unset_fields) — they're filter controls, not
+        # request-body fields.
         for key, value in overrides.items():
-            body.setdefault(key, value)
+            if key in self._META_VALVES:
+                continue
+            body[key] = value
 
         return body
