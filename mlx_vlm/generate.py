@@ -292,8 +292,46 @@ def normalize_resize_shape(
     return (values[0], values[0]) if len(values) == 1 else tuple(values)
 
 
-# A stream on the default device just for generation
-generation_stream = mx.new_thread_local_stream(mx.default_device())
+# Generation stream — lazily created per-thread.
+#
+# Earlier this module exposed `generation_stream` as a module-level singleton
+# created via mx.new_thread_local_stream() at import time. That ties the stream
+# (and any arrays computed under it) to the import-time thread; calling these
+# functions from a different thread produces "There is no Stream(gpu, N) in
+# current thread" at the trailing mx.async_eval / mx.eval ops outside the
+# `with mx.stream(...)` block.
+#
+# The architecturally-sound fix is to lazily create a per-thread stream the
+# first time each thread enters generate.py code. Each thread's arrays are
+# bound to its own stream and async_eval finds it on the same thread.
+import threading as _threading
+
+_thread_local_streams = _threading.local()
+
+
+def _get_generation_stream():
+    """Return (and lazily resolve) the calling thread's generation stream.
+
+    Uses mx.default_stream(device) rather than mx.new_thread_local_stream:
+    the former returns each thread's auto-registered default stream
+    (matching the BatchGenerator GPU thread's pattern at server.py), while
+    the latter creates a new stream object that mx.async_eval cannot find
+    on subsequent calls — the "no Stream(gpu, N) in current thread" error.
+    """
+    stream = getattr(_thread_local_streams, "stream", None)
+    if stream is None:
+        stream = mx.default_stream(mx.default_device())
+        _thread_local_streams.stream = stream
+    return stream
+
+
+# Backward-compat shim: code that imported `generation_stream` as a module
+# attribute still resolves it. Read-only proxy that materializes the calling
+# thread's stream on attribute access via __getattr__ at module level.
+def __getattr__(name):
+    if name == "generation_stream":
+        return _get_generation_stream()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def maybe_quantize_kv_cache(
@@ -432,6 +470,14 @@ class GenerationResult:
     prompt_tps: float = 0.0
     generation_tps: float = 0.0
     peak_memory: float = 0.0
+    # Set on the final yield (post-loop) of stream_generate.
+    #   "stop"   - tokenizer.stopping_criteria matched (EOS / chat-template stop)
+    #   "length" - max_tokens reached without a stop token
+    #   None     - mid-stream chunk; no terminal signal yet
+    # Per-token chunks always carry None; only the final yield carries the
+    # terminal reason. Callers can either branch on it or rely on iterator
+    # exhaustion as the ultimate terminator.
+    finish_reason: Optional[str] = None
 
 
 class PromptCacheState:
@@ -440,11 +486,31 @@ class PromptCacheState:
     Pass this to stream_generate via the ``prompt_cache_state`` kwarg to
     reuse the KV cache from previous turns.  Only the new tokens (after
     the common prefix) are processed, avoiding redundant prefill.
+
+    For hybrid models with non-trimmable layers (Qwen 3.5/3.6 GatedDeltaNet,
+    Mamba-style, etc.), pass a ``snapshot_ring`` to enable rewind support.
+    Without one, mid-conversation rewinds (regenerate, edit) fall back to
+    full re-prefill since the standard ``_trim_cache`` path can't safely
+    rewind recurrent state.
+
+    ``rewind_enabled`` is the master toggle for the snapshot-restore code
+    path. ``False`` means snapshots are still captured (cheap; future
+    sessions might toggle on) but never used to restore — the rewind guard
+    falls through to full re-prefill. Useful for A/B testing or when an
+    operator wants to disable the restore path without rebuilding sessions.
     """
 
-    def __init__(self):
+    def __init__(self, snapshot_ring=None, rewind_enabled: bool = True):
         self.cache: Optional[List[Any]] = None
         self.token_ids: Optional[List[int]] = None
+        self.rewind_enabled = rewind_enabled
+        # Local import so this module stays importable without snapshot.py
+        # being touched by callers that don't need it.
+        if snapshot_ring is None:
+            from .snapshot import DeltaNetSnapshotRing
+
+            snapshot_ring = DeltaNetSnapshotRing()
+        self.snapshot_ring = snapshot_ring
 
     def find_prefix_length(self, new_ids: list) -> int:
         """Return the number of leading tokens that match the cached ids."""
@@ -457,9 +523,52 @@ class PromptCacheState:
         return max_len
 
     def update(self, token_ids: list, kv_cache: list):
-        """Store the full token sequence and corresponding KV cache."""
-        self.token_ids = list(token_ids)
+        """Store the full token sequence and corresponding KV cache.
+
+        Also captures a DeltaNet state snapshot at this offset (the current
+        turn boundary) when a snapshot ring is attached and the cache
+        contains non-trimmable layers. The capture is refcount-cheap.
+
+        Snapshot invariant: each ``DeltaNetSnapshot`` represents the
+        recurrent state after processing the cached token sequence's
+        first ``offset`` tokens. When the new ``token_ids`` diverges from
+        the previously-cached sequence at position ``d``, every snapshot
+        with ``offset > d`` references state conditioned on tokens that
+        are no longer in the live cache (e.g. the prior turn's assistant
+        message was edited or replaced). Restoring such a snapshot would
+        produce a DeltaNet state inconsistent with the trimmed KV layers
+        and silently drift generation. Drop them eagerly here.
+        """
+        new_ids = list(token_ids)
+
+        if (
+            self.token_ids is not None
+            and self.snapshot_ring is not None
+            and self.snapshot_ring.enabled
+        ):
+            divergence = 0
+            limit = min(len(self.token_ids), len(new_ids))
+            while divergence < limit and self.token_ids[divergence] == new_ids[divergence]:
+                divergence += 1
+            # If the new sequence is shorter than the cached one OR diverges
+            # mid-prefix, snapshots past `divergence` are stale.
+            if divergence < len(self.token_ids):
+                dropped = self.snapshot_ring.drop_after(divergence)
+                if dropped:
+                    logger.debug(
+                        "Snapshot ring: dropped %d stale snapshot(s) past "
+                        "token-sequence divergence at offset %d (cached len=%d, "
+                        "new len=%d).",
+                        dropped,
+                        divergence,
+                        len(self.token_ids),
+                        len(new_ids),
+                    )
+
+        self.token_ids = new_ids
         self.cache = kv_cache
+        if self.snapshot_ring is not None and self.snapshot_ring.enabled:
+            self.snapshot_ring.capture(offset=len(self.token_ids), cache=kv_cache)
 
 
 def _speculative_walk(
@@ -559,7 +668,7 @@ def _dflash_rounds(
         )
         mx.async_eval(draft_tokens)
 
-        with mx.stream(generation_stream):
+        with mx.stream(_get_generation_stream()):
             verify_input = mx.concatenate(
                 [mx.array([[b]], dtype=token_dtype), draft_tokens],
                 axis=1,
@@ -591,7 +700,7 @@ def _dflash_rounds(
         b = new_tokens[-1] if new_tokens else b
 
         if accepted < bs - 1:
-            with mx.stream(generation_stream):
+            with mx.stream(_get_generation_stream()):
                 lm.rollback_speculative_cache(
                     prompt_cache, verify_out.gdn_states, accepted, bs
                 )
@@ -675,7 +784,7 @@ def _dflash_rounds_batch(
         mx.async_eval(draft_tokens)
 
         # Verify
-        with mx.stream(generation_stream):
+        with mx.stream(_get_generation_stream()):
             verify_input = mx.concatenate([b_arr[:, None], draft_tokens], axis=1)
             verify_out = lm(
                 verify_input,
@@ -728,7 +837,7 @@ def _dflash_rounds_batch(
                 b[orig] = new_tokens_list[j][-1]
 
         if min_accepted < bs - 1:
-            with mx.stream(generation_stream):
+            with mx.stream(_get_generation_stream()):
                 lm.rollback_speculative_cache(
                     prompt_cache, verify_out.gdn_states, accepted_arr, bs
                 )
@@ -895,7 +1004,7 @@ def generate_step(
     def _step(y, inputs_embeds=None):
         nonlocal tokens, kwargs, last_outputs
 
-        with mx.stream(generation_stream):
+        with mx.stream(_get_generation_stream()):
             if "decoder_input_ids" in kwargs:
                 outputs = model.language_model(
                     cache=prompt_cache,
@@ -932,7 +1041,7 @@ def generate_step(
 
             return y, logprobs.squeeze(0)
 
-    with mx.stream(generation_stream):
+    with mx.stream(_get_generation_stream()):
         # Get input embeddings (handles both multimodal and text-only)
         embedding_output = model.get_input_embeddings(
             input_ids, pixel_values, mask=mask, **kwargs
@@ -1204,9 +1313,12 @@ def stream_generate(
         # with no rewind primitive). _trim_cache below only handles caches
         # with an offset attribute, so non-trimmable caches would silently
         # retain state past the rewind point — KV layers shrink correctly,
-        # DeltaNet state does not, generation drifts. Force a full re-prefill
-        # when ANY cache reports is_trimmable() == False. Conservative: loses
-        # prefix-cache reuse on hybrid models, but preserves correctness.
+        # DeltaNet state does not, generation drifts. The PromptCacheState's
+        # snapshot ring captures recurrent state at turn boundaries; we
+        # restore the nearest snapshot and treat its offset as the new
+        # prefix point so the model forward replays [snap.offset, full_len)
+        # — both KV and DeltaNet end up coherent. If no usable snapshot
+        # exists (or the ring is disabled), force full re-prefill.
         def _has_non_trimmable(entries):
             for c in entries:
                 if hasattr(c, "is_trimmable") and not c.is_trimmable():
@@ -1219,14 +1331,62 @@ def stream_generate(
                         return True
             return False
 
+        def _restore_deltanet_state(entries, snapshot_states):
+            """Restore non-trimmable cache state from a snapshot list. The
+            snapshot list aligns positionally with `entries` — None entries
+            correspond to trimmable (KV) layers and are skipped here.
+            """
+            from mlx_lm.models.cache import ArraysCache
+
+            for c, s in zip(entries, snapshot_states):
+                if s is not None and isinstance(c, ArraysCache):
+                    c.state = s
+
         if prefix_len > 0 and prefix_len < len(prompt_cache_state.token_ids):
             if _has_non_trimmable(prompt_cache_state.cache):
-                logger.debug(
-                    "Hybrid-Cache Rewind Guard: prompt cache contains "
-                    "non-trimmable layers (e.g. DeltaNet state). Forcing "
-                    "full re-prefill to avoid silent state drift."
+                ring = getattr(prompt_cache_state, "snapshot_ring", None)
+                rewind_enabled = getattr(
+                    prompt_cache_state, "rewind_enabled", True
                 )
-                prefix_len = 0
+                snap = (
+                    ring.find_nearest(prefix_len)
+                    if (ring is not None and ring.enabled and rewind_enabled)
+                    else None
+                )
+                if snap is None:
+                    # Operationally significant: full re-prefill costs
+                    # ~10x compared to cache reuse on hybrid models. If
+                    # this fires every multi-turn request the chat
+                    # template likely has a latest-vs-prior asymmetry
+                    # that needs an alignment kwarg (see prompt_utils.py
+                    # CACHE_ALIGNMENT_KWARGS).
+                    logger.warning(
+                        "Hybrid-Cache Rewind Guard: no snapshot available "
+                        "for rewind to %d (ring=%s, rewind_enabled=%s). "
+                        "Forcing full re-prefill.",
+                        prefix_len,
+                        len(ring) if ring else "none",
+                        rewind_enabled,
+                    )
+                    prefix_len = 0
+                else:
+                    _restore_deltanet_state(prompt_cache_state.cache, snap.states)
+                    # Bumped to WARNING because rewind indicates unusual
+                    # flow (regenerate or message edit), worth surfacing
+                    # by default so operators see when it happens.
+                    logger.warning(
+                        "DeltaNet snapshot rewind: restored from offset %d, "
+                        "replaying %d tokens to reach prefix %d.",
+                        snap.offset,
+                        prefix_len - snap.offset,
+                        prefix_len,
+                    )
+                    # Treat the snapshot offset as the new prefix point.
+                    # The trim+prefill below will trim KV layers to
+                    # snap.offset and run the model forward on tokens
+                    # [snap.offset, full_len), advancing both KV and
+                    # DeltaNet from the restored state.
+                    prefix_len = snap.offset
 
         if prefix_len > 0 and prefix_len < input_ids.shape[1]:
             reused_prefix_len = prefix_len
@@ -1387,7 +1547,7 @@ def stream_generate(
 
     total_prompt_tokens = reused_prefix_len + input_ids.size
 
-    with wired_limit(model, [generation_stream]):
+    with wired_limit(model, [_get_generation_stream()]):
         detokenizer = processor.detokenizer
         detokenizer.reset()
         thinking_criteria = getattr(tokenizer, "thinking_budget_criteria", None)
@@ -1395,6 +1555,11 @@ def stream_generate(
         tic = time.perf_counter()
 
         generated_tokens = []
+        # Track loop exit reason so the final yield can carry it. "stop"
+        # means tokenizer.stopping_criteria matched (EOS / chat-template
+        # stop); falling out of the loop without setting this means the
+        # generator exhausted (max_tokens reached) → "length".
+        stopped_by_criteria = False
         for n, (token, logprobs) in enumerate(gen):
             if n == 0:
                 prompt_time = time.perf_counter() - tic
@@ -1409,6 +1574,7 @@ def stream_generate(
 
             # Stop generation if the token is in the eos_token_ids
             if tokenizer.stopping_criteria(token):
+                stopped_by_criteria = True
                 break
 
             detokenizer.add_token(token, skip_special_token_ids=skip_special_token_ids)
@@ -1437,6 +1603,7 @@ def stream_generate(
             prompt_tps=prompt_tps,
             generation_tps=(n + 1) / (time.perf_counter() - tic),
             peak_memory=mx.get_peak_memory() / 1e9,
+            finish_reason="stop" if stopped_by_criteria else "length",
         )
 
         # Save cache state for potential reuse on next turn
@@ -1780,20 +1947,14 @@ class GenerationBatch:
         self.compute_logprobs = True
         self.top_logprobs_k = top_logprobs_k
         self.logits_processors = logits_processors or []
-        self.token_context = [list(ctx) for ctx in (token_context or [])]
-
-        # Logits processors (e.g. repetition / presence / frequency penalty,
+        # token_context[i] is the rolling per-sequence token buffer fed to
+        # logits processors (repetition / presence / frequency penalty,
         # logit bias). mlx_lm's processors are written for single-sequence
-        # generation — they take (tokens, logits) and use logits[:, tokens].
-        # In continuous batching, each sequence has its own token history,
-        # so we apply processors per-row in _step rather than across the
-        # whole batch. _histories[i] is the rolling token buffer for the
-        # i-th sequence (Python list of ints, capped at _PENALTY_HISTORY_SIZE).
-        self.logits_processors = logits_processors or []
-        if self.logits_processors:
-            self._histories: List[List[int]] = [[] for _ in uids]
-        else:
-            self._histories = None
+        # inputs — `logits[:, tokens]` indexes the same tokens across all
+        # batch rows — so we apply per-row in _step. Capped at
+        # _PENALTY_HISTORY_SIZE since processors slice [-context_size:]
+        # internally and never see beyond that window.
+        self.token_context = [list(ctx) for ctx in (token_context or [])]
 
         self._current_tokens = None
         self._current_lps = None
@@ -1818,22 +1979,6 @@ class GenerationBatch:
         if self._rope_deltas is not None:
             fwd_kwargs["rope_deltas"] = self._rope_deltas
 
-        # Append the current input tokens to per-sequence histories before
-        # the forward pass. `inputs` here is whatever was sampled in the
-        # previous step (or the initial seed token on the very first call).
-        # mlx_lm's penalty processors slice `tokens[-context_size:]` so an
-        # extra leading token has negligible semantic effect; tracking it
-        # uniformly avoids the off-by-one bookkeeping of "is this the first
-        # step" for sequences inserted mid-batch via extend().
-        if self.logits_processors and self._histories is not None:
-            inputs_list = inputs.tolist()
-            for i, tok in enumerate(inputs_list):
-                self._histories[i].append(int(tok))
-                if len(self._histories[i]) > self._PENALTY_HISTORY_SIZE:
-                    self._histories[i] = self._histories[i][
-                        -self._PENALTY_HISTORY_SIZE :
-                    ]
-
         output = self._language_model(
             inputs[:, None], cache=self.prompt_cache, **fwd_kwargs
         )
@@ -1846,6 +1991,10 @@ class GenerationBatch:
                 self.token_context = [[] for _ in self.uids]
             for i, token in enumerate(last_tokens):
                 self.token_context[i].append(token)
+                if len(self.token_context[i]) > self._PENALTY_HISTORY_SIZE:
+                    self.token_context[i] = self.token_context[i][
+                        -self._PENALTY_HISTORY_SIZE :
+                    ]
 
             processed_logits = []
             for i in range(logits.shape[0]):
@@ -1864,22 +2013,6 @@ class GenerationBatch:
             logits = mx.concatenate(processed_logits, axis=0)
 
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-
-        # Apply logits processors per-sequence. Upstream processors are
-        # written for single-sequence inputs (`logits[:, tokens]` indexes
-        # the same tokens across all batch rows), so we slice each row
-        # and apply with that sequence's own token history. Modified rows
-        # are stacked back into a single tensor for sampling.
-        if self.logits_processors and self._histories is not None:
-            modified_rows = []
-            for i, history in enumerate(self._histories):
-                row = logprobs[i : i + 1]
-                if history:
-                    hist = mx.array(history, dtype=mx.int32)
-                    for processor in self.logits_processors:
-                        row = processor(hist, row)
-                modified_rows.append(row)
-            logprobs = mx.concatenate(modified_rows, axis=0)
 
         sampled = self.sampler(logprobs)
 
@@ -1935,19 +2068,6 @@ class GenerationBatch:
         self.token_context.extend(other.token_context)
         self.logits_processors.extend(other.logits_processors)
 
-        # Per-sequence token histories. New sequences start with an empty
-        # history regardless of what the joining batch had — they're brand
-        # new from the caller's perspective. logits_processors stays the
-        # one this batch was constructed with (matches the existing
-        # "first request's sampler wins" semantics — there's no per-request
-        # processor support in continuous batching today).
-        if self._histories is not None:
-            self._histories.extend([] for _ in other.uids)
-        elif other._histories is not None:
-            # Adopt the other batch's histories if we don't have any yet.
-            self._histories = list(other._histories)
-            self.logits_processors = other.logits_processors
-
         if self._current_tokens is None:
             self._current_tokens = other._current_tokens
             self._current_lps = other._current_lps
@@ -1999,11 +2119,6 @@ class GenerationBatch:
             self.token_context = [self.token_context[idx] for idx in keep]
         if self.logits_processors:
             self.logits_processors = [self.logits_processors[idx] for idx in keep]
-
-        if self._histories is not None:
-            self._histories = (
-                [self._histories[idx] for idx in keep] if keep else []
-            )
 
         if not keep:
             self.prompt_cache.clear()
@@ -2080,10 +2195,19 @@ class GenerationBatch:
         compute_logprobs=True,
         top_logprobs_k=0,
         logits_processors: Optional[
-            List[Callable[[mx.array, mx.array], mx.array]]
+            List[Optional[List[Callable[[mx.array, mx.array], mx.array]]]]
         ] = None,
     ):
-        """Create an empty generation batch."""
+        """Create an empty generation batch.
+
+        ``logits_processors`` is a per-uid list aligned with ``uids`` —
+        each entry is either ``None`` (no processors for that sequence)
+        or a list of callables to apply per-step. ``_step`` iterates
+        ``self.logits_processors[i]`` and expects a list, never a bare
+        callable. Pass ``None`` (the default) for a fresh empty batch
+        and let ``extend()`` append per-uid entries as sequences merge
+        in from ``PromptProcessingBatch``.
+        """
         batch = cls.__new__(cls)
         batch.model = model
         batch._language_model = getattr(model, "language_model", model)
@@ -2096,8 +2220,7 @@ class GenerationBatch:
         batch.compute_logprobs = compute_logprobs
         batch.top_logprobs_k = top_logprobs_k
         batch.token_context = []
-        batch.logits_processors = []
-        batch._histories = [] if batch.logits_processors else None
+        batch.logits_processors = logits_processors or []
         batch._current_tokens = None
         batch._current_lps = None
         batch._next_tokens = None
@@ -2303,9 +2426,6 @@ class BatchGenerator:
             List[Callable[[mx.array, mx.array], mx.array]]
         ] = None,
         stream=None,
-        logits_processors: Optional[
-            List[Callable[[mx.array, mx.array], mx.array]]
-        ] = None,
     ):
         self.model = model
         self.max_tokens = max_tokens
@@ -2333,17 +2453,26 @@ class BatchGenerator:
         self.prefill_batch_size = prefill_batch_size
         self.completion_batch_size = completion_batch_size
 
-        self._stream = stream or generation_stream
+        self._stream = stream or _get_generation_stream()
 
         self.tokenizer.stopping_criteria.add_eos_token_ids(stop_tokens)
 
+        # The empty GenerationBatch starts with zero uids and therefore
+        # zero per-uid logits_processors entries. The broadcast list lives
+        # on `self.logits_processors` (BatchGenerator) and is replicated
+        # per-uid inside `insert()` when the caller doesn't supply an
+        # explicit per-uid list. Seeding the empty batch with the flat
+        # broadcast list would mix flat callables and per-uid lists once
+        # `extend()` appends entries from PromptProcessingBatch — see
+        # `_step`, which indexes `self.logits_processors[i]` and expects
+        # a list (or None), never a bare callable.
         self._generation_batch = GenerationBatch.empty(
             self.model,
             self.sampler,
             self.tokenizer.stopping_criteria,
             compute_logprobs=self.compute_logprobs,
             top_logprobs_k=self.top_logprobs_k,
-            logits_processors=self.logits_processors,
+            logits_processors=None,
         )
         self._prompt_batch: Optional[PromptProcessingBatch] = None
         self._unprocessed_sequences = []

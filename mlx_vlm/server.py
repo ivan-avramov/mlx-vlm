@@ -8,6 +8,7 @@ import re
 import sys
 import time
 import uuid
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -38,14 +39,16 @@ from .generate import (
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,
     BatchGenerator,
+    PromptCacheState,
     _dflash_rounds_batch,
     _make_cache,
     generate,
     normalize_resize_shape,
     stream_generate,
 )
-from .prompt_utils import apply_chat_template
+from .prompt_utils import apply_chat_template, get_cache_alignment_kwargs
 from .sample_utils import top_p_sampling
+from .snapshot import DEFAULT_RING_SIZE, DeltaNetSnapshotRing
 from .structured import build_json_schema_logits_processor
 from .tool_parsers import _infer_tool_parser, load_tool_module
 from .utils import load, prepare_inputs, sanitize_strict_json
@@ -60,6 +63,16 @@ THINKING_TRUNCATION_MSG = (
     "[Thinking used the entire token budget without producing a visible "
     "response. Try increasing max_tokens or setting a lower thinking_budget.]"
 )
+
+# Opener literals scanned for in the assistant continuation when checking
+# whether the chat template has prefilled the model into a thinking block
+# (e.g. unsloth Qwen 3.6 with enable_thinking=True ends the rendered prompt
+# with "<think>\n", forcing the model to start inside the reasoning block).
+# When matched, the streaming SSE state machine is seeded with in_thinking=True
+# so reasoning content routes to delta.reasoning instead of delta.content.
+_PREFILLED_OPENERS: Tuple[str, ...] = ("<think>", "<|channel>thought")
+_PREFILL_FLAG_CACHE_MAX = 16
+_PREFILL_FLAG_CACHE: "OrderedDict[Tuple[int, frozenset], bool]" = OrderedDict()
 
 
 def _truncate(text: str) -> str:
@@ -316,7 +329,17 @@ class ResponseGenerator:
         images: Optional[List] = None,
         audio: Optional[List] = None,
         args: Optional[GenerationArguments] = None,
+        prompt_cache_state: Optional["PromptCacheState"] = None,
     ) -> Tuple[GenerationContext, Iterator[StreamingToken]]:
+        """Submit a generation request to the GPU thread.
+
+        When ``prompt_cache_state`` is provided, the GPU thread will route
+        the request through the cached-request path (Phase 2): prefix
+        match against the cached token_ids, snapshot-restore + cache trim
+        on rewind, run prefill on the suffix only, and update the cache
+        state at the end of generation. Without it (default), the request
+        flows through the standard continuous-batching path.
+        """
         self.wait_until_ready()
         args = args or GenerationArguments()
         if self.draft_model is not None and args.logits_processors is not None:
@@ -334,7 +357,21 @@ class ResponseGenerator:
             else len(raw_inputs["input_ids"])
         )
 
-        self.requests.put((rqueue, raw_inputs, prompt_tokens, args, images))
+        # Cached-path consumers need the original prompt string (stream_generate
+        # accepts a string, re-tokenizes internally with prompt_cache_state's
+        # prefix-match). Carrying it through the queue lets the daemon thread
+        # dispatch to either path with full context.
+        self.requests.put(
+            (
+                rqueue,
+                raw_inputs,
+                prompt_tokens,
+                args,
+                images,
+                prompt_cache_state,
+                prompt,
+            )
+        )
 
         # Block until the GPU thread sends back the context
         ctx = rqueue.get()
@@ -432,6 +469,113 @@ class ResponseGenerator:
             presence_penalty=args.presence_penalty,
             frequency_penalty=args.frequency_penalty,
         )
+
+    def _process_cached_request(
+        self,
+        rqueue: Queue,
+        prompt: str,
+        images: Optional[List],
+        args: GenerationArguments,
+        prompt_tokens: int,
+        prompt_cache_state: "PromptCacheState",
+    ) -> None:
+        """Run a chat_id'd request inline on the daemon thread.
+
+        Handles prefix-cache reuse, DeltaNet snapshot rewind, prefill on
+        the suffix only, and token-by-token generation. Pushes
+        ``StreamingToken`` instances to ``rqueue`` as tokens are produced
+        so the async endpoint can stream them back to the client.
+
+        Runs synchronously on the GPU/model-owning thread; cancellation is
+        cooperative via ``self._cancelled``.
+
+        Notes / limitations:
+          - Speculative decoding is bypassed for cached requests (TODO 1
+            in memory.md §25). Cached path uses non-speculative generation.
+          - Single-sequence semantics (B=1). Multiple concurrent cached
+            requests are processed serially via the daemon's request queue.
+        """
+        # Reserve a uid so cancellation can target this request. Matches the
+        # BatchGenerator path (server.py:778) so the existing _cancel(uid)
+        # / _drain_cancellations machinery — which keys on whatever uid the
+        # caller observes via GenerationContext — works uniformly.
+        uid = id(rqueue)
+
+        # Send back the GenerationContext so generate() can return its
+        # iterator on the caller side. Mirrors the BatchGenerator path.
+        rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
+
+        # Build kwargs for stream_generate. Mirrors the legacy fallback
+        # call in chat_completions_endpoint, plus prompt_cache_state.
+        gen_kwargs = args.to_generate_kwargs()
+        gen_kwargs["prompt_cache_state"] = prompt_cache_state
+        if self.kv_bits is not None:
+            gen_kwargs["kv_bits"] = self.kv_bits
+            gen_kwargs["kv_group_size"] = self.kv_group_size
+            gen_kwargs["kv_quant_scheme"] = self.kv_quant_scheme
+            gen_kwargs["quantized_kv_start"] = self.quantized_kv_start
+
+        # Local import to avoid circular dependency at module load.
+        from .generate import stream_generate as _stream_generate
+
+        try:
+            for chunk in _stream_generate(
+                model=self.model,
+                processor=self.processor,
+                prompt=prompt,
+                image=images if images else None,
+                vision_cache=self.vision_cache,
+                **gen_kwargs,
+            ):
+                # Cooperative cancellation check: drain any pending cancel
+                # for this uid and break early if matched.
+                with self._cancel_lock:
+                    if uid in self._cancelled:
+                        self._cancelled.discard(uid)
+                        rqueue.put(None)
+                        return
+
+                # Convert GenerationResult chunks to StreamingToken format
+                # so the endpoint's existing chunk loop works unchanged.
+                token_id = chunk.token
+                if hasattr(token_id, "item"):
+                    token_id = int(token_id.item())
+                token_id = int(token_id) if token_id is not None else 0
+
+                # GenerationResult.logprobs is the full log-prob vector for
+                # the next token (an mx.array of shape [vocab]); the
+                # BatchGenerator path passes a scalar per-token logprob in
+                # StreamingToken.logprobs (server.py:937, _make_logprob_content
+                # at server.py:2624 expects scalar-shape). Extract the chosen
+                # token's log-prob to match.
+                lp_scalar = 0.0
+                if chunk.logprobs is not None:
+                    try:
+                        lp_scalar = float(chunk.logprobs[token_id].item())
+                    except (IndexError, TypeError, AttributeError):
+                        lp_scalar = 0.0
+
+                rqueue.put(
+                    StreamingToken(
+                        text=chunk.text,
+                        token=token_id,
+                        logprobs=lp_scalar,
+                        finish_reason=chunk.finish_reason,
+                        peak_memory=chunk.peak_memory,
+                    )
+                )
+        except Exception as e:
+            logger.error(
+                "Error in cached-request generation (uid=%d): %s",
+                uid,
+                e,
+                exc_info=True,
+            )
+            rqueue.put(e)
+        finally:
+            # Sentinel: signal end of stream. The endpoint's iterator
+            # treats None as a terminator (matches BatchGenerator path).
+            rqueue.put(None)
 
     def _gpu_embed(self, raw_inputs: dict, images=None) -> Tuple[mx.array, dict]:
         """GPU-only: run vision encoder if needed. Must run on GPU thread."""
@@ -532,7 +676,30 @@ class ResponseGenerator:
                             except Exception:
                                 pass
 
-                for rqueue, raw_inputs, prompt_tokens, args, images in new_items:
+                for (
+                    rqueue,
+                    raw_inputs,
+                    prompt_tokens,
+                    args,
+                    images,
+                    prompt_cache_state,
+                    formatted_prompt,
+                ) in new_items:
+                    # Phase 2.B: dispatch cached requests to the dedicated
+                    # handler. They run inline on this daemon thread (the
+                    # one that owns the model) and skip continuous batching
+                    # — single-chat semantics, snapshot rewind, prefix reuse.
+                    if prompt_cache_state is not None:
+                        self._process_cached_request(
+                            rqueue=rqueue,
+                            prompt=formatted_prompt,
+                            images=images,
+                            args=args,
+                            prompt_tokens=prompt_tokens,
+                            prompt_cache_state=prompt_cache_state,
+                        )
+                        continue
+
                     if batch_gen is None:
                         batch_gen = BatchGenerator(
                             self.model.language_model,
@@ -558,12 +725,22 @@ class ResponseGenerator:
                     if has_embeds and batch_gen.unprocessed_prompts:
                         self._flush(batch_gen, active)
 
+                    # Combine broadcast penalty processors (built from the
+                    # FIRST request's args at BatchGenerator construction)
+                    # with this request's structured-output processors.
+                    # Passing only the structured list would silently drop
+                    # the penalty processors; passing None when structured
+                    # is set would drop the structured processor.
+                    structured = args.logits_processors or []
+                    combined = list(self._make_logits_processors(args)) + list(
+                        structured
+                    )
                     try:
                         (uid,) = batch_gen.insert(
                             [input_ids.squeeze(0).tolist()],
                             max_tokens=args.max_tokens,
                             prompt_kwargs=[gen_kwargs],
-                            logits_processors=[args.logits_processors],
+                            logits_processors=[combined or None],
                         )
                     except Exception as e:
                         rqueue.put(e)
@@ -641,7 +818,15 @@ class ResponseGenerator:
                 max_tokens_map = {}
                 all_input_ids = []
 
-                for rqueue, raw_inputs, prompt_tokens, args, images in pending:
+                for (
+                    rqueue,
+                    raw_inputs,
+                    prompt_tokens,
+                    args,
+                    images,
+                    _prompt_cache_state,  # Speculative path skips cached integration — see TODO 1 in memory.md §25
+                    _formatted_prompt,  # Same — forwarded for parity but unused here
+                ) in pending:
                     input_ids, _ = self._gpu_embed(raw_inputs, images)
                     uid = id(rqueue)
                     uids.append(uid)
@@ -1043,6 +1228,66 @@ def _compute_thinking_budget(
     return int(max_tokens * THINKING_BUDGET_RATIO)
 
 
+def _has_prefilled_opener(processor, template_kwargs: dict) -> bool:
+    """Detect whether the chat template prefills a thinking opener in the
+    assistant continuation.
+
+    Some templates (notably unsloth Qwen 3.6 ports with enable_thinking=True)
+    end the rendered prompt with an opener like ``<think>\\n``, leaving the
+    model already inside a reasoning block. The model emits the closer but
+    never the opener, which breaks the streaming SSE state machine that
+    detects thinking boundaries by scanning the output stream.
+
+    Detection: render the same canonical conversation twice, with and
+    without ``add_generation_prompt``. The diff is the assistant
+    continuation; if it ends with a known opener literal, the template is
+    prefilling. The result is a property of (processor, template_kwargs),
+    invariant across message content, and is cached in a small LRU.
+    """
+    try:
+        cache_key = (id(processor), frozenset(template_kwargs.items()))
+    except TypeError:
+        cache_key = None
+
+    if cache_key is not None and cache_key in _PREFILL_FLAG_CACHE:
+        _PREFILL_FLAG_CACHE.move_to_end(cache_key)
+        return _PREFILL_FLAG_CACHE[cache_key]
+
+    flag = _compute_prefill_flag(processor, template_kwargs)
+
+    if cache_key is not None:
+        _PREFILL_FLAG_CACHE[cache_key] = flag
+        if len(_PREFILL_FLAG_CACHE) > _PREFILL_FLAG_CACHE_MAX:
+            _PREFILL_FLAG_CACHE.popitem(last=False)
+    return flag
+
+
+def _compute_prefill_flag(processor, template_kwargs: dict) -> bool:
+    canonical_msgs = [{"role": "user", "content": "x"}]
+    tk = getattr(processor, "tokenizer", processor)
+    try:
+        actual = tk.apply_chat_template(
+            canonical_msgs,
+            tokenize=False,
+            add_generation_prompt=True,
+            **template_kwargs,
+        )
+        no_gen = tk.apply_chat_template(
+            canonical_msgs,
+            tokenize=False,
+            add_generation_prompt=False,
+            **template_kwargs,
+        )
+    except Exception as e:
+        logger.debug(
+            "prefill-opener detection: render failed (%s); assuming no prefill", e
+        )
+        return False
+
+    suffix = actual[len(no_gen) :] if actual.startswith(no_gen) else actual[-200:]
+    return suffix.rstrip().endswith(_PREFILLED_OPENERS)
+
+
 def _decode_token(tokenizer, token_id: int) -> Tuple[str, Optional[List[int]]]:
     """Decode a single token id to its string + UTF-8 bytes."""
     try:
@@ -1083,6 +1328,123 @@ response_generator: Optional[ResponseGenerator] = None
 
 # Loading/unloading utilities
 model_cache = {}
+
+# --- Per-chat-id PromptCacheState session manager ---
+# Maps chat_id -> {state: PromptCacheState, last_used: float}.
+# OrderedDict gives O(1) LRU behavior via move_to_end / popitem(last=False).
+# Phase 2 (server.py:_process_cached_request) routes chat_id'd requests
+# through the daemon thread that owns the model, applying prefix-cache
+# reuse and DeltaNet snapshot rewind on hybrid models.
+_session_caches: "OrderedDict[str, dict]" = OrderedDict()
+_session_caches_lock = Lock()
+
+# --- Per-chat / DeltaNet config (set by main() from argparse) ---
+# argparse defaults are populated from env vars at parser-construction time
+# (see main()), so by the time these holders are written they already
+# reflect the full precedence chain CLI arg > env var > module default.
+# Module-level defaults below are what direct importers (tests, chat.py
+# without main()) see if main() doesn't run.
+_deltanet_ring_size: int = DEFAULT_RING_SIZE
+_deltanet_rewind_enabled: bool = True
+_session_cache_max: int = 8
+_chat_id_header: str = "X-MLX-VLM-Chat-Id"
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read an env var as int with graceful fallback on missing/invalid.
+
+    Used at argparse construction time to populate `default=` for int
+    options that accept env-var fallback. Failing soft (rather than
+    raising) keeps a typo'd env var from breaking server startup; the
+    user gets the documented default and the typo is visible in --help.
+    """
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        return default
+
+
+def _env_choice(name: str, default: str, choices: list) -> str:
+    """Read an env var with choice validation. Falls back to default if
+    the env value isn't one of the allowed choices (case-insensitive)."""
+    val = os.environ.get(name, default).lower()
+    return val if val in choices else default
+
+
+def _resolve_chat_id(raw_request, parsed_request) -> Optional[str]:
+    """Resolve a stable chat_id from request header / body fields.
+
+    Order of precedence:
+      1. HTTP header (configurable name; default X-MLX-VLM-Chat-Id).
+      2. Top-level `chat_id` field on the request body.
+      3. `metadata.chat_id` on the body (some clients including OpenWebUI
+         send conversation metadata here).
+      4. None — caller falls through to no-cache path.
+
+    No fallback hash is computed: requiring the client to opt-in via header
+    or explicit field avoids accidental cross-conversation cache hits.
+    """
+    if raw_request is not None:
+        header_val = raw_request.headers.get(_chat_id_header)
+        if header_val:
+            return str(header_val).strip()
+    direct = getattr(parsed_request, "chat_id", None)
+    if direct:
+        return str(direct).strip()
+    metadata = getattr(parsed_request, "metadata", None)
+    if isinstance(metadata, dict):
+        meta_chat_id = metadata.get("chat_id")
+        if meta_chat_id:
+            return str(meta_chat_id).strip()
+    return None
+
+
+def get_or_create_prompt_cache_state(chat_id: str) -> PromptCacheState:
+    """Look up or create a PromptCacheState for the given chat_id, applying
+    LRU eviction at the configured session cap.
+
+    New PromptCacheState instances are constructed with the snapshot ring
+    size and rewind-enabled toggle resolved at CLI startup. Snapshot.py
+    itself doesn't read env vars; configuration flows down explicitly
+    from this layer.
+    """
+    max_sessions = _session_cache_max
+    with _session_caches_lock:
+        if chat_id in _session_caches:
+            entry = _session_caches[chat_id]
+            entry["last_used"] = time.time()
+            _session_caches.move_to_end(chat_id)
+            return entry["state"]
+
+        state = PromptCacheState(
+            snapshot_ring=DeltaNetSnapshotRing(max_size=_deltanet_ring_size),
+            rewind_enabled=_deltanet_rewind_enabled,
+        )
+        _session_caches[chat_id] = {"state": state, "last_used": time.time()}
+        while max_sessions > 0 and len(_session_caches) > max_sessions:
+            evicted_id, _evicted = _session_caches.popitem(last=False)
+            logger.debug(
+                "Evicting per-chat PromptCacheState for chat_id=%s (LRU, max=%d)",
+                evicted_id,
+                max_sessions,
+            )
+        return state
+
+
+def clear_session_caches() -> None:
+    """Drop all per-chat caches. Called on model unload."""
+    with _session_caches_lock:
+        _session_caches.clear()
+
+
+# Note on cross-thread MLX streams: generate.py uses a per-thread lazy
+# stream (see _get_generation_stream there), so each worker thread that
+# enters the legacy stream_generate / generate path automatically gets
+# its own stream registered on first use. No additional setup needed
+# here.
 
 
 @asynccontextmanager
@@ -1236,6 +1598,9 @@ def unload_model_sync():
     if "vision_cache" in model_cache:
         model_cache["vision_cache"].clear()
     model_cache = {}
+    # Drop per-chat PromptCacheState sessions; their KV/DeltaNet refs
+    # would otherwise pin the unloaded weights' allocations.
+    clear_session_caches()
     # Force garbage collection
     gc.collect()
     mx.clear_cache()
@@ -2161,12 +2526,17 @@ async def responses_endpoint(request: Request):
 
 @app.post("/chat/completions", response_model=None)
 @app.post("/v1/chat/completions", response_model=None, include_in_schema=False)
-async def chat_completions_endpoint(request: ChatRequest):
+async def chat_completions_endpoint(request: ChatRequest, raw_request: Request):
     """
     Generate text based on a prompt and optional images.
     Prompt must be a list of chat messages, including system, user, and assistant messages.
     System message will be ignored if not already in the prompt.
     Can operate in streaming or non-streaming mode.
+
+    If a chat_id is supplied (via the configured header or body field),
+    a per-chat PromptCacheState is reused across requests for prefix-cache
+    reuse and DeltaNet snapshot rewind. Routing through the legacy
+    stream_generate path is automatic in that case.
     """
 
     request_start = time.perf_counter()
@@ -2275,6 +2645,30 @@ async def chat_completions_endpoint(request: ChatRequest):
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
 
+        # Per-chat PromptCacheState for prefix-cache reuse across turns.
+        # Resolve chat_id BEFORE rendering the chat template — when caching
+        # is active, we merge cache-alignment template kwargs (e.g.
+        # preserve_thinking=True for unsloth-modified Qwen templates) into
+        # apply_chat_template so prior-turn renderings stay token-aligned
+        # with what was previously cached. The kwargs are silent no-ops on
+        # templates that don't reference them, so always-on is safe.
+        chat_id = (
+            _resolve_chat_id(raw_request, request) if _session_cache_max > 0 else None
+        )
+        prompt_cache_state = (
+            get_or_create_prompt_cache_state(chat_id) if chat_id else None
+        )
+        if chat_id:
+            logger.debug(
+                "chat/completions chat_id=%s session_state=%s",
+                chat_id,
+                "found" if prompt_cache_state.cache is not None else "fresh",
+            )
+
+        template_kwargs = gen_args.to_template_kwargs()
+        if prompt_cache_state is not None:
+            template_kwargs.update(get_cache_alignment_kwargs())
+
         formatted_prompt = apply_chat_template(
             processor,
             config,
@@ -2282,18 +2676,19 @@ async def chat_completions_endpoint(request: ChatRequest):
             num_images=len(images),
             num_audios=len(audio),
             tools=tools,
-            **gen_args.to_template_kwargs(),
+            **template_kwargs,
         )
 
         logger.debug(
             "chat/completions request: model=%s images=%d audio=%d "
-            "max_tokens=%s temp=%s stream=%s",
+            "max_tokens=%s temp=%s stream=%s chat_id=%s",
             request.model,
             len(images),
             len(audio),
             gen_args.max_tokens,
             gen_args.temperature,
             request.stream,
+            chat_id or "<none>",
         )
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("  TRACE formatted prompt: %s", _truncate(formatted_prompt))
@@ -2311,6 +2706,18 @@ async def chat_completions_endpoint(request: ChatRequest):
                 gen_args.thinking_budget is not None,
             )
 
+        # Templates that prefill the thinking opener (e.g. unsloth Qwen 3.6
+        # with enable_thinking=True ends the prompt with "<think>\n") leave
+        # the model already inside the reasoning block. The model emits the
+        # closer but never the opener, so the SSE state machine below must
+        # start with in_thinking=True; otherwise reasoning leaks into
+        # delta.content and the closing </think> shows up as plain text.
+        thinking_prefilled = _has_prefilled_opener(processor, template_kwargs)
+        if thinking_prefilled:
+            logger.debug(
+                "  Thinking opener prefilled by template; seeding in_thinking=True"
+            )
+
         if request.stream:
             # Streaming response using ResponseGenerator for continuous batching
             async def stream_generator():
@@ -2320,19 +2727,26 @@ async def chat_completions_endpoint(request: ChatRequest):
                 try:
                     # Use ResponseGenerator if available, otherwise fall back to stream_generate
                     if response_generator is not None:
-                        # generate() does blocking Queue.get — run off event loop
+                        # generate() does blocking Queue.get — run off event loop.
+                        # prompt_cache_state is forwarded; the GPU thread will
+                        # dispatch to the cached-request handler if non-None
+                        # (Phase 2.B). Currently ignored on the GPU side until
+                        # 2.B lands.
                         ctx, token_iter = await asyncio.to_thread(
                             response_generator.generate,
                             formatted_prompt,
                             images if images else None,
                             audio if audio else None,
                             gen_args,
+                            prompt_cache_state,
                         )
 
                         output_tokens = 0
                         request_id = f"chatcmpl-{uuid.uuid4()}"
-                        # Track thinking state for reasoning/content split
-                        in_thinking = False
+                        # Track thinking state for reasoning/content split.
+                        # Seeded True when the template prefills an opener
+                        # (see thinking_prefilled above).
+                        in_thinking = thinking_prefilled
                         accumulated = ""
                         full_output = ""  # raw output for tool call parsing
                         thinking_tokens = 0  # server-side thinking token count
@@ -2628,11 +3042,14 @@ async def chat_completions_endpoint(request: ChatRequest):
                         text = ""
                         pt = gt = 0
                         pm = 0.0
+                        # prompt_cache_state forwarded; GPU thread dispatches
+                        # to cached-request handler when non-None (Phase 2.B).
                         ctx, token_iter = response_generator.generate(
                             prompt=formatted_prompt,
                             images=images if images else None,
                             audio=audio if audio else None,
                             args=gen_args,
+                            prompt_cache_state=prompt_cache_state,
                         )
                         pt = ctx.prompt_tokens
                         for token in token_iter:
@@ -2968,6 +3385,55 @@ def main():
         help="Enable auto-reload for development.",
     )
     parser.add_argument(
+        "--cache-session-max",
+        type=int,
+        default=_env_int("MLX_VLM_CACHE_SESSION_MAX", 8),
+        help=(
+            "Maximum number of per-chat PromptCacheState sessions retained "
+            "concurrently. Used for prefix-cache reuse across turns and "
+            "DeltaNet snapshot rewind on hybrid models. LRU eviction at "
+            "this cap. Set to 0 to disable per-chat caching entirely. "
+            "Env fallback: MLX_VLM_CACHE_SESSION_MAX. Default: 8."
+        ),
+    )
+    parser.add_argument(
+        "--cache-chat-id-header",
+        type=str,
+        default=os.environ.get("MLX_VLM_CACHE_CHAT_ID_HEADER", "X-MLX-VLM-Chat-Id"),
+        help=(
+            "HTTP header name carrying the chat_id used to key per-chat "
+            "PromptCacheState. Falls back to body fields chat_id / "
+            "metadata.chat_id if the header is absent. Env fallback: "
+            "MLX_VLM_CACHE_CHAT_ID_HEADER. Default: X-MLX-VLM-Chat-Id."
+        ),
+    )
+    parser.add_argument(
+        "--deltanet-rewind",
+        type=str,
+        default=_env_choice("MLX_VLM_DELTANET_REWIND", "auto", ["on", "off", "auto"]),
+        choices=["on", "off", "auto"],
+        help=(
+            "Hybrid-cache rewind master switch for models with non-trimmable "
+            "layers (Qwen 3.5/3.6 GatedDeltaNet, Mamba-style, etc.). 'auto' "
+            "and 'on' both enable the snapshot-restore path (only fires when "
+            "the model actually has a non-trimmable cache and a usable "
+            "snapshot exists). 'off' forces full re-prefill on every "
+            "hybrid-model rewind. Env fallback: MLX_VLM_DELTANET_REWIND. "
+            "Default: auto."
+        ),
+    )
+    parser.add_argument(
+        "--deltanet-ring-size",
+        type=int,
+        default=_env_int("MLX_VLM_DELTANET_RING_SIZE", DEFAULT_RING_SIZE),
+        help=(
+            "Number of DeltaNet state snapshots retained per session "
+            "(FIFO). Each snapshot ~75 MB on Qwen 3.6 27B. Set to 0 to "
+            "disable snapshots (forces full re-prefill on hybrid rewind). "
+            "Env fallback: MLX_VLM_DELTANET_RING_SIZE. Default: 3."
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         type=str,
         default=None,
@@ -3005,6 +3471,16 @@ def main():
     os.environ["QUANTIZED_KV_START"] = str(args.quantized_kv_start)
     if args.top_logprobs_k is not None:
         os.environ["TOP_LOGPROBS_K"] = str(args.top_logprobs_k)
+    # Per-chat / DeltaNet config — argparse already resolved CLI args + env
+    # defaults; just publish to the module-level holders so import-time
+    # callers (get_or_create_prompt_cache_state, _resolve_chat_id, the
+    # endpoint chat_id gate) can read the live values.
+    global _deltanet_ring_size, _deltanet_rewind_enabled
+    global _session_cache_max, _chat_id_header
+    _deltanet_ring_size = max(0, int(args.deltanet_ring_size))
+    _deltanet_rewind_enabled = args.deltanet_rewind.lower() != "off"
+    _session_cache_max = max(0, int(args.cache_session_max))
+    _chat_id_header = args.cache_chat_id_header
 
     # Configure logging — CLI args override env vars, env vars override defaults
     log_level_str = args.log_level or os.environ.get("MLX_VLM_LOG_LEVEL", "INFO")

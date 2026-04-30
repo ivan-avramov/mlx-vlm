@@ -2,6 +2,66 @@ from enum import Enum
 from functools import partial
 from typing import Any, Dict, List, Union
 
+# ---------------------------------------------------------------------------
+# Chat-template kwargs for prefix-cache-friendly multi-turn rendering.
+#
+# Some chat templates render the LATEST assistant turn differently from
+# PRIOR assistant turns in the conversation history. For example, the
+# unsloth-modified Qwen 3.6 template injects an empty `<think>\n\n</think>\n\n`
+# block in the latest-assistant header but renders prior assistant turns as
+# bare `<|im_start|>assistant\n{content}` — i.e. without the think wrapper.
+#
+# That asymmetry breaks prefix-cache reuse: turn N's CACHED tokens (which
+# contain the think wrapper because it was in the prefill prompt) won't
+# match turn N+1's RENDERED tokens (which omit the wrapper for the now-
+# "prior" assistant turn). Hybrid models (DeltaNet, Mamba, etc.) — whose
+# non-trimmable recurrent state can't be safely rewound across the divergence
+# point without a snapshot — fall back to full re-prefill on every multi-turn
+# request, costing ~10x in prefill time.
+#
+# Templates that are aware of this issue expose escape-hatch kwargs that
+# force symmetric rendering across turns. This registry is the canonical
+# list of such kwargs; the server merges them into apply_chat_template
+# calls when a per-chat PromptCacheState is active.
+#
+# Invariant: every kwarg here has been verified to be a TRUE NO-OP on
+# templates that don't reference it. Jinja's `{% if X is defined %}` guard
+# is what makes that work — passing an undefined kwarg silently does
+# nothing. Verification was done empirically by rendering identical
+# multi-turn conversations with and without each kwarg on canonical
+# templates (Qwen3-Next, Qwen3-32B): tokens were byte-identical.
+#
+# Adding a new entry:
+#   1. Discover a chat template that breaks cache reuse via a new
+#      asymmetric pattern.
+#   2. Confirm the template exposes a kwarg that toggles symmetric
+#      rendering (search the template source for `is defined` patterns).
+#   3. Verify the new kwarg is a no-op on the official templates we care
+#      about by tokenizing a multi-turn conversation with and without it
+#      and checking the token sequences are identical.
+#   4. Add the entry below with a comment naming the template family it
+#      addresses.
+# ---------------------------------------------------------------------------
+CACHE_ALIGNMENT_KWARGS: Dict[str, Any] = {
+    # Unsloth Qwen 3.x ports (e.g. `unsloth/Qwen3.6-27B-UD-MLX-6bit`):
+    # latest-assistant header injects `<think>\n\n</think>\n\n` while prior
+    # assistants render bare. `preserve_thinking=True` forces the same
+    # wrapper on prior assistants. No-op on official Qwen templates
+    # (Qwen3-Next, Qwen3-32B, Qwen3-30B-A3B-2507, Qwen3-235B-A22B-2507) —
+    # they don't reference the kwarg.
+    "preserve_thinking": True,
+}
+
+
+def get_cache_alignment_kwargs() -> Dict[str, Any]:
+    """Return chat-template kwargs known to enable cache-friendly rendering.
+
+    Callers pass these to `apply_chat_template` whenever a per-chat
+    PromptCacheState is active. See CACHE_ALIGNMENT_KWARGS for the
+    invariant and entry-addition criteria.
+    """
+    return dict(CACHE_ALIGNMENT_KWARGS)
+
 
 class MessageFormat(Enum):
     """Enum for different message format types."""

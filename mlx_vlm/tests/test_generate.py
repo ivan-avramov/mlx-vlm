@@ -488,6 +488,35 @@ class TestBatchGenerator:
         second = batch.next()
         assert [r.token for r in second] == [2, 2]
 
+    def test_batch_generator_empty_generation_batch_does_not_seed_flat_processors(
+        self, mock_model, mock_processor
+    ):
+        """Regression: BatchGenerator must not seed its empty internal
+        GenerationBatch with the flat broadcast logits_processors list.
+
+        The empty batch starts with zero uids; per-uid lists are appended
+        via extend() as sequences merge in from PromptProcessingBatch.
+        Seeding the empty batch with a flat list mixes flat callables and
+        per-uid lists, and `_step` then crashes with
+        ``TypeError: 'function' object is not iterable`` when it tries to
+        iterate ``self.logits_processors[i]`` and finds a bare callable.
+        """
+        rep_penalty = lambda tokens, logits: logits  # noqa: E731
+
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            max_tokens=50,
+            logits_processors=[rep_penalty],
+        )
+        # The empty inner batch must start with no per-uid entries —
+        # NOT the broadcast flat list.
+        assert gen._generation_batch.logits_processors == []
+        # And the broadcast list is preserved on the outer BatchGenerator
+        # so insert() can replicate it per-uid when callers don't supply
+        # an explicit list.
+        assert gen.logits_processors == [rep_penalty]
+
     def test_remove_from_unprocessed(self, mock_model, mock_processor):
         gen = BatchGenerator(
             model=mock_model.language_model,

@@ -415,3 +415,120 @@ class TestCountThinkingTagTokens:
 
     def test_no_tags(self):
         assert server._count_thinking_tag_tokens("plain text") == 0
+
+
+class _FakeTokenizer:
+    """Minimal tokenizer stub whose apply_chat_template emulates the
+    rendering behavior of a real chat template for prefill-opener detection.
+    """
+
+    def __init__(self, suffix_with_gen: str, suffix_no_gen: str = ""):
+        self._suffix_with_gen = suffix_with_gen
+        self._suffix_no_gen = suffix_no_gen
+
+    def apply_chat_template(
+        self, messages, tokenize=False, add_generation_prompt=True, **kwargs
+    ):
+        body = "".join(
+            f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n" for m in messages
+        )
+        return body + (
+            self._suffix_with_gen if add_generation_prompt else self._suffix_no_gen
+        )
+
+
+class _FakeProcessor:
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+
+
+class TestHasPrefilledOpener:
+    """Tests for _has_prefilled_opener detection across template families."""
+
+    def setup_method(self):
+        server._PREFILL_FLAG_CACHE.clear()
+
+    def test_unsloth_qwen_thinking_on_is_prefilled(self):
+        # unsloth Qwen 3.6 with enable_thinking=True ends with <think>\n
+        proc = _FakeProcessor(
+            _FakeTokenizer(
+                suffix_with_gen="<|im_start|>assistant\n<think>\n",
+                suffix_no_gen="",
+            )
+        )
+        assert server._has_prefilled_opener(proc, {"enable_thinking": True}) is True
+
+    def test_unsloth_qwen_thinking_off_is_not_prefilled(self):
+        # enable_thinking=False renders the empty pair; suffix ends with </think>
+        proc = _FakeProcessor(
+            _FakeTokenizer(
+                suffix_with_gen="<|im_start|>assistant\n<think>\n\n</think>\n\n",
+                suffix_no_gen="",
+            )
+        )
+        assert server._has_prefilled_opener(proc, {"enable_thinking": False}) is False
+
+    def test_canonical_qwen_thinking_on_is_not_prefilled(self):
+        # canonical Qwen 3 leaves the assistant header bare; model emits both tags
+        proc = _FakeProcessor(
+            _FakeTokenizer(suffix_with_gen="<|im_start|>assistant\n", suffix_no_gen="")
+        )
+        assert server._has_prefilled_opener(proc, {"enable_thinking": True}) is False
+
+    def test_gemma_native_opener_is_prefilled(self):
+        # If a future Gemma-style template prefilled <|channel>thought
+        proc = _FakeProcessor(
+            _FakeTokenizer(
+                suffix_with_gen="<start_of_turn>model\n<|channel>thought",
+                suffix_no_gen="",
+            )
+        )
+        assert server._has_prefilled_opener(proc, {"enable_thinking": True}) is True
+
+    def test_template_render_failure_returns_false(self):
+        class _BrokenTokenizer:
+            def apply_chat_template(self, *args, **kwargs):
+                raise RuntimeError("template error")
+
+        proc = _FakeProcessor(_BrokenTokenizer())
+        assert server._has_prefilled_opener(proc, {}) is False
+
+    def test_caches_result_on_repeat_calls(self):
+        calls = {"count": 0}
+
+        class _CountingTokenizer(_FakeTokenizer):
+            def apply_chat_template(self, *args, **kwargs):
+                calls["count"] += 1
+                return super().apply_chat_template(*args, **kwargs)
+
+        proc = _FakeProcessor(
+            _CountingTokenizer(suffix_with_gen="<|im_start|>assistant\n<think>\n")
+        )
+        kwargs = {"enable_thinking": True}
+
+        assert server._has_prefilled_opener(proc, kwargs) is True
+        first_call_count = calls["count"]
+        # Second call with identical kwargs hits cache (no new renders)
+        assert server._has_prefilled_opener(proc, kwargs) is True
+        assert calls["count"] == first_call_count
+
+    def test_distinct_kwargs_get_distinct_cache_entries(self):
+        proc = _FakeProcessor(
+            _FakeTokenizer(suffix_with_gen="<|im_start|>assistant\n<think>\n")
+        )
+        # Both should be True for this stub, but they exercise the cache key
+        assert server._has_prefilled_opener(proc, {"enable_thinking": True}) is True
+        assert server._has_prefilled_opener(proc, {"enable_thinking": False}) is True
+        # Two distinct keys cached
+        assert len(server._PREFILL_FLAG_CACHE) >= 2
+
+    def test_unhashable_kwargs_skip_cache_but_still_compute(self):
+        proc = _FakeProcessor(
+            _FakeTokenizer(suffix_with_gen="<|im_start|>assistant\n<think>\n")
+        )
+        # dict value is unhashable; helper should fall through gracefully
+        result = server._has_prefilled_opener(proc, {"tools": [{"name": "x"}]})
+        assert result is True
+        # No cache entry written for unhashable keys
+        for k in server._PREFILL_FLAG_CACHE:
+            assert "tools" not in dict(k[1])
