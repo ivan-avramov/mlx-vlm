@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import gc
+import hashlib
 import json
 import logging
 import os
@@ -59,6 +60,26 @@ DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
 DEBUG_PREVIEW_CHARS = 2000
 THINKING_BUDGET_RATIO = 0.80  # auto-budget: 80% of max_tokens for thinking
+
+# Maximum tolerable silence on the per-request streaming queue before
+# the iterator declares the daemon hung. The daemon emits KeepAlive
+# heartbeats per prefill chunk and per generation step, so this is the
+# upper bound on the gap between *any* daemon activity — which is at
+# most one prefill_step_size's worth of compute during prefill and
+# sub-second in steady state. ~60s comfortably covers the heaviest
+# prefill chunk on a 27B 6-bit model and still surfaces a real hang
+# quickly.
+TOKEN_QUEUE_TIMEOUT_SECS = 60.0
+
+# How often the cached-path watchdog thread pings the rqueue with a
+# KeepAlive while stream_generate is running. The cached path can't
+# emit heartbeats from inside its own prefill loop (that lives in
+# generate.py and yields nothing until the first generated token), so
+# we run a per-request watchdog thread that pings on a timer while the
+# `for chunk in stream_generate(...)` loop is active. Must be well
+# under TOKEN_QUEUE_TIMEOUT_SECS so a few missed timer ticks don't
+# trip the iterator.
+CACHED_PATH_HEARTBEAT_INTERVAL_SECS = 10.0
 THINKING_TRUNCATION_MSG = (
     "[Thinking used the entire token budget without producing a visible "
     "response. Try increasing max_tokens or setting a lower thinking_budget.]"
@@ -210,6 +231,20 @@ class StreamingToken:
     finish_reason: Optional[str]
     peak_memory: float = 0.0
     top_logprobs: Optional[List[Tuple[int, float]]] = None
+
+
+class KeepAlive:
+    """Heartbeat sentinel emitted by the daemon during long-running
+    prefill chunks so the iterator's queue-get timer resets and we can
+    distinguish 'slow but progressing' from 'daemon dead'.
+
+    The iterator filters these out before yielding to SSE consumers — so
+    they're invisible end-to-end. Exists as a class (not a singleton)
+    only so `isinstance()` is the discriminator; instances carry no
+    state.
+    """
+
+    __slots__ = ()
 
 
 class ResponseGenerator:
@@ -380,30 +415,47 @@ class ResponseGenerator:
 
         uid = ctx.uid
 
-        def token_iterator():
-            # Mark ended before yielding the final token so a consumer that
-            # closes immediately after seeing finish_reason isn't treated
-            # as a client abort.
-            ended = False
-            try:
-                while True:
-                    item = rqueue.get(timeout=60.0)
-                    if item is None:
-                        ended = True
-                        break
-                    if isinstance(item, Exception):
-                        ended = True
-                        raise item
-                    if getattr(item, "finish_reason", None):
-                        ended = True
-                    yield item
-                    if ended:
-                        break
-            finally:
-                if not ended:
-                    self._cancel(uid)
+        return ctx, self._token_iterator(rqueue, uid)
 
-        return ctx, token_iterator()
+    def _token_iterator(self, rqueue: Queue, uid: int):
+        """Yield StreamingToken items from rqueue until the daemon signals
+        end-of-stream (None sentinel), raises (Exception item), or stalls
+        for ``TOKEN_QUEUE_TIMEOUT_SECS`` of total silence.
+
+        ``KeepAlive`` heartbeats from the daemon during prefill are
+        filtered out — they reset the queue timer without surfacing to
+        the caller. If the iterator exits before the daemon finishes
+        (client disconnect, timeout, exception), it cancels the uid so
+        the daemon can stop generating and free resources.
+        """
+        # Mark ended before yielding the final token so a consumer that
+        # closes immediately after seeing finish_reason isn't treated
+        # as a client abort.
+        ended = False
+        try:
+            while True:
+                # The daemon emits KeepAlive sentinels per prefill chunk
+                # and per generation step, so this timeout is the
+                # maximum tolerable silence between *any* daemon
+                # activity — sub-second in steady state, at most one
+                # prefill_step_size of compute during prefill.
+                item = rqueue.get(timeout=TOKEN_QUEUE_TIMEOUT_SECS)
+                if isinstance(item, KeepAlive):
+                    continue
+                if item is None:
+                    ended = True
+                    break
+                if isinstance(item, Exception):
+                    ended = True
+                    raise item
+                if getattr(item, "finish_reason", None):
+                    ended = True
+                yield item
+                if ended:
+                    break
+        finally:
+            if not ended:
+                self._cancel(uid)
 
     def _cpu_preprocess(self, prompt, images=None, audio=None) -> dict:
         """CPU-only: tokenize text, load/resize images. Thread-safe."""
@@ -518,6 +570,29 @@ class ResponseGenerator:
         # Local import to avoid circular dependency at module load.
         from .generate import stream_generate as _stream_generate
 
+        # Heartbeat watchdog. stream_generate yields nothing during
+        # prefill — only after the first generated token. On a fresh
+        # cache (no prefix to reuse) with a large prompt, that initial
+        # silence can comfortably exceed the iterator's queue timeout.
+        # The BatchGenerator path solves this by emitting heartbeats
+        # per prefill chunk inside _step; here we don't have an
+        # equivalent hook, so a per-request timer thread pings rqueue
+        # while we wait. Heartbeats stop as soon as the for-loop exits
+        # (success, exception, or cancellation); the thread is daemon
+        # so a stuck join never blocks process shutdown.
+        heartbeat_done = Event()
+
+        def _heartbeat_pump():
+            while not heartbeat_done.wait(
+                timeout=CACHED_PATH_HEARTBEAT_INTERVAL_SECS
+            ):
+                rqueue.put(KeepAlive())
+
+        heartbeat_thread = Thread(
+            target=_heartbeat_pump, daemon=True, name=f"cached-heartbeat-{uid}"
+        )
+        heartbeat_thread.start()
+
         try:
             for chunk in _stream_generate(
                 model=self.model,
@@ -573,6 +648,12 @@ class ResponseGenerator:
             )
             rqueue.put(e)
         finally:
+            # Stop the heartbeat watchdog before pushing the terminator
+            # so any straggling KeepAlive lands BEFORE the None sentinel
+            # in the queue. The iterator filters trailing heartbeats
+            # either way, but order keeps the contract clean.
+            heartbeat_done.set()
+            heartbeat_thread.join(timeout=1.0)
             # Sentinel: signal end of stream. The endpoint's iterator
             # treats None as a terminator (matches BatchGenerator path).
             rqueue.put(None)
@@ -962,10 +1043,21 @@ class ResponseGenerator:
                 )
 
     def _step(self, batch_gen, active, gen_kwargs=None):
-        """One batch generation step: prefill + decode."""
+        """One batch generation step: prefill + decode.
+
+        During prefill, ``batch_gen.next()`` returns no responses for many
+        iterations until prompt processing completes. To prevent the
+        iterator's queue-get timer from interpreting that silence as a
+        daemon hang, emit a ``KeepAlive`` heartbeat to every active
+        rqueue when this step produced no real responses. The iterator
+        filters these out before yielding to SSE consumers.
+        """
         kwargs = gen_kwargs or {}
         _, responses = batch_gen.next(**kwargs)
         if not responses:
+            heartbeat = KeepAlive()
+            for info in active.values():
+                info["rqueue"].put(heartbeat)
             return
 
         for r in responses:
@@ -1348,6 +1440,17 @@ _deltanet_ring_size: int = DEFAULT_RING_SIZE
 _deltanet_rewind_enabled: bool = True
 _session_cache_max: int = 8
 _chat_id_header: str = "X-MLX-VLM-Chat-Id"
+# Anonymous-session hash-chain matching: when a request arrives without
+# any explicit chat_id, route it to whichever session shares the longest
+# turn-hash prefix (>= _MIN_HASH_PREFIX_MATCH turns). Default on; flip
+# off in multi-user deployments where two distinct conversations sharing
+# a prefix would constitute a covert side-channel.
+_cache_anon_sessions: bool = True
+# Minimum number of leading turn-hashes that must match before we'll
+# reuse an existing session for an anonymous request. 2 = "system + at
+# least one user message" — a system-only match (length 1) saves only
+# the few system tokens of prefill and is not worth the routing risk.
+_MIN_HASH_PREFIX_MATCH: int = 2
 
 
 def _env_int(name: str, default: int) -> int:
@@ -1375,17 +1478,15 @@ def _env_choice(name: str, default: str, choices: list) -> str:
 
 
 def _resolve_chat_id(raw_request, parsed_request) -> Optional[str]:
-    """Resolve a stable chat_id from request header / body fields.
+    """Pull an explicit chat_id off the request (header / body / metadata).
 
     Order of precedence:
       1. HTTP header (configurable name; default X-MLX-VLM-Chat-Id).
       2. Top-level `chat_id` field on the request body.
       3. `metadata.chat_id` on the body (some clients including OpenWebUI
          send conversation metadata here).
-      4. None — caller falls through to no-cache path.
-
-    No fallback hash is computed: requiring the client to opt-in via header
-    or explicit field avoids accidental cross-conversation cache hits.
+      4. None — caller (`_resolve_session`) falls through to anonymous
+         hash-prefix matching when enabled.
     """
     if raw_request is not None:
         header_val = raw_request.headers.get(_chat_id_header)
@@ -1400,6 +1501,105 @@ def _resolve_chat_id(raw_request, parsed_request) -> Optional[str]:
         if meta_chat_id:
             return str(meta_chat_id).strip()
     return None
+
+
+# Fields whose presence affects per-turn cache identity. `reasoning` is
+# excluded because clients (notably OpenWebUI) drop it when echoing
+# assistant messages back; including it would deterministically miss on
+# every multi-turn conversation. Everything else round-trips reliably.
+_HASHABLE_FIELDS: Tuple[str, ...] = (
+    "role",
+    "content",
+    "tool_calls",
+    "tool_call_id",
+    "name",
+)
+
+
+def _coerce_hashable(value):
+    """Recursively coerce pydantic models within a value to plain dicts.
+
+    Needed because `json.dumps(..., default=str)` would otherwise stringify
+    nested pydantic objects via their repr, which embeds memory addresses
+    and breaks hash stability across runs.
+    """
+    if hasattr(value, "model_dump"):
+        return value.model_dump(exclude_none=True)
+    if isinstance(value, list):
+        return [_coerce_hashable(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _coerce_hashable(v) for k, v in value.items()}
+    return value
+
+
+def _canonical_message(msg) -> str:
+    """Render a message into a stable JSON string for hashing.
+
+    Accepts pydantic ChatMessage models or plain dicts. Keeps only the
+    `_HASHABLE_FIELDS` allow-list, drops None values, and sorts keys so
+    the byte representation is deterministic regardless of input shape.
+    """
+    if isinstance(msg, dict):
+        d = {k: msg[k] for k in _HASHABLE_FIELDS if msg.get(k) is not None}
+    else:
+        d = {}
+        for k in _HASHABLE_FIELDS:
+            v = getattr(msg, k, None)
+            if v is None:
+                continue
+            d[k] = _coerce_hashable(v)
+    d = _coerce_hashable(d)
+    return json.dumps(d, sort_keys=True, ensure_ascii=False, default=str)
+
+
+def _chain_hash(prev_digest: bytes, canonical_str: str) -> bytes:
+    h = hashlib.sha256()
+    h.update(prev_digest)
+    h.update(b"\x00")
+    h.update(canonical_str.encode("utf-8"))
+    return h.digest()
+
+
+def _compute_turn_hashes(messages: list) -> List[str]:
+    """Build a chained sha256 hash list — one entry per message.
+
+    h[0] = sha256(canonical(messages[0]))
+    h[k] = sha256(h[k-1] || 0x00 || canonical(messages[k]))
+
+    Each h[k] uniquely identifies the conversation prefix through
+    message k. Two requests share a hash prefix of length m iff their
+    first m messages are pairwise byte-identical under canonicalization.
+    """
+    if not isinstance(messages, list):
+        return []
+    hashes: List[str] = []
+    prev = b""
+    for msg in messages:
+        digest = _chain_hash(prev, _canonical_message(msg))
+        hashes.append(digest.hex())
+        prev = digest
+    return hashes
+
+
+def _hash_assistant_turn(
+    prev_hash_hex: str,
+    content: Optional[str],
+    tool_calls: Optional[list],
+) -> str:
+    """Compute h[k] for the just-generated assistant message.
+
+    Mirrors `_canonical_message` for an assistant turn so the resulting
+    hash equals what we'd get if the same content+tool_calls dict were
+    echoed back in a future request and re-hashed via the request path.
+    """
+    msg_dict: dict = {"role": "assistant"}
+    if content is not None:
+        msg_dict["content"] = content
+    if tool_calls:
+        msg_dict["tool_calls"] = _coerce_hashable(list(tool_calls))
+    canon = json.dumps(msg_dict, sort_keys=True, ensure_ascii=False, default=str)
+    prev = bytes.fromhex(prev_hash_hex) if prev_hash_hex else b""
+    return _chain_hash(prev, canon).hex()
 
 
 def get_or_create_prompt_cache_state(chat_id: str) -> PromptCacheState:
@@ -1423,7 +1623,15 @@ def get_or_create_prompt_cache_state(chat_id: str) -> PromptCacheState:
             snapshot_ring=DeltaNetSnapshotRing(max_size=_deltanet_ring_size),
             rewind_enabled=_deltanet_rewind_enabled,
         )
-        _session_caches[chat_id] = {"state": state, "last_used": time.time()}
+        _session_caches[chat_id] = {
+            "state": state,
+            "last_used": time.time(),
+            # Chained per-message sha256s. Populated by `_sync_session_hashes`
+            # on each request and `_append_session_assistant_hash` after each
+            # generation. Used by `_find_session_by_hash_prefix` to route
+            # anonymous requests to the right session.
+            "turn_hashes": [],
+        }
         while max_sessions > 0 and len(_session_caches) > max_sessions:
             evicted_id, _evicted = _session_caches.popitem(last=False)
             logger.debug(
@@ -1438,6 +1646,143 @@ def clear_session_caches() -> None:
     """Drop all per-chat caches. Called on model unload."""
     with _session_caches_lock:
         _session_caches.clear()
+
+
+def _find_session_by_hash_prefix(
+    request_hashes: List[str],
+) -> Tuple[Optional[str], int]:
+    """Pick the session whose stored turn_hashes shares the longest prefix
+    with the request's hashes.
+
+    Returns ``(session_id, match_len)``. ``session_id`` is None when no
+    session matches at least `_MIN_HASH_PREFIX_MATCH` turns — system-only
+    matches don't justify cache reuse and would create a side-channel
+    where every fresh chat with the same system prompt latches onto a
+    prior unrelated session.
+
+    O(sessions × turns) under the LRU cap (~8 × ~50). Negligible.
+    """
+    if not request_hashes:
+        return None, 0
+    best_id: Optional[str] = None
+    best_len = 0
+    with _session_caches_lock:
+        for sid, entry in _session_caches.items():
+            stored = entry.get("turn_hashes") or []
+            common = 0
+            for a, b in zip(stored, request_hashes):
+                if a != b:
+                    break
+                common += 1
+            if common > best_len:
+                best_len = common
+                best_id = sid
+    if best_len < _MIN_HASH_PREFIX_MATCH:
+        return None, 0
+    return best_id, best_len
+
+
+def _sync_session_hashes(session_id: str, request_hashes: List[str]) -> None:
+    """Replace the session's stored chain with the request's chain.
+
+    Each request is the source of truth for the conversation's history
+    up through its last message; previously-stored hashes for those
+    positions may be stale (client edited a past turn, regenerated, etc.).
+    Token-level divergence inside ``PromptCacheState.update`` independently
+    handles the cache-trim half of the story; this helper only keeps the
+    routing metadata in sync so the next request can find this session.
+    """
+    with _session_caches_lock:
+        entry = _session_caches.get(session_id)
+        if entry is not None:
+            entry["turn_hashes"] = list(request_hashes)
+            entry["last_used"] = time.time()
+
+
+def _append_session_assistant_hash(session_id: str, assistant_hash: str) -> None:
+    """Append the just-generated assistant turn's hash to the session.
+
+    Called after generation completes so the next request — which echoes
+    that assistant message back as part of the conversation history —
+    can match through it via `_find_session_by_hash_prefix`.
+
+    If the client canonicalizes the assistant message differently than
+    we did (whitespace, structural reordering), the next request's hash
+    for that turn will diverge and the match will fall short by one
+    turn. The cache then trims the assistant tokens and re-prefills them
+    — wasteful but correct. Reasonable clients (OWUI, OpenAI SDK) echo
+    byte-for-byte what we streamed, so this should be rare.
+    """
+    with _session_caches_lock:
+        entry = _session_caches.get(session_id)
+        if entry is not None:
+            entry["turn_hashes"].append(assistant_hash)
+            entry["last_used"] = time.time()
+
+
+def _resolve_session(
+    raw_request, parsed_request
+) -> Tuple[Optional[str], Optional[PromptCacheState], List[str]]:
+    """Pick the right per-chat session for this request.
+
+    Returns ``(session_id, prompt_cache_state, request_turn_hashes)``.
+    The first two are None when caching is disabled or no usable
+    identifier can be derived.
+
+    Resolution order:
+      1. Explicit chat_id (header / body / metadata) — wins; treated as
+         a stable user-supplied key. Hash chain is still synced onto the
+         entry so anonymous requests can fall through to it later if the
+         client drops the explicit id.
+      2. Anonymous hash-prefix match against existing sessions, when
+         ``_cache_anon_sessions`` is on. Routes to the session whose
+         stored turn_hashes shares the longest prefix with this request,
+         requiring at least `_MIN_HASH_PREFIX_MATCH` matching turns.
+      3. New anonymous session keyed by an internal uuid, when anon
+         caching is on and the request has at least one hashable
+         message.
+      4. None — caching disabled or no messages to hash; caller falls
+         through to the non-cached path.
+    """
+    if _session_cache_max <= 0:
+        return None, None, []
+
+    messages = getattr(parsed_request, "messages", None)
+    if messages is None:
+        messages = getattr(parsed_request, "input", None)
+    request_hashes = (
+        _compute_turn_hashes(messages) if isinstance(messages, list) else []
+    )
+
+    explicit_id = _resolve_chat_id(raw_request, parsed_request)
+    if explicit_id:
+        state = get_or_create_prompt_cache_state(explicit_id)
+        if request_hashes:
+            _sync_session_hashes(explicit_id, request_hashes)
+        return explicit_id, state, request_hashes
+
+    if not _cache_anon_sessions or not request_hashes:
+        return None, None, request_hashes
+
+    matched_id, match_len = _find_session_by_hash_prefix(request_hashes)
+    if matched_id is not None:
+        state = get_or_create_prompt_cache_state(matched_id)
+        _sync_session_hashes(matched_id, request_hashes)
+        logger.debug(
+            "Anonymous session hash-prefix match: id=%s prefix=%d/%d turns",
+            matched_id,
+            match_len,
+            len(request_hashes),
+        )
+        return matched_id, state, request_hashes
+
+    new_id = f"anon:{uuid.uuid4().hex[:16]}"
+    state = get_or_create_prompt_cache_state(new_id)
+    _sync_session_hashes(new_id, request_hashes)
+    logger.debug(
+        "Anonymous session created: id=%s turns=%d", new_id, len(request_hashes)
+    )
+    return new_id, state, request_hashes
 
 
 # Note on cross-thread MLX streams: generate.py uses a per-thread lazy
@@ -2652,17 +2997,20 @@ async def chat_completions_endpoint(request: ChatRequest, raw_request: Request):
         # apply_chat_template so prior-turn renderings stay token-aligned
         # with what was previously cached. The kwargs are silent no-ops on
         # templates that don't reference them, so always-on is safe.
-        chat_id = (
-            _resolve_chat_id(raw_request, request) if _session_cache_max > 0 else None
-        )
-        prompt_cache_state = (
-            get_or_create_prompt_cache_state(chat_id) if chat_id else None
+        #
+        # _resolve_session unifies four paths: explicit chat_id from the
+        # client, anonymous hash-prefix match against existing sessions,
+        # new anonymous session, or no caching. request_turn_hashes is
+        # the chain we'll append the assistant hash onto after generation.
+        chat_id, prompt_cache_state, request_turn_hashes = _resolve_session(
+            raw_request, request
         )
         if chat_id:
             logger.debug(
-                "chat/completions chat_id=%s session_state=%s",
+                "chat/completions chat_id=%s session_state=%s turns=%d",
                 chat_id,
                 "found" if prompt_cache_state.cache is not None else "fresh",
+                len(request_turn_hashes),
             )
 
         template_kwargs = gen_args.to_template_kwargs()
@@ -2918,9 +3266,11 @@ async def chat_completions_endpoint(request: ChatRequest, raw_request: Request):
                                 break
 
                         # Parse tool calls from full output and emit final chunk
+                        emitted_tool_calls = None
                         if tool_module is not None:
                             tc = process_tool_calls(full_output, tool_module, tools)
                             if tc["calls"]:
+                                emitted_tool_calls = tc["calls"]
                                 choices = [
                                     ChatStreamChoice(
                                         finish_reason="tool_calls",
@@ -2941,6 +3291,23 @@ async def chat_completions_endpoint(request: ChatRequest, raw_request: Request):
                                     _truncate(str(chunk_data)),
                                 )
                                 yield f"data: {chunk_data.model_dump_json()}\n\n"
+
+                        # Record the assistant turn's hash on the session so
+                        # the next request — which echoes this assistant
+                        # message back as part of history — can match
+                        # through it via _find_session_by_hash_prefix.
+                        # Hash the post-thinking-strip content (= what the
+                        # client receives and will echo back) plus parsed
+                        # tool_calls. Reasoning is intentionally excluded;
+                        # see _HASHABLE_FIELDS rationale.
+                        if chat_id and request_turn_hashes:
+                            asst_reasoning, asst_content = _split_thinking(full_output)
+                            asst_hash = _hash_assistant_turn(
+                                request_turn_hashes[-1],
+                                asst_content if asst_content else None,
+                                emitted_tool_calls,
+                            )
+                            _append_session_assistant_hash(chat_id, asst_hash)
                     else:
                         # Fallback to stream_generate
                         token_iterator = stream_generate(
@@ -3148,6 +3515,16 @@ async def chat_completions_endpoint(request: ChatRequest, raw_request: Request):
                     )
 
                 content = sanitize_strict_json(content) if content else content
+
+                # Record the assistant turn's hash on the session — see the
+                # streaming path's matching block for the rationale.
+                if chat_id and request_turn_hashes:
+                    asst_hash = _hash_assistant_turn(
+                        request_turn_hashes[-1],
+                        content if content else None,
+                        parsed_tool_calls,
+                    )
+                    _append_session_assistant_hash(chat_id, asst_hash)
 
                 choices = [
                     ChatChoice(
@@ -3408,6 +3785,25 @@ def main():
         ),
     )
     parser.add_argument(
+        "--cache-anon-sessions",
+        type=str,
+        default=_env_choice(
+            "MLX_VLM_CACHE_ANON_SESSIONS", "on", ["on", "off"]
+        ),
+        choices=["on", "off"],
+        help=(
+            "Route requests that arrive without an explicit chat_id to "
+            "the per-chat session whose stored turn-hash chain shares "
+            "the longest prefix with this request. Chained sha256 over "
+            "every message guarantees that distinct conversations diverge "
+            "as soon as their content does (no shared-opening collision). "
+            "Default: on. Turn off in multi-user deployments where users "
+            "could observe cache-hit timing as a side-channel signal "
+            "that someone else previously sent the same prompt. Env "
+            "fallback: MLX_VLM_CACHE_ANON_SESSIONS."
+        ),
+    )
+    parser.add_argument(
         "--deltanet-rewind",
         type=str,
         default=_env_choice("MLX_VLM_DELTANET_REWIND", "auto", ["on", "off", "auto"]),
@@ -3476,11 +3872,17 @@ def main():
     # callers (get_or_create_prompt_cache_state, _resolve_chat_id, the
     # endpoint chat_id gate) can read the live values.
     global _deltanet_ring_size, _deltanet_rewind_enabled
-    global _session_cache_max, _chat_id_header
+    global _session_cache_max, _chat_id_header, _cache_anon_sessions
     _deltanet_ring_size = max(0, int(args.deltanet_ring_size))
     _deltanet_rewind_enabled = args.deltanet_rewind.lower() != "off"
     _session_cache_max = max(0, int(args.cache_session_max))
     _chat_id_header = args.cache_chat_id_header
+    _cache_anon_sessions = args.cache_anon_sessions.lower() != "off"
+    logger.info(
+        "Per-chat cache: explicit-chat-id %s, anonymous hash-chain matching %s",
+        "enabled" if _session_cache_max > 0 else "disabled",
+        "enabled" if _cache_anon_sessions and _session_cache_max > 0 else "disabled",
+    )
 
     # Configure logging — CLI args override env vars, env vars override defaults
     log_level_str = args.log_level or os.environ.get("MLX_VLM_LOG_LEVEL", "INFO")

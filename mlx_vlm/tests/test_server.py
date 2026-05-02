@@ -532,3 +532,688 @@ class TestHasPrefilledOpener:
         # No cache entry written for unhashable keys
         for k in server._PREFILL_FLAG_CACHE:
             assert "tools" not in dict(k[1])
+
+
+class TestDetectThinkingFormat:
+    def test_gemma_channel_opener(self):
+        # The native Gemma 4 thinking marker.
+        prompt = "user msg ... <|channel>thought\n"
+        assert server._detect_thinking_format(prompt) == "gemma"
+
+    def test_gemma_alternate_think_marker(self):
+        # The "<|think|>" alternate marker also resolves to gemma.
+        assert server._detect_thinking_format("foo <|think|> bar") == "gemma"
+
+    def test_generic_think_tag(self):
+        # Qwen / DeepSeek / generic family.
+        assert server._detect_thinking_format("hello <think>\n") == "generic"
+
+    def test_no_thinking_tags(self):
+        assert server._detect_thinking_format("just a plain prompt") is None
+
+    def test_gemma_takes_precedence_over_generic(self):
+        # If both appear, gemma wins (it's checked first). This matters
+        # because some templates emit both markers in nested chains.
+        prompt = "<|channel>thought ... <think>"
+        assert server._detect_thinking_format(prompt) == "gemma"
+
+
+class TestComputeThinkingBudget:
+    def test_returns_none_when_no_format(self):
+        # Non-thinking models get no budget enforcement at all.
+        assert server._compute_thinking_budget(1000, None, None) is None
+
+    def test_returns_none_even_with_client_budget_and_no_format(self):
+        # Client-supplied budget is ignored when the model doesn't emit
+        # thinking tags — there's nothing to count.
+        assert server._compute_thinking_budget(1000, 500, None) is None
+
+    def test_auto_budget_from_max_tokens(self):
+        # Default formula: 80% of max_tokens. Floor via int().
+        out = server._compute_thinking_budget(1000, None, "gemma")
+        assert out == 800
+
+    def test_auto_budget_uses_ratio_constant(self):
+        # If THINKING_BUDGET_RATIO ever changes, this assertion catches
+        # accidental drift between server.py and the documented ratio.
+        out = server._compute_thinking_budget(2000, None, "generic")
+        assert out == int(2000 * server.THINKING_BUDGET_RATIO)
+
+    def test_client_budget_overrides_auto(self):
+        # Explicit thinking_budget on the request wins, even when smaller
+        # than the auto formula.
+        assert server._compute_thinking_budget(10000, 500, "gemma") == 500
+
+    def test_client_budget_can_exceed_auto(self):
+        # And even when larger — clients can opt into deeper thinking.
+        assert server._compute_thinking_budget(1000, 5000, "generic") == 5000
+
+    def test_zero_client_budget_disables_thinking_immediately(self):
+        # 0 is a meaningful explicit value — "no thinking" — distinct
+        # from None. Server-side enforcement should fire at first thinking
+        # token.
+        assert server._compute_thinking_budget(1000, 0, "gemma") == 0
+
+
+class TestMakeLogprobContent:
+    class _FakeTokenizer:
+        """Stub tokenizer that maps known token ids to text."""
+
+        def __init__(self, mapping):
+            self.mapping = mapping
+
+        def decode(self, ids):
+            return self.mapping.get(int(ids[0]), f"<unk:{ids[0]}>")
+
+    def test_chosen_token_logprob_only(self):
+        tk = self._FakeTokenizer({42: "hello"})
+        out = server._make_logprob_content(tk, token_id=42, logprob=-0.5)
+        assert out.token == "hello"
+        assert out.logprob == pytest.approx(-0.5)
+        assert out.top_logprobs == []
+        # bytes() of "hello" UTF-8.
+        assert out.bytes == list(b"hello")
+
+    def test_top_k_zero_skips_top_logprobs_even_when_provided(self):
+        # The contract: top_k=0 means "don't include alternatives" — the
+        # caller didn't ask for them. Honoring this matters because
+        # building TopLogprob entries requires an extra decode per id.
+        tk = self._FakeTokenizer({1: "a", 2: "b"})
+        out = server._make_logprob_content(
+            tk, token_id=1, logprob=-1.0, top_logprobs=[(2, -2.0)], top_k=0
+        )
+        assert out.top_logprobs == []
+
+    def test_top_k_truncates_top_logprobs(self):
+        tk = self._FakeTokenizer({1: "a", 2: "b", 3: "c", 4: "d"})
+        out = server._make_logprob_content(
+            tk,
+            token_id=1,
+            logprob=-1.0,
+            top_logprobs=[(2, -2.0), (3, -3.0), (4, -4.0)],
+            top_k=2,
+        )
+        assert [t.token for t in out.top_logprobs] == ["b", "c"]
+        assert [t.logprob for t in out.top_logprobs] == [-2.0, -3.0]
+
+    def test_decode_failure_yields_empty_string_not_crash(self):
+        # _decode_token swallows exceptions — an unknown id with a
+        # tokenizer that raises shouldn't take down the streaming loop.
+        class _FailTokenizer:
+            def decode(self, ids):
+                raise RuntimeError("boom")
+
+        out = server._make_logprob_content(_FailTokenizer(), token_id=999, logprob=-1.0)
+        assert out.token == ""
+        # Empty string -> empty bytes list (not None).
+        assert out.bytes == []
+
+    def test_logprob_coerced_to_float(self):
+        # The streaming path passes scalar mx.array values via .item();
+        # if a numpy float64 ever leaks through, the Pydantic model
+        # should still accept it.
+        import numpy as np
+
+        tk = self._FakeTokenizer({1: "x"})
+        out = server._make_logprob_content(tk, token_id=1, logprob=np.float64(-0.25))
+        assert isinstance(out.logprob, float)
+        assert out.logprob == pytest.approx(-0.25)
+
+
+class TestBuildGenArgsPenaltyAndSeedPlumbing:
+    """memory.md #24 — verify the four advanced-params knobs flow from
+    request body / Ollama aliases all the way through to GenerationArguments.
+    Regressions here are silent: the slider in OpenWebUI moves but the
+    server ignores it.
+    """
+
+    def _base_request(self, **overrides):
+        # Minimal request stub matching the attributes _build_gen_args
+        # reads. Every field defaulted to None so individual tests only
+        # set what they care about.
+        defaults = dict(
+            max_tokens=None,
+            max_output_tokens=None,
+            temperature=None,
+            top_p=None,
+            top_k=None,
+            min_p=None,
+            seed=None,
+            repetition_penalty=None,
+            repeat_penalty=None,
+            presence_penalty=None,
+            frequency_penalty=None,
+            logit_bias=None,
+            enable_thinking=False,
+            thinking_budget=None,
+            thinking_start_token=None,
+        )
+        defaults.update(overrides)
+        return SimpleNamespace(**defaults)
+
+    def test_seed_plumbed_through(self):
+        req = self._base_request(seed=42)
+        args = server._build_gen_args(req)
+        assert args.seed == 42
+
+    def test_seed_default_is_none_not_zero(self):
+        # Critical: a non-None default of 0 would silently re-seed every
+        # request to the same value, eliminating sampling variance. The
+        # contract is "omitted seed = don't reseed".
+        req = self._base_request()
+        args = server._build_gen_args(req)
+        assert args.seed is None
+
+    def test_repeat_penalty_alias_recognized(self):
+        # Ollama / OpenWebUI native UI slider name. Must alias to
+        # repetition_penalty when the OpenAI-style name isn't present.
+        req = self._base_request(repeat_penalty=1.15)
+        args = server._build_gen_args(req)
+        assert args.repetition_penalty == 1.15
+
+    def test_repetition_penalty_wins_when_both_set(self):
+        # If a client somehow sends both, the OpenAI-style name takes
+        # precedence (the alias is a fallback, not an override).
+        req = self._base_request(repetition_penalty=1.20, repeat_penalty=1.05)
+        args = server._build_gen_args(req)
+        assert args.repetition_penalty == 1.20
+
+    def test_repeat_penalty_falsy_falls_through_to_repetition(self):
+        # Defensive: 0 / None / False on the alias must not poison a
+        # real repetition_penalty value. Implementation uses `or`, so
+        # any falsy alias falls through.
+        req = self._base_request(repetition_penalty=1.10, repeat_penalty=None)
+        args = server._build_gen_args(req)
+        assert args.repetition_penalty == 1.10
+
+    def test_presence_penalty_plumbed_through(self):
+        # Qwen 3.x family REQUIRES presence_penalty (rep_penalty is
+        # forbidden by the model creator). Losing this drops the only
+        # sane loop-mitigation knob for those models.
+        req = self._base_request(presence_penalty=1.5)
+        args = server._build_gen_args(req)
+        assert args.presence_penalty == 1.5
+
+    def test_frequency_penalty_plumbed_through(self):
+        # Llama 3.x family uses frequency_penalty. Same silent-drop risk.
+        req = self._base_request(frequency_penalty=0.5)
+        args = server._build_gen_args(req)
+        assert args.frequency_penalty == 0.5
+
+    def test_all_four_penalties_independent(self):
+        req = self._base_request(
+            seed=7,
+            repetition_penalty=1.10,
+            presence_penalty=1.20,
+            frequency_penalty=0.30,
+        )
+        args = server._build_gen_args(req)
+        assert args.seed == 7
+        assert args.repetition_penalty == 1.10
+        assert args.presence_penalty == 1.20
+        assert args.frequency_penalty == 0.30
+
+    def test_unset_penalties_are_none_not_zero(self):
+        # Distinguishing None from 0 matters: mlx_lm's
+        # make_logits_processors checks `is not None` to decide whether
+        # to install each processor. A 0.0 default would install a no-op
+        # processor and burn cycles per token.
+        args = server._build_gen_args(self._base_request())
+        assert args.repetition_penalty is None
+        assert args.presence_penalty is None
+        assert args.frequency_penalty is None
+        assert args.seed is None
+
+
+class TestTokenIteratorHeartbeat:
+    """The streaming iterator filters KeepAlive heartbeats so slow
+    prefill (which produces no real tokens for many seconds) doesn't
+    trip the queue-timeout. The contract:
+
+      - KeepAlive items don't yield, but reset the timeout (each
+        rqueue.get returns one queue interaction).
+      - None terminates the stream cleanly.
+      - Exception items raise to the caller.
+      - StreamingToken with finish_reason ends the stream after yield.
+      - Real silence longer than TOKEN_QUEUE_TIMEOUT_SECS raises
+        queue.Empty (not caught here — surfaces to the caller).
+    """
+
+    @staticmethod
+    def _make_response_generator():
+        """Bypass ResponseGenerator.__init__ — we only exercise
+        _token_iterator and _cancel, neither of which touches model state.
+        """
+        rg = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        rg._cancelled = set()
+        rg._cancel_lock = __import__("threading").Lock()
+        return rg
+
+    def test_keepalive_filtered_not_yielded(self):
+        from queue import Queue
+
+        rg = self._make_response_generator()
+        q: Queue = Queue()
+        # Many heartbeats then one real token then sentinel.
+        q.put(server.KeepAlive())
+        q.put(server.KeepAlive())
+        q.put(server.KeepAlive())
+        token = server.StreamingToken(
+            text="hi", token=42, logprobs=-0.1, finish_reason=None
+        )
+        q.put(token)
+        q.put(None)
+
+        items = list(rg._token_iterator(q, uid=1))
+        # All heartbeats consumed silently — only the real token reaches
+        # the caller.
+        assert len(items) == 1
+        assert items[0].token == 42
+
+    def test_finish_reason_token_ends_stream(self):
+        from queue import Queue
+
+        rg = self._make_response_generator()
+        q: Queue = Queue()
+        final = server.StreamingToken(
+            text="bye", token=2, logprobs=0.0, finish_reason="stop"
+        )
+        q.put(final)
+        # Sentinel never gets a chance to be read — the iterator should
+        # end on finish_reason without blocking on the queue.
+
+        items = list(rg._token_iterator(q, uid=2))
+        assert len(items) == 1
+        assert items[0].finish_reason == "stop"
+
+    def test_none_sentinel_terminates_cleanly(self):
+        from queue import Queue
+
+        rg = self._make_response_generator()
+        q: Queue = Queue()
+        q.put(None)
+
+        items = list(rg._token_iterator(q, uid=3))
+        assert items == []
+        # Ended cleanly — no cancellation queued.
+        assert 3 not in rg._cancelled
+
+    def test_exception_item_raises_to_caller(self):
+        from queue import Queue
+
+        rg = self._make_response_generator()
+        q: Queue = Queue()
+        q.put(RuntimeError("backend exploded"))
+
+        gen = rg._token_iterator(q, uid=4)
+        with pytest.raises(RuntimeError, match="backend exploded"):
+            list(gen)
+
+    def test_keepalive_bursts_dont_yield_anything(self):
+        # Pure heartbeat stream followed by termination — verify the
+        # iterator collapses cleanly without spurious yields.
+        from queue import Queue
+
+        rg = self._make_response_generator()
+        q: Queue = Queue()
+        for _ in range(50):
+            q.put(server.KeepAlive())
+        q.put(None)
+
+        items = list(rg._token_iterator(q, uid=5))
+        assert items == []
+
+    def test_unfinished_iterator_cancels_uid(self, monkeypatch):
+        # If the consumer breaks out early (or the iterator exits
+        # without the daemon's None sentinel), the finally block must
+        # call _cancel(uid) so the daemon stops generating tokens for a
+        # client that's no longer listening.
+        from queue import Queue
+
+        rg = self._make_response_generator()
+        q: Queue = Queue()
+        token = server.StreamingToken(
+            text="x", token=1, logprobs=0.0, finish_reason=None
+        )
+        q.put(token)
+        # No None sentinel, no finish_reason — consumer breaks early.
+
+        cancelled = []
+        monkeypatch.setattr(rg, "_cancel", lambda uid: cancelled.append(uid))
+
+        gen = rg._token_iterator(q, uid=99)
+        # Consume the first token, then close without exhausting.
+        first = next(gen)
+        assert first.token == 1
+        gen.close()
+
+        assert cancelled == [99]
+
+    def test_finished_iterator_does_not_cancel(self, monkeypatch):
+        from queue import Queue
+
+        rg = self._make_response_generator()
+        q: Queue = Queue()
+        q.put(None)  # immediate clean termination
+
+        cancelled = []
+        monkeypatch.setattr(rg, "_cancel", lambda uid: cancelled.append(uid))
+
+        list(rg._token_iterator(q, uid=100))
+        assert cancelled == []
+
+    def test_heartbeat_resets_timeout_window(self, monkeypatch):
+        # Critical regression guard: a steady drip of heartbeats keeps
+        # the iterator alive even past TOKEN_QUEUE_TIMEOUT_SECS of real
+        # wall time. Implementation detail: queue.get's timeout is a
+        # per-call deadline, NOT a cumulative one — every successful
+        # get (heartbeat included) resets the window.
+        #
+        # We don't sleep TOKEN_QUEUE_TIMEOUT_SECS in tests; instead we
+        # patch the constant to a tiny value and prove that an
+        # interleaved heartbeat-then-token stream completes successfully
+        # despite each gap being shorter than the timeout but their sum
+        # exceeding it — by simply emitting them faster than one step.
+        from queue import Queue
+
+        monkeypatch.setattr(server, "TOKEN_QUEUE_TIMEOUT_SECS", 0.5)
+
+        rg = self._make_response_generator()
+        q: Queue = Queue()
+        # 20 heartbeats interleaved with 5 tokens — total stream is
+        # well under 0.5s wall clock since everything is pre-queued.
+        for _ in range(20):
+            q.put(server.KeepAlive())
+        for i in range(5):
+            q.put(
+                server.StreamingToken(
+                    text=str(i), token=i, logprobs=0.0, finish_reason=None
+                )
+            )
+        q.put(None)
+
+        items = list(rg._token_iterator(q, uid=11))
+        assert [t.token for t in items] == [0, 1, 2, 3, 4]
+
+
+class TestStepEmitsHeartbeatDuringPrefill:
+    """Direct test for the daemon-side hook: when batch_gen.next() yields
+    no responses (we're inside a prefill chunk), _step pushes a
+    KeepAlive to every active rqueue. Without this, prefill chunks
+    would silently consume time and the iterator's queue-get timer
+    would interpret the gap as a daemon hang.
+    """
+
+    @staticmethod
+    def _make_response_generator():
+        rg = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        rg._cancelled = set()
+        return rg
+
+    @staticmethod
+    def _fake_batch_gen(responses):
+        # batch_gen.next() returns (stats, responses). _step ignores
+        # stats so the first slot can be anything.
+        return SimpleNamespace(next=lambda **kw: (None, responses))
+
+    def test_empty_responses_emits_keepalive_per_active_uid(self):
+        from queue import Queue
+
+        rg = self._make_response_generator()
+        q1, q2 = Queue(), Queue()
+        active = {
+            10: {"rqueue": q1, "tokens": [], "prev_text": ""},
+            20: {"rqueue": q2, "tokens": [], "prev_text": ""},
+        }
+        rg._step(self._fake_batch_gen([]), active)
+
+        ka1 = q1.get_nowait()
+        ka2 = q2.get_nowait()
+        assert isinstance(ka1, server.KeepAlive)
+        assert isinstance(ka2, server.KeepAlive)
+        # No further items — heartbeat is one-per-step, not a flood.
+        assert q1.empty()
+        assert q2.empty()
+
+    def test_responses_present_skips_heartbeat(self):
+        # When prefill is done and the step produced real responses,
+        # we don't ALSO push a heartbeat — the response itself counts
+        # as activity, and stacking heartbeats behind tokens just
+        # wastes queue churn.
+        from queue import Queue
+
+        rg = self._make_response_generator()
+        rg.tokenizer = SimpleNamespace(decode=lambda toks: "x" * len(toks))
+        q = Queue()
+        active = {7: {"rqueue": q, "tokens": [], "prev_text": ""}}
+
+        # Construct a minimal real-shaped response.
+        resp = SimpleNamespace(
+            uid=7, token=42, finish_reason=None, token_logprob=-0.5
+        )
+        rg._step(self._fake_batch_gen([resp]), active)
+
+        # First item is the StreamingToken; no KeepAlive emitted.
+        item = q.get_nowait()
+        assert isinstance(item, server.StreamingToken)
+        assert item.token == 42
+        assert q.empty()
+
+    def test_no_active_uids_emits_nothing(self):
+        # Defensive: no active uids means no rqueues to ping. Must not
+        # crash on the empty-dict iteration.
+        rg = self._make_response_generator()
+        rg._step(self._fake_batch_gen([]), active={})
+        # Nothing to assert — just no exception.
+
+
+class TestCachedPathHeartbeatWatchdog:
+    """The cached path's stream_generate yields nothing during its
+    internal prefill loop. _process_cached_request runs a per-request
+    timer thread that pumps KeepAlive sentinels into rqueue while the
+    `for chunk in stream_generate(...)` loop is active, so the
+    iterator's queue timer doesn't interpret legitimate prefill silence
+    as a hang.
+
+    These tests stub stream_generate so the watchdog logic can be
+    exercised without spinning up a real model.
+    """
+
+    @staticmethod
+    def _make_response_generator(stream_generate_stub):
+        """Build a ResponseGenerator with the bare attributes
+        _process_cached_request reads. The stream_generate symbol is
+        imported locally inside the method, so we patch via a fake
+        ``mlx_vlm.generate.stream_generate``.
+        """
+        rg = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        rg.model = SimpleNamespace()
+        rg.processor = SimpleNamespace()
+        rg.vision_cache = None
+        rg.kv_bits = None
+        rg.kv_group_size = None
+        rg.kv_quant_scheme = None
+        rg.quantized_kv_start = None
+        rg._cancelled = set()
+        rg._cancel_lock = __import__("threading").Lock()
+        return rg
+
+    @staticmethod
+    def _stub_args():
+        # GenerationArguments needs only to_generate_kwargs() for our
+        # purposes. Use the real class with defaults so the kwargs dict
+        # is realistic.
+        return server.GenerationArguments()
+
+    def test_slow_prefill_produces_heartbeats(self, monkeypatch):
+        # Simulate a slow prefill: stream_generate sleeps before yielding
+        # its first chunk. With the watchdog, the rqueue receives at
+        # least one KeepAlive before the real chunk arrives, plus the
+        # final StreamingToken and None sentinel.
+        from queue import Queue
+        import time
+
+        # Tighten the heartbeat interval so the test runs in ~0.1s.
+        monkeypatch.setattr(server, "CACHED_PATH_HEARTBEAT_INTERVAL_SECS", 0.02)
+
+        # Fake stream_generate: sleep 0.10s (≈ 5 heartbeat intervals),
+        # then yield one terminal chunk. Mimics prefill silence followed
+        # by a single end-of-generation token.
+        def fake_stream_generate(**kwargs):
+            time.sleep(0.10)
+            yield SimpleNamespace(
+                token=42,
+                text="hi",
+                logprobs=None,
+                finish_reason="stop",
+                peak_memory=0.0,
+            )
+
+        # mlx_vlm.generate the function shadows the submodule on the
+        # package, so the dotted-path setattr resolves to the function.
+        # Patch via sys.modules to reach the actual submodule that the
+        # cached-path's local `from .generate import stream_generate`
+        # resolves against.
+        import sys
+
+        monkeypatch.setattr(
+            sys.modules["mlx_vlm.generate"], "stream_generate", fake_stream_generate
+        )
+
+        rg = self._make_response_generator(fake_stream_generate)
+        rqueue: Queue = Queue()
+        prompt_cache_state = SimpleNamespace()  # opaque; only forwarded
+
+        rg._process_cached_request(
+            rqueue=rqueue,
+            prompt="hello",
+            images=None,
+            args=self._stub_args(),
+            prompt_tokens=5,
+            prompt_cache_state=prompt_cache_state,
+        )
+
+        # Drain the queue. Expected order:
+        #   1. GenerationContext (always pushed first)
+        #   2. >=1 KeepAlive (from the watchdog during prefill silence)
+        #   3. StreamingToken (the real chunk)
+        #   4. None (terminator)
+        items = []
+        while not rqueue.empty():
+            items.append(rqueue.get_nowait())
+
+        assert isinstance(items[0], server.GenerationContext)
+        assert items[-1] is None
+        keepalive_count = sum(1 for it in items if isinstance(it, server.KeepAlive))
+        token_count = sum(1 for it in items if isinstance(it, server.StreamingToken))
+        assert keepalive_count >= 1, (
+            f"watchdog should have emitted at least one KeepAlive "
+            f"during the 0.10s silence; got items={[type(i).__name__ for i in items]}"
+        )
+        assert token_count == 1
+
+    def test_watchdog_stops_before_terminator(self, monkeypatch):
+        # The finally block sets heartbeat_done BEFORE pushing the None
+        # sentinel, so by the time None is on the queue the watchdog
+        # is no longer pumping. After the iterator hits None it stops
+        # reading; any straggler KeepAlive that landed earlier is
+        # filtered by isinstance check.
+        from queue import Queue
+        import time
+
+        monkeypatch.setattr(server, "CACHED_PATH_HEARTBEAT_INTERVAL_SECS", 0.01)
+
+        def fake_stream_generate(**kwargs):
+            yield SimpleNamespace(
+                token=1,
+                text="x",
+                logprobs=None,
+                finish_reason="stop",
+                peak_memory=0.0,
+            )
+
+        # mlx_vlm.generate the function shadows the submodule on the
+        # package, so the dotted-path setattr resolves to the function.
+        # Patch via sys.modules to reach the actual submodule that the
+        # cached-path's local `from .generate import stream_generate`
+        # resolves against.
+        import sys
+
+        monkeypatch.setattr(
+            sys.modules["mlx_vlm.generate"], "stream_generate", fake_stream_generate
+        )
+
+        rg = self._make_response_generator(fake_stream_generate)
+        rqueue: Queue = Queue()
+
+        rg._process_cached_request(
+            rqueue=rqueue,
+            prompt="x",
+            images=None,
+            args=self._stub_args(),
+            prompt_tokens=1,
+            prompt_cache_state=SimpleNamespace(),
+        )
+
+        # Give the daemon thread a moment to fully exit; the watchdog's
+        # join(timeout=1.0) should have stopped it deterministically.
+        time.sleep(0.05)
+        items = []
+        while not rqueue.empty():
+            items.append(rqueue.get_nowait())
+
+        # Sentinel must be the LAST item. No further heartbeats arrive
+        # after the None — that would be a leak past the finally.
+        assert items[-1] is None
+        none_index = items.index(None)
+        assert none_index == len(items) - 1, (
+            f"None terminator must be last; got "
+            f"{[type(i).__name__ for i in items]}"
+        )
+
+    def test_exception_in_stream_generate_still_stops_watchdog(self, monkeypatch):
+        # If stream_generate raises, the except block puts the exception
+        # on the queue, the finally block must still stop the watchdog
+        # AND push the None sentinel.
+        from queue import Queue
+        import time
+
+        monkeypatch.setattr(server, "CACHED_PATH_HEARTBEAT_INTERVAL_SECS", 0.01)
+
+        def fake_stream_generate(**kwargs):
+            time.sleep(0.05)
+            raise RuntimeError("backend exploded")
+            yield  # unreachable; needed to make this a generator
+
+        # mlx_vlm.generate the function shadows the submodule on the
+        # package, so the dotted-path setattr resolves to the function.
+        # Patch via sys.modules to reach the actual submodule that the
+        # cached-path's local `from .generate import stream_generate`
+        # resolves against.
+        import sys
+
+        monkeypatch.setattr(
+            sys.modules["mlx_vlm.generate"], "stream_generate", fake_stream_generate
+        )
+
+        rg = self._make_response_generator(fake_stream_generate)
+        rqueue: Queue = Queue()
+
+        rg._process_cached_request(
+            rqueue=rqueue,
+            prompt="x",
+            images=None,
+            args=self._stub_args(),
+            prompt_tokens=1,
+            prompt_cache_state=SimpleNamespace(),
+        )
+
+        items = []
+        while not rqueue.empty():
+            items.append(rqueue.get_nowait())
+
+        # Order: GenerationContext, [KeepAlives], Exception, None.
+        assert isinstance(items[0], server.GenerationContext)
+        assert items[-1] is None
+        # The error gets logged AND surfaced as an Exception item.
+        assert any(isinstance(it, RuntimeError) for it in items)
