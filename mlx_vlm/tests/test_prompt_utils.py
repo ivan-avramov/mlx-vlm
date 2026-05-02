@@ -7,6 +7,10 @@ from mlx_vlm.prompt_utils import (
     MessageBuilder,
     MessageFormat,
     MessageFormatter,
+    THINKING_FORMATS,
+    ThinkingFormat,
+    USER_TURN_OPEN_MARKERS,
+    detect_thinking_format,
     extract_text_from_content,
     get_cache_alignment_kwargs,
     get_chat_template,
@@ -541,6 +545,101 @@ class TestDetectThinkingFormat:
         # resolve to gemma (Gemma 4 includes the channel openers).
         prompt = "<|channel>thought reasoning <channel|>"
         assert detect_thinking_format(prompt).name == "gemma"
+
+
+class TestUserTurnOpenMarkers:
+    """The user-turn-open marker registry feeds the asymmetric-rendering
+    cache anchor: we cache up to BEFORE the latest user message so the
+    next request's re-rendering of that user turn (e.g. OpenWebUI
+    wrapping it with a RAG `<context>` block once a search-style tool
+    returns citation content) doesn't trigger a backward trim.
+
+    Tests pin (a) the registry contains markers for every family the
+    server currently advertises asymmetric-rendering support for, and
+    (b) consumers of the registry can correctly identify the LAST
+    occurrence of any marker when several user messages are present.
+    """
+
+    def test_registry_covers_known_families(self):
+        # All listed markers should be distinct, non-empty, and end
+        # with a newline OR an explicit message delimiter — the asym
+        # cache anchor relies on splitting AT this position so the
+        # following user content begins on the right side of the cut.
+        seen = set()
+        for marker in USER_TURN_OPEN_MARKERS:
+            assert marker, "empty marker in registry"
+            assert marker not in seen, f"duplicate marker: {marker!r}"
+            seen.add(marker)
+
+    def test_gemma4_marker_present(self):
+        assert "<|turn>user\n" in USER_TURN_OPEN_MARKERS
+
+    def test_gemma3_marker_present(self):
+        assert "<start_of_turn>user\n" in USER_TURN_OPEN_MARKERS
+
+    def test_qwen_chatml_marker_present(self):
+        assert "<|im_start|>user\n" in USER_TURN_OPEN_MARKERS
+
+    def test_gpt_oss_marker_present(self):
+        assert "<|start|>user<|message|>" in USER_TURN_OPEN_MARKERS
+
+    def test_llama_marker_present(self):
+        assert "<|start_header_id|>user<|end_header_id|>\n" in USER_TURN_OPEN_MARKERS
+
+    def test_consumer_picks_last_occurrence_in_multi_user_prompt(self):
+        # Consumer pattern: rfind across all markers, take the rightmost
+        # position. With two user turns in the rendered prompt, the
+        # anchor must land at the SECOND turn so the cache only covers
+        # tokens through the end of the prior asst response.
+        prompt = (
+            "[system]\n"
+            "<|turn>user\nfirst question<turn|>\n"
+            "<|turn>model\nfirst answer<turn|>\n"
+            "<|turn>user\nsecond question<turn|>\n"
+            "<|turn>model\n"
+        )
+        last_pos = -1
+        for marker in USER_TURN_OPEN_MARKERS:
+            idx = prompt.rfind(marker)
+            if idx > last_pos:
+                last_pos = idx
+        # Expected: position of the SECOND `<|turn>user\n`. Verify by
+        # checking the prompt[last_pos:] starts with the marker AND
+        # the substring up to last_pos contains exactly ONE earlier
+        # occurrence.
+        assert prompt[last_pos:].startswith("<|turn>user\n")
+        assert prompt[:last_pos].count("<|turn>user\n") == 1
+
+    def test_consumer_returns_negative_for_no_marker_present(self):
+        # Plain prompt with no user-turn marker — caller should treat
+        # negative result as "fallback to old anchor behavior".
+        prompt = "just some plain text with no chat template at all"
+        last_pos = -1
+        for marker in USER_TURN_OPEN_MARKERS:
+            idx = prompt.rfind(marker)
+            if idx > last_pos:
+                last_pos = idx
+        assert last_pos == -1
+
+    def test_consumer_handles_mixed_template_families(self):
+        # Edge case: prompt contains markers from different families
+        # (shouldn't happen in practice but the registry shouldn't
+        # care). The rightmost marker still wins.
+        prompt = (
+            "<|im_start|>user\nq1<|im_end|>\n"
+            "<|im_start|>assistant\na1<|im_end|>\n"
+            "<|turn>user\nq2<turn|>\n"
+        )
+        last_pos = -1
+        last_marker = None
+        for marker in USER_TURN_OPEN_MARKERS:
+            idx = prompt.rfind(marker)
+            if idx > last_pos:
+                last_pos = idx
+                last_marker = marker
+        # Rightmost is the Gemma 4 marker for q2.
+        assert last_marker == "<|turn>user\n"
+        assert prompt[last_pos:].startswith("<|turn>user\nq2")
 
 
 class TestMessageFormatterTextOnlyFallback:

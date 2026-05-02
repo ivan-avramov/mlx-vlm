@@ -313,6 +313,26 @@ class TestSplitThinking:
         assert reasoning == "Only thinking."
         assert content == ""
 
+    def test_gemma_native_pipe_delimited_opener(self):
+        # Gemma 4's actual thinking opener is `<|think|>`, NOT `<think>`.
+        # Pre-registry, _split_thinking only matched `<think>` / `</think>`
+        # so Gemma reasoning blocks weren't recognized — first content
+        # token after `</think>` got consumed by the broken state in the
+        # streaming machine. This test pins the correct behavior.
+        text = "<|think|>\nIdentifying myself...</think>\nI am a large language model."
+        reasoning, content = server._split_thinking(text)
+        assert reasoning == "Identifying myself..."
+        assert content == "I am a large language model."
+
+    def test_gemma_prefilled_opener_only_closer_in_output(self):
+        # Real Gemma 4 production pattern: chat template seeds the model
+        # mid-thinking, model emits only the closer. The splitter must
+        # treat everything up to the closer as reasoning.
+        text = "Reasoning content here</think>\nVisible answer."
+        reasoning, content = server._split_thinking(text)
+        assert reasoning == "Reasoning content here"
+        assert content == "Visible answer."
+
 
 class TestChatMessageSchema:
     """Tests for ChatMessage accepting tool-calling roles and fields."""
@@ -1133,14 +1153,18 @@ class TestIsTemplateThinkingAsymmetric:
 
 
 class TestDetectThinkingFormat:
-    def test_gemma_channel_opener(self):
-        # The native Gemma 4 thinking marker.
-        prompt = "user msg ... <|channel>thought\n"
-        assert server._detect_thinking_format(prompt) == "gemma"
+    """Helper now returns a `ThinkingFormat` (or None) instead of a
+    string identifier. Each format has its own opener/closer literals
+    in the registry; consumers read tag tuples off the returned object.
+    """
 
-    def test_gemma_alternate_think_marker(self):
-        # The "<|think|>" alternate marker also resolves to gemma.
-        assert server._detect_thinking_format("foo <|think|> bar") == "gemma"
+    def test_gemma_native_opener(self):
+        # Gemma 4's actual thinking opener is the pipe-delimited tag.
+        # Earlier versions of `_detect_thinking_format` conflated this
+        # with gpt-oss's `<|channel>thought`; the registry separates them.
+        fmt = server._detect_thinking_format("foo <|think|> bar")
+        assert fmt is not None
+        assert fmt.name == "gemma"
 
     def test_channel_thought_opener_matches_gemma(self):
         # `<|channel>thought` is now in Gemma 4's openers tuple too
@@ -1161,14 +1185,33 @@ class TestDetectThinkingFormat:
     def test_no_thinking_tags(self):
         assert server._detect_thinking_format("just a plain prompt") is None
 
-    def test_gemma_takes_precedence_over_generic(self):
-        # If both appear, gemma wins (it's checked first). This matters
-        # because some templates emit both markers in nested chains.
-        prompt = "<|channel>thought ... <think>"
-        assert server._detect_thinking_format(prompt) == "gemma"
+    def test_gemma_takes_precedence_over_qwen(self):
+        # If a prompt contains both `<|think|>` and `<think>` literals
+        # (rare, but possible in pathological echoed history), gemma
+        # wins — it's listed first in THINKING_FORMATS, and first-match
+        # ordering is the registry's specificity contract.
+        prompt = "<|think|> reasoning ... <think>"
+        fmt = server._detect_thinking_format(prompt)
+        assert fmt is not None
+        assert fmt.name == "gemma"
 
 
 class TestComputeThinkingBudget:
+    """`thinking_format` is now a ThinkingFormat object (or None);
+    only the truthy-or-not check matters here."""
+
+    @pytest.fixture
+    def gemma_fmt(self):
+        from mlx_vlm.prompt_utils import THINKING_FORMATS
+
+        return next(f for f in THINKING_FORMATS if f.name == "gemma")
+
+    @pytest.fixture
+    def qwen_fmt(self):
+        from mlx_vlm.prompt_utils import THINKING_FORMATS
+
+        return next(f for f in THINKING_FORMATS if f.name == "qwen")
+
     def test_returns_none_when_no_format(self):
         # Non-thinking models get no budget enforcement at all.
         assert server._compute_thinking_budget(1000, None, None) is None
@@ -1178,31 +1221,31 @@ class TestComputeThinkingBudget:
         # thinking tags — there's nothing to count.
         assert server._compute_thinking_budget(1000, 500, None) is None
 
-    def test_auto_budget_from_max_tokens(self):
+    def test_auto_budget_from_max_tokens(self, gemma_fmt):
         # Default formula: 80% of max_tokens. Floor via int().
-        out = server._compute_thinking_budget(1000, None, "gemma")
+        out = server._compute_thinking_budget(1000, None, gemma_fmt)
         assert out == 800
 
-    def test_auto_budget_uses_ratio_constant(self):
+    def test_auto_budget_uses_ratio_constant(self, qwen_fmt):
         # If THINKING_BUDGET_RATIO ever changes, this assertion catches
         # accidental drift between server.py and the documented ratio.
-        out = server._compute_thinking_budget(2000, None, "generic")
+        out = server._compute_thinking_budget(2000, None, qwen_fmt)
         assert out == int(2000 * server.THINKING_BUDGET_RATIO)
 
-    def test_client_budget_overrides_auto(self):
+    def test_client_budget_overrides_auto(self, gemma_fmt):
         # Explicit thinking_budget on the request wins, even when smaller
         # than the auto formula.
-        assert server._compute_thinking_budget(10000, 500, "gemma") == 500
+        assert server._compute_thinking_budget(10000, 500, gemma_fmt) == 500
 
-    def test_client_budget_can_exceed_auto(self):
+    def test_client_budget_can_exceed_auto(self, qwen_fmt):
         # And even when larger — clients can opt into deeper thinking.
-        assert server._compute_thinking_budget(1000, 5000, "generic") == 5000
+        assert server._compute_thinking_budget(1000, 5000, qwen_fmt) == 5000
 
-    def test_zero_client_budget_disables_thinking_immediately(self):
+    def test_zero_client_budget_disables_thinking_immediately(self, gemma_fmt):
         # 0 is a meaningful explicit value — "no thinking" — distinct
         # from None. Server-side enforcement should fire at first thinking
         # token.
-        assert server._compute_thinking_budget(1000, 0, "gemma") == 0
+        assert server._compute_thinking_budget(1000, 0, gemma_fmt) == 0
 
 
 class TestMakeLogprobContent:

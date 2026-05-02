@@ -1,6 +1,7 @@
+from dataclasses import dataclass
 from enum import Enum
 from functools import partial
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 # ---------------------------------------------------------------------------
 # Chat-template kwargs for prefix-cache-friendly multi-turn rendering.
@@ -159,6 +160,36 @@ THINKING_FORMATS: Tuple[ThinkingFormat, ...] = (
         tag_token_count=4,
     ),
 )
+
+
+USER_TURN_OPEN_MARKERS: Tuple[str, ...] = (
+    # Gemma 4 — uses `<|turn>user\n` (no `<` because the family's chat
+    # template renders the role inside the bespoke turn delimiter).
+    "<|turn>user\n",
+    # Gemma 3 — uses the older `<start_of_turn>user\n` form.
+    "<start_of_turn>user\n",
+    # Qwen 2.x / 3.x and most ChatML-style templates.
+    "<|im_start|>user\n",
+    # gpt-oss / OpenAI-style channeled chat template.
+    "<|start|>user<|message|>",
+    # Llama 3.x family.
+    "<|start_header_id|>user<|end_header_id|>\n",
+    # Phi / DeepSeek-Chat-style.
+    "<|user|>\n",
+)
+"""Per-template literals that mark the start of a user turn in the
+rendered prompt. Used by the asymmetric-cache anchoring path to find
+the position BEFORE the latest user message — the cache is anchored
+there so subsequent re-renders of that user message (e.g. OpenWebUI
+wrapping the latest user query with a RAG `<context>` block once a
+search-style tool returns citation-worthy content) don't trigger a
+backward trim of the cache.
+
+Ordered first-match-wins: callers should iterate and use the LAST
+position of any marker in the rendered prompt. Each entry is a
+distinct literal — there's no overlap between families' user-turn
+delimiters.
+"""
 
 
 def detect_thinking_format(text: str) -> Optional[ThinkingFormat]:

@@ -73,6 +73,142 @@ def _kv_seq_axis(shape) -> int:
     return 2
 
 
+def _trim_cache(c, target_len):
+    """Recursively trim a KV cache (or nested container of caches) so its
+    sequence dimension is exactly ``target_len``.
+
+    Handles list / tuple containers, hybrid wrappers exposing ``.caches``,
+    and the common per-layer cache shapes. Static caches (TurboQuant,
+    Rotating SWA) manage their own internal structure via ``.trim()`` /
+    ``.truncate()``; standard caches additionally need a physical slice
+    on the K/V tensors so ghost tokens / step-padding don't desync RoPE
+    on the next forward pass.
+
+    Used in two places: (1) start-of-generation prefix-cache reuse —
+    trim cached state to the common prefix before resuming forward;
+    (2) end-of-generation discard of the assistant turn — trim back to
+    prefill length so the persisted cache state always ends at an
+    end-of-user-turn boundary, sidestepping the asymmetric-rendering
+    problem (thinking content present in cache but absent in next
+    request's echoed assistant message).
+    """
+    if isinstance(c, (list, tuple)):
+        for sub_c in c:
+            _trim_cache(sub_c, target_len)
+        return
+    if hasattr(c, "caches"):
+        for sub_c in c.caches:
+            _trim_cache(sub_c, target_len)
+        return
+    if not hasattr(c, "offset"):
+        return
+    current_offset = int(c.offset.item() if hasattr(c.offset, "item") else c.offset)
+    if current_offset <= target_len:
+        return
+    # Update MLX native state pointers
+    if hasattr(c, "trim"):
+        c.trim(current_offset - target_len)
+    elif hasattr(c, "truncate"):
+        c.truncate(target_len)
+    else:
+        c.offset = target_len
+
+    # Caches that own their internal storage layout — leave the K/V
+    # structure alone after the trim/truncate above moved the offset.
+    #   - TurboQuantKVCache, RotatingKVCache, BatchRotatingKVCache:
+    #     ring/static-sized buffers; physical slicing would corrupt
+    #     them.
+    #   - QuantizedKVCache, BatchQuantizedKVCache: `.keys` and
+    #     `.values` are 3-element lists `[quantized_uint32, scales,
+    #     biases]` (a single layer of state, not a chunked sequence).
+    #     The chunked-list branch below would treat the 3 components
+    #     as 3 sequence chunks and silently strip scales+biases —
+    #     producing a 1-element list that breaks the next call to
+    #     `mx.quantized_matmul(queries, *q_keys, ...)` with a "missing
+    #     scales argument" TypeError.
+    if type(c).__name__ in (
+        "TurboQuantKVCache",
+        "RotatingKVCache",
+        "BatchRotatingKVCache",
+        "QuantizedKVCache",
+        "BatchQuantizedKVCache",
+    ):
+        return
+
+    k_attr = "keys" if hasattr(c, "keys") else "k" if hasattr(c, "k") else None
+    v_attr = (
+        "values" if hasattr(c, "values") else "v" if hasattr(c, "v") else None
+    )
+    if not (k_attr and v_attr):
+        return
+    k_arr = getattr(c, k_attr)
+    v_arr = getattr(c, v_attr)
+    if k_arr is None or v_arr is None:
+        return
+
+    if isinstance(k_arr, mx.array):
+        seq_axis = _kv_seq_axis(k_arr.shape)
+        if seq_axis == 1:
+            setattr(c, k_attr, k_arr[:, :target_len, ...])
+            setattr(c, v_attr, v_arr[:, :target_len, ...])
+        else:
+            setattr(c, k_attr, k_arr[:, :, :target_len, ...])
+            setattr(c, v_attr, v_arr[:, :, :target_len, ...])
+    elif isinstance(k_arr, list):
+        # ChunkedKVCache list slicing
+        new_k, new_v = [], []
+        current_len = 0
+        for k, v in zip(k_arr, v_arr):
+            seq_axis = _kv_seq_axis(k.shape)
+            chunk_len = k.shape[seq_axis]
+            if current_len + chunk_len <= target_len:
+                new_k.append(k)
+                new_v.append(v)
+                current_len += chunk_len
+            elif current_len < target_len:
+                sl = target_len - current_len
+                if seq_axis == 1:
+                    new_k.append(k[:, :sl, ...])
+                    new_v.append(v[:, :sl, ...])
+                else:
+                    new_k.append(k[:, :, :sl, ...])
+                    new_v.append(v[:, :, :sl, ...])
+                break
+            else:
+                break
+        setattr(c, k_attr, new_k)
+        setattr(c, v_attr, new_v)
+
+    # Force execution to clean graph
+    mx.eval(getattr(c, k_attr), getattr(c, v_attr))
+
+
+def _first_kv_offset(entries) -> int:
+    """Return the offset of the first cache layer that exposes an
+    ``offset`` attribute, recursing into nested ``.caches`` containers.
+
+    Hybrid topologies (Qwen 3.5/3.6 GatedDeltaNet, Mamba-style) mix
+    ``ArraysCache`` (recurrent state, no ``offset``) with attention
+    KV layers (``KVCache``/``RotatingKVCache``/``TurboQuantKVCache``,
+    which do have ``offset``). All KV layers advance in lockstep
+    during prefill, so reading any one is correct — but the first
+    layer is not guaranteed to be one of them. Returns 0 for empty
+    input or all-recurrent topologies.
+    """
+    for c in entries:
+        if hasattr(c, "offset"):
+            return int(c.offset.item() if hasattr(c.offset, "item") else c.offset)
+        if hasattr(c, "caches"):
+            inner = _first_kv_offset(c.caches)
+            if inner:
+                return inner
+        elif isinstance(c, (list, tuple)):
+            inner = _first_kv_offset(c)
+            if inner:
+                return inner
+    return 0
+
+
 def parse_arguments():
     parser = argparse.ArgumentParser(
         description="Generate text from an image using a model."
@@ -504,6 +640,13 @@ class PromptCacheState:
         self.cache: Optional[List[Any]] = None
         self.token_ids: Optional[List[int]] = None
         self.rewind_enabled = rewind_enabled
+        # Set by the server after asymmetry detection on the (processor,
+        # template_kwargs) pair. When True, post-generation cache anchors
+        # at end-of-user via rotating-layer snapshot+restore. When False
+        # (default), cache anchors at end-of-asst (forward extension on
+        # next request). See server.py:_is_template_thinking_asymmetric
+        # and stream_generate's post-gen branch.
+        self.is_asymmetric_rendering: bool = False
         # Local import so this module stays importable without snapshot.py
         # being touched by callers that don't need it.
         if snapshot_ring is None:
@@ -895,6 +1038,10 @@ def generate_step(
     draft_model: Optional[nn.Module] = None,
     draft_kind: str = "dflash",
     draft_block_size: Optional[int] = None,
+    snapshot_at_offset: Optional[int] = None,
+    rotating_snapshot_capture: Optional[List["RotatingKVSnapshot"]] = None,
+    arrays_snapshot_capture: Optional[List[Optional[List[mx.array]]]] = None,
+    anchor_capture_offset: Optional[List[int]] = None,
     **kwargs,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
@@ -1058,12 +1205,78 @@ def generate_step(
         )
         if getattr(model, "no_chunked_prefill", False):
             prefill_step_size = None
-        if prefill_step_size is not None and inputs_embeds.shape[1] > prefill_step_size:
+        # Cumulative offset of "tokens already in the cache":
+        # the prior turn's cached tokens (if any) plus tokens
+        # processed so far in this prefill loop. ``_first_kv_offset``
+        # skips layers without ``.offset`` (``ArraysCache`` in
+        # Qwen 3.5/3.6 hybrid + Mamba-style models) and reads any
+        # KV layer's offset — all KV layers advance in lockstep
+        # during prefill, so any one is correct.
+        initial_cache_offset = _first_kv_offset(prompt_cache)
+
+        # Pre-prefill anchor capture: when the latest-user-turn
+        # marker is at or before the current cache offset (typical
+        # for OWUI tool-continuation calls where the same user
+        # message gets multiple chat-completion calls and the marker
+        # stays at the original user-message position), the live
+        # cache state at start of this turn IS the anchor we want
+        # to persist. The in-loop capture won't fire at this offset
+        # because ``cumulative_offset`` advances past
+        # ``snapshot_at_offset`` on the first chunk → all chunks
+        # classify as "skip". Without this pre-capture, the
+        # asymmetric path falls back to end-of-user, overwriting
+        # the good anchor with end-of-prefill content
+        # (tool_response). On the next NEW user turn the SWA ring
+        # has wrapped past the divergence point → SWA Ring Buffer
+        # Corruption Guard fires → full re-prefill.
+        if _should_capture_anchor_pre_prefill(
+            snapshot_at_offset=snapshot_at_offset,
+            initial_cache_offset=initial_cache_offset,
+            prompt_cache_present=bool(prompt_cache),
+        ):
+            _capture_anchor_state(
+                prompt_cache,
+                offset=initial_cache_offset,
+                rotating_capture=rotating_snapshot_capture,
+                arrays_capture=arrays_snapshot_capture,
+                anchor_offset_list=anchor_capture_offset,
+            )
+
+        # Enter the loop if either (a) the prompt is too long for a
+        # single forward pass, or (b) an anchor capture is pending
+        # whose offset falls inside the loop's reachable range. Case
+        # (b) catches the short-prefill regression: when prior cache
+        # reuse leaves a small delta (< prefill_step_size), the anchor
+        # would otherwise be skipped and the next turn's asymmetric
+        # re-render would force a full re-prefill.
+        anchor_in_loop_range = _anchor_within_loop_range(
+            initial_cache_offset, inputs_embeds.shape[1], snapshot_at_offset
+        )
+        if prefill_step_size is not None and (
+            inputs_embeds.shape[1] > prefill_step_size or anchor_in_loop_range
+        ):
             # Chunked prefill with embeddings
             total_tokens = inputs_embeds.shape[1]
+            cumulative_offset = initial_cache_offset
+            snapshot_done = False
             with tqdm(total=total_tokens, desc="Prefill", unit="tok") as pbar:
                 while inputs_embeds.shape[1] > 1:
                     n_to_process = min(prefill_step_size, inputs_embeds.shape[1] - 1)
+
+                    # Asymmetric-rendering snapshot landing: shrink
+                    # the chunk so it ends EXACTLY on
+                    # ``snapshot_at_offset`` when crossing it. See
+                    # ``_adjust_chunk_for_snapshot_landing`` for the
+                    # math + ``_compute_anchor_before_latest_user_offset``
+                    # for why we want a snapshot at the user-turn
+                    # boundary specifically.
+                    n_to_process = _adjust_chunk_for_snapshot_landing(
+                        cumulative_offset,
+                        n_to_process,
+                        snapshot_at_offset,
+                        snapshot_done,
+                    )
+
                     model.language_model(
                         inputs=input_ids[:, :n_to_process],
                         inputs_embeds=inputs_embeds[:, :n_to_process],
@@ -1073,6 +1286,41 @@ def generate_step(
                     )
                     quantize_cache_fn(prompt_cache)
                     mx.eval([c.state for c in prompt_cache])
+                    cumulative_offset += n_to_process
+
+                    # Snapshot decision per chunk boundary. Two paths:
+                    #   - "capture_and_finalize": exact target landed,
+                    #     capture and stop scanning.
+                    #   - "capture_as_fallback": pre-target chunk
+                    #     boundary, capture as best-available; later
+                    #     iterations may replace with a closer one.
+                    # The fallback handles snapshot_at_offset values
+                    # that the chunked-prefill loop can't land on
+                    # exactly (typical cause: BPE context-sensitivity
+                    # makes ``tokenizer.encode(prefix)`` disagree by a
+                    # few tokens with the full prompt's cumulative
+                    # tally at the same byte position).
+                    action = _classify_snapshot_action(
+                        cumulative_offset,
+                        snapshot_at_offset,
+                        snapshot_done,
+                    )
+                    if action != "skip":
+                        # Capture all three side-channels in lockstep.
+                        # See ``_capture_anchor_state`` for per-channel
+                        # semantics. Latest-wins so a later
+                        # ``capture_and_finalize`` replaces an earlier
+                        # ``capture_as_fallback``.
+                        _capture_anchor_state(
+                            prompt_cache,
+                            offset=cumulative_offset,
+                            rotating_capture=rotating_snapshot_capture,
+                            arrays_capture=arrays_snapshot_capture,
+                            anchor_offset_list=anchor_capture_offset,
+                        )
+                        if action == "capture_and_finalize":
+                            snapshot_done = True
+
                     inputs_embeds = inputs_embeds[:, n_to_process:]
                     input_ids = input_ids[:, n_to_process:]
                     mx.clear_cache()
@@ -1168,6 +1416,370 @@ def _rotating_rewind_safe(entries, target_len) -> bool:
                 return False
         elif isinstance(c, (list, tuple)):
             if not _rotating_rewind_safe(c, target_len):
+                return False
+    return True
+
+
+def _is_rotating_kv_layer(c) -> bool:
+    """True if `c` is a RotatingKVCache (sliding-window KV cache)."""
+    return type(c).__name__ in ("RotatingKVCache", "BatchRotatingKVCache")
+
+
+def _anchor_within_loop_range(
+    initial_cache_offset: int,
+    prompt_len: int,
+    snapshot_at_offset: Optional[int],
+) -> bool:
+    """Return True iff ``snapshot_at_offset`` falls strictly inside the
+    chunked-prefill loop's reachable range.
+
+    The loop processes tokens in [initial_cache_offset,
+    initial_cache_offset + prompt_len - 1) — the final token is
+    reserved for the post-loop ``_step`` forward pass that produces
+    the first generation logits, so it can't be a snapshot landing
+    point. Anchors equal to ``initial_cache_offset`` are also
+    excluded: the cache is already at that offset, no capture is
+    needed (and the loop wouldn't iterate at that boundary anyway).
+
+    Used to gate loop entry: when the prompt is shorter than
+    ``prefill_step_size`` (typical after good cache reuse) the loop
+    is normally skipped, but if an anchor target falls inside the
+    range we MUST enter the loop or lose the asymmetric-rendering
+    anchor for that turn — leading to a full re-prefill on the next
+    turn when the client re-renders the user message differently.
+    """
+    if snapshot_at_offset is None:
+        return False
+    return (
+        initial_cache_offset < snapshot_at_offset
+        and snapshot_at_offset < initial_cache_offset + prompt_len - 1
+    )
+
+
+def _should_capture_anchor_pre_prefill(
+    snapshot_at_offset: Optional[int],
+    initial_cache_offset: int,
+    prompt_cache_present: bool,
+) -> bool:
+    """Return True iff the anchor capture should fire BEFORE the
+    chunked-prefill loop runs (capturing from the cache state at
+    start of ``generate_step``).
+
+    Fires when the cache state at start of this turn IS the anchor
+    state we want to persist — i.e. the latest-user-turn marker is
+    at or before the current cache offset. Two situations match:
+
+      * **Equality** (``initial == snapshot``): typical OWUI tool-
+        continuation steady state. The user-turn marker hasn't
+        moved across multiple chat-completion calls (model →
+        tool_call → tool_response → model continues → ...), and the
+        prior call already persisted at exactly that anchor.
+
+      * **Strict-greater** (``initial > snapshot``): degenerate
+        transient where a prior call's fallback advanced the cache
+        past the anchor we'd ideally want. We can't go back to the
+        original anchor (SWA ring may have wrapped past it), so we
+        capture at ``initial`` as best-available — at least we stop
+        advancing further on subsequent tool-continuation calls.
+
+    The in-loop capture won't fire in either case because
+    ``_classify_snapshot_action`` returns ``"skip"`` once
+    ``cumulative_offset > snapshot_at_offset``, which happens after
+    the first chunk. Without the pre-prefill capture, the asymmetric
+    path falls back to end-of-user, overwriting the good anchor with
+    end-of-prefill content (tool_response). On the next NEW user
+    turn, the SWA ring has wrapped past the divergence point → SWA
+    Ring Buffer Corruption Guard fires → full re-prefill.
+
+    Cold-start (``prompt_cache_present=False``) is excluded — there's
+    no live cache state to capture, and the in-loop capture handles
+    cold-start cases naturally.
+    """
+    if snapshot_at_offset is None:
+        return False
+    if not prompt_cache_present:
+        return False
+    return initial_cache_offset >= snapshot_at_offset
+
+
+def _adjust_chunk_for_snapshot_landing(
+    cumulative_offset: int,
+    n_to_process: int,
+    snapshot_at_offset: Optional[int],
+    snapshot_done: bool,
+) -> int:
+    """Shrink ``n_to_process`` so the chunked-prefill loop lands EXACTLY
+    on ``snapshot_at_offset`` when the about-to-process chunk would
+    otherwise cross it. No-op when there's no target, the target was
+    already captured, or the chunk doesn't cross the target.
+
+    Pure function — extracted from the chunked prefill loop so the
+    boundary-alignment math can be unit-tested without driving the
+    model. The `> snapshot_at_offset` (strict inequality) is
+    deliberate: if the chunk would land EXACTLY on the target with no
+    shrink (cumulative + n == snapshot), no adjustment is needed.
+    """
+    if snapshot_at_offset is None or snapshot_done:
+        return n_to_process
+    if (
+        cumulative_offset < snapshot_at_offset
+        and cumulative_offset + n_to_process > snapshot_at_offset
+    ):
+        return snapshot_at_offset - cumulative_offset
+    return n_to_process
+
+
+def _classify_snapshot_action(
+    cumulative_offset: int,
+    snapshot_at_offset: Optional[int],
+    snapshot_done: bool,
+) -> str:
+    """At a chunked-prefill chunk boundary, classify what to do with
+    the rotating-layer snapshot. Returns one of:
+
+      * ``"skip"`` — no target set, target already captured, or we
+        overshot the target without a usable boundary on this chunk.
+      * ``"capture_and_finalize"`` — chunk landed EXACTLY on the
+        target offset (shrink-logic worked or natural alignment).
+        Capture and stop scanning further boundaries.
+      * ``"capture_as_fallback"`` — chunk ended at an offset before
+        the target. Capture as the best-available approximation,
+        replacing any prior fallback so the latest (closest-to-target)
+        wins. Don't finalize — a later iteration may land closer or
+        on-target.
+
+    The fallback path matters when the caller's ``snapshot_at_offset``
+    can't be hit exactly during chunked prefill — for instance when
+    the helper that computed it (re-tokenizing a prefix string)
+    disagrees by an off-by-N with the prefill's actual cumulative
+    tally because of BPE context-sensitivity at the boundary. Pre-fix:
+    the chunked prefill would silently fail to capture and the
+    asymmetric path would fall back to end-of-user anchoring, exposing
+    the next request to OWUI-RAG-wrapping divergence on the latest
+    user message. Post-fix: we capture at the closest boundary ≤
+    target, anchoring the cache slightly earlier (a few hundred tokens
+    over-prefilled per turn) but still robustly invariant to user-
+    message wrapping.
+    """
+    if snapshot_at_offset is None or snapshot_done:
+        return "skip"
+    if cumulative_offset == snapshot_at_offset:
+        return "capture_and_finalize"
+    if cumulative_offset < snapshot_at_offset:
+        return "capture_as_fallback"
+    return "skip"
+
+
+def _compute_anchor_before_latest_user_offset(
+    formatted_prompt: str,
+    tokenizer,
+) -> Optional[int]:
+    """Find the token offset just before the LATEST user-turn-open marker
+    in ``formatted_prompt``. Returns None if no known user-turn marker
+    is present.
+
+    The asymmetric-rendering cache path uses this offset as the anchor:
+    the cache is persisted holding tokens [0, offset), so the next
+    request's prompt can re-render the latest user message in any
+    shape (e.g. OpenWebUI's RAG `<context>` wrapping that injects
+    citation instructions when a search-style tool returns) without
+    triggering a backward trim. The last user message itself is
+    re-prefilled forward on every turn — small constant cost vs.
+    the full re-prefill we'd otherwise eat on every wrapping change.
+
+    Per-template markers come from ``prompt_utils.USER_TURN_OPEN_MARKERS``;
+    we scan all of them and pick the LAST occurrence of ANY marker (the
+    rightmost user-turn-open in the rendered prompt). The character
+    position of that marker becomes the anchor's substring boundary;
+    we then re-tokenize just the prefix and return its token count.
+
+    Re-tokenizing the prefix is cheap (a few ms on a few-thousand-byte
+    string) and avoids the brittleness of trying to derive a token
+    offset from a substring offset on a tokenizer that may merge or
+    split byte sequences across the boundary.
+    """
+    from .prompt_utils import USER_TURN_OPEN_MARKERS
+
+    last_pos = -1
+    for marker in USER_TURN_OPEN_MARKERS:
+        idx = formatted_prompt.rfind(marker)
+        if idx > last_pos:
+            last_pos = idx
+    if last_pos < 0:
+        return None
+
+    prefix = formatted_prompt[:last_pos]
+    try:
+        prefix_ids = tokenizer.encode(prefix, add_special_tokens=False)
+    except TypeError:
+        # Some tokenizers (e.g. SentencePiece-only) don't accept
+        # ``add_special_tokens``; fall back to plain encode.
+        prefix_ids = tokenizer.encode(prefix)
+    return len(prefix_ids)
+
+
+def _capture_rotating_layers_for_snapshot(cache_list, capture_fn):
+    """Walk a flat cache list and snapshot every rotating layer.
+
+    Returns a list of `RotatingKVSnapshot` objects (one per rotating
+    layer found). Each snapshot records its `layer_index` so the
+    restore path can match it back to the same position.
+
+    Hybrid wrappers (CacheList exposing `.caches`) aren't unwrapped
+    here — Gemma 4's prompt cache is flat (alternating standard +
+    rotating layers at the top level). If a future model needs nested
+    handling, recurse on `.caches` like `_trim_cache` does.
+    """
+    snapshots = []
+    for idx, c in enumerate(cache_list):
+        if _is_rotating_kv_layer(c):
+            snapshots.append(capture_fn(c, idx))
+    return snapshots
+
+
+def _restore_rotating_layers_from_snapshots(cache_list, snapshots) -> None:
+    """Restore each snapshot back into its corresponding live layer."""
+    from .snapshot import restore_rotating
+
+    by_idx = {s.layer_index: s for s in snapshots}
+    for idx, c in enumerate(cache_list):
+        snap = by_idx.get(idx)
+        if snap is not None and _is_rotating_kv_layer(c):
+            restore_rotating(c, snap)
+
+
+def _capture_arrays_layers_for_snapshot(cache_list):
+    """Walk a flat cache list and snapshot every ``ArraysCache`` layer.
+
+    Returns a list aligned positionally with ``cache_list``: ``None`` for
+    non-ArraysCache layers, ``list(c.state)`` (refcount-cheap copy of the
+    layer's state list) for ArraysCache layers. Returns an empty list if
+    no ArraysCache layers are present (pure-attention model — caller
+    skips the restore step entirely).
+
+    Used by the asymmetric-rendering anchor path on hybrid topologies
+    (Qwen 3.5/3.6 GatedDeltaNet, Mamba) where some attention layers
+    are recurrent (``ArraysCache``) and need their state preserved at
+    the before-latest-user boundary, parallel to how
+    ``_capture_rotating_layers_for_snapshot`` preserves SWA state.
+    Without this, the persisted cache's recurrent state is at end-of-
+    asst (post-generation) rather than at the anchor offset — the next
+    turn's prefix-cache reuse silently drifts.
+    """
+    from mlx_lm.models.cache import ArraysCache
+
+    snapshots = []
+    any_arrays = False
+    for c in cache_list:
+        if isinstance(c, ArraysCache):
+            snapshots.append(list(c.state))
+            any_arrays = True
+        else:
+            snapshots.append(None)
+    return snapshots if any_arrays else []
+
+
+def _restore_arrays_layers_from_snapshots(cache_list, snapshots) -> None:
+    """Restore captured ``ArraysCache`` state back onto the live layers.
+
+    Snapshots align positionally with ``cache_list`` — None entries
+    correspond to non-ArraysCache layers (skipped). No-op when
+    ``snapshots`` is empty (pure-attention model).
+    """
+    if not snapshots:
+        return
+    from mlx_lm.models.cache import ArraysCache
+
+    for c, s in zip(cache_list, snapshots):
+        if s is not None and isinstance(c, ArraysCache):
+            c.state = s
+
+
+def _capture_anchor_state(
+    prompt_cache,
+    offset: int,
+    rotating_capture: Optional[List["RotatingKVSnapshot"]],
+    arrays_capture: Optional[List[Optional[List[mx.array]]]],
+    anchor_offset_list: Optional[List[int]],
+) -> None:
+    """Capture all three side-channels for an asymmetric-anchor
+    landing: rotating-layer snapshots, ArraysCache snapshots, and
+    the offset marker.
+
+    Used at two sites:
+      * pre-prefill (``initial_cache_offset >= snapshot_at_offset``):
+        capture the cache state as it stands at start of
+        ``generate_step``, before any prefill forward pass mutates it.
+      * in-loop (chunk boundary at or before ``snapshot_at_offset``):
+        capture after the chunk's forward pass when cumulative offset
+        crosses or matches the target.
+
+    Each list is cleared before populating so latest-wins semantics
+    hold across multiple in-loop calls (an exact landing replaces a
+    prior fallback). ``None`` for any list means "this side-channel
+    is not active for this request" (asymmetric rendering disabled
+    or model topology has no rotating/arrays layers — the offset
+    marker still fires for plain-attention anchor trim).
+    """
+    from .snapshot import capture_rotating
+
+    if rotating_capture is not None:
+        captured_rot = _capture_rotating_layers_for_snapshot(
+            prompt_cache, capture_rotating
+        )
+        if captured_rot:
+            rotating_capture.clear()
+            rotating_capture.extend(captured_rot)
+
+    if arrays_capture is not None:
+        captured_arr = _capture_arrays_layers_for_snapshot(prompt_cache)
+        if captured_arr:
+            arrays_capture.clear()
+            arrays_capture.extend(captured_arr)
+
+    if anchor_offset_list is not None:
+        anchor_offset_list.clear()
+        anchor_offset_list.append(offset)
+
+
+def _rotating_post_gen_trim_safe(entries, target_len) -> bool:
+    """Strict variant of `_rotating_rewind_safe` for the *post-generation*
+    cache trim path.
+
+    `_rotating_rewind_safe` only flags as unsafe the case where the trim
+    target sits below the oldest-still-valid logical position
+    (``offset - max_size``). That's correct for forward extension after
+    a small backward trim — newly-prefilled tokens overwrite the slots
+    near the trim point and the wraparound resolves itself.
+
+    The post-gen trim is different: we trim AT the moment of persisting,
+    *before* any further writes. If the ring buffer wrapped during
+    generation (``offset > max_size``), some slots between
+    ``target_len`` and ``offset`` have been overwritten by even-later
+    content, AND slots near ``target_len`` (after trim) hold post-target
+    content from the just-generated tokens. The ring is no longer a
+    coherent representation of the prefix [0, target_len), and the next
+    request's attention will read garbage K/V from the misaligned slots.
+    Empirically: Gemma 4 26B 8-bit produced repetition loops on turn 2
+    when the lenient check passed but the strict invariant was violated.
+
+    The strictly-safe condition is: the ring never wrapped at all
+    (``offset <= max_size``). Otherwise, callers should persist the
+    full end-of-asst state and let the next request's existing rewind
+    guard force full re-prefill.
+    """
+    for c in entries:
+        name = type(c).__name__
+        if name in ("RotatingKVCache", "BatchRotatingKVCache"):
+            offset = int(c.offset.item() if hasattr(c.offset, "item") else c.offset)
+            max_size = getattr(c, "max_size", None)
+            if max_size is not None and offset > max_size:
+                return False
+        elif hasattr(c, "caches"):
+            if not _rotating_post_gen_trim_safe(c.caches, target_len):
+                return False
+        elif isinstance(c, (list, tuple)):
+            if not _rotating_post_gen_trim_safe(c, target_len):
                 return False
     return True
 
@@ -1291,6 +1903,25 @@ def stream_generate(
     image_token_index = getattr(model.config, "image_token_index", None)
     vision_cache = kwargs.pop("vision_cache", None)
 
+    # Detection result from server.py:_is_template_thinking_asymmetric.
+    # When True, the chat template strips thinking content from prior
+    # assistant messages → cache must anchor at end-of-user (snapshot
+    # rotating layers + trim others). When False (default), cache
+    # anchors at end-of-asst — symmetric forward extension on the
+    # next request, no snapshot machinery needed. See snapshot.py
+    # `RotatingKVSnapshot` for the snapshot primitive itself.
+    #
+    # Read from PromptCacheState so the server can set it once per
+    # session (it's a property of the (processor, template_kwargs)
+    # pair, invariant across requests). Explicit kwarg override is
+    # supported for tests and callers without a PromptCacheState.
+    is_asymmetric_rendering = bool(kwargs.pop("is_asymmetric_rendering", False))
+    _maybe_state = kwargs.get("prompt_cache_state", None)
+    if _maybe_state is not None and not is_asymmetric_rendering:
+        is_asymmetric_rendering = bool(
+            getattr(_maybe_state, "is_asymmetric_rendering", False)
+        )
+
     if kwargs.get("input_ids", None) is not None:
         input_ids = kwargs.pop("input_ids")
         pixel_values = kwargs.pop("pixel_values", None)
@@ -1405,110 +2036,10 @@ def stream_generate(
             if not has_image_in_new:
                 pixel_values = None
                 kwargs.pop("cached_image_features", None)
-            # Reuse the saved KV cache (trimmed to prefix length)
+            # Reuse the saved KV cache (trimmed to prefix length).
+            # _trim_cache is module-level (lifted from this site so the
+            # post-generation trim path can also reach it).
             kv_cache = prompt_cache_state.cache
-
-            # Recursive cache trimming that handles nested structures,
-            # seq-axis variation, and physical slicing with mx.eval.
-            def _trim_cache(c, target_len):
-                if isinstance(c, (list, tuple)):
-                    for sub_c in c:
-                        _trim_cache(sub_c, target_len)
-                elif hasattr(c, "caches"):
-                    for sub_c in c.caches:
-                        _trim_cache(sub_c, target_len)
-                elif hasattr(c, "offset"):
-                    current_offset = int(
-                        c.offset.item() if hasattr(c.offset, "item") else c.offset
-                    )
-
-                    if current_offset > target_len:
-                        # Update MLX native state pointers
-                        if hasattr(c, "trim"):
-                            c.trim(current_offset - target_len)
-                        elif hasattr(c, "truncate"):
-                            c.truncate(target_len)
-                        else:
-                            c.offset = target_len
-
-                        # Physical slice for standard caches to strip ghost
-                        # tokens and step-padding (prevents RoPE desync).
-                        # Static caches (TurboQuant, Rotating) manage their own
-                        # internal structures via trim/truncate above.
-                        if type(c).__name__ not in (
-                            "TurboQuantKVCache",
-                            "RotatingKVCache",
-                            "BatchRotatingKVCache",
-                        ):
-                            k_attr = (
-                                "keys"
-                                if hasattr(c, "keys")
-                                else "k" if hasattr(c, "k") else None
-                            )
-                            v_attr = (
-                                "values"
-                                if hasattr(c, "values")
-                                else "v" if hasattr(c, "v") else None
-                            )
-
-                            if k_attr and v_attr:
-                                k_arr = getattr(c, k_attr)
-                                v_arr = getattr(c, v_attr)
-
-                                if k_arr is not None and v_arr is not None:
-                                    if isinstance(k_arr, mx.array):
-                                        seq_axis = _kv_seq_axis(k_arr.shape)
-                                        if seq_axis == 1:
-                                            setattr(
-                                                c,
-                                                k_attr,
-                                                k_arr[:, :target_len, ...],
-                                            )
-                                            setattr(
-                                                c,
-                                                v_attr,
-                                                v_arr[:, :target_len, ...],
-                                            )
-                                        else:
-                                            setattr(
-                                                c,
-                                                k_attr,
-                                                k_arr[:, :, :target_len, ...],
-                                            )
-                                            setattr(
-                                                c,
-                                                v_attr,
-                                                v_arr[:, :, :target_len, ...],
-                                            )
-
-                                    elif isinstance(k_arr, list):
-                                        # ChunkedKVCache list slicing
-                                        new_k, new_v = [], []
-                                        current_len = 0
-                                        for k, v in zip(k_arr, v_arr):
-                                            seq_axis = _kv_seq_axis(k.shape)
-                                            chunk_len = k.shape[seq_axis]
-                                            if current_len + chunk_len <= target_len:
-                                                new_k.append(k)
-                                                new_v.append(v)
-                                                current_len += chunk_len
-                                            elif current_len < target_len:
-                                                sl = target_len - current_len
-                                                if seq_axis == 1:
-                                                    new_k.append(k[:, :sl, ...])
-                                                    new_v.append(v[:, :sl, ...])
-                                                else:
-                                                    new_k.append(k[:, :, :sl, ...])
-                                                    new_v.append(v[:, :, :sl, ...])
-                                                break
-                                            else:
-                                                break
-                                        setattr(c, k_attr, new_k)
-                                        setattr(c, v_attr, new_v)
-
-                                    # Force execution to clean graph
-                                    mx.eval(getattr(c, k_attr), getattr(c, v_attr))
-
             for c in kv_cache:
                 _trim_cache(c, prefix_len)
 
@@ -1551,6 +2082,42 @@ def stream_generate(
 
     total_prompt_tokens = reused_prefix_len + input_ids.size
 
+    # Asymmetric-rendering anchor: compute the token offset of the LAST
+    # user-turn-open marker in the rendered prompt and ask generate_step
+    # to capture rotating-layer state at that boundary during chunked
+    # prefill. Persisting the cache anchored at this offset (instead of
+    # end-of-user) means the next request's re-rendering of the latest
+    # user message — for instance OpenWebUI wrapping it with a RAG
+    # `<context>` block once a search-style tool returns citation
+    # content — won't trigger a backward trim. The latest user message
+    # itself gets re-prefilled forward on every turn (small cost
+    # bounded by user-message length); everything before it stays
+    # cached. ``rotating_snapshot_capture`` is a mutable side-channel
+    # — generate_step appends the captured RotatingKVSnapshot entries
+    # into it as the boundary is crossed mid-prefill.
+    # Three parallel side-channels for the asymmetric anchor capture:
+    #   * rotating  — RotatingKVCache (Gemma 4 SWA layers)
+    #   * arrays    — ArraysCache (Qwen 3.5/3.6 DeltaNet layers, Mamba)
+    #   * offset    — single-entry list holding the actual offset reached
+    # All three populate at the same chunk boundary; per-model topology
+    # determines which snapshot lists carry content. The offset marker
+    # is what the post-gen branch keys on — it fires the anchor path
+    # even on pure plain-attention models where both snapshot lists
+    # are empty (just trim KV layers to the anchor offset).
+    snapshot_at_offset: Optional[int] = None
+    mid_prefill_rotating_capture: List["RotatingKVSnapshot"] = []
+    mid_prefill_arrays_capture: List[Optional[List[mx.array]]] = []
+    mid_prefill_anchor_offset: List[int] = []
+    if is_asymmetric_rendering and prompt_cache_state is not None:
+        snapshot_at_offset = _compute_anchor_before_latest_user_offset(
+            prompt, tokenizer
+        )
+        if snapshot_at_offset is not None:
+            kwargs["snapshot_at_offset"] = snapshot_at_offset
+            kwargs["rotating_snapshot_capture"] = mid_prefill_rotating_capture
+            kwargs["arrays_snapshot_capture"] = mid_prefill_arrays_capture
+            kwargs["anchor_capture_offset"] = mid_prefill_anchor_offset
+
     with wired_limit(model, [_get_generation_stream()]):
         detokenizer = processor.detokenizer
         detokenizer.reset()
@@ -1564,11 +2131,43 @@ def stream_generate(
         # stop); falling out of the loop without setting this means the
         # generator exhausted (max_tokens reached) → "length".
         stopped_by_criteria = False
+        # Rotating-layer snapshots captured at end-of-prefill, used at
+        # post-generation to restore the SWA layers' state to the
+        # end-of-user boundary. Populated lazily on n==0 below — see
+        # snapshot.py docstring for the rationale.
+        rotating_snapshots: List["RotatingKVSnapshot"] = []
         for n, (token, logprobs) in enumerate(gen):
             if n == 0:
                 prompt_time = time.perf_counter() - tic
                 prompt_tps = total_prompt_tokens / prompt_time
                 tic = time.perf_counter()
+
+                # End-of-prefill cache state has just been produced (the
+                # generator's first yield = first generated token, but
+                # that token is sampled from the post-prefill logits and
+                # has NOT been written into the cache yet — that happens
+                # on the next forward pass). Capture rotating-layer
+                # state now if the chat template renders prior asst
+                # turns asymmetrically; we'll restore after generation
+                # so the persisted cache anchors at end-of-user.
+                if (
+                    is_asymmetric_rendering
+                    and prompt_cache_state is not None
+                ):
+                    from .snapshot import (
+                        RotatingKVSnapshot,
+                        capture_rotating,
+                    )
+
+                    rotating_snapshots = _capture_rotating_layers_for_snapshot(
+                        tracked_cache, capture_rotating
+                    )
+                    if rotating_snapshots:
+                        logger.debug(
+                            "Captured %d rotating-layer snapshot(s) at "
+                            "end-of-prefill for asymmetric-rendering session.",
+                            len(rotating_snapshots),
+                        )
 
             generated_tokens.append(token)
 
@@ -1610,12 +2209,138 @@ def stream_generate(
             finish_reason="stop" if stopped_by_criteria else "length",
         )
 
-        # Save cache state for potential reuse on next turn
+        # Save cache state for potential reuse on next turn. Two paths,
+        # selected by `is_asymmetric_rendering` (computed in the server
+        # via `_is_template_thinking_asymmetric` and passed in as
+        # kwargs):
+        #
+        # ASYMMETRIC (e.g. Gemma 4 — chat template strips thinking
+        # content from prior assistant messages on every render):
+        #   The cache absorbed every generated token, but the next
+        #   request's render of this assistant turn will strip the
+        #   thinking content. Token-level divergence would fire at
+        #   the asst boundary → backward trim → wrap-corrupted SWA →
+        #   full re-prefill. Avoid all of that by anchoring the cache
+        #   at end-of-user:
+        #     • Restore rotating layers from the snapshot captured at
+        #       n==0 above (SWA's ring can't be trimmed back through
+        #       a wrap; restore is the only safe primitive).
+        #     • Trim non-rotating layers via `_trim_cache` (their
+        #       offset+slice is reversible; no snapshot needed).
+        #     • Persist `prefill_ids` only.
+        #   Next request prefills (asst-in-whatever-shape + new user)
+        #   forward — never a backward trim, regardless of how the
+        #   client renders the assistant turn.
+        #
+        # SYMMETRIC (e.g. Qwen 3.x official, Gemma 3, DeepSeek, Llama
+        # — chat template renders prior assistants symmetrically):
+        #   What we cached for this assistant turn matches what the
+        #   next request will render. Persist the FULL state including
+        #   gen tokens. Next request's prefix-match extends naturally
+        #   through the assistant; no backward trim ever needed.
+        #
+        # The hash chain on PromptCacheState extends only via the
+        # inbound path (server.py:_resolve_session → _sync_session_hashes
+        # ); we never append the just-generated assistant's hash here.
         if prompt_cache_state is not None:
-            all_ids = full_input_ids_list + [
-                t.item() if hasattr(t, "item") else t for t in generated_tokens
-            ]
-            prompt_cache_state.update(all_ids, tracked_cache)
+            prefill_len = len(full_input_ids_list)
+            if is_asymmetric_rendering:
+                # Asymmetric anchoring. Prefer the mid-prefill snapshot
+                # captured at ``snapshot_at_offset`` (the last user-turn
+                # boundary): persisting the cache there means the next
+                # request can re-render the latest user message in any
+                # shape (OpenWebUI RAG wrapping, dynamic system
+                # injections, etc.) without triggering a backward trim.
+                # Falls back to the end-of-prefill snapshot when the
+                # boundary couldn't be located (no recognizable user-
+                # turn marker) or when chunked prefill didn't run
+                # (short prompts) — same end-of-user behavior as
+                # before.
+                if (
+                    mid_prefill_anchor_offset
+                    and snapshot_at_offset is not None
+                ):
+                    # Anchor at the captured offset, NOT at
+                    # ``snapshot_at_offset``. They may differ by a
+                    # few tokens when the chunked-prefill loop
+                    # couldn't land exactly on the target (BPE
+                    # context-sensitivity in the helper's prefix
+                    # tokenization). The captured offset is the
+                    # authoritative position both snapshot types
+                    # represent — using it here keeps cache
+                    # token_ids and per-layer offsets in sync.
+                    #
+                    # Three independent restore steps; each is a
+                    # no-op when its snapshot list is empty:
+                    #   * rotating: SWA layers (Gemma 4)
+                    #   * arrays:   DeltaNet recurrent state (Qwen 3.5/3.6)
+                    #   * trim:     plain non-rotating KV layers
+                    # The model's topology determines which fire.
+                    anchor_offset = mid_prefill_anchor_offset[0]
+                    _restore_rotating_layers_from_snapshots(
+                        tracked_cache, mid_prefill_rotating_capture
+                    )
+                    _restore_arrays_layers_from_snapshots(
+                        tracked_cache, mid_prefill_arrays_capture
+                    )
+                    for c in tracked_cache:
+                        if not _is_rotating_kv_layer(c):
+                            _trim_cache(c, anchor_offset)
+                    anchor_token_ids = full_input_ids_list[:anchor_offset]
+                    prompt_cache_state.update(anchor_token_ids, tracked_cache)
+                    anchor_offset_kind = (
+                        "exact"
+                        if anchor_offset == snapshot_at_offset
+                        else "fallback"
+                    )
+                    logger.debug(
+                        "Asymmetric path: persisted cache BEFORE latest "
+                        "user message (anchor=%d [%s of target %d] / "
+                        "prefill_len %d); restored %d rotating + %d "
+                        "arrays layer(s), trimmed %d non-rotating "
+                        "layer(s).",
+                        anchor_offset,
+                        anchor_offset_kind,
+                        snapshot_at_offset,
+                        prefill_len,
+                        len(mid_prefill_rotating_capture),
+                        sum(
+                            1 for s in mid_prefill_arrays_capture
+                            if s is not None
+                        ),
+                        sum(
+                            1 for c in tracked_cache
+                            if not _is_rotating_kv_layer(c)
+                        ),
+                    )
+                else:
+                    # Fallback: anchor at end-of-user (= end-of-prefill).
+                    if rotating_snapshots:
+                        _restore_rotating_layers_from_snapshots(
+                            tracked_cache, rotating_snapshots
+                        )
+                    for c in tracked_cache:
+                        if not _is_rotating_kv_layer(c):
+                            _trim_cache(c, prefill_len)
+                    prompt_cache_state.update(full_input_ids_list, tracked_cache)
+                    logger.debug(
+                        "Asymmetric path (fallback): persisted cache at "
+                        "end-of-user (offset %d); restored %d rotating "
+                        "layer(s) from end-of-prefill snapshot, trimmed "
+                        "%d non-rotating layer(s).",
+                        prefill_len,
+                        len(rotating_snapshots),
+                        sum(
+                            1 for c in tracked_cache
+                            if not _is_rotating_kv_layer(c)
+                        ),
+                    )
+            else:
+                # Symmetric: persist full end-of-asst state.
+                full_ids = full_input_ids_list + [
+                    t.item() if hasattr(t, "item") else t for t in generated_tokens
+                ]
+                prompt_cache_state.update(full_ids, tracked_cache)
 
         # Cleanup after generation
         mx.clear_cache()

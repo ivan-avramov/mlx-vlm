@@ -136,3 +136,107 @@ class DeltaNetSnapshotRing:
 
     def clear(self) -> None:
         self._snapshots.clear()
+
+
+# ---------------------------------------------------------------------------
+# RotatingKVCache snapshots
+#
+# Sliding-window attention layers (mlx_lm's RotatingKVCache) hold their
+# K/V state in a ring buffer that's mutated in-place during generation.
+# Once the ring wraps (offset > max_size), `RotatingKVCache.trim(n)`
+# can't undo the writes — it only decrements offset/_idx, leaving the
+# physical slots filled with whatever was written last. Asymmetric
+# chat templates (Gemma 4: thinking content present in cache after
+# generation but stripped from prior-asst rendering on the next request)
+# need the cache to anchor at end-of-user, but we can't trim back to it
+# safely on a wrapped ring.
+#
+# Solution mirrors the DeltaNet path above: capture a snapshot right
+# after prefill completes (while the end-of-prefill state still exists),
+# generate as usual, then restore the snapshot. The persisted cache state
+# always reflects end-of-user, regardless of how generation mutated the
+# ring.
+#
+# Memory cost: ~1 MB per SWA layer at kv_bits=4 + max_size=1024 (Gemma 4
+# 26B 8-bit), held only between end-of-prefill and end-of-generation.
+# Released after restore. Capture is forced to materialize via
+# ``mx.array(x)`` + ``mx.eval()`` — verified empirically that this
+# produces an independent buffer (subsequent in-place writes to the
+# source don't affect the snapshot).
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RotatingKVSnapshot:
+    """Frozen snapshot of one ``RotatingKVCache`` layer's state.
+
+    Holds defensive copies of ``keys`` / ``values`` plus the integer
+    state attributes (``offset``, ``_idx``, ``max_size``, ``keep``).
+    Restoring overwrites the live layer's K/V tensors and pointer
+    state, returning it to the captured state byte-for-byte.
+
+    ``layer_index`` records this layer's position in the
+    ``prompt_cache`` list so the caller can match snapshots to layers
+    when restoring (the cache list ordering is stable across a session).
+    """
+
+    layer_index: int
+    keys: Optional[mx.array]
+    values: Optional[mx.array]
+    offset: int
+    idx: int
+    max_size: int
+    keep: int
+
+
+def capture_rotating(layer, layer_index: int) -> RotatingKVSnapshot:
+    """Capture a defensive snapshot of a RotatingKVCache layer.
+
+    The K/V tensors are materialized via ``mx.array(...)`` + ``mx.eval()``
+    so that subsequent in-place writes from generation
+    (``layer.keys[..., a:b, :] = new_kv``) don't leak into the
+    snapshot. Verified empirically — see the comment block above.
+    """
+    keys_copy: Optional[mx.array] = None
+    values_copy: Optional[mx.array] = None
+    if layer.keys is not None:
+        keys_copy = mx.array(layer.keys)
+    if layer.values is not None:
+        values_copy = mx.array(layer.values)
+    if keys_copy is not None or values_copy is not None:
+        # Force materialization in MLX's lazy graph so the buffers are
+        # definitely independent before we hand back the snapshot.
+        mx.eval(*(a for a in (keys_copy, values_copy) if a is not None))
+    return RotatingKVSnapshot(
+        layer_index=layer_index,
+        keys=keys_copy,
+        values=values_copy,
+        offset=int(
+            layer.offset.item() if hasattr(layer.offset, "item") else layer.offset
+        ),
+        idx=int(
+            layer._idx.item() if hasattr(layer._idx, "item") else layer._idx
+        ),
+        max_size=int(layer.max_size),
+        keep=int(getattr(layer, "keep", 0)),
+    )
+
+
+def restore_rotating(layer, snapshot: RotatingKVSnapshot) -> None:
+    """Write a captured snapshot back into a live RotatingKVCache layer.
+
+    After this call, ``layer`` is byte-for-byte the layer that existed
+    at capture time — same K/V contents, same offset, same write
+    pointer, same ring metadata. Any writes generation made are
+    discarded.
+    """
+    layer.keys = snapshot.keys
+    layer.values = snapshot.values
+    layer.offset = snapshot.offset
+    layer._idx = snapshot.idx
+    # max_size and keep are layer-construction-time parameters and don't
+    # change during a session; we restore them defensively in case some
+    # hybrid wrapper rewrote them.
+    layer.max_size = snapshot.max_size
+    if hasattr(layer, "keep"):
+        layer.keep = snapshot.keep

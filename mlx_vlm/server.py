@@ -47,7 +47,12 @@ from .generate import (
     normalize_resize_shape,
     stream_generate,
 )
-from .prompt_utils import apply_chat_template, get_cache_alignment_kwargs
+from .prompt_utils import (
+    apply_chat_template,
+    detect_thinking_format,
+    get_cache_alignment_kwargs,
+    ThinkingFormat,
+)
 from .sample_utils import top_p_sampling
 from .snapshot import DEFAULT_RING_SIZE, DeltaNetSnapshotRing
 from .structured import build_json_schema_logits_processor
@@ -85,13 +90,19 @@ THINKING_TRUNCATION_MSG = (
     "response. Try increasing max_tokens or setting a lower thinking_budget.]"
 )
 
-# Opener literals scanned for in the assistant continuation when checking
-# whether the chat template has prefilled the model into a thinking block
-# (e.g. unsloth Qwen 3.6 with enable_thinking=True ends the rendered prompt
-# with "<think>\n", forcing the model to start inside the reasoning block).
-# When matched, the streaming SSE state machine is seeded with in_thinking=True
-# so reasoning content routes to delta.reasoning instead of delta.content.
-_PREFILLED_OPENERS: Tuple[str, ...] = ("<think>", "<|channel>thought")
+# Sourced from prompt_utils.THINKING_FORMATS at module load. Used to
+# detect whether the chat template has prefilled the model into a thinking
+# block (e.g. unsloth Qwen 3.6 with enable_thinking=True ends the rendered
+# prompt with "<think>\n", forcing the model to start inside the reasoning
+# block). When matched, the streaming SSE state machine is seeded with
+# in_thinking=True so reasoning content routes to delta.reasoning instead
+# of delta.content.
+def _all_thinking_openers() -> Tuple[str, ...]:
+    from .prompt_utils import THINKING_FORMATS
+
+    return tuple(op for fmt in THINKING_FORMATS for op in fmt.openers)
+
+
 _PREFILL_FLAG_CACHE_MAX = 16
 _PREFILL_FLAG_CACHE: "OrderedDict[Tuple[int, frozenset], bool]" = OrderedDict()
 
@@ -1255,59 +1266,101 @@ def _build_structured_logits_processors(request, processor):
 
 def _count_thinking_tag_tokens(text: str) -> int:
     """Count tokens consumed by thinking tags (excluded from completion_tokens)."""
-    count = 0
-    # <|channel>thought (2 tokens) + <channel|> (1 token) + EOS (1 token)
-    if "<|channel>thought" in text and "<channel|>" in text:
-        count = 4
-    elif "<think>" in text and "</think>" in text:
-        count = 2  # <think> and </think> are 1 token each typically
-    return count
+    fmt = detect_thinking_format(text)
+    if fmt is None:
+        return 0
+    # Both opener and closer must be present in the output for the tag pair
+    # to have actually consumed tokens; partial output (e.g. mid-thinking
+    # truncation) shouldn't be debited the closer's tokens.
+    has_opener = any(op in text for op in fmt.openers)
+    has_closer = any(cl in text for cl in fmt.closers)
+    if has_opener and has_closer:
+        return fmt.tag_token_count
+    return 0
 
 
 def _split_thinking(text: str) -> Tuple[Optional[str], str]:
-    """Split thinking tags from content. Returns (reasoning, content)."""
-    # Handle <|channel>thought...<channel|> format (gemma4)
-    # Also handle partial tag: text starting with "thought\n" (continuation)
-    if "<|channel>thought" in text or (
-        "<channel|>" in text and text.lstrip().startswith("thought")
-    ):
-        parts = text.split("<channel|>", 1)
-        if len(parts) == 2:
-            reasoning = (
-                parts[0].replace("<|channel>thought", "").lstrip("thought").strip()
-            )
-            content = parts[1].strip()
-            return reasoning or None, content
-        reasoning = parts[0].replace("<|channel>thought", "").lstrip("thought").strip()
-        return reasoning or None, ""
-    # Handle <think>...</think> format (qwen3.5 etc)
-    # Also handle partial: output starts with thinking text + </think> (no opening tag)
-    if "<think>" in text or "</think>" in text:
-        parts = text.split("</think>", 1)
-        if len(parts) == 2:
-            reasoning = parts[0].replace("<think>", "").strip()
-            content = parts[1].strip()
-            return reasoning or None, content
-        return parts[0].replace("<think>", "").strip(), ""
-    return None, text
+    """Split thinking tags from content. Returns (reasoning, content).
 
-
-def _detect_thinking_format(prompt: str) -> Optional[str]:
-    """Detect thinking model format from the formatted prompt.
-
-    Returns "gemma", "generic", or None.
+    Uses the THINKING_FORMATS registry. If no known opener is present in
+    `text` but a closer IS, treat everything before the closer as
+    reasoning (the prefilled-opener case where the chat template seeded
+    the model inside a thinking block, so the model emits only the closer).
     """
-    if "<|think|>" in prompt or "<|channel>thought" in prompt:
-        return "gemma"
-    if "<think>" in prompt:
-        return "generic"
-    return None
+    fmt = detect_thinking_format(text)
+
+    # No known opener — but a closer-only output is still a valid
+    # prefilled-opener case. Pick the format whose closer matches.
+    if fmt is None:
+        from .prompt_utils import THINKING_FORMATS
+
+        for candidate in THINKING_FORMATS:
+            for cl in candidate.closers:
+                if cl in text:
+                    fmt = candidate
+                    break
+            if fmt is not None:
+                break
+
+    if fmt is None:
+        return None, text
+
+    # Find the earliest closer occurrence.
+    closer_idx = -1
+    closer_used = ""
+    for cl in fmt.closers:
+        idx = text.find(cl)
+        if idx >= 0 and (closer_idx < 0 or idx < closer_idx):
+            closer_idx = idx
+            closer_used = cl
+
+    if closer_idx < 0:
+        # Opener present but no closer — entire text is in-progress reasoning.
+        reasoning = text
+        for op in fmt.openers:
+            reasoning = reasoning.replace(op, "")
+        return _strip_thinking_quirks(fmt, reasoning) or None, ""
+
+    reasoning = text[:closer_idx]
+    content = text[closer_idx + len(closer_used) :]
+    for op in fmt.openers:
+        reasoning = reasoning.replace(op, "")
+    return _strip_thinking_quirks(fmt, reasoning) or None, content.strip()
+
+
+def _strip_thinking_quirks(fmt: ThinkingFormat, reasoning: str) -> str:
+    """Apply per-format reasoning-text fixups after opener removal.
+
+    gpt-oss leaves a literal "thought" word right after the opener even
+    when the opener literal `<|channel>thought` is stripped (the
+    tokenization splits the channel name). Other formats are clean.
+    """
+    cleaned = reasoning.strip()
+    if fmt.name == "gpt-oss":
+        # `<|channel>thought` may render as `<|channel>` + `thought` across
+        # two tokens; stripping the literal opener leaves a leading
+        # "thought" word. Conservative lstrip — only consume that exact
+        # prefix, not any of those characters elsewhere.
+        if cleaned.startswith("thought"):
+            cleaned = cleaned[len("thought") :].lstrip()
+    return cleaned
+
+
+def _detect_thinking_format(prompt: str) -> Optional[ThinkingFormat]:
+    """Detect thinking-format from a formatted chat prompt.
+
+    Thin wrapper around `prompt_utils.detect_thinking_format` so the
+    server module's existing call sites have a stable name. Returns the
+    matched `ThinkingFormat` object (or None) — callers read tag tuples
+    off it instead of branching on a string identifier.
+    """
+    return detect_thinking_format(prompt)
 
 
 def _compute_thinking_budget(
     max_tokens: int,
     client_budget: Optional[int],
-    thinking_format: Optional[str],
+    thinking_format: Optional[ThinkingFormat],
 ) -> Optional[int]:
     """Compute effective server-side thinking budget.
 
@@ -3185,17 +3238,31 @@ async def chat_completions_endpoint(request: ChatRequest, raw_request: Request):
 
             # Strip thinking blocks from previous assistant messages to prevent
             # token bloat from accumulated thought content in multi-turn chats.
+            # Uses registry tags so the same opener/closer literals that the
+            # streaming state machine and `_split_thinking` recognize are the
+            # ones we strip here.
             if message.role == "assistant" and isinstance(msg["content"], str):
                 content = msg["content"]
-                # Gemma format: <|channel>thought...<channel|>
-                content = re.sub(
-                    r"<\|channel>thought.*?<channel\|>\n*",
-                    "",
-                    content,
-                    flags=re.DOTALL,
-                )
-                # Generic format: <think>...</think>
-                content = re.sub(r"<think>.*?</think>\n*", "", content, flags=re.DOTALL)
+                from .prompt_utils import THINKING_FORMATS
+
+                for fmt in THINKING_FORMATS:
+                    for op in fmt.openers:
+                        for cl in fmt.closers:
+                            pattern = re.escape(op) + r".*?" + re.escape(cl) + r"\n*"
+                            content = re.sub(
+                                pattern, "", content, flags=re.DOTALL
+                            )
+                # Also strip stray closer-only blocks (prefilled-opener case
+                # where the model emitted only the closer in its reply).
+                for fmt in THINKING_FORMATS:
+                    for cl in fmt.closers:
+                        # If there's a closer with no preceding opener, treat
+                        # everything from the start of `content` up to (and
+                        # including) the closer as reasoning to strip.
+                        if cl in content and not any(
+                            op in content for op in fmt.openers
+                        ):
+                            content = content.split(cl, 1)[1]
                 msg["content"] = content.strip()
 
             # Preserve tool-calling metadata.
@@ -3330,6 +3397,23 @@ async def chat_completions_endpoint(request: ChatRequest, raw_request: Request):
                 "  Generation starts inside thinking block; seeding "
                 "in_thinking=True"
             )
+
+        # Decide whether this request's effective rendering will
+        # mismatch what we cached during generation — see
+        # `_is_template_thinking_asymmetric` for the heuristic. When
+        # True, stream_generate's post-gen branch anchors the cache at
+        # end-of-user via rotating-layer snapshot+restore so the next
+        # request's stripped-thinking echo doesn't trigger a backward
+        # trim. When False, persist full state (forward extension).
+        if prompt_cache_state is not None:
+            prompt_cache_state.is_asymmetric_rendering = (
+                _is_template_thinking_asymmetric(formatted_prompt)
+            )
+            if prompt_cache_state.is_asymmetric_rendering:
+                logger.debug(
+                    "  Thinking format detected; post-gen will anchor cache "
+                    "at end-of-user via rotating snapshot+restore."
+                )
 
         if request.stream:
             # Streaming response using ResponseGenerator for continuous batching
@@ -3540,11 +3624,9 @@ async def chat_completions_endpoint(request: ChatRequest, raw_request: Request):
                                 break
 
                         # Parse tool calls from full output and emit final chunk
-                        emitted_tool_calls = None
                         if tool_module is not None:
                             tc = process_tool_calls(full_output, tool_module, tools)
                             if tc["calls"]:
-                                emitted_tool_calls = tc["calls"]
                                 choices = [
                                     ChatStreamChoice(
                                         finish_reason="tool_calls",
@@ -3566,22 +3648,17 @@ async def chat_completions_endpoint(request: ChatRequest, raw_request: Request):
                                 )
                                 yield f"data: {chunk_data.model_dump_json()}\n\n"
 
-                        # Record the assistant turn's hash on the session so
-                        # the next request — which echoes this assistant
-                        # message back as part of history — can match
-                        # through it via _find_session_by_hash_prefix.
-                        # Hash the post-thinking-strip content (= what the
-                        # client receives and will echo back) plus parsed
-                        # tool_calls. Reasoning is intentionally excluded;
-                        # see _HASHABLE_FIELDS rationale.
-                        if chat_id and request_turn_hashes:
-                            asst_reasoning, asst_content = _split_thinking(full_output)
-                            asst_hash = _hash_assistant_turn(
-                                request_turn_hashes[-1],
-                                asst_content if asst_content else None,
-                                emitted_tool_calls,
-                            )
-                            _append_session_assistant_hash(chat_id, asst_hash)
+                        # We deliberately do NOT pre-compute and append an
+                        # assistant-turn hash here. The chain extends on the
+                        # *inbound* path: the next request will echo this
+                        # assistant message back as part of its history, and
+                        # `_compute_turn_hashes` will hash the client's
+                        # canonical form. Pre-computing from server output
+                        # risks drift (thinking-strip vs. streamed-content,
+                        # whitespace) which would shorten the prefix match
+                        # for no real benefit — cache trimming is governed
+                        # by token-level divergence in PromptCacheState,
+                        # not by hash-chain length.
                     else:
                         # Fallback to stream_generate
                         token_iterator = stream_generate(
@@ -3790,15 +3867,8 @@ async def chat_completions_endpoint(request: ChatRequest, raw_request: Request):
 
                 content = sanitize_strict_json(content) if content else content
 
-                # Record the assistant turn's hash on the session — see the
-                # streaming path's matching block for the rationale.
-                if chat_id and request_turn_hashes:
-                    asst_hash = _hash_assistant_turn(
-                        request_turn_hashes[-1],
-                        content if content else None,
-                        parsed_tool_calls,
-                    )
-                    _append_session_assistant_hash(chat_id, asst_hash)
+                # No post-generation hash append — the chain extends on the
+                # inbound path. See the streaming path's matching block.
 
                 choices = [
                     ChatChoice(
