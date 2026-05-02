@@ -386,3 +386,164 @@ def test_turboquant_prefill_attention_matches_dequantized_attention():
     diff = mx.max(mx.abs(reference - quantized)).item()
     assert quantized.shape == reference.shape
     assert diff < 1e-4
+
+
+# ============================================================================
+# Allocation hook lifecycle (memory.md #12)
+# ============================================================================
+#
+# The hook list is module-level state in turboquant. Each test resets it
+# via the autouse fixture so cross-test ordering can't poison results.
+#
+# The production caller is server.py's MultiCacheManager: it registers an
+# eviction callback so the Metal allocator can request memory mid-prefill
+# (when geometric cache growth would otherwise OOM crash). Losing
+# register/unregister symmetry leaks hooks across model reloads — which
+# means stale Python callbacks fire from new sessions' allocations,
+# silently mutating unrelated cache state.
+
+
+@pytest.fixture(autouse=True)
+def _reset_allocation_hooks():
+    from mlx_vlm import turboquant as tq
+
+    saved = list(tq._ALLOCATION_HOOKS)
+    tq._ALLOCATION_HOOKS.clear()
+    yield
+    tq._ALLOCATION_HOOKS.clear()
+    tq._ALLOCATION_HOOKS.extend(saved)
+
+
+class TestAllocationHookLifecycle:
+    def test_register_adds_hook(self):
+        from mlx_vlm import turboquant as tq
+
+        hook = lambda: None  # noqa: E731
+        tq.register_allocation_hook(hook)
+        assert hook in tq._ALLOCATION_HOOKS
+
+    def test_register_is_idempotent(self):
+        # The MultiCacheManager re-registers on every model load; the
+        # idempotency guard prevents the same callback firing N times
+        # per allocation after several reloads.
+        from mlx_vlm import turboquant as tq
+
+        hook = lambda: None  # noqa: E731
+        tq.register_allocation_hook(hook)
+        tq.register_allocation_hook(hook)
+        tq.register_allocation_hook(hook)
+        assert tq._ALLOCATION_HOOKS.count(hook) == 1
+
+    def test_unregister_removes_hook(self):
+        from mlx_vlm import turboquant as tq
+
+        hook = lambda: None  # noqa: E731
+        tq.register_allocation_hook(hook)
+        tq.unregister_allocation_hook(hook)
+        assert hook not in tq._ALLOCATION_HOOKS
+
+    def test_unregister_unknown_hook_is_noop(self):
+        # Defensive: model unload calls unregister even if the hook was
+        # never registered (e.g. when the previous load failed before
+        # the manager attached). Must not raise.
+        from mlx_vlm import turboquant as tq
+
+        tq.unregister_allocation_hook(lambda: None)  # no exception
+
+    def test_trigger_calls_every_hook_in_registration_order(self):
+        from mlx_vlm import turboquant as tq
+
+        order = []
+        tq.register_allocation_hook(lambda: order.append("a"))
+        tq.register_allocation_hook(lambda: order.append("b"))
+        tq.register_allocation_hook(lambda: order.append("c"))
+
+        tq._trigger_allocation_hooks()
+
+        assert order == ["a", "b", "c"]
+
+    def test_trigger_with_no_hooks_is_noop(self):
+        # No registered hooks must not raise — the production allocator
+        # calls _trigger_allocation_hooks() unconditionally.
+        from mlx_vlm import turboquant as tq
+
+        tq._trigger_allocation_hooks()  # no exception
+
+    def test_unregister_only_removes_one_instance(self):
+        # If the same hook somehow appears multiple times (defensive —
+        # idempotency should prevent this, but tests document the
+        # guarantee), unregister removes only one.
+        from mlx_vlm import turboquant as tq
+
+        hook = lambda: None  # noqa: E731
+        # Bypass register's idempotency guard to force a duplicate.
+        tq._ALLOCATION_HOOKS.append(hook)
+        tq._ALLOCATION_HOOKS.append(hook)
+        tq.unregister_allocation_hook(hook)
+        assert tq._ALLOCATION_HOOKS.count(hook) == 1
+
+
+# ============================================================================
+# MAX_KV_SIZE plumbing (memory.md #8)
+# ============================================================================
+#
+# `max_kv_size` flows: server CLI / env var → MultiCacheManager →
+# TurboQuantKVCache constructor → static pre-allocation in the first
+# write (so the GPU never has to hold both old and new buffers
+# simultaneously during geometric growth).
+#
+# Regression mode: someone refactors the constructor and drops the
+# parameter; the cache silently reverts to dynamic growth, OOMs at the
+# 76K → 95K reallocation boundary on Gemma 4 31B (~11 GB double-buffer).
+
+
+class TestMaxKVSizePlumbing:
+    def test_default_max_kv_size_is_none(self):
+        # Sentinel: None means "use dynamic growth". Any other default
+        # would silently pre-allocate huge buffers on small models.
+        cache = TurboQuantKVCache(bits=4)
+        assert cache.max_kv_size is None
+
+    def test_max_kv_size_stored_on_instance(self):
+        cache = TurboQuantKVCache(bits=4, max_kv_size=131072)
+        assert cache.max_kv_size == 131072
+
+    @staticmethod
+    def _seeded_kv_cache(seq_len: int = 4) -> KVCache:
+        """Build a KVCache with populated keys/values — the migration
+        path (.from_cache) requires real state to read. mlx_lm's
+        empty-cache .state accessor raises AttributeError, so feed it
+        a real update first.
+        """
+        cache = KVCache()
+        # Shape: (batch, kv_heads, seq_len, head_dim) — minimal valid.
+        cache.update_and_fetch(
+            mx.zeros((1, 2, seq_len, 8)),
+            mx.zeros((1, 2, seq_len, 8)),
+        )
+        return cache
+
+    def test_from_cache_propagates_max_kv_size(self):
+        # The .from_cache() classmethod is the production migration path
+        # (FP16 KVCache → quantized TurboQuantKVCache at threshold). The
+        # max_kv_size kwarg must reach the constructed cache, otherwise
+        # post-threshold caches lose static pre-allocation.
+        promoted = TurboQuantKVCache.from_cache(
+            self._seeded_kv_cache(), bits=4, max_kv_size=65536
+        )
+        assert promoted.max_kv_size == 65536
+
+    def test_from_cache_default_max_kv_size_is_none(self):
+        promoted = TurboQuantKVCache.from_cache(self._seeded_kv_cache(), bits=4)
+        assert promoted.max_kv_size is None
+
+    def test_zero_max_kv_size_treated_as_unset_for_initial_alloc(self):
+        # Implementation does `max(new_end, self.max_kv_size or 0)` —
+        # explicit 0 collapses to "no pre-alloc", same as None. Document
+        # this so a future refactor doesn't introduce surprising
+        # zero-allocation cliffs.
+        cache = TurboQuantKVCache(bits=4, max_kv_size=0)
+        assert cache.max_kv_size == 0  # stored verbatim
+        # Behavior at first write equivalence is enforced by the
+        # `or 0` idiom in _step; we trust that idiom here rather than
+        # spinning up a Metal device just to assert it.

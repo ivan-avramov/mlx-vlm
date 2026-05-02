@@ -1,6 +1,16 @@
 """Tests for prompt_utils module, specifically multimodal content handling."""
 
-from mlx_vlm.prompt_utils import extract_text_from_content
+import pytest
+
+from mlx_vlm.prompt_utils import (
+    CACHE_ALIGNMENT_KWARGS,
+    MessageBuilder,
+    MessageFormat,
+    MessageFormatter,
+    extract_text_from_content,
+    get_cache_alignment_kwargs,
+    get_chat_template,
+)
 
 
 class TestExtractTextFromContent:
@@ -389,3 +399,225 @@ class TestExtractTextFromContentEdgeCases:
         ]
         result = extract_text_from_content(content)
         assert result == "Actual content"
+
+
+class TestCacheAlignmentKwargs:
+    """memory.md #27 — cache-friendly chat-template kwargs registry.
+
+    Invariant: every kwarg here is a true no-op on templates that don't
+    reference it (Jinja's `is defined` guard makes that safe). The
+    registry is consumed by the server when a per-chat PromptCacheState
+    is active to keep multi-turn renderings byte-aligned.
+    """
+
+    def test_registry_returns_a_copy(self):
+        # Mutating the result must not poison subsequent calls — server
+        # threads merge this into apply_chat_template kwargs, and one
+        # request mutating the dict would affect every other.
+        first = get_cache_alignment_kwargs()
+        first["intruder"] = True
+        second = get_cache_alignment_kwargs()
+        assert "intruder" not in second
+        assert "intruder" not in CACHE_ALIGNMENT_KWARGS
+
+    def test_registry_includes_preserve_thinking_for_unsloth_qwen(self):
+        # Specific entry guard — losing this regresses cache reuse on
+        # `unsloth/Qwen3.6-*` ports without producing any visible error
+        # (just ~10x slower multi-turn prefill on hybrid models).
+        kwargs = get_cache_alignment_kwargs()
+        assert kwargs.get("preserve_thinking") is True
+
+    def test_all_values_are_truthy_or_explicit_false(self):
+        # Boolean toggles only; any None value would make the no-op
+        # invariant unverifiable (`{% if x is defined %}` evaluates
+        # `None` as defined).
+        for key, value in get_cache_alignment_kwargs().items():
+            assert value is not None, f"{key} must not be None in registry"
+
+
+class TestMessageFormatterTextOnlyFallback:
+    """memory.md #20 — pure text models (Qwen 2.5, gemma3_text) load via
+    mlx_lm and aren't in MODEL_CONFIG. MessageFormatter must return a
+    plain text dict instead of raising.
+    """
+
+    def test_unknown_model_returns_plain_dict(self):
+        formatter = MessageFormatter("definitely-not-a-real-model")
+        msg = formatter.format_message(prompt="hello", role="user")
+        assert msg == {"role": "user", "content": "hello"}
+
+    def test_unknown_model_preserves_role(self):
+        formatter = MessageFormatter("ghost_model")
+        msg = formatter.format_message(prompt="sys text", role="system")
+        assert msg["role"] == "system"
+        assert msg["content"] == "sys text"
+
+    def test_unknown_model_format_type_is_none(self):
+        # Internal invariant: the fallback path is gated on
+        # `format_type is None` (the formatter_map .get returns None).
+        formatter = MessageFormatter("nonexistent_vlm")
+        assert formatter.format_type is None
+
+    def test_unknown_model_ignores_image_request(self):
+        # No image tokens to insert for text-only models — the
+        # num_images > 0 path must NOT crash.
+        formatter = MessageFormatter("unknown_model")
+        msg = formatter.format_message(prompt="hi", role="user", num_images=1)
+        assert msg == {"role": "user", "content": "hi"}
+
+
+class TestMessageFormatterImageSchema:
+    """memory.md #3 — Gemma's chat template (and several others) require
+    multimodal content as a list with `{type: image}` items, not OpenAI's
+    `{type: image_url}`. The vision schema rewrite happens inside
+    MessageFormatter._format_list_with_image, not in server.py.
+    """
+
+    def test_gemma_produces_type_image_dict(self):
+        # gemma4 uses LIST_WITH_IMAGE per MODEL_CONFIG; vision content
+        # must be `{type: image}` (NOT `{type: image_url}`).
+        formatter = MessageFormatter("gemma4")
+        msg = formatter.format_message(prompt="describe", role="user", num_images=1)
+        assert msg["role"] == "user"
+        types = [item.get("type") for item in msg["content"] if isinstance(item, dict)]
+        assert "image" in types
+        # Must be the bare `image` form, not `image_url`.
+        assert "image_url" not in types
+
+    def test_image_url_preferring_model_uses_image_url_schema(self):
+        # Some models (e.g. ERNIE) actually want `{type: image_url}`.
+        # The MessageFormatter switches on use_image_url; this guards
+        # against accidentally rewriting their schema as well.
+        msg = MessageBuilder.image_url_message()
+        assert msg == {"type": "image_url"}
+
+    def test_user_role_skip_image_token_omits_image(self):
+        # Multi-message conversations skip image tokens on prior user
+        # turns (only the latest user message gets the image).
+        formatter = MessageFormatter("gemma4")
+        msg = formatter.format_message(
+            prompt="prior turn", role="user", num_images=1, skip_image_token=True
+        )
+        types = [item.get("type") for item in msg["content"] if isinstance(item, dict)]
+        assert "image" not in types
+
+    def test_assistant_role_never_gets_image(self):
+        formatter = MessageFormatter("gemma4")
+        msg = formatter.format_message(prompt="response", role="assistant", num_images=1)
+        types = [item.get("type") for item in msg["content"] if isinstance(item, dict)]
+        assert "image" not in types
+
+
+class TestGetChatTemplateProcessorFallback:
+    """memory.md #5 — AutoProcessor sometimes loads without exposing
+    chat_template; get_chat_template must fall back to processor.tokenizer.
+    """
+
+    class _StubTokenizer:
+        """Tokenizer with a real chat_template; records what it received."""
+
+        def __init__(self, chat_template="dummy template"):
+            self.chat_template = chat_template
+            self.last_call = None
+
+        def apply_chat_template(self, messages, **kwargs):
+            self.last_call = {"messages": messages, "kwargs": kwargs}
+            # Return something deterministic so callers can assert the
+            # fallback ran.
+            return f"RENDERED({len(messages)} msgs)"
+
+    def test_processor_with_template_used_directly(self):
+        # Happy path: processor itself has chat_template + apply_chat_template.
+        proc = self._StubTokenizer(chat_template="proc_template")
+        result = get_chat_template(
+            proc, [{"role": "user", "content": "hi"}], add_generation_prompt=True
+        )
+        assert result == "RENDERED(1 msgs)"
+
+    def test_falls_back_to_tokenizer_when_processor_lacks_template(self):
+        # Processor exposes apply_chat_template but no chat_template;
+        # the helper should walk through to processor.tokenizer.
+        class _ProcessorWithoutTemplate:
+            chat_template = None
+
+            def __init__(self, tk):
+                self.tokenizer = tk
+
+            def apply_chat_template(self, messages, **kwargs):
+                raise AssertionError("processor path should have been skipped")
+
+        tk = self._StubTokenizer(chat_template="tokenizer_template")
+        proc = _ProcessorWithoutTemplate(tk)
+        result = get_chat_template(
+            proc, [{"role": "user", "content": "hi"}], add_generation_prompt=True
+        )
+        assert result == "RENDERED(1 msgs)"
+        # Confirms it actually went through the tokenizer.
+        assert tk.last_call is not None
+
+    def test_falls_back_to_plain_prompt_when_no_template_anywhere(self):
+        # Both processor and tokenizer lack chat_template — the helper
+        # builds a Role: content style flat prompt rather than crashing.
+        class _BlankProcessor:
+            chat_template = None
+
+            class _BlankTokenizer:
+                chat_template = None
+
+                def apply_chat_template(self, *args, **kwargs):
+                    raise AssertionError("plain path should bypass tokenizer")
+
+            tokenizer = _BlankTokenizer()
+
+            def apply_chat_template(self, *args, **kwargs):
+                raise AssertionError("plain path should bypass processor")
+
+        result = get_chat_template(
+            _BlankProcessor(),
+            [
+                {"role": "system", "content": "you are helpful"},
+                {"role": "user", "content": "hi"},
+            ],
+            add_generation_prompt=True,
+        )
+        assert isinstance(result, str)
+        assert "hi" in result
+        # Multi-message conversations render with Role: content prefixes
+        # and terminate with `Assistant:` when add_generation_prompt is
+        # set. Single-user-message conversations short-circuit to bare
+        # content (covered by the next test).
+        assert result.rstrip().endswith("Assistant:")
+        assert "you are helpful" in result
+
+    def test_plain_prompt_single_user_message_returns_bare_content(self):
+        # Special-case in _messages_to_plain_prompt: a single user
+        # message renders as just its content, no Role: prefix or
+        # trailing Assistant: marker. Models that lack a chat template
+        # entirely behave most predictably this way.
+        class _BlankProcessor:
+            chat_template = None
+
+            class _BlankTokenizer:
+                chat_template = None
+
+            tokenizer = _BlankTokenizer()
+
+        result = get_chat_template(
+            _BlankProcessor(),
+            [{"role": "user", "content": "hi"}],
+            add_generation_prompt=True,
+        )
+        assert result == "hi"
+
+    def test_chat_template_override_kwarg_respected(self):
+        # `chat_template` kwarg lets callers override even when the
+        # processor exposes its own template.
+        proc = self._StubTokenizer(chat_template="builtin")
+        get_chat_template(
+            proc,
+            [{"role": "user", "content": "hi"}],
+            add_generation_prompt=True,
+            chat_template="custom override",
+        )
+        # The override is forwarded to apply_chat_template via **kwargs.
+        assert proc.last_call["kwargs"].get("chat_template") == "custom override"

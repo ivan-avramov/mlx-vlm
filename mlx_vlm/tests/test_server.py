@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -391,14 +392,168 @@ class TestSuppressToolCallContent:
 
 
 class TestProcessToolCalls:
-    """Tests for tool call parsing from model output."""
+    """Tests for tool call parsing from model output (memory.md #4).
+
+    The wrapper layers the OpenAI-spec adapters (id, type=function,
+    json.dumps(arguments)) on top of the model's native tool-call parser.
+    Regressions here surface as Pydantic validation errors in OpenWebUI
+    when it sees a tool_calls list missing the required fields.
+    """
+
+    @staticmethod
+    def _module(parse_returns, tool_call_start="<tc>", tool_call_end="</tc>"):
+        """Build a fake tool_module whose parse_tool_call returns canned values.
+
+        ``parse_returns`` is either a single dict (return-as-is for every call)
+        or a list of (dict|Exception) — replayed in order so multi-call
+        scenarios can mix valid + invalid parses.
+        """
+        if not isinstance(parse_returns, list):
+            parse_returns = [parse_returns]
+        cursor = {"i": 0}
+
+        def parse_tool_call(text, tools):
+            i = cursor["i"]
+            cursor["i"] += 1
+            value = parse_returns[i] if i < len(parse_returns) else parse_returns[-1]
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        return SimpleNamespace(
+            tool_call_start=tool_call_start,
+            tool_call_end=tool_call_end,
+            parse_tool_call=parse_tool_call,
+        )
 
     def test_no_tool_calls(self):
-        # Minimal tool module mock
-        module = SimpleNamespace(tool_call_start="<tc>", tool_call_end="</tc>")
+        module = self._module({})
         result = server.process_tool_calls("Just text.", module, [])
         assert result["calls"] == []
         assert result["remaining_text"] == "Just text."
+
+    def test_single_call_emits_openai_shape(self):
+        module = self._module({"name": "get_weather", "arguments": {"city": "SF"}})
+        out = server.process_tool_calls(
+            'Reply: <tc>{"name": "get_weather", "arguments": {"city": "SF"}}</tc>',
+            module,
+            [],
+        )
+
+        assert len(out["calls"]) == 1
+        call = out["calls"][0]
+        # OpenAI-mandated fields — OpenWebUI's Pydantic validation
+        # requires these exact keys.
+        assert call["type"] == "function"
+        assert call["index"] == 0
+        assert "id" in call and isinstance(call["id"], str) and call["id"]
+        assert call["function"]["name"] == "get_weather"
+        # Arguments must be a JSON STRING (not dict) per OpenAI spec.
+        assert call["function"]["arguments"] == '{"city": "SF"}'
+
+    def test_dict_arguments_serialized_to_json_string(self):
+        # Even nested dicts and unicode must round-trip cleanly.
+        module = self._module({"name": "fn", "arguments": {"q": "héllo", "n": 3}})
+        out = server.process_tool_calls(
+            "<tc>...</tc>", module, []
+        )
+        args = out["calls"][0]["function"]["arguments"]
+        assert isinstance(args, str)
+        # ensure_ascii=False keeps non-ASCII verbatim — OpenWebUI displays
+        # this in a chat bubble; escaped sequences would look wrong to
+        # the user.
+        parsed = json.loads(args)
+        assert parsed == {"q": "héllo", "n": 3}
+
+    def test_string_arguments_passed_through_unchanged(self):
+        # Some parsers return arguments already-JSON-stringified — the
+        # wrapper must NOT re-encode (which would double-escape quotes).
+        module = self._module({"name": "fn", "arguments": '{"x": 1}'})
+        out = server.process_tool_calls("<tc>...</tc>", module, [])
+        assert out["calls"][0]["function"]["arguments"] == '{"x": 1}'
+
+    def test_multiple_calls_get_distinct_indices(self):
+        module = self._module(
+            [
+                {"name": "first", "arguments": {}},
+                {"name": "second", "arguments": {}},
+                {"name": "third", "arguments": {}},
+            ]
+        )
+        out = server.process_tool_calls(
+            "<tc>a</tc> mid <tc>b</tc> mid <tc>c</tc>",
+            module,
+            [],
+        )
+        assert [c["function"]["name"] for c in out["calls"]] == [
+            "first",
+            "second",
+            "third",
+        ]
+        assert [c["index"] for c in out["calls"]] == [0, 1, 2]
+        # Each call gets a distinct id (UUID).
+        ids = {c["id"] for c in out["calls"]}
+        assert len(ids) == 3
+
+    def test_invalid_call_is_skipped_valid_calls_survive(self):
+        # Rescue path: a malformed call must not poison neighboring
+        # valid calls. memory.md #15 — the streaming pipeline expects
+        # at most 'valid_count' entries back.
+        module = self._module(
+            [
+                {"name": "ok", "arguments": {}},
+                ValueError("malformed"),
+                {"name": "also_ok", "arguments": {}},
+            ]
+        )
+        out = server.process_tool_calls(
+            "<tc>good</tc> <tc>bad</tc> <tc>good2</tc>",
+            module,
+            [],
+        )
+        names = [c["function"]["name"] for c in out["calls"]]
+        assert "ok" in names
+        assert "also_ok" in names
+        assert len(out["calls"]) == 2
+
+    def test_tool_call_markup_stripped_from_remaining_text(self):
+        module = self._module({"name": "fn", "arguments": {}})
+        out = server.process_tool_calls(
+            "Before <tc>{...}</tc> after.", module, []
+        )
+        # The matched markup is replaced with a single space and
+        # surrounding whitespace stripped.
+        assert "<tc>" not in out["remaining_text"]
+        assert "</tc>" not in out["remaining_text"]
+        assert "Before" in out["remaining_text"]
+        assert "after" in out["remaining_text"]
+
+    def test_empty_tool_call_end_uses_newline_terminator(self):
+        # Some parsers (Ollama-flavored) signal a tool call by start
+        # marker only, terminating at newline. The pattern must switch
+        # to newline-anchored when tool_call_end == "".
+        module = self._module(
+            {"name": "fn", "arguments": {}},
+            tool_call_start="<<call>>",
+            tool_call_end="",
+        )
+        out = server.process_tool_calls(
+            "lead <<call>>get_weather city=SF\nMore text.",
+            module,
+            [],
+        )
+        assert len(out["calls"]) == 1
+        assert "<<call>>" not in out["remaining_text"]
+        # Trailing prose preserved on the next line.
+        assert "More text" in out["remaining_text"]
+
+    def test_name_whitespace_stripped(self):
+        # Defensive: parsers occasionally leak whitespace into the name
+        # field. The wrapper strips it — OpenAI clients reject names
+        # with leading/trailing whitespace.
+        module = self._module({"name": "  spaced_fn  ", "arguments": {}})
+        out = server.process_tool_calls("<tc>x</tc>", module, [])
+        assert out["calls"][0]["function"]["name"] == "spaced_fn"
 
 
 class TestCountThinkingTagTokens:
