@@ -1143,6 +1143,72 @@ def generate_step(
         n += 1
 
 
+def _rotating_rewind_safe(entries, target_len) -> bool:
+    """Return True if every RotatingKVCache in ``entries`` (recursing
+    into nested ``.caches`` and list/tuple containers) can safely rewind
+    to ``target_len``.
+
+    Ring buffers lose historical context once they wrap (offset > max_size).
+    Rewinding into the overwritten region creates a "Memory Hole" and ghost
+    tokens that cause Softmax anomalies (hallucination loops). However,
+    if the buffer hasn't wrapped, all positions are still valid and a
+    rewind is safe — just trim the offset.
+    """
+    for c in entries:
+        name = type(c).__name__
+        if name in ("RotatingKVCache", "BatchRotatingKVCache"):
+            offset = int(c.offset.item() if hasattr(c.offset, "item") else c.offset)
+            max_size = getattr(c, "max_size", None)
+            if max_size is not None and offset > max_size:
+                # Buffer has wrapped — data before (offset - max_size) is gone
+                if target_len < (offset - max_size):
+                    return False
+        elif hasattr(c, "caches"):
+            if not _rotating_rewind_safe(c.caches, target_len):
+                return False
+        elif isinstance(c, (list, tuple)):
+            if not _rotating_rewind_safe(c, target_len):
+                return False
+    return True
+
+
+def _has_non_trimmable(entries) -> bool:
+    """Return True if any cache in ``entries`` (recursing into nested
+    ``.caches`` and list/tuple containers) reports ``is_trimmable() ==
+    False``.
+
+    Hybrid models (Qwen 3.5/3.6 GatedDeltaNet via ``ArraysCache``,
+    Mamba-style hybrids) advance recurrent state monotonically with no
+    rewind primitive. ``_trim_cache`` only handles caches with an
+    ``offset`` attribute, so non-trimmable layers would silently retain
+    state past the rewind point — KV layers shrink correctly, recurrent
+    state does not, generation drifts. Callers use this signal to gate
+    snapshot-restore-or-full-re-prefill.
+    """
+    for c in entries:
+        if hasattr(c, "is_trimmable") and not c.is_trimmable():
+            return True
+        if hasattr(c, "caches"):
+            if _has_non_trimmable(c.caches):
+                return True
+        elif isinstance(c, (list, tuple)):
+            if _has_non_trimmable(c):
+                return True
+    return False
+
+
+def _restore_deltanet_state(entries, snapshot_states) -> None:
+    """Restore non-trimmable cache state from a snapshot list. The
+    snapshot list aligns positionally with ``entries`` — None entries
+    correspond to trimmable (KV) layers and are skipped here.
+    """
+    from mlx_lm.models.cache import ArraysCache
+
+    for c, s in zip(entries, snapshot_states):
+        if s is not None and isinstance(c, ArraysCache):
+            c.state = s
+
+
 def stream_generate(
     model: nn.Module,
     processor: PreTrainedTokenizer,
@@ -1271,33 +1337,6 @@ def stream_generate(
     if prompt_cache_state is not None and prompt_cache_state.cache is not None:
         prefix_len = prompt_cache_state.find_prefix_length(full_input_ids_list)
 
-        # SWA / RotatingKVCache Corruption Guard
-        # Ring buffers lose historical context once they wrap (offset > max_size).
-        # Rewinding into the overwritten region creates a "Memory Hole" and ghost
-        # tokens that cause Softmax anomalies (hallucination loops).  However,
-        # if the buffer hasn't wrapped, all positions are still valid and a
-        # rewind is safe — just trim the offset.
-        def _rotating_rewind_safe(entries, target_len):
-            """Return True if every RotatingKVCache can safely rewind to target_len."""
-            for c in entries:
-                name = type(c).__name__
-                if name in ("RotatingKVCache", "BatchRotatingKVCache"):
-                    offset = int(
-                        c.offset.item() if hasattr(c.offset, "item") else c.offset
-                    )
-                    max_size = getattr(c, "max_size", None)
-                    if max_size is not None and offset > max_size:
-                        # Buffer has wrapped — data before (offset - max_size) is gone
-                        if target_len < (offset - max_size):
-                            return False
-                elif hasattr(c, "caches"):
-                    if not _rotating_rewind_safe(c.caches, target_len):
-                        return False
-                elif isinstance(c, (list, tuple)):
-                    if not _rotating_rewind_safe(c, target_len):
-                        return False
-            return True
-
         if prefix_len > 0 and prefix_len < len(prompt_cache_state.token_ids):
             if not _rotating_rewind_safe(prompt_cache_state.cache, prefix_len):
                 logger.debug(
@@ -1306,41 +1345,6 @@ def stream_generate(
                     prefix_len,
                 )
                 prefix_len = 0
-
-        # Hybrid-Cache Rewind Guard
-        # Models with non-trimmable layers (e.g. Qwen 3.5 / 3.6 GatedDeltaNet
-        # uses ArraysCache for recurrent state, which advances monotonically
-        # with no rewind primitive). _trim_cache below only handles caches
-        # with an offset attribute, so non-trimmable caches would silently
-        # retain state past the rewind point — KV layers shrink correctly,
-        # DeltaNet state does not, generation drifts. The PromptCacheState's
-        # snapshot ring captures recurrent state at turn boundaries; we
-        # restore the nearest snapshot and treat its offset as the new
-        # prefix point so the model forward replays [snap.offset, full_len)
-        # — both KV and DeltaNet end up coherent. If no usable snapshot
-        # exists (or the ring is disabled), force full re-prefill.
-        def _has_non_trimmable(entries):
-            for c in entries:
-                if hasattr(c, "is_trimmable") and not c.is_trimmable():
-                    return True
-                if hasattr(c, "caches"):
-                    if _has_non_trimmable(c.caches):
-                        return True
-                elif isinstance(c, (list, tuple)):
-                    if _has_non_trimmable(c):
-                        return True
-            return False
-
-        def _restore_deltanet_state(entries, snapshot_states):
-            """Restore non-trimmable cache state from a snapshot list. The
-            snapshot list aligns positionally with `entries` — None entries
-            correspond to trimmable (KV) layers and are skipped here.
-            """
-            from mlx_lm.models.cache import ArraysCache
-
-            for c, s in zip(entries, snapshot_states):
-                if s is not None and isinstance(c, ArraysCache):
-                    c.state = s
 
         if prefix_len > 0 and prefix_len < len(prompt_cache_state.token_ids):
             if _has_non_trimmable(prompt_cache_state.cache):
