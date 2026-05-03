@@ -63,6 +63,123 @@ def get_cache_alignment_kwargs() -> Dict[str, Any]:
     return dict(CACHE_ALIGNMENT_KWARGS)
 
 
+# ---------------------------------------------------------------------------
+# Thinking-format registry.
+#
+# Different model families wrap their reasoning blocks in different tag
+# pairs. The streaming SSE state machine (`server.py:chat_completions_endpoint`)
+# uses these tags to split outgoing tokens between `delta.reasoning`
+# (thinking content) and `delta.content` (visible output). The same tags
+# also drive `_compute_thinking_budget`, `_count_thinking_tag_tokens`,
+# `_split_thinking`, and `_has_prefilled_opener`.
+#
+# Centralizing the tags here avoids the drift bug we hit before (multiple
+# call sites hardcoding their own subsets — e.g. `_detect_thinking_format`
+# recognized Gemma's `<|think|>` opener but `_split_thinking` and the
+# streaming state machine looked only for `<think>`/`</think>` and
+# `<|channel>thought`/`<channel|>`, so Gemma's reasoning block leaked
+# into `delta.content` and the leading content token was eaten at the
+# `</think>` boundary).
+#
+# Adding a new format:
+#   1. Inspect the model's chat template + a sample completion to identify
+#      the opener and closer literals.
+#   2. List any prefixes the streaming state machine should buffer
+#      mid-token to avoid leaking partial-tag bytes into delta.content
+#      (typically the `<` or `<|` prefix of each tag).
+#   3. Estimate `tag_token_count` — the per-turn token cost of the
+#      opener+closer pair, used to debit `completion_tokens`. For most
+#      formats this is 2 (one token each); gpt-oss splits the channel
+#      marker, hence its higher count.
+#   4. Add an entry to THINKING_FORMATS, ordered most-specific first.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ThinkingFormat:
+    """Tag literals for one model family's reasoning-block wrapper.
+
+    All consumers (detection, streaming state machine, splitter, budget
+    enforcer, prefilled-opener guard) read the same tag tuples here so
+    they can't drift out of sync.
+    """
+
+    name: str
+    openers: Tuple[str, ...]
+    closers: Tuple[str, ...]
+    # Substrings to suppress mid-token in the streaming state machine.
+    # Without this, a single token like `</think>` (or its byte-prefix
+    # split across two tokens) leaks into delta.content while the state
+    # machine is still deciding whether it's a tag. Each entry should
+    # be the longest unambiguous prefix of an opener or closer.
+    partial_buffers: Tuple[str, ...]
+    # Estimated token count consumed by one opener+closer pair on this
+    # family's tokenizer. Used to subtract from `completion_tokens` so
+    # the count reflects user-visible content only.
+    tag_token_count: int
+
+
+THINKING_FORMATS: Tuple[ThinkingFormat, ...] = (
+    # Gemma 4: the chat template injects `<|think|>` at the system
+    # block when enable_thinking=True (a global "thinking on" marker,
+    # not a per-turn delimiter). The model's actual per-turn thinking
+    # content is bracketed by `<|channel>thought ... <channel|>` —
+    # same syntax as gpt-oss. Empirically the model also emits a bare
+    # `</think>` as a closer in some samples, so both closer literals
+    # are listed. The streaming state machine matches ANY listed opener
+    # to enter thinking and ANY listed closer to exit.
+    ThinkingFormat(
+        name="gemma",
+        openers=("<|think|>", "<|channel>thought"),
+        closers=("</think>", "<channel|>"),
+        partial_buffers=("<|think", "<|channel", "</think", "<channel"),
+        tag_token_count=2,
+    ),
+    # Qwen 3.x family + most generic `<think>...</think>` thinkers.
+    # Distinct opener from Gemma; the registry's first-match-wins
+    # ordering puts Gemma above Qwen so prompts containing both
+    # literals resolve to the more specific one.
+    ThinkingFormat(
+        name="qwen",
+        openers=("<think>",),
+        closers=("</think>",),
+        partial_buffers=("<think", "</think"),
+        tag_token_count=2,
+    ),
+    # gpt-oss / OpenAI-style channeled thought. Distinct from Gemma
+    # in detection only (it doesn't use the `<|think|>` global marker).
+    # Tag literals overlap with Gemma's per-turn syntax — both are
+    # listed so the streaming state machine works either way once the
+    # family is identified.
+    ThinkingFormat(
+        name="gpt-oss",
+        openers=("<|channel>thought",),
+        closers=("<channel|>",),
+        partial_buffers=("<|channel>", "<channel"),
+        tag_token_count=4,
+    ),
+)
+
+
+def detect_thinking_format(text: str) -> Optional[ThinkingFormat]:
+    """Match a chat-template prompt or model output against the registry.
+
+    Returns the first format whose opener literal appears in `text`, or
+    None if no known thinking format is detected. First-match-wins
+    ordering is determined by the THINKING_FORMATS tuple — most-specific
+    formats appear first.
+
+    Used both at request time (against the rendered prompt) and at
+    output time (against accumulated generation, e.g. by `_split_thinking`
+    when the format wasn't already known).
+    """
+    for fmt in THINKING_FORMATS:
+        for opener in fmt.openers:
+            if opener in text:
+                return fmt
+    return None
+
+
 class MessageFormat(Enum):
     """Enum for different message format types."""
 

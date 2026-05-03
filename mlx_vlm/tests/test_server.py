@@ -560,9 +560,15 @@ class TestCountThinkingTagTokens:
     """Tests for thinking tag token counting."""
 
     def test_channel_tags(self):
+        # `<|channel>thought ... <channel|>` content resolves to
+        # gemma (its openers tuple includes `<|channel>thought`),
+        # whose tag_token_count is 2. A pure-gpt-oss-style output
+        # would historically count as 4; the merge into gemma costs
+        # ~2 tokens of accounting precision on completion_tokens —
+        # cosmetic only.
         assert (
             server._count_thinking_tag_tokens("<|channel>thought\ntext<channel|>answer")
-            == 4
+            == 2
         )
 
     def test_think_tags(self):
@@ -689,6 +695,443 @@ class TestHasPrefilledOpener:
             assert "tools" not in dict(k[1])
 
 
+class TestIsPromptInsideThinking:
+    """Regression for the Gemma 4 leak where the streaming state machine
+    failed to seed in_thinking=True because `_has_prefilled_opener`
+    only checked the prompt tail, missing Gemma's global `<|think|>`
+    marker at the system block (memory.md #29).
+
+    `_is_prompt_inside_thinking` does a structural scan of the whole
+    rendered prompt and returns True iff there's an opener with no
+    closer following it — handling both tail-prefilled (Qwen 3.6
+    unsloth) and globally-opened (Gemma 4) cases.
+    """
+
+    def test_gemma_global_think_marker_at_start(self):
+        # The exact pattern in user logs: <|think|> at the top of the
+        # system block, no closer anywhere in the prompt → model is
+        # in-thinking from gen-start.
+        prompt = (
+            "<|think|>\n"
+            "system content\n"
+            "<|tool>declaration:foo<tool|>\n"
+            "<turn|>\n"
+            "<|turn>user\nhi<turn|>\n"
+            "<|turn>model\n"
+        )
+        assert server._is_prompt_inside_thinking(prompt) is True
+
+    def test_qwen_tail_prefilled_opener(self):
+        # The unsloth Qwen 3.6 case the original `_has_prefilled_opener`
+        # was designed for. Same-direction signal here.
+        prompt = (
+            "<|im_start|>user\nhi<|im_end|>\n"
+            "<|im_start|>assistant\n<think>\n"
+        )
+        assert server._is_prompt_inside_thinking(prompt) is True
+
+    def test_closed_thinking_block_returns_false(self):
+        # Gemma 4 with enable_thinking=False renders an empty block:
+        # `<|channel>thought\n<channel|>`. Opener is followed by closer
+        # → not in thinking.
+        prompt = (
+            "<|turn>user\nhi<turn|>\n<|turn>model\n"
+            "<|channel>thought\n<channel|>"
+        )
+        assert server._is_prompt_inside_thinking(prompt) is False
+
+    def test_no_thinking_format_in_prompt(self):
+        prompt = "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
+        assert server._is_prompt_inside_thinking(prompt) is False
+
+    def test_opener_then_closer_then_opener_again(self):
+        # Pathological case: a previously-closed thinking block, then a
+        # fresh opener at the tail. Latest opener has no following
+        # closer → in thinking.
+        prompt = (
+            "earlier <|channel>thought\nfoo<channel|> done"
+            "\n<|turn>model\n<|think|>"
+        )
+        assert server._is_prompt_inside_thinking(prompt) is True
+
+
+class TestPartialTagStartPos:
+    """Tests for the ends-with-prefix detector that replaces the buggy
+    `p in accumulated` substring match. The substring check could only
+    fire after `accumulated` had grown to the partial's full length;
+    by then the tag's leading bytes had already streamed through as
+    `delta.content` piecewise, leaking literal `<|c`/`<|ch`/`<|chan`
+    fragments. The ends-with-prefix check fires from the very first
+    matching byte.
+    """
+
+    def test_returns_none_when_no_partial_at_end(self):
+        partials = ("<|channel", "<|think")
+        assert server._partial_tag_start_pos("plain text", partials) is None
+
+    def test_matches_single_char_prefix(self):
+        # The exact failure mode: a single `<` arrives as one token.
+        # The substring check would not fire (`"<|channel"` is 9 chars,
+        # accumulated is 1). Ends-with-prefix sees `<` matches the
+        # 1-char prefix of every `<…` partial.
+        partials = ("<|channel", "<|think")
+        assert server._partial_tag_start_pos("hello <", partials) == 6
+
+    def test_matches_growing_prefix_across_calls(self):
+        # Drive the accumulated buffer character by character. Every
+        # state along the way should still be detected as partial.
+        partials = ("<|channel", "<|think")
+        for accum in ("<", "<|", "<|c", "<|ch", "<|cha", "<|chan", "<|chann", "<|channe", "<|channel"):
+            pos = server._partial_tag_start_pos(accum, partials)
+            assert pos == 0, f"failed at accum={accum!r} got pos={pos}"
+
+    def test_returns_earliest_match_when_multiple_overlapping(self):
+        # Keep the leftmost partial-start position when two literals
+        # have overlapping prefixes (`</think` and `<channel` both
+        # contain `<`).
+        partials = ("</think", "<channel")
+        assert server._partial_tag_start_pos("text <", partials) == 5
+
+    def test_no_match_for_string_in_middle_of_accumulated(self):
+        # A complete tag in the middle of accumulated isn't a partial
+        # at the end. Caller's tag-find logic handles complete tags
+        # via the find()-based branch; partial detection is only for
+        # the trailing region.
+        partials = ("<|channel",)
+        assert server._partial_tag_start_pos("<|channel> stuff", partials) is None
+
+    def test_empty_accumulated(self):
+        partials = ("<|channel",)
+        assert server._partial_tag_start_pos("", partials) is None
+
+    def test_empty_partials_tuple(self):
+        # No format → no partials to track → no match.
+        assert server._partial_tag_start_pos("anything", ()) is None
+
+
+class TestStepThinkingState:
+    """Pure-function tests for the streaming-state-machine helper that
+    replaced the inline branch chain in chat_completions_endpoint.
+
+    Pins the three failure modes from production logs:
+      1. Token-spanning tags eating content (`<channel|>2` dropping
+         the leading `2 + ` of "2 + 2 = 4").
+      2. Tag-prefix bytes leaking as content because the partial check
+         used substring instead of ends-with-prefix.
+      3. Multiple state transitions in a single token (closer +
+         visible + opener + reasoning all fused) silently dropping the
+         second transition.
+    """
+
+    @pytest.fixture
+    def gemma_fmt(self):
+        from mlx_vlm.prompt_utils import THINKING_FORMATS
+
+        return next(f for f in THINKING_FORMATS if f.name == "gemma")
+
+    def _drive(self, tokens, fmt, in_thinking_start=False):
+        """Run a sequence of tokens through the helper, accumulating
+        the emitted reasoning + content streams. Returns
+        ``(end_in_thinking, end_accumulated, full_reasoning, full_content)``.
+        """
+        in_thinking = in_thinking_start
+        accumulated = ""
+        reasoning_parts = []
+        content_parts = []
+        for t in tokens:
+            in_thinking, accumulated, dr, dc = server._step_thinking_state(
+                t, in_thinking, accumulated, fmt
+            )
+            if dr is not None:
+                reasoning_parts.append(dr)
+            if dc is not None:
+                content_parts.append(dc)
+        return (
+            in_thinking,
+            accumulated,
+            "".join(reasoning_parts),
+            "".join(content_parts),
+        )
+
+    # --- Headline failure modes from the production logs -----------------
+
+    def test_token_spanning_closer_emits_pre_and_post(self, gemma_fmt):
+        # Gemma 4 production bug: "2 + 2 = 4" rendered as "2 = 4"
+        # because the closer + leading visible char came in one token.
+        # Pre-fix: branch 2 fired, transitioned, dropped the entire
+        # token. Post-fix: split at closer, emit "thinking content"
+        # as reasoning and "2" as content for the same iteration.
+        in_thinking, accumulated, dr, dc = server._step_thinking_state(
+            "thinking content<channel|>2",
+            True,
+            "",
+            gemma_fmt,
+        )
+        assert in_thinking is False
+        assert accumulated == ""
+        assert dr == "thinking content"
+        assert dc == "2"
+
+    def test_partial_opener_buffered_then_completed(self, gemma_fmt):
+        # Gemma 4 production bug: `<|channel>thought` literal showed
+        # up in delta.content. Cause was the substring partial check
+        # — `<|channel` (9 chars) couldn't match accumulated until
+        # accumulated had 9+ chars, so individual tag-prefix tokens
+        # streamed straight to delta.content.
+        # Post-fix: ends-with-prefix matches from the very first byte.
+        in_thinking, accumulated, reasoning, content = self._drive(
+            ["hello ", "<", "|", "channel>thought", "\nreasoning", "<channel|>", "visible"],
+            gemma_fmt,
+            in_thinking_start=False,
+        )
+        assert in_thinking is False
+        assert accumulated == ""
+        assert content == "hello visible"
+        assert reasoning == "\nreasoning"
+        # Crucial invariant: no fragment of the opener literal leaked
+        # into content.
+        assert "<|" not in content
+        assert "channel" not in content
+
+    def test_multi_transition_token(self, gemma_fmt):
+        # closer + visible + opener + reasoning all fused into one
+        # token. Pre-fix: only the first transition fired; the second
+        # and third were dropped. Post-fix: helper loops over all
+        # transitions in the accumulated buffer.
+        in_thinking, accumulated, dr, dc = server._step_thinking_state(
+            "r1<channel|>between<|channel>thoughtr2",
+            True,
+            "",
+            gemma_fmt,
+        )
+        assert in_thinking is True
+        assert accumulated == ""
+        assert dr == "r1" + "r2"
+        assert dc == "between"
+
+    # --- Other invariants ------------------------------------------------
+
+    def test_no_format_passthrough(self):
+        # Non-thinking model: no format detected. Token text streams
+        # through as content unchanged; in_thinking stays False;
+        # accumulated unchanged.
+        in_thinking, accumulated, dr, dc = server._step_thinking_state(
+            "plain text", False, "", None
+        )
+        assert in_thinking is False
+        assert accumulated == ""
+        assert dr is None
+        assert dc == "plain text"
+
+    def test_seeded_in_thinking_routes_first_tokens_to_reasoning(self, gemma_fmt):
+        # Gemma 4 + enable_thinking=True: streaming starts with
+        # in_thinking=True (seeded by `_is_prompt_inside_thinking`).
+        # First tokens are reasoning until a closer arrives.
+        in_thinking, accumulated, reasoning, content = self._drive(
+            ["thinking ", "content ", "more"],
+            gemma_fmt,
+            in_thinking_start=True,
+        )
+        assert in_thinking is True
+        # No closer arrived → still buffering nothing, all emitted as
+        # reasoning streamed.
+        assert reasoning == "thinking content more"
+        assert content == ""
+
+    def test_round_trip_multiple_thinking_blocks(self, gemma_fmt):
+        # Real Gemma 4 pattern: thinks, closes, emits content, opens
+        # again, thinks again, closes, emits content. State machine
+        # must transition cleanly through every boundary.
+        in_thinking, accumulated, reasoning, content = self._drive(
+            [
+                "thinking-1",
+                "<channel|>",
+                "visible-1 ",
+                "<|channel>thought\n",
+                "thinking-2",
+                "<channel|>",
+                "visible-2",
+            ],
+            gemma_fmt,
+            in_thinking_start=True,
+        )
+        assert in_thinking is False
+        assert accumulated == ""
+        assert reasoning == "thinking-1" + "\nthinking-2"
+        assert content == "visible-1 visible-2"
+
+    def test_partial_at_end_is_carried_forward(self, gemma_fmt):
+        # A partial tag at the end of one token's accumulated should
+        # be preserved verbatim across the call boundary so the next
+        # token can complete (or invalidate) it.
+        in_thinking, accumulated, dr, dc = server._step_thinking_state(
+            "before <", False, "", gemma_fmt
+        )
+        assert in_thinking is False
+        assert accumulated == "<"  # buffered
+        assert dr is None
+        assert dc == "before "
+
+    def test_partial_buffer_invalidated_by_non_tag_continuation(self, gemma_fmt):
+        # Partial `<` followed by a non-matching char like `a` should
+        # be released back into content (it wasn't a tag after all).
+        # The helper handles this by re-checking on each call: at next
+        # call, accumulated="<a"; no opener matches; no partial at end
+        # (`<a` doesn't end with a prefix of any partial); flush all
+        # as content.
+        # First token: buffer the `<`.
+        s = server._step_thinking_state("<", False, "", gemma_fmt)
+        assert s == (False, "<", None, None)
+        # Second token: completion that's NOT a tag. The buffered `<`
+        # must be released, plus the new content.
+        in_thinking, accumulated, dr, dc = server._step_thinking_state(
+            "a", *s[:2][::-1][::-1][:2], gemma_fmt
+        ) if False else server._step_thinking_state(
+            "a", s[0], s[1], gemma_fmt
+        )
+        assert in_thinking is False
+        assert accumulated == ""
+        assert dr is None
+        assert dc == "<a"
+
+    def test_empty_token_no_op(self, gemma_fmt):
+        in_thinking, accumulated, dr, dc = server._step_thinking_state(
+            "", False, "", gemma_fmt
+        )
+        assert in_thinking is False
+        assert accumulated == ""
+        assert dr is None
+        assert dc is None
+
+    def test_helper_appends_token_internally_no_double_count(self, gemma_fmt):
+        # Regression for the "every word doubled" bug observed in the
+        # production Gemma 4 stream after the helper rewrite. The caller
+        # must NOT pre-append `token.text` to `accumulated` before calling
+        # the helper — the helper does it internally. If both append,
+        # every byte of the token streams twice (visible content +
+        # reasoning), which the user saw as "The The user user is is...".
+        #
+        # Pin the contract: drive a sequence of plain-text tokens (no
+        # thinking transitions) and assert the concatenated emitted
+        # content exactly equals the input concatenation, byte-for-byte.
+        in_thinking = False
+        accumulated = ""
+        emitted = []
+        tokens = ["Hello", " ", "world", ", ", "this is ", "a ", "test."]
+        for t in tokens:
+            in_thinking, accumulated, dr, dc = server._step_thinking_state(
+                t, in_thinking, accumulated, gemma_fmt
+            )
+            assert dr is None, f"unexpected reasoning emit on plain token: {dr!r}"
+            if dc is not None:
+                emitted.append(dc)
+        assert "".join(emitted) == "".join(tokens), (
+            f"emitted content {''.join(emitted)!r} != input {''.join(tokens)!r}"
+        )
+
+    def test_helper_appends_token_internally_with_buffered_partial(self, gemma_fmt):
+        # Same byte-for-byte invariant when partial buffering is in
+        # play. Tokens carry a `<` that ends up not being a tag (the
+        # next token resolves it as plain content). Output across both
+        # tokens must exactly equal the input concatenation.
+        in_thinking, accum1, dr1, dc1 = server._step_thinking_state(
+            "before <", False, "", gemma_fmt
+        )
+        in_thinking, accum2, dr2, dc2 = server._step_thinking_state(
+            " after", in_thinking, accum1, gemma_fmt
+        )
+        assert dr1 is None and dr2 is None
+        emitted = (dc1 or "") + (dc2 or "")
+        assert emitted == "before < after", (
+            f"got {emitted!r}, expected 'before < after'"
+        )
+
+    def test_seeded_in_thinking_elides_per_turn_opener(self, gemma_fmt):
+        # Production bug (Gemma 4 26B 8-bit, OWUI first-turn):
+        # `<|think|>` global system marker seeds in_thinking=True. The
+        # model's first emission is the per-turn opener
+        # `<|channel>thought\n` followed by reasoning. Pre-fix the
+        # state machine only scanned closers while in_thinking, so the
+        # opener literal leaked into delta.reasoning and the user
+        # saw `<|channel>thought\nThe user is asking...` rendered
+        # verbatim in the thinking block.
+        # Post-fix: openers seen while already in_thinking are
+        # structural markers — elide without state transition, so
+        # only the actual reasoning prose streams to delta.reasoning.
+        in_thinking, accumulated, reasoning, content = self._drive(
+            [
+                "<|channel>thought\n",
+                "The user is asking who I am.",
+                "<channel|>",
+                "I am a large language model.",
+            ],
+            gemma_fmt,
+            in_thinking_start=True,
+        )
+        assert in_thinking is False
+        assert accumulated == ""
+        assert reasoning == "\nThe user is asking who I am."
+        assert content == "I am a large language model."
+        # Crucial invariant: no fragment of the per-turn opener
+        # literal leaked into the reasoning stream.
+        assert "<|channel" not in reasoning
+        assert "channel>thought" not in reasoning
+
+    def test_seeded_in_thinking_elides_opener_split_across_tokens(self, gemma_fmt):
+        # Same bug, byte-streamed variant: the opener arrives byte-by-
+        # byte from the tokenizer. The partial-buffer path must fire
+        # immediately (ends-with-prefix) so no prefix bytes leak as
+        # reasoning content while accumulated is too short to contain
+        # the full literal.
+        in_thinking, accumulated, reasoning, content = self._drive(
+            ["<", "|", "channel", ">thought", "\nreasoning"],
+            gemma_fmt,
+            in_thinking_start=True,
+        )
+        assert in_thinking is True
+        assert accumulated == ""
+        assert reasoning == "\nreasoning"
+        assert content == ""
+        assert "<" not in reasoning
+        assert "channel" not in reasoning
+
+
+class TestIsTemplateThinkingAsymmetric:
+    """Tests for the asymmetric-rendering heuristic that gates the
+    SWA-snapshot path (memory.md #30).
+
+    The heuristic: a thinking format detected in the rendered prompt
+    means a thinking-aware client (OWUI, OpenAI SDK with reasoning
+    suppression, etc.) will likely strip reasoning before echoing the
+    assistant turn back. Cache holds full thinking content; next
+    request's render lacks it → asymmetric. Engaging the snapshot
+    path is the safe default for any thinking model.
+    """
+
+    def test_gemma_native_thinking_is_asymmetric(self):
+        # Gemma 4: `<|think|>` opener anywhere in the rendered prompt
+        # signals the model is in a thinking-aware regime.
+        prompt = "<|think|>\nsystem stuff\n<turn|>...<turn|>model\n"
+        assert server._is_template_thinking_asymmetric(prompt) is True
+
+    def test_qwen_thinking_is_asymmetric(self):
+        prompt = "<|im_start|>assistant\n<think>\nreasoning\n</think>\n"
+        assert server._is_template_thinking_asymmetric(prompt) is True
+
+    def test_gpt_oss_channel_is_asymmetric(self):
+        prompt = "user x <|channel>thought\nfoo<channel|> visible"
+        assert server._is_template_thinking_asymmetric(prompt) is True
+
+    def test_no_thinking_format_is_symmetric(self):
+        # Plain non-thinking prompt — no detection, no snapshot needed.
+        # Cache anchors at end-of-asst (current symmetric behavior).
+        prompt = "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n"
+        assert server._is_template_thinking_asymmetric(prompt) is False
+
+    def test_empty_prompt_is_symmetric(self):
+        assert server._is_template_thinking_asymmetric("") is False
+
+
 class TestDetectThinkingFormat:
     def test_gemma_channel_opener(self):
         # The native Gemma 4 thinking marker.
@@ -699,9 +1142,21 @@ class TestDetectThinkingFormat:
         # The "<|think|>" alternate marker also resolves to gemma.
         assert server._detect_thinking_format("foo <|think|> bar") == "gemma"
 
-    def test_generic_think_tag(self):
-        # Qwen / DeepSeek / generic family.
-        assert server._detect_thinking_format("hello <think>\n") == "generic"
+    def test_channel_thought_opener_matches_gemma(self):
+        # `<|channel>thought` is now in Gemma 4's openers tuple too
+        # (per-turn inline thinking, same syntax as gpt-oss). Gemma is
+        # registry-listed first, so first-match wins. Behavior-wise
+        # identical to gpt-oss for streaming purposes; only the brand
+        # differs.
+        fmt = server._detect_thinking_format("user msg ... <|channel>thought\n")
+        assert fmt is not None
+        assert fmt.name == "gemma"
+
+    def test_qwen_think_tag(self):
+        # Qwen / DeepSeek / generic `<think>...</think>` family.
+        fmt = server._detect_thinking_format("hello <think>\n")
+        assert fmt is not None
+        assert fmt.name == "qwen"
 
     def test_no_thinking_tags(self):
         assert server._detect_thinking_format("just a plain prompt") is None

@@ -435,6 +435,114 @@ class TestCacheAlignmentKwargs:
             assert value is not None, f"{key} must not be None in registry"
 
 
+class TestThinkingFormatRegistry:
+    """memory.md #29 — centralized opener/closer literals per family.
+
+    Drift between sites (detection, splitter, streaming state machine,
+    budget enforcer, prefilled-opener guard) was the root cause of the
+    Gemma 4 leading-content-token-eating artifact. Tests pin the
+    registry's contract: every consumer must agree on the tags.
+    """
+
+    def test_registry_has_known_families(self):
+        names = [f.name for f in THINKING_FORMATS]
+        assert names == ["gemma", "qwen", "gpt-oss"], (
+            "ordering matters — first-match-wins resolves ambiguous "
+            "prompts; specificity is encoded in the tuple order."
+        )
+
+    def test_each_format_is_frozen(self):
+        # Frozen dataclass = registry entries can't be mutated at runtime
+        # without raising, which guards against accidental drift if a
+        # caller patches openers in-place.
+        for fmt in THINKING_FORMATS:
+            with pytest.raises(Exception):
+                fmt.openers = ("hacked",)  # type: ignore[misc]
+
+    def test_each_format_has_at_least_one_opener_and_closer(self):
+        for fmt in THINKING_FORMATS:
+            assert fmt.openers, f"{fmt.name} has no openers"
+            assert fmt.closers, f"{fmt.name} has no closers"
+            assert fmt.tag_token_count >= 1, f"{fmt.name} tag_token_count <= 0"
+
+    def test_partial_buffers_are_prefixes_of_real_tags(self):
+        # The streaming state-machine uses `partial_buffers` to suppress
+        # mid-token leakage. Each entry must be a prefix of either an
+        # opener or a closer; otherwise it'd never match a partial-tag
+        # arrival and we'd leak bytes.
+        for fmt in THINKING_FORMATS:
+            all_tags = fmt.openers + fmt.closers
+            for partial in fmt.partial_buffers:
+                assert any(tag.startswith(partial) for tag in all_tags), (
+                    f"{fmt.name}: partial_buffer {partial!r} is not a prefix "
+                    f"of any opener/closer"
+                )
+
+    def test_gemma_carries_both_global_and_per_turn_openers(self):
+        # Gemma 4 is trained on both shapes: `<|think|>` is the global
+        # marker injected at the system block when enable_thinking=True,
+        # and `<|channel>thought` is the per-turn opener the model emits
+        # for in-line thinking blocks. Both must be in the registry's
+        # openers tuple so the streaming state machine recognizes
+        # either one.
+        gemma = next(f for f in THINKING_FORMATS if f.name == "gemma")
+        assert "<|think|>" in gemma.openers
+        assert "<|channel>thought" in gemma.openers
+        # Likewise, the model emits both `</think>` and `<channel|>`
+        # as closers (cross-format trained); both must match.
+        assert "</think>" in gemma.closers
+        assert "<channel|>" in gemma.closers
+
+    def test_qwen_uses_plain_think_opener(self):
+        qwen = next(f for f in THINKING_FORMATS if f.name == "qwen")
+        assert qwen.openers == ("<think>",)
+        assert qwen.closers == ("</think>",)
+
+
+class TestDetectThinkingFormat:
+    """`detect_thinking_format` is the single entry point all server-side
+    helpers use to learn what tags to expect. Tests pin both positive
+    matches per family and the first-match-wins ambiguity resolution."""
+
+    def test_detects_gemma_native_opener(self):
+        assert detect_thinking_format("foo <|think|> bar").name == "gemma"
+
+    def test_detects_qwen_open_tag(self):
+        assert detect_thinking_format("hello <think>\n").name == "qwen"
+
+    def test_channel_thought_opener_resolves_to_gemma(self):
+        # Gemma 4 lists `<|channel>thought` among its openers (per-turn
+        # inline thinking syntax) and is registry-listed first, so an
+        # input containing only that opener resolves to gemma rather
+        # than gpt-oss. Streaming-wise both formats use the same closer
+        # so the behavior is identical; only the format-name brand
+        # changes.
+        assert detect_thinking_format("ms <|channel>thought x").name == "gemma"
+
+    def test_returns_none_for_plain_text(self):
+        assert detect_thinking_format("just a plain prompt") is None
+
+    def test_returns_none_when_only_closer_present(self):
+        # Closer-only outputs are handled at split-time (the prefilled-
+        # opener case), but the detection-from-prompt path requires an
+        # opener to identify the family unambiguously.
+        assert detect_thinking_format("trailing </think> only") is None
+
+    def test_first_match_wins_for_ambiguous_prompts(self):
+        # `<|think|>` (gemma) listed before `<think>` (qwen). A prompt
+        # that contains both literals resolves to gemma.
+        prompt = "<|think|> first ... <think> second"
+        assert detect_thinking_format(prompt).name == "gemma"
+
+    def test_qwen_match_does_not_steal_from_channel_format(self):
+        # `<think>` vs `<|channel>thought` are unrelated literals; Qwen
+        # detection must not match a channel-formatted prompt. With
+        # the merged Gemma registry, channel-formatted prompts now
+        # resolve to gemma (Gemma 4 includes the channel openers).
+        prompt = "<|channel>thought reasoning <channel|>"
+        assert detect_thinking_format(prompt).name == "gemma"
+
+
 class TestMessageFormatterTextOnlyFallback:
     """memory.md #20 — pure text models (Qwen 2.5, gemma3_text) load via
     mlx_lm and aren't in MODEL_CONFIG. MessageFormatter must return a

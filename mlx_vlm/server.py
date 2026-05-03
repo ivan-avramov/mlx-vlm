@@ -1377,7 +1377,258 @@ def _compute_prefill_flag(processor, template_kwargs: dict) -> bool:
         return False
 
     suffix = actual[len(no_gen) :] if actual.startswith(no_gen) else actual[-200:]
-    return suffix.rstrip().endswith(_PREFILLED_OPENERS)
+    return suffix.rstrip().endswith(_all_thinking_openers())
+
+
+def _is_prompt_inside_thinking(formatted_prompt: str) -> bool:
+    """Return True if generation will start *inside* an unclosed thinking
+    block.
+
+    Structural check on the actual rendered prompt: locate the latest
+    occurrence of any known thinking opener and the latest occurrence of
+    any known closer. If an opener exists and no closer follows it, the
+    model is in thinking-mode at gen-start — the streaming SSE state
+    machine must seed ``in_thinking=True`` so the model's continuation
+    routes to ``delta.reasoning`` until the closer arrives.
+
+    Two distinct cases this captures:
+      1. Tail-prefilled openers like unsloth Qwen 3.6's ``<think>\\n``
+         at the end of `<|im_start|>assistant\\n`.
+      2. Global openers like Gemma 4's ``<|think|>`` injected at the
+         system block when ``enable_thinking=True``. The model treats
+         the whole conversation as in-thinking until it emits a closer.
+
+    A literal opener appearing inside user/system content is a
+    theoretical false positive but vanishingly rare — chat templates
+    wrap user content with role markers the model can distinguish, and
+    the registry's openers are unusual byte sequences unlikely to
+    appear in natural text.
+    """
+    from .prompt_utils import THINKING_FORMATS
+
+    last_opener = -1
+    for fmt in THINKING_FORMATS:
+        for op in fmt.openers:
+            idx = formatted_prompt.rfind(op)
+            if idx > last_opener:
+                last_opener = idx
+    if last_opener < 0:
+        return False
+    last_closer = -1
+    for fmt in THINKING_FORMATS:
+        for cl in fmt.closers:
+            idx = formatted_prompt.rfind(cl)
+            if idx > last_closer:
+                last_closer = idx
+    return last_closer < last_opener
+
+
+def _partial_tag_start_pos(
+    accumulated: str, partial_buffers: Tuple[str, ...]
+) -> Optional[int]:
+    """Return the earliest position in ``accumulated`` where a partial
+    tag prefix starts, OR None if accumulated does not end with a
+    partial-tag prefix.
+
+    A "partial tag" is any non-empty proper prefix of a known partial
+    buffer literal that ``accumulated`` ends with. E.g. given partials
+    ``("<|channel",)`` and accumulated ``"some content<|c"``, this
+    returns the index of the leading ``<`` (12) — the caller can emit
+    ``"some content"`` as the current state's delta and keep the
+    trailing ``"<|c"`` buffered until enough characters arrive to
+    decide whether it's a real tag.
+
+    Crucially uses ENDSWITH a prefix rather than CONTAINS substring.
+    The substring check (the bug we replaced) would never fire until
+    accumulated had grown large enough to contain the full partial,
+    by which point the partial-tag bytes had already leaked into
+    delta.content as multiple short tokens (`<`, `|`, `c`, ...).
+    """
+    earliest: Optional[int] = None
+    for p in partial_buffers:
+        # Try every prefix length from longest to shortest so we get
+        # the earliest start position when multiple lengths match.
+        for k in range(len(p), 0, -1):
+            tail_start = len(accumulated) - k
+            if tail_start < 0:
+                continue
+            if accumulated[tail_start:] == p[:k]:
+                if earliest is None or tail_start < earliest:
+                    earliest = tail_start
+                break
+    return earliest
+
+
+def _step_thinking_state(
+    token_text: str,
+    in_thinking: bool,
+    accumulated: str,
+    fmt: Optional[ThinkingFormat],
+) -> Tuple[bool, str, Optional[str], Optional[str]]:
+    """Process one streamed token through the thinking-state machine.
+
+    Returns ``(new_in_thinking, new_accumulated, delta_reasoning,
+    delta_content)``. Each returned delta is either ``None`` (no
+    emission of that kind for this token) or a non-empty string ready
+    to send to the SSE consumer.
+
+    Replaces the inline branch chain that lived in
+    ``chat_completions_endpoint`` and accumulated three known bugs:
+
+      1. **Token-spanning tags ate content.** When the same token
+         contained a tag plus pre-tag and/or post-tag content (e.g.
+         ``<channel|>2`` after the model finishes thinking), the old
+         branches fired the state transition but emitted nothing for
+         that token at all — so the leading ``2`` of "2 + 2 = 4" was
+         silently dropped. This rewrite splits at the tag boundary,
+         emits pre-tag content under the OLD state, transitions, then
+         emits post-tag content under the NEW state.
+
+      2. **Partial-buffer check used substring instead of ends-with.**
+         The old branch ``any(p in accumulated for p in tf_partials)``
+         could not match until ``accumulated`` had grown to at least
+         the length of a partial (e.g. 9 chars for ``"<|channel"``).
+         Until then, individual tag-prefix tokens (``<``, ``|``, ``c``)
+         streamed straight to ``delta.content`` and the user saw raw
+         tag literals in the visible response. Replaced with
+         ``_partial_tag_start_pos`` (ends-with-prefix), which matches
+         from the very first byte of a tag.
+
+      3. **Multiple transitions in one token weren't handled.** Old
+         code processed one transition per token max. With Gemma 4's
+         pattern of ``<closer><opener>`` (immediately re-opening
+         thinking after closing), a single token could carry both
+         and the second transition was lost. The internal ``while``
+         loop here handles any number of transitions per token by
+         re-entering the decision at the new state with the residual
+         accumulated.
+
+    A ``None`` ``fmt`` means no thinking format is detected; pass the
+    token through as content unchanged. The streaming loop uses this
+    case for non-thinking models.
+    """
+    if fmt is None:
+        return in_thinking, accumulated, None, (token_text or None)
+
+    accumulated = accumulated + token_text
+    reasoning_parts: List[str] = []
+    content_parts: List[str] = []
+
+    while True:
+        # Scan ALL tags, distinguishing state-changing vs structural
+        # markers. Closers are state-changing while in_thinking;
+        # openers are state-changing while not in_thinking. The other
+        # direction (e.g. an opener encountered while already
+        # in_thinking) is a redundant structural marker that should
+        # be elided without state transition. This matters for Gemma 4
+        # with global `<|think|>` seeding: the model emits a per-turn
+        # opener `<|channel>thought` *while we're already in_thinking*,
+        # and pre-fix that literal leaked into delta.reasoning because
+        # the scan only considered closers.
+        if in_thinking:
+            state_tags = fmt.closers
+            marker_tags = fmt.openers
+        else:
+            state_tags = fmt.openers
+            marker_tags = fmt.closers
+
+        best_idx = -1
+        best_tag = ""
+        best_changes_state = False
+        for tag in state_tags:
+            idx = accumulated.find(tag)
+            if idx >= 0 and (best_idx < 0 or idx < best_idx):
+                best_idx = idx
+                best_tag = tag
+                best_changes_state = True
+        for tag in marker_tags:
+            idx = accumulated.find(tag)
+            if idx >= 0 and (best_idx < 0 or idx < best_idx):
+                best_idx = idx
+                best_tag = tag
+                best_changes_state = False
+
+        if best_idx >= 0:
+            # Found a tag — split, emit pre-tag content under the
+            # current state, then either flip state (if state-changing)
+            # or just elide (if structural marker), and continue with
+            # the post-tag remainder so further tags in this token are
+            # also processed.
+            pre = accumulated[:best_idx]
+            if pre:
+                if in_thinking:
+                    reasoning_parts.append(pre)
+                else:
+                    content_parts.append(pre)
+            if best_changes_state:
+                in_thinking = not in_thinking
+            accumulated = accumulated[best_idx + len(best_tag) :]
+            continue
+
+        # No complete tag in accumulated. Check whether accumulated
+        # ENDS with a partial-tag prefix; if so, emit everything before
+        # that partial under the current state and keep the partial
+        # buffered for the next token. If not, emit the full
+        # accumulated under the current state and clear it.
+        partial_start = _partial_tag_start_pos(accumulated, fmt.partial_buffers)
+        if partial_start is not None:
+            pre = accumulated[:partial_start]
+            if pre:
+                if in_thinking:
+                    reasoning_parts.append(pre)
+                else:
+                    content_parts.append(pre)
+            accumulated = accumulated[partial_start:]
+        else:
+            if accumulated:
+                if in_thinking:
+                    reasoning_parts.append(accumulated)
+                else:
+                    content_parts.append(accumulated)
+            accumulated = ""
+        break
+
+    delta_reasoning = "".join(reasoning_parts) if reasoning_parts else None
+    delta_content = "".join(content_parts) if content_parts else None
+    return in_thinking, accumulated, delta_reasoning, delta_content
+
+
+def _is_template_thinking_asymmetric(formatted_prompt: str) -> bool:
+    """Return True if this request's effective rendering will mismatch
+    what we cached during generation — driving the cache-vs-prompt
+    asymmetry that forces a backwards trim on multi-turn requests.
+
+    The asymmetry has two halves:
+      1. The model emits thinking content (`<|think|>...</think>`,
+         `<think>...</think>`, `<|channel>thought ... <channel|>`,
+         etc.) into its response. The KV cache absorbs every byte.
+      2. The client (OpenWebUI, OpenAI SDK with reasoning suppression,
+         most "thinking-aware" UIs) strips reasoning before echoing
+         the assistant message back as conversation history. The
+         next request's chat-template render of that prior turn
+         therefore lacks the thinking content the cache holds.
+
+    Half (1) is detectable from the rendered prompt — `_detect_thinking_format`
+    matches the family's tag literals. Half (2) is a property of the
+    client and unobservable from the server side. The simplest correct
+    heuristic is "if a thinking format is in play, assume the client
+    will strip" — true of every commonly-deployed thinking-aware UI.
+
+    Trade-off: on the rare workflow where the client preserves
+    thinking content verbatim, we'll engage the asymmetric path
+    unnecessarily and pay one assistant-length re-prefill per turn
+    (~200 tokens on a typical reply). Bounded and small. Catching that
+    case requires client introspection we don't have.
+
+    The CACHE_ALIGNMENT_KWARGS path (memory.md #27) is orthogonal:
+    `preserve_thinking=True` on unsloth Qwen ports makes the template
+    re-wrap echoed content in thinking tags, restoring symmetry. We
+    don't currently distinguish that case from a non-aligned thinking
+    template here — both engage the snapshot path. If profiling shows
+    the unsloth-Qwen redundant-trim cost is worth eliminating, gate on
+    `preserve_thinking` in the kwargs.
+    """
+    return detect_thinking_format(formatted_prompt) is not None
 
 
 def _decode_token(tokenizer, token_id: int) -> Tuple[str, Optional[List[int]]]:
@@ -3060,10 +3311,24 @@ async def chat_completions_endpoint(request: ChatRequest, raw_request: Request):
         # closer but never the opener, so the SSE state machine below must
         # start with in_thinking=True; otherwise reasoning leaks into
         # delta.content and the closing </think> shows up as plain text.
-        thinking_prefilled = _has_prefilled_opener(processor, template_kwargs)
+        # Two cases for "model starts inside a thinking block":
+        #   (a) Template prefills an opener at the tail of the assistant
+        #       continuation — unsloth Qwen 3.6 `<think>\\n` style. Detected
+        #       by `_has_prefilled_opener` against a synthetic render.
+        #   (b) Template injects a global opener earlier in the prompt
+        #       — Gemma 4 `<|think|>` in the system block when
+        #       enable_thinking=True. The model is in-thinking from
+        #       gen-start even though the opener isn't at the tail.
+        #       Detected by structural scan over the actual rendered
+        #       prompt via `_is_prompt_inside_thinking`.
+        # Either signal seeds in_thinking=True for the SSE state machine.
+        thinking_prefilled = _has_prefilled_opener(
+            processor, template_kwargs
+        ) or _is_prompt_inside_thinking(formatted_prompt)
         if thinking_prefilled:
             logger.debug(
-                "  Thinking opener prefilled by template; seeding in_thinking=True"
+                "  Generation starts inside thinking block; seeding "
+                "in_thinking=True"
             )
 
         if request.stream:
@@ -3114,27 +3379,43 @@ async def chat_completions_endpoint(request: ChatRequest, raw_request: Request):
                             if token is None:
                                 break
                             output_tokens += 1
-                            accumulated += token.text
+                            # Note: do NOT append token.text to accumulated
+                            # here — `_step_thinking_state` does the append
+                            # internally so callers pass the *previous*
+                            # accumulated and just the *new* token. Pre-fix
+                            # this loop appended twice and every word in the
+                            # streamed output rendered duplicated.
                             full_output += token.text
 
-                            # Detect thinking boundaries
-                            delta_reasoning = None
-                            delta_content = None
+                            # Route this token through the thinking-state
+                            # helper. Replaces the inline branch chain that
+                            # had three known bugs:
+                            #   - token-spanning tags ate content (closer +
+                            #     leading visible char in one token).
+                            #   - partial-buffer used substring instead of
+                            #     ends-with-prefix; tag prefixes leaked
+                            #     piecewise as content.
+                            #   - multiple transitions per token weren't
+                            #     handled; second transition was lost.
+                            # See `_step_thinking_state` for the full
+                            # behavior contract.
+                            (
+                                in_thinking,
+                                accumulated,
+                                delta_reasoning,
+                                delta_content,
+                            ) = _step_thinking_state(
+                                token.text,
+                                in_thinking,
+                                accumulated,
+                                thinking_format,
+                            )
 
-                            if not in_thinking and (
-                                "<|channel>thought" in accumulated
-                                or "<think>" in accumulated
-                            ):
-                                in_thinking = True
-                                accumulated = ""
-                                # Don't emit opening tag tokens
-                            elif in_thinking and (
-                                "<channel|>" in accumulated or "</think>" in accumulated
-                            ):
-                                in_thinking = False
-                                accumulated = ""
-                                # Don't emit closing tag tokens
-                            elif in_thinking:
+                            # Thinking-budget enforcement: count this token
+                            # against the budget if any part of it was
+                            # routed to reasoning. When budget is exceeded,
+                            # emit a truncation indicator and bail.
+                            if delta_reasoning is not None:
                                 thinking_tokens += 1
                                 if (
                                     thinking_budget is not None
@@ -3169,13 +3450,6 @@ async def chat_completions_endpoint(request: ChatRequest, raw_request: Request):
                                     )
                                     yield f"data: {trunc_chunk.model_dump_json()}\n\n"
                                     break
-                                delta_reasoning = token.text
-                            elif not in_thinking and (
-                                "<|channel>" in accumulated or "<think" in accumulated
-                            ):
-                                pass  # Partial tag, don't emit yet
-                            else:
-                                delta_content = token.text
 
                             # Suppress tool-call markup from content
                             in_tool_call, delta_content = suppress_tool_call_content(
