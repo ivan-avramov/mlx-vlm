@@ -15,6 +15,7 @@ MLX-VLM is a package for inference and fine-tuning of Vision Language Models (VL
   - [Python Script](#python-script)
   - [Server (FastAPI)](#server-fastapi)
     - [Continuous Batching](#continuous-batching)
+    - [Automatic Prefix Caching (APC)](#automatic-prefix-caching-apc)
     - [KV Cache Quantization](#kv-cache-quantization)
 - [Activation Quantization (CUDA)](#activation-quantization-cuda)
 - [Multi-Image Chat Support](#multi-image-chat-support)
@@ -302,10 +303,153 @@ Verify via the health endpoint:
 
 ```sh
 curl http://localhost:8080/health
-# {"status":"healthy","loaded_model":"...","continuous_batching_enabled":true}
+# {"status":"healthy","loaded_model":"...","apc_enabled":false}
 ```
 
 If `--model` is omitted, the model is loaded on the first request.
+
+### Automatic Prefix Caching (APC)
+
+Automatic Prefix Caching reuses block-level K/V cache state across requests that share the same prefix. It is useful for repeated long documents, long chat histories, or retrieval contexts where each request appends a short new suffix.
+
+APC has two tiers:
+
+- **Warm memory**: keeps reusable `APCBlock` tensors in process memory. This is the fastest path, but it keeps both the reusable block pool and the runtime `KVCache`.
+- **Warm disk**: persists cached prefixes as safetensors shards so they survive process restarts. Warm-disk reads build the layer-major prompt cache directly without promoting restored blocks into the `APCBlock` pool; writes can still populate both memory and disk tiers.
+
+#### Python Script
+
+Use `APCManager` directly when calling `stream_generate`:
+
+```python
+from pathlib import Path
+
+from mlx_vlm import load, stream_generate
+from mlx_vlm.apc import APCManager, DiskBlockStore
+from mlx_vlm.prompt_utils import apply_chat_template
+
+model_id = "Qwen/Qwen3-VL-4B-Instruct"
+model, processor = load(model_id)
+
+disk = DiskBlockStore(
+    Path("~/.cache/mlx-vlm/caching").expanduser(),
+    namespace=model_id,
+    max_bytes=3 * (1 << 30),  # 3 GB disk cap; use None for uncapped
+)
+apc = APCManager(num_blocks=4096, block_size=16, disk=disk)
+
+document = Path("long_document.txt").read_text()
+
+try:
+    # First request computes the full prefix and stores reusable K/V blocks.
+    prompt1 = apply_chat_template(
+        processor,
+        model.config,
+        prompt=f"{document}\n\nSummarize the key decisions.",
+        num_images=0,
+    )
+    for _ in stream_generate(
+        model, processor, prompt1, max_tokens=128, temperature=0.0, apc_manager=apc
+    ):
+        pass
+
+    # Second request shares the same document prefix and only prefills the suffix.
+    prompt2 = apply_chat_template(
+        processor,
+        model.config,
+        prompt=f"{document}\n\nList the open engineering risks.",
+        num_images=0,
+    )
+    for chunk in stream_generate(
+        model, processor, prompt2, max_tokens=128, temperature=0.0, apc_manager=apc
+    ):
+        print(chunk.text, end="", flush=True)
+
+    print(apc.stats_snapshot())
+finally:
+    apc.close()
+```
+
+To compare cold, warm-memory, and warm-disk behavior with a model:
+
+```sh
+python scripts/bench_apc_context_sweep.py \
+  --model Qwen/Qwen3-VL-4B-Instruct \
+  --contexts 8000 20000 50000 100000 \
+  --disk-cap-gb 0 \
+  --shard-max-blocks 256
+```
+
+For a disk-eviction workload:
+
+```sh
+python scripts/bench_apc_disk_genstep.py \
+  --model Qwen/Qwen3-VL-4B-Instruct \
+  --test-prompt-tokens 8000 \
+  --fill-prompts 80 \
+  --disk-cap-gb 3.0
+```
+
+#### Server
+
+Enable in-memory APC for the server with environment variables:
+
+```sh
+APC_ENABLED=1 \
+APC_NUM_BLOCKS=4096 \
+mlx_vlm.server --model Qwen/Qwen3-VL-4B-Instruct --port 8080
+```
+
+Enable the persistent disk tier:
+
+```sh
+APC_ENABLED=1 \
+APC_NUM_BLOCKS=4096 \
+APC_DISK_PATH=~/.cache/mlx-vlm/caching \
+APC_DISK_MAX_GB=3 \
+APC_DISK_SHARD_MAX_BLOCKS=256 \
+mlx_vlm.server --model Qwen/Qwen3-VL-4B-Instruct --port 8080
+```
+
+Repeated requests with the same long prefix will hit APC automatically:
+
+```sh
+curl -X POST "http://localhost:8080/v1/chat/completions" \
+  -H "Content-Type: application/json" \
+  -H "X-APC-Tenant: demo" \
+  -d '{
+    "model": "Qwen/Qwen3-VL-4B-Instruct",
+    "messages": [{
+      "role": "user",
+      "content": "Paste a long shared document here.\n\nNow answer question A."
+    }],
+    "max_tokens": 128
+  }'
+```
+
+Use the same `X-APC-Tenant` value for requests that may share cached prefixes. Use different tenant values to isolate cache entries between users or workspaces.
+
+Inspect and reset APC state:
+
+```sh
+curl http://localhost:8080/v1/cache/stats
+curl -X POST http://localhost:8080/v1/cache/reset
+```
+
+Common APC environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `APC_ENABLED` | `0` | Set to `1` to enable APC |
+| `APC_NUM_BLOCKS` | `2048` | Number of in-memory APC blocks |
+| `APC_BLOCK_SIZE` | `16` | Tokens per APC block |
+| `APC_DISK_PATH` | unset | Directory for persistent disk shards |
+| `APC_DISK_MAX_GB` | `0` | Disk cap in GB; `0` means uncapped |
+| `APC_DISK_SHARD_MAX_BLOCKS` | `256` | Max blocks per disk segment shard |
+| `APC_MAX_POOL_TENSORS` | `450000` | Stops adding memory blocks before the Metal resource limit; disk writes continue |
+| `APC_HASH` | `fast` | Set to `sha256` for a stable cryptographic hash |
+
+APC is disabled automatically for models that use a custom cache layout. On the server, APC is also skipped when KV-cache quantization is enabled.
 
 #### KV Cache Quantization
 
