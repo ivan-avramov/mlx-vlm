@@ -663,8 +663,13 @@ def _mtp_rounds_batch(
     # Per-row state. ``positions`` is the absolute position id of each
     # row's pending bonus (= row's logical KV length). All rows start at
     # ``L_prefill`` and advance by ``accepted_i + 1`` per round.
-    L_prefill = int(prompt_cache[0].offset)
-    positions = [L_prefill] * B
+    offset0 = prompt_cache[0].offset
+    if isinstance(offset0, mx.array):
+        L_prefill = int(offset0.max().item())
+        positions = [int(x) for x in offset0.tolist()]
+    else:
+        L_prefill = int(offset0)
+        positions = [L_prefill] * B
     draft_model.set_shared_kv(
         shared_kv_states, kv_offset=L_prefill, position=mx.array(positions)
     )
@@ -821,7 +826,10 @@ def _mtp_rounds_batch(
 
         # Re-bind drafter with new shared_kv and per-row positions.
         positions_active = [positions[active_idx[j]] for j in range(len(active_idx))]
-        new_kv_offset = int(prompt_cache[0].offset)
+        offset0 = prompt_cache[0].offset
+        new_kv_offset = (
+            int(offset0.max().item()) if isinstance(offset0, mx.array) else int(offset0)
+        )
         draft_model.set_shared_kv(
             next_shared_kv,
             kv_offset=new_kv_offset,
