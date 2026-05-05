@@ -85,6 +85,16 @@ TOKEN_QUEUE_TIMEOUT_SECS = 60.0
 # under TOKEN_QUEUE_TIMEOUT_SECS so a few missed timer ticks don't
 # trip the iterator.
 CACHED_PATH_HEARTBEAT_INTERVAL_SECS = 10.0
+
+# Mid-stream telemetry: emit a per-request log line every N generated tokens
+# with rolling/avg tok-per-sec and elapsed time. 0 disables. Useful for
+# diagnosing apparent UI stalls (e.g. OWUI hiding long tool-call bodies)
+# without waiting for end-of-request stats. Cost is one logger.info per N
+# tokens — negligible vs. a single decode step.
+STREAM_TELEMETRY_INTERVAL = int(
+    os.environ.get("MLX_VLM_STREAM_TELEMETRY_INTERVAL", "500")
+)
+
 THINKING_TRUNCATION_MSG = (
     "[Thinking used the entire token budget without producing a visible "
     "response. Try increasing max_tokens or setting a lower thinking_budget.]"
@@ -604,6 +614,11 @@ class ResponseGenerator:
         )
         heartbeat_thread.start()
 
+        tel_start = time.perf_counter()
+        tel_last_time = tel_start
+        tel_last_at = 0
+        tel_n = 0
+
         try:
             for chunk in _stream_generate(
                 model=self.model,
@@ -650,6 +665,27 @@ class ResponseGenerator:
                         peak_memory=chunk.peak_memory,
                     )
                 )
+
+                if STREAM_TELEMETRY_INTERVAL > 0 and chunk.finish_reason is None:
+                    tel_n += 1
+                    if tel_n - tel_last_at >= STREAM_TELEMETRY_INTERVAL:
+                        now = time.perf_counter()
+                        window_n = tel_n - tel_last_at
+                        window_dt = now - tel_last_time
+                        elapsed = now - tel_start
+                        rolling_tps = window_n / window_dt if window_dt > 0 else 0.0
+                        avg_tps = tel_n / elapsed if elapsed > 0 else 0.0
+                        logger.info(
+                            "Stream Telemetry | uid=%d | tokens=%d | "
+                            "rolling_tps=%.2f | avg_tps=%.2f | elapsed=%.1fs | cached",
+                            uid,
+                            tel_n,
+                            rolling_tps,
+                            avg_tps,
+                            elapsed,
+                        )
+                        tel_last_at = tel_n
+                        tel_last_time = now
         except Exception as e:
             logger.error(
                 "Error in cached-request generation (uid=%d): %s",
@@ -839,11 +875,15 @@ class ResponseGenerator:
                         continue
 
                     rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
+                    now = time.perf_counter()
                     active[uid] = {
                         "rqueue": rqueue,
                         "tokens": [],
                         "prev_text": "",
                         "gen_kwargs": gen_kwargs if has_embeds else None,
+                        "start_time": now,
+                        "last_log_time": now,
+                        "last_log_at": 0,
                     }
 
                     if has_embeds:
@@ -1102,6 +1142,27 @@ class ResponseGenerator:
                     top_logprobs=getattr(r, "top_logprobs", None),
                 )
             )
+
+            if STREAM_TELEMETRY_INTERVAL > 0 and r.finish_reason is None:
+                n = len(info["tokens"])
+                if n - info["last_log_at"] >= STREAM_TELEMETRY_INTERVAL:
+                    now = time.perf_counter()
+                    window_n = n - info["last_log_at"]
+                    window_dt = now - info["last_log_time"]
+                    elapsed = now - info["start_time"]
+                    rolling_tps = window_n / window_dt if window_dt > 0 else 0.0
+                    avg_tps = n / elapsed if elapsed > 0 else 0.0
+                    logger.info(
+                        "Stream Telemetry | uid=%d | tokens=%d | "
+                        "rolling_tps=%.2f | avg_tps=%.2f | elapsed=%.1fs",
+                        r.uid,
+                        n,
+                        rolling_tps,
+                        avg_tps,
+                        elapsed,
+                    )
+                    info["last_log_at"] = n
+                    info["last_log_time"] = now
 
             if r.finish_reason is not None:
                 rqueue.put(None)
