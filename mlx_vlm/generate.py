@@ -219,7 +219,8 @@ def parse_arguments():
         "--draft-kind",
         type=str,
         default="dflash",
-        help="Drafter family. Currently only 'dflash' is supported.",
+        help="Drafter family. Supported: 'dflash' (Qwen3.5 DFlash), "
+        "'mtp' (Gemma 4 Multi-Token Prediction / Assistant model).",
     )
     parser.add_argument(
         "--draft-block-size",
@@ -452,6 +453,338 @@ def _speculative_walk_batch(
         accepted_list.append(acc)
         new_tokens_list.append(new)
     return accepted_list, new_tokens_list
+
+
+def _mtp_rounds(
+    model: nn.Module,
+    draft_model: nn.Module,
+    prompt_cache: List[Any],
+    hidden: mx.array,
+    shared_kv_states: dict,
+    *,
+    first_bonus: int,
+    max_tokens: int,
+    sampler: Callable[[mx.array], mx.array],
+    draft_block_size: Optional[int] = None,
+    token_dtype: mx.Dtype = mx.int32,
+) -> Generator[Tuple[int, None], None, None]:
+    """Gemma 4 MTP (Single-Position Multi-Token) speculative-decoding round loop.
+
+    Mirrors ``_dflash_rounds`` but with three differences:
+    (1) the drafter consumes the target's last-layer hidden + last-layer
+    shared K/V per layer-type rather than concatenated multi-layer hiddens;
+    (2) ``draft_block`` is autoregressive (K small forwards) rather than a
+    single masked forward; (3) ``rollback_speculative_cache`` ignores
+    ``gdn_states`` (Gemma 4 has no SSM/GDN state).
+    """
+    lm = model.language_model if hasattr(model, "language_model") else model
+    if not hasattr(lm, "rollback_speculative_cache"):
+        raise RuntimeError(
+            f"{type(lm).__name__} does not implement rollback_speculative_cache. "
+            "MTP speculative decoding currently only supports gemma4."
+        )
+
+    block_total = (
+        draft_block_size
+        if draft_block_size is not None
+        else int(draft_model.config.block_size)
+    )
+    draft_model.reset(model)
+
+    # Hidden from prefill is full prompt-length; reduce to a single slot.
+    # The semantically-correct choice is the *last* prompt token's hidden:
+    # the just-sampled bonus is the next-token prediction from that position,
+    # so its embedding paired with that hidden is what the drafter expects.
+    # (HF's literal ``[:, n_last_matches:n_last_matches+1]`` with ``n_matches=0``
+    # on the first round picks position 0, which is BOS — they get away with
+    # it because subsequent rounds slice into the per-call verify hidden, but
+    # the round-1 acceptance is wasted. We don't replicate that quirk.)
+    if hidden.shape[1] > 1:
+        hidden = hidden[:, -1:, :]
+
+    kv_offset = int(prompt_cache[0].offset)
+    draft_model.set_shared_kv(shared_kv_states, kv_offset)
+
+    b = first_bonus
+    emitted = 1  # caller already yielded the first bonus
+
+    while emitted < max_tokens:
+        bs = min(block_total, max_tokens - emitted + 1)
+        if bs <= 1:
+            break
+
+        draft_tokens = draft_model.draft_block(
+            b, hidden, None, bs, sampler, token_dtype
+        )
+        mx.async_eval(draft_tokens)
+
+        with mx.stream(generation_stream):
+            verify_input = mx.concatenate(
+                [mx.array([[b]], dtype=token_dtype), draft_tokens], axis=1
+            )
+            verify_out = lm(
+                verify_input,
+                cache=prompt_cache,
+                return_hidden=True,
+                return_shared_kv=True,
+            )
+            hidden_full = verify_out.hidden_states[-1]  # [B, bs, backbone]
+            target_tokens = sampler(verify_out.logits)
+        mx.async_eval(target_tokens, hidden_full)
+
+        accepted, new_tokens = _speculative_walk(
+            draft_tokens, target_tokens, max_tokens - emitted
+        )
+        draft_model.accept_lens.append(accepted)
+
+        for tok in new_tokens:
+            yield tok, None
+            emitted += 1
+            if emitted >= max_tokens:
+                return
+
+        # Hidden for next round: pick the slot of the newly accepted bonus.
+        hidden = hidden_full[:, accepted : accepted + 1, :]
+        b = new_tokens[-1] if new_tokens else b
+
+        if accepted < bs - 1:
+            with mx.stream(generation_stream):
+                lm.rollback_speculative_cache(prompt_cache, None, accepted, bs)
+
+        # Slice shared_kv_states to the post-rollback length and rebind.
+        rejected = bs - (accepted + 1)
+        next_shared_kv = {}
+        for k, kv in verify_out.shared_kv_states.items():
+            K, V = kv
+            valid = K.shape[-2] - rejected
+            if valid <= 0 or valid >= K.shape[-2]:
+                next_shared_kv[k] = (
+                    (K, V) if valid >= K.shape[-2] else (K[..., :1, :], V[..., :1, :])
+                )
+            else:
+                next_shared_kv[k] = (K[..., :valid, :], V[..., :valid, :])
+        kv_offset = int(prompt_cache[0].offset)
+        draft_model.set_shared_kv(next_shared_kv, kv_offset)
+
+        if emitted % 256 == 0:
+            mx.clear_cache()
+
+
+def _mtp_rounds_batch(
+    model: nn.Module,
+    draft_model: nn.Module,
+    prompt_cache: List[Any],
+    hidden: mx.array,
+    shared_kv_states: dict,
+    *,
+    first_bonus: mx.array,
+    max_tokens: int,
+    sampler: Callable[[mx.array], mx.array],
+    draft_block_size: Optional[int] = None,
+    token_dtype: mx.Dtype = mx.int32,
+    stop_check: Optional[Callable[[int, int], bool]] = None,
+    eos_token_ids: Optional[set] = None,
+) -> Generator[Tuple[List[Optional[int]], None], None, None]:
+    """Batched Gemma 4 MTP round loop (B > 1).
+
+    Mirrors ``_dflash_rounds_batch``: per-row state tracked by original
+    index, continuous-batching filter on row finish. Differences vs DFlash
+    batched: drafter consumes ``shared_kv_states`` (per-layer-type K/V
+    snapshot) instead of multi-layer hidden capture, ``draft_block`` is
+    autoregressive, and the per-round ``shared_kv`` slicing mirrors
+    ``rollback_speculative_cache``'s tail-zero pattern so each row's KV
+    has the correct row-specific valid length.
+    """
+    lm = model.language_model if hasattr(model, "language_model") else model
+    if not hasattr(lm, "rollback_speculative_cache"):
+        raise RuntimeError(
+            f"{type(lm).__name__} does not implement rollback_speculative_cache."
+        )
+
+    B = first_bonus.shape[0]
+    block_total = (
+        draft_block_size
+        if draft_block_size is not None
+        else int(draft_model.config.block_size)
+    )
+    draft_model.reset(model)
+
+    # First-round hidden: prefill output may have shape [B, L, H]; reduce
+    # to a single slot per row (last prompt token's hidden — see comment in
+    # ``_mtp_rounds`` for rationale).
+    if hidden.shape[1] > 1:
+        hidden = hidden[:, -1:, :]
+
+    # Per-row state. ``positions`` is the absolute position id of each
+    # row's pending bonus (= row's logical KV length). All rows start at
+    # ``L_prefill`` and advance by ``accepted_i + 1`` per round.
+    L_prefill = int(prompt_cache[0].offset)
+    positions = [L_prefill] * B
+    draft_model.set_shared_kv(
+        shared_kv_states, kv_offset=L_prefill, position=mx.array(positions)
+    )
+
+    b = first_bonus.tolist()
+    emitted = [1] * B
+    finished = [False] * B
+    active_idx = list(range(B))
+
+    while len(active_idx) > 0:
+        remaining = [
+            max(1, max_tokens - emitted[active_idx[j]] + 1)
+            for j in range(len(active_idx))
+        ]
+        bs = min(block_total, min(remaining))
+        if bs <= 1:
+            break
+
+        n_active = len(active_idx)
+        b_active = [b[active_idx[j]] for j in range(n_active)]
+        b_arr = mx.array(b_active, dtype=token_dtype)
+
+        # Draft (autoregressive K-step). hidden / shared_kv state was set
+        # via set_shared_kv above; the drafter pulls it from there.
+        draft_tokens = draft_model.draft_block(
+            b_arr, hidden, None, bs, sampler, token_dtype
+        )
+        mx.async_eval(draft_tokens)
+
+        # Verify
+        with mx.stream(generation_stream):
+            verify_input = mx.concatenate([b_arr[:, None], draft_tokens], axis=1)
+            verify_out = lm(
+                verify_input,
+                cache=prompt_cache,
+                return_hidden=True,
+                return_shared_kv=True,
+            )
+            hidden_full = verify_out.hidden_states[-1]  # [B_active, bs, H]
+            target_tokens = sampler(verify_out.logits)
+        mx.async_eval(target_tokens, hidden_full)
+
+        # Walk per-row
+        budgets = [max_tokens - emitted[active_idx[j]] for j in range(n_active)]
+        accepted_list, new_tokens_list = _speculative_walk_batch(
+            draft_tokens, target_tokens, budgets
+        )
+        for a in accepted_list:
+            draft_model.accept_lens.append(a)
+
+        max_a = max(accepted_list)
+        accepted_arr = mx.array(accepted_list)
+
+        # Per-row hidden: each row picks its own accepted slot from
+        # hidden_full. Build [B_active, 1, H] with row-i's hidden at
+        # position accepted_list[i].
+        if max_a < bs - 1 or any(a < max_a for a in accepted_list):
+            row_idx = mx.arange(n_active)
+            col_idx = mx.array(accepted_list)
+            # gather: hidden_full[row_idx, col_idx, :] -> [B_active, H]
+            hidden = hidden_full[row_idx, col_idx, :][:, None, :]
+        else:
+            hidden = hidden_full[:, -1:, :]
+
+        # Emit (map active slots back to original indices)
+        max_new = max(len(nt) for nt in new_tokens_list) if new_tokens_list else 0
+        for pos in range(max_new):
+            tokens_out: List[Optional[int]] = [None] * B
+            for j in range(n_active):
+                orig = active_idx[j]
+                if pos < len(new_tokens_list[j]) and not finished[orig]:
+                    tok = new_tokens_list[j][pos]
+                    tokens_out[orig] = tok
+                    emitted[orig] += 1
+                    if emitted[orig] >= max_tokens:
+                        finished[orig] = True
+                    if eos_token_ids is not None and tok in eos_token_ids:
+                        finished[orig] = True
+                    if stop_check is not None and stop_check(orig, tok):
+                        finished[orig] = True
+            yield tokens_out, None
+
+        # Update bonus tokens and per-row positions
+        for j in range(n_active):
+            orig = active_idx[j]
+            if new_tokens_list[j]:
+                b[orig] = new_tokens_list[j][-1]
+            positions[orig] = positions[orig] + accepted_list[j] + 1
+
+        # Rollback target cache (uniform trim by ``bs - max_a - 1`` plus
+        # per-row tail-zero on rows that accepted less).
+        if max_a < bs - 1:
+            with mx.stream(generation_stream):
+                lm.rollback_speculative_cache(prompt_cache, None, accepted_arr, bs)
+
+        # Slice + tail-zero ``verify_out.shared_kv_states`` to match the
+        # post-rollback target cache. After this, all rows share the same
+        # tensor length but rows that accepted less have zeros in the tail
+        # positions [L_prefill_round + accepted_i + 1, L_prefill_round + max_a + 1).
+        rejected_global = bs - (max_a + 1)
+        next_shared_kv = {}
+        for k, kv in verify_out.shared_kv_states.items():
+            K, V = kv
+            valid = K.shape[-2] - rejected_global
+            if valid >= K.shape[-2]:
+                K_next, V_next = K, V
+            elif valid <= 0:
+                K_next = K[..., :1, :]
+                V_next = V[..., :1, :]
+            else:
+                K_next = K[..., :valid, :]
+                V_next = V[..., :valid, :]
+            # Per-row tail-zero on rows that accepted less than max_a.
+            if any(a < max_a for a in accepted_list):
+                # K_next/V_next shape: [B_active, H, valid, D]
+                # For row i, zero positions [valid - max_a + accepted_i, valid).
+                # (verify_start = valid - (max_a + 1), and tail begins at
+                # verify_start + accepted_i + 1 = valid - max_a + accepted_i.)
+                K_arr = mx.array(K_next)  # ensure materialized for slicing
+                V_arr = mx.array(V_next)
+                K_arr = mx.array(K_arr)
+                V_arr = mx.array(V_arr)
+                mask_rows = mx.arange(K_next.shape[-2])  # [valid]
+                # Build per-row mask: True where position should be kept.
+                # Shape [B_active, valid]. Row i keeps positions [0, valid - max_a + accepted_i).
+                keep_lens = mx.array(
+                    [valid - max_a + a for a in accepted_list], dtype=mx.int32
+                )  # [B_active]
+                keep_mask = mask_rows[None, :] < keep_lens[:, None]  # [B_active, valid]
+                keep_f = keep_mask.astype(K_next.dtype)[:, None, :, None]  # broadcast
+                K_next = K_next * keep_f
+                V_next = V_next * keep_f
+            next_shared_kv[k] = (K_next, V_next)
+
+        # Continuous batching: filter finished sequences. Only safe when
+        # the caches expose a .filter() method (e.g. BatchKVCache); the
+        # plain KVCache / RotatingKVCache do not, so we keep all rows
+        # in the batch and just stop emitting for finished rows. End the
+        # round-loop when every row has finished.
+        cache_filterable = all(hasattr(c, "filter") for c in prompt_cache)
+        if all(finished[active_idx[j]] for j in range(n_active)):
+            break
+        if cache_filterable:
+            keep_slots = [j for j in range(n_active) if not finished[active_idx[j]]]
+            if len(keep_slots) < n_active:
+                keep_mx = mx.array(keep_slots, dtype=mx.int32)
+                for c in prompt_cache:
+                    c.filter(keep_mx)
+                hidden = hidden[keep_mx]
+                for k in next_shared_kv:
+                    K_next, V_next = next_shared_kv[k]
+                    next_shared_kv[k] = (K_next[keep_mx], V_next[keep_mx])
+                active_idx = [active_idx[j] for j in keep_slots]
+
+        # Re-bind drafter with new shared_kv and per-row positions.
+        positions_active = [positions[active_idx[j]] for j in range(len(active_idx))]
+        new_kv_offset = int(prompt_cache[0].offset)
+        draft_model.set_shared_kv(
+            next_shared_kv,
+            kv_offset=new_kv_offset,
+            position=mx.array(positions_active),
+        )
+
+        if sum(emitted) % 256 == 0:
+            mx.clear_cache()
 
 
 def _dflash_rounds(
@@ -812,7 +1145,13 @@ def generate_step(
     # Speculative decoding setup
     last_outputs = None
     if draft_model is not None:
-        kwargs["capture_layer_ids"] = list(draft_model.config.target_layer_ids)
+        if draft_kind == "mtp":
+            # MTP drafter consumes target's last-layer hidden + shared K/V
+            # (per layer-type) rather than per-layer hidden captures.
+            kwargs["return_hidden"] = True
+            kwargs["return_shared_kv"] = True
+        else:
+            kwargs["capture_layer_ids"] = list(draft_model.config.target_layer_ids)
         prefill_step_size = None
         # Reset stale mRoPE state from any previous generation.
         lm = model.language_model if hasattr(model, "language_model") else model
@@ -859,7 +1198,7 @@ def generate_step(
             else:
                 kwargs = {}
 
-            return y, logprobs.squeeze(0)
+            return y, logprobs.squeeze(0) if logprobs.shape[0] == 1 else logprobs
 
     with mx.stream(generation_stream):
         # Get input embeddings (handles both multimodal and text-only)
@@ -906,12 +1245,59 @@ def generate_step(
 
     # Speculative decoding
     if draft_model is not None:
-        hidden = mx.concatenate(last_outputs.hidden_states, axis=-1)
         B = input_ids.shape[0]
+        if draft_kind == "mtp":
+            shared_kv_states = last_outputs.shared_kv_states
+            hidden = last_outputs.hidden_states[-1]
+            if B == 1:
+                mx.eval(y)
+                yield y.item(), logprobs
+                yield from _mtp_rounds(
+                    model,
+                    draft_model,
+                    prompt_cache,
+                    hidden,
+                    shared_kv_states,
+                    first_bonus=y.item(),
+                    max_tokens=max_tokens,
+                    sampler=sampler,
+                    draft_block_size=draft_block_size,
+                    token_dtype=input_ids.dtype,
+                )
+            else:
+                mx.eval(y)
+                # ``y`` is shape (B,) from sampler — no squeeze needed.
+                first_bonus = y if y.ndim == 1 else y.reshape(-1)
+                yield first_bonus.tolist(), logprobs
+                # Surface EOS token IDs from the model config so per-row
+                # stops are detected inside the round loop.
+                eos = getattr(model.config, "eos_token_id", None)
+                if isinstance(eos, int):
+                    eos_set = {eos}
+                elif eos is None:
+                    eos_set = None
+                else:
+                    eos_set = set(int(x) for x in eos)
+                yield from _mtp_rounds_batch(
+                    model,
+                    draft_model,
+                    prompt_cache,
+                    hidden,
+                    shared_kv_states,
+                    first_bonus=first_bonus,
+                    max_tokens=max_tokens,
+                    sampler=sampler,
+                    draft_block_size=draft_block_size,
+                    token_dtype=input_ids.dtype,
+                    eos_token_ids=eos_set,
+                )
+            return
+
         if draft_kind != "dflash":
             raise ValueError(
-                f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash']"
+                f"Unknown draft_kind {draft_kind!r}. Supported: " "['dflash', 'mtp']"
             )
+        hidden = mx.concatenate(last_outputs.hidden_states, axis=-1)
         if B == 1:
             mx.eval(y)
             yield y.item(), logprobs
