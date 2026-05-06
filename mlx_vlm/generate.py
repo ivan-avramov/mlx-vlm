@@ -2497,7 +2497,19 @@ class PromptProcessingBatch:
             else []
         )
         self._inputs_embeds = inputs_embeds
-        self._prompt_kwargs = prompt_kwargs
+        self._prompt_kwargs = prompt_kwargs or {}
+        self._prompt_length_aware_keys: List[str] = []
+        if self._prompt_kwargs and self._inputs_embeds is not None:
+            prompt_batch = self._inputs_embeds.shape[0]
+            prompt_len = self._inputs_embeds.shape[1]
+            for k, v in self._prompt_kwargs.items():
+                if (
+                    isinstance(v, mx.array)
+                    and v.ndim >= 2
+                    and v.shape[0] == prompt_batch
+                    and v.shape[1] == prompt_len
+                ):
+                    self._prompt_length_aware_keys.append(k)
 
         # APC metadata used for post-prefill block harvest (per-row).
         self._apc_meta = apc_meta or []
@@ -2626,6 +2638,14 @@ class PromptProcessingBatch:
             )
             meta["checkpoint_done"] = True
 
+    def _prompt_kwargs_for_step(self, n: Optional[int] = None) -> dict:
+        if n is None or not self._prompt_length_aware_keys:
+            return self._prompt_kwargs
+        out = dict(self._prompt_kwargs)
+        for k in self._prompt_length_aware_keys:
+            out[k] = out[k][:, :n, ...]
+        return out
+
     def prompt_step(self) -> int:
         """Process one chunk of the prompt. Returns tokens processed."""
         if not self.needs_processing():
@@ -2638,18 +2658,21 @@ class PromptProcessingBatch:
             n = min(n, checkpoint_col - self._processed_prompt_columns)
         if n <= 0:
             return 0
+        prompt_kwargs = self._prompt_kwargs_for_step(n)
         self.model(
             self._input_ids[:, :n],
             cache=self.prompt_cache,
             inputs_embeds=self._inputs_embeds[:, :n],
             n_to_process=n,
-            **self._prompt_kwargs,
+            **prompt_kwargs,
         )
         mx.eval([c.state for c in self.prompt_cache])
         self._processed_prompt_columns += n
         self._store_apc_exact_checkpoints()
         self._inputs_embeds = self._inputs_embeds[:, n:]
         self._input_ids = self._input_ids[:, n:]
+        for k in self._prompt_length_aware_keys:
+            self._prompt_kwargs[k] = self._prompt_kwargs[k][:, n:, ...]
         mx.clear_cache()
         return n
 
@@ -3119,14 +3142,26 @@ class BatchGenerator:
         # in _apc_extra_hash, never forwarded to the model.
         merged_kwargs: dict = {}
         per_row_keys: dict = {}
-        for kw in prompt_kwargs_list:
+        for i, kw in enumerate(prompt_kwargs_list):
             if not kw:
                 continue
+            full_len = len(full_ids[i])
+            prefix_len = prefix_lens[i]
+            right_pad = right_pad_per_row[i]
             for k, v in kw.items():
                 if k == "inputs_embeds" or k in self._APC_PRIVATE_KEYS:
                     continue
                 if isinstance(v, mx.array) and v.ndim > 0 and v.shape[0] >= 1:
-                    per_row_keys.setdefault(k, []).append(v[:1])
+                    row_v = v[:1]
+                    if v.shape[0] == 1 and v.ndim >= 2 and v.shape[1] == full_len:
+                        row_v = row_v[:, prefix_len:, ...]
+                        if right_pad > 0:
+                            pad_shape = (row_v.shape[0], right_pad) + tuple(
+                                row_v.shape[2:]
+                            )
+                            row_pad = mx.zeros(pad_shape, dtype=row_v.dtype)
+                            row_v = mx.concatenate([row_v, row_pad], axis=1)
+                    per_row_keys.setdefault(k, []).append(row_v)
                 elif k not in merged_kwargs:
                     merged_kwargs[k] = v
         for k, vs in per_row_keys.items():
