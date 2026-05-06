@@ -49,6 +49,7 @@ from .generate import (
 from .prompt_utils import apply_chat_template
 from .sample_utils import top_p_sampling
 from .structured import build_json_schema_logits_processor
+from .tokenizer_utils import make_streaming_detokenizer
 from .tool_parsers import _infer_tool_parser_from_processor, load_tool_module
 from .utils import load, prepare_inputs
 from .version import __version__
@@ -592,8 +593,7 @@ class ResponseGenerator:
                     rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
                     active[uid] = {
                         "rqueue": rqueue,
-                        "tokens": [],
-                        "prev_text": "",
+                        "detokenizer": make_streaming_detokenizer(self.processor),
                         "gen_kwargs": gen_kwargs if has_embeds else None,
                     }
 
@@ -666,6 +666,7 @@ class ResponseGenerator:
                 uids = []
                 rqueues = {}
                 token_lists = {}
+                stream_infos = {}
                 max_tokens_map = {}
                 all_input_ids = []
 
@@ -675,6 +676,9 @@ class ResponseGenerator:
                     uids.append(uid)
                     rqueues[uid] = rqueue
                     token_lists[uid] = []
+                    stream_infos[uid] = {
+                        "detokenizer": make_streaming_detokenizer(self.processor)
+                    }
                     max_tokens_map[uid] = args.max_tokens
                     all_input_ids.append(input_ids.squeeze(0).tolist())
                     rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
@@ -699,25 +703,35 @@ class ResponseGenerator:
                 first_bonus = sampler(out.logits[:, -1:]).squeeze(-1)
                 mx.eval(first_bonus, hidden, out.logits)
 
+                finished_uids = set()
+
                 # Send first bonus tokens to clients
                 fb_list = first_bonus.tolist()
                 for j, uid in enumerate(uids):
                     tok = int(fb_list[j])
                     token_lists[uid].append(tok)
-                    text = self.tokenizer.decode([tok])
+                    is_stop = tok in self.stop_tokens
+                    is_max = len(token_lists[uid]) >= max_tokens_map[uid]
+                    finish = "stop" if is_stop else "length" if is_max else None
+                    text = self._stream_text(stream_infos[uid], tok, finish)
                     rqueues[uid].put(
                         StreamingToken(
                             text=text,
                             token=tok,
                             logprobs=0.0,
-                            finish_reason=None,
+                            finish_reason=finish,
                             peak_memory=mx.get_peak_memory() / 1e9,
                         )
                     )
+                    if finish is not None:
+                        rqueues[uid].put(None)
+                        finished_uids.add(uid)
+
+                if len(finished_uids) == len(uids):
+                    continue
 
                 # --- Phase 3: speculative decode rounds ---
                 max_tok = max(max_tokens_map[u] for u in uids)
-                finished_uids = set()
 
                 def stop_check(seq_idx, token_id):
                     uid = uids[seq_idx]
@@ -766,20 +780,14 @@ class ResponseGenerator:
                         token_lists[uid].append(tok)
                         tokens = token_lists[uid]
 
-                        if len(tokens) >= 2:
-                            prev = self.tokenizer.decode(tokens[:-1])
-                            curr = self.tokenizer.decode(tokens)
-                            text = curr[len(prev) :]
-                        else:
-                            text = self.tokenizer.decode(tokens)
-
                         is_stop = tok in self.stop_tokens
                         is_max = len(tokens) >= max_tokens_map[uid]
                         finish = "stop" if is_stop else "length" if is_max else None
+                        text = self._stream_text(stream_infos[uid], tok, finish)
 
                         rqueues[uid].put(
                             StreamingToken(
-                                text="" if is_stop else text,
+                                text=text,
                                 token=tok,
                                 logprobs=0.0,
                                 finish_reason=finish,
@@ -804,9 +812,11 @@ class ResponseGenerator:
                 # Finalize any remaining
                 for uid in uids:
                     if uid not in finished_uids:
+                        stream_infos[uid]["detokenizer"].finalize()
+                        text = stream_infos[uid]["detokenizer"].last_segment
                         rqueues[uid].put(
                             StreamingToken(
-                                text="",
+                                text=text,
                                 token=0,
                                 logprobs=0.0,
                                 finish_reason="length",
@@ -837,13 +847,7 @@ class ResponseGenerator:
             if hasattr(tok, "item"):
                 tok = tok.item()
 
-            if r.finish_reason == "stop":
-                text = ""
-            else:
-                info["tokens"].append(tok)
-                curr = self.tokenizer.decode(info["tokens"])
-                text = curr[len(info["prev_text"]) :]
-                info["prev_text"] = curr
+            text = self._stream_text(info, tok, r.finish_reason)
 
             lp = r.token_logprob
 
@@ -861,6 +865,17 @@ class ResponseGenerator:
             if r.finish_reason is not None:
                 rqueue.put(None)
                 del active[r.uid]
+
+    def _stream_text(self, info: dict, token: int, finish_reason: Optional[str]) -> str:
+        """Convert one generated token into a streaming text segment."""
+        detokenizer = info["detokenizer"]
+        if finish_reason == "stop":
+            detokenizer.finalize()
+        else:
+            detokenizer.add_token(token)
+            if finish_reason is not None:
+                detokenizer.finalize()
+        return detokenizer.last_segment
 
     def _flush(self, batch_gen, active):
         """Drain all pending text-only prompts before inserting an image request."""
