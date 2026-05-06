@@ -224,9 +224,11 @@ def parse_arguments():
     parser.add_argument(
         "--draft-kind",
         type=str,
-        default="dflash",
+        default=None,
+        choices=["dflash", "mtp"],
         help="Drafter family. Supported: 'dflash' (Qwen3.5 DFlash), "
-        "'mtp' (Gemma 4 Multi-Token Prediction / Assistant model).",
+        "'mtp' (Gemma 4 Multi-Token Prediction / Assistant model). "
+        "Default: auto-detected from the drafter's HF model_type.",
     )
     parser.add_argument(
         "--draft-block-size",
@@ -616,6 +618,14 @@ def _mtp_rounds(
             mx.clear_cache()
 
 
+def _batch_cache_left_padding(prompt_cache: List[Any]) -> Optional[mx.array]:
+    for cache_entry in prompt_cache:
+        left_padding = getattr(cache_entry, "left_padding", None)
+        if left_padding is not None:
+            return left_padding
+    return None
+
+
 def _mtp_rounds_batch(
     model: nn.Module,
     draft_model: nn.Module,
@@ -637,9 +647,8 @@ def _mtp_rounds_batch(
     index, continuous-batching filter on row finish. Differences vs DFlash
     batched: drafter consumes ``shared_kv_states`` (per-layer-type K/V
     snapshot) instead of multi-layer hidden capture, ``draft_block`` is
-    autoregressive, and the per-round ``shared_kv`` slicing mirrors
-    ``rollback_speculative_cache``'s tail-zero pattern so each row's KV
-    has the correct row-specific valid length.
+    autoregressive, and the per-round ``shared_kv`` snapshot is normalized
+    back to the unbatched prefix-valid layout before each drafter rebind.
     """
     lm = model.language_model if hasattr(model, "language_model") else model
     if not hasattr(lm, "rollback_speculative_cache"):
@@ -672,7 +681,10 @@ def _mtp_rounds_batch(
         L_prefill = int(offset0)
         positions = [L_prefill] * B
     draft_model.set_shared_kv(
-        shared_kv_states, kv_offset=L_prefill, position=mx.array(positions)
+        shared_kv_states,
+        kv_offset=L_prefill,
+        position=mx.array(positions),
+        left_padding=_batch_cache_left_padding(prompt_cache),
     )
 
     b = first_bonus.tolist()
@@ -767,9 +779,8 @@ def _mtp_rounds_batch(
                 lm.rollback_speculative_cache(prompt_cache, None, accepted_arr, bs)
 
         # Slice + tail-zero ``verify_out.shared_kv_states`` to match the
-        # post-rollback target cache. After this, all rows share the same
-        # tensor length but rows that accepted less have zeros in the tail
-        # positions [L_prefill_round + accepted_i + 1, L_prefill_round + max_a + 1).
+        # post-rollback target cache. ``set_shared_kv()`` will normalize the
+        # resulting hybrid layout back into a prefix-valid drafter view.
         rejected_global = bs - (max_a + 1)
         next_shared_kv = {}
         for k, kv in verify_out.shared_kv_states.items():
@@ -835,6 +846,7 @@ def _mtp_rounds_batch(
             next_shared_kv,
             kv_offset=new_kv_offset,
             position=mx.array(positions_active),
+            left_padding=_batch_cache_left_padding(prompt_cache),
         )
 
         if sum(emitted) % 256 == 0:
@@ -2008,6 +2020,8 @@ _SEQUENCE_ALIGNED_PROMPT_KWARGS = {
     "pos_hw",
 }
 
+APC_PRIVATE_PROMPT_KEYS = ("_apc_tenant", "_apc_image_hash")
+
 
 def _prompt_kwarg_row(v: mx.array, row_idx: int, batch_size: int) -> mx.array:
     if v.shape[0] == batch_size:
@@ -2058,6 +2072,56 @@ def _pad_sequence_aligned_prompt_kwarg(
     pad_v = mx.zeros(pad_shape, dtype=v.dtype)
     parts = [pad_v, v] if left else [v, pad_v]
     return mx.concatenate(parts, axis=1)
+
+
+def _merge_prefill_prompt_kwargs(
+    prompt_kwargs_list: List[Optional[dict]],
+    input_ids: List[List[int]],
+) -> Tuple[mx.array, dict]:
+    """Batch per-row prompt kwargs for a left-padded prefill forward."""
+    lengths = [len(ids) for ids in input_ids]
+    max_length = max(lengths)
+
+    row_embeds: List[mx.array] = []
+    embed_dtype = None
+    embed_dim = None
+    for kw, length in zip(prompt_kwargs_list, lengths):
+        if not kw or kw.get("inputs_embeds") is None:
+            raise ValueError("inputs_embeds is required")
+        embeds = kw["inputs_embeds"]  # [1, length, D]
+        embed_dtype = embeds.dtype
+        embed_dim = embeds.shape[-1]
+        if length < max_length:
+            pad = mx.zeros(
+                (embeds.shape[0], max_length - length, embed_dim),
+                dtype=embed_dtype,
+            )
+            embeds = mx.concatenate([pad, embeds], axis=1)
+        row_embeds.append(embeds)
+    inputs_embeds = mx.concatenate(row_embeds, axis=0)
+
+    merged_kwargs: dict = {}
+    per_row_keys: dict = {}
+    batch_size = len(prompt_kwargs_list)
+    for i, (kw, length) in enumerate(zip(prompt_kwargs_list, lengths)):
+        if not kw:
+            continue
+        for k, v in kw.items():
+            if k == "inputs_embeds" or k in APC_PRIVATE_PROMPT_KEYS:
+                continue
+            if isinstance(v, mx.array) and v.ndim > 0 and v.shape[0] >= 1:
+                row_v = _prompt_kwarg_row(v, i, batch_size)
+                if _is_sequence_aligned_prompt_kwarg(k, row_v, length):
+                    row_v = _pad_sequence_aligned_prompt_kwarg(
+                        row_v, max_length, left=True
+                    )
+                per_row_keys.setdefault(k, []).append(row_v)
+            elif k not in merged_kwargs:
+                merged_kwargs[k] = v
+    for k, vs in per_row_keys.items():
+        merged_kwargs[k] = mx.concatenate(vs, axis=0)
+
+    return inputs_embeds, merged_kwargs
 
 
 def _extend_cache(cache_a, cache_b):
@@ -3026,7 +3090,7 @@ class BatchGenerator:
     # ---------------- APC integration helpers ----------------
     # Keys that are APC-only metadata; stripped from ``prompt_kwargs`` before
     # the merged kwargs are passed to the language model forward.
-    _APC_PRIVATE_KEYS = ("_apc_tenant", "_apc_image_hash")
+    _APC_PRIVATE_KEYS = APC_PRIVATE_PROMPT_KEYS
 
     def _apc_extra_hash(self, prompt_kwargs: dict) -> int:
         """Salt for the APC hash chain."""
@@ -3511,48 +3575,9 @@ class BatchGenerator:
             prompt_kwargs_list = [s[3] for s in sequences]
             logits_processors = [s[4] for s in sequences]
 
-            # Concatenate per-row inputs_embeds (left-padded to max length so
-            # all rows end at the same cache index). Other tensor kwargs get
-            # concatenated along the batch dim too; scalars take row 0.
-            lengths = [len(ids) for ids in input_ids]
-            max_length = max(lengths)
-            row_embeds: List[mx.array] = []
-            embed_dtype = None
-            embed_dim = None
-            for kw, l in zip(prompt_kwargs_list, lengths):
-                if not kw or kw.get("inputs_embeds") is None:
-                    raise ValueError("inputs_embeds is required")
-                e = kw["inputs_embeds"]  # [1, l, D]
-                embed_dtype = e.dtype
-                embed_dim = e.shape[-1]
-                if l < max_length:
-                    pad = mx.zeros(
-                        (e.shape[0], max_length - l, embed_dim), dtype=embed_dtype
-                    )
-                    e = mx.concatenate([pad, e], axis=1)  # left-pad
-                row_embeds.append(e)
-            inputs_embeds = mx.concatenate(row_embeds, axis=0)
-
-            merged_kwargs: dict = {}
-            per_row_keys: dict = {}
-            batch_size = len(prompt_kwargs_list)
-            for i, (kw, l) in enumerate(zip(prompt_kwargs_list, lengths)):
-                if not kw:
-                    continue
-                for k, v in kw.items():
-                    if k == "inputs_embeds" or k in self._APC_PRIVATE_KEYS:
-                        continue
-                    if isinstance(v, mx.array) and v.ndim > 0 and v.shape[0] >= 1:
-                        row_v = _prompt_kwarg_row(v, i, batch_size)
-                        if _is_sequence_aligned_prompt_kwarg(k, row_v, l):
-                            row_v = _pad_sequence_aligned_prompt_kwarg(
-                                row_v, max_length, left=True
-                            )
-                        per_row_keys.setdefault(k, []).append(row_v)
-                    elif k not in merged_kwargs:
-                        merged_kwargs[k] = v
-            for k, vs in per_row_keys.items():
-                merged_kwargs[k] = mx.concatenate(vs, axis=0)
+            inputs_embeds, merged_kwargs = _merge_prefill_prompt_kwargs(
+                prompt_kwargs_list, input_ids
+            )
 
             # APC: also harvest cold-prefill prefixes so future requests hit.
             apc_meta = self._build_apc_meta_for_cold(input_ids, prompt_kwargs_list)
@@ -3929,8 +3954,18 @@ def main():
     if args.draft_model is not None:
         from .speculative.drafters import load_drafter
 
-        print(f"Loading drafter ({args.draft_kind}): {args.draft_model}")
-        draft_model = load_drafter(args.draft_model, kind=args.draft_kind)
+        print(f"Loading drafter ({args.draft_kind or 'auto'}): {args.draft_model}")
+        draft_model, resolved_kind = load_drafter(
+            args.draft_model, kind=args.draft_kind
+        )
+        if args.draft_kind is None:
+            print(f"  → auto-detected --draft-kind={resolved_kind!r}.")
+        elif resolved_kind != args.draft_kind:
+            print(
+                f"  → drafter requires --draft-kind={resolved_kind!r}; "
+                f"using {resolved_kind!r} instead of {args.draft_kind!r}."
+            )
+        args.draft_kind = resolved_kind
 
     prompt = args.prompt
 

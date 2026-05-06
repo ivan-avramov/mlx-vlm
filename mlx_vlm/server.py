@@ -41,6 +41,7 @@ from .generate import (
     BatchGenerator,
     _dflash_rounds_batch,
     _make_cache,
+    _merge_prefill_prompt_kwargs,
     _mtp_rounds_batch,
     generate,
     normalize_resize_shape,
@@ -325,13 +326,24 @@ class ResponseGenerator:
                 stop_tokens.add(config.eos_token_id)
 
         draft_model = None
-        draft_kind = os.environ.get("MLX_VLM_DRAFT_KIND", "dflash")
+        draft_kind = os.environ.get("MLX_VLM_DRAFT_KIND")
         draft_model_path = os.environ.get("MLX_VLM_DRAFT_MODEL")
         if draft_model_path:
             from .speculative.drafters import load_drafter
 
-            print(f"Loading speculative drafter ({draft_kind}): {draft_model_path}")
-            draft_model = load_drafter(draft_model_path, kind=draft_kind)
+            print(
+                f"Loading speculative drafter ({draft_kind or 'auto'}): "
+                f"{draft_model_path}"
+            )
+            draft_model, resolved_kind = load_drafter(draft_model_path, kind=draft_kind)
+            if draft_kind is None:
+                print(f"  → auto-detected --draft-kind={resolved_kind!r}.")
+            elif resolved_kind != draft_kind:
+                print(
+                    f"  → drafter requires --draft-kind={resolved_kind!r}; "
+                    f"using {resolved_kind!r} instead of {draft_kind!r}."
+                )
+            draft_kind = resolved_kind
             print("Drafter ready — speculative decoding enabled.")
 
         self.model = model
@@ -677,9 +689,15 @@ class ResponseGenerator:
                 stream_infos = {}
                 max_tokens_map = {}
                 all_input_ids = []
+                prompt_kwargs_list = []
+
+                if hasattr(lm, "_position_ids"):
+                    lm._position_ids = None
+                if hasattr(lm, "_rope_deltas"):
+                    lm._rope_deltas = None
 
                 for rqueue, raw_inputs, prompt_tokens, args, images in pending:
-                    input_ids, _ = self._gpu_embed(raw_inputs, images)
+                    input_ids, gen_kwargs = self._gpu_embed(raw_inputs, images)
                     uid = id(rqueue)
                     uids.append(uid)
                     rqueues[uid] = rqueue
@@ -689,6 +707,7 @@ class ResponseGenerator:
                     }
                     max_tokens_map[uid] = args.max_tokens
                     all_input_ids.append(input_ids.squeeze(0).tolist())
+                    prompt_kwargs_list.append(gen_kwargs)
                     rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
                     sampler = self._make_sampler(args) or _make_sampler(temp=0)
 
@@ -700,12 +719,17 @@ class ResponseGenerator:
                 ]
                 input_mx = mx.array(padded, dtype=mx.int32)
 
+                inputs_embeds_mx, prompt_kwargs = _merge_prefill_prompt_kwargs(
+                    prompt_kwargs_list, all_input_ids
+                )
+
                 prompt_cache = _make_cache(lm, left_padding)
-                lm._position_ids = None
-                lm._rope_deltas = None
+
+                lm_call_kwargs = {**prefill_kwargs, **prompt_kwargs}
+                lm_call_kwargs["inputs_embeds"] = inputs_embeds_mx
 
                 with mx.stream(generation_stream):
-                    out = lm(input_mx, cache=prompt_cache, **prefill_kwargs)
+                    out = lm(input_mx, cache=prompt_cache, **lm_call_kwargs)
                 hidden = _speculative_hidden_state(draft_kind, out)
                 shared_kv_states = out.shared_kv_states if is_mtp else None
                 first_bonus = sampler(out.logits[:, -1:]).squeeze(-1)
@@ -2960,9 +2984,10 @@ def main():
     parser.add_argument(
         "--draft-kind",
         type=str,
-        default="dflash",
+        default=None,
         choices=["dflash", "mtp"],
-        help="Drafter family — 'dflash' (default) or 'mtp' (Gemma 4).",
+        help="Drafter family — 'dflash' or 'mtp' (Gemma 4). "
+        "Default: auto-detected from the drafter's HF model_type.",
     )
     parser.add_argument(
         "--draft-block-size",
@@ -3002,7 +3027,8 @@ def main():
     os.environ["MLX_VLM_VISION_CACHE_SIZE"] = str(args.vision_cache_size)
     if args.draft_model:
         os.environ["MLX_VLM_DRAFT_MODEL"] = args.draft_model
-        os.environ["MLX_VLM_DRAFT_KIND"] = args.draft_kind
+        if args.draft_kind is not None:
+            os.environ["MLX_VLM_DRAFT_KIND"] = args.draft_kind
         if args.draft_block_size is not None:
             os.environ["MLX_VLM_DRAFT_BLOCK_SIZE"] = str(args.draft_block_size)
     if args.prefill_step_size:
