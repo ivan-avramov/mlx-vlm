@@ -229,7 +229,7 @@ class TestResponseGenerator:
         args = server.GenerationArguments()
         assert args.max_tokens == server.DEFAULT_MAX_TOKENS
         assert args.temperature == server.DEFAULT_TEMPERATURE
-        assert args.enable_thinking is True
+        assert args.enable_thinking is False
         assert args.logit_bias is None
 
     def test_token_queue_timeout_defaults_to_long_prefill_window(self, monkeypatch):
@@ -462,6 +462,47 @@ class TestResponseGenerator:
         args = server._build_gen_args(req)
         assert args.max_tokens == 256
         assert args.enable_thinking is True
+
+    def test_build_gen_args_uses_server_thinking_default_when_omitted(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("MLX_VLM_ENABLE_THINKING", "1")
+        req = server.ChatRequest(
+            model="demo",
+            messages=[server.ChatMessage(role="user", content="hi")],
+        )
+
+        assert "enable_thinking" not in req.model_fields_set
+        assert server._build_gen_args(req).enable_thinking is True
+
+        monkeypatch.setenv("MLX_VLM_ENABLE_THINKING", "0")
+        req = server.ChatRequest(
+            model="demo",
+            messages=[server.ChatMessage(role="user", content="hi")],
+        )
+
+        assert server._build_gen_args(req).enable_thinking is False
+
+    def test_build_gen_args_request_thinking_overrides_server_default(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("MLX_VLM_ENABLE_THINKING", "1")
+        req = server.ChatRequest(
+            model="demo",
+            messages=[server.ChatMessage(role="user", content="hi")],
+            enable_thinking=False,
+        )
+
+        assert server._build_gen_args(req).enable_thinking is False
+
+        monkeypatch.setenv("MLX_VLM_ENABLE_THINKING", "0")
+        req = server.ChatRequest(
+            model="demo",
+            messages=[server.ChatMessage(role="user", content="hi")],
+            enable_thinking=True,
+        )
+
+        assert server._build_gen_args(req).enable_thinking is True
 
     def test_gpu_embed_hashes_pixel_values_without_image_ref(self):
         class Embed:

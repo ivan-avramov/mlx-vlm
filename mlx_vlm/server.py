@@ -58,6 +58,7 @@ from .vision_cache import VisionFeatureCache
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
 DEFAULT_TOKEN_QUEUE_TIMEOUT = 600.0
+DEFAULT_ENABLE_THINKING = False
 
 
 def _get_speculative_rounds_batch(draft_kind: str):
@@ -113,6 +114,13 @@ def get_token_queue_timeout():
     if timeout <= 0:
         return None
     return timeout
+
+
+def get_server_enable_thinking():
+    raw = os.environ.get("MLX_VLM_ENABLE_THINKING")
+    if raw is None:
+        return DEFAULT_ENABLE_THINKING
+    return raw.lower() in ("1", "true", "yes", "on")
 
 
 def get_quantized_kv_bits(model: str):
@@ -174,7 +182,7 @@ class GenerationArguments:
     seed: Optional[int] = None
     repetition_penalty: Optional[float] = None
     logit_bias: Optional[dict] = None
-    enable_thinking: bool = True
+    enable_thinking: bool = DEFAULT_ENABLE_THINKING
     thinking_budget: Optional[int] = None
     thinking_start_token: Optional[str] = None
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None
@@ -965,6 +973,11 @@ def _build_gen_args(
     logit_bias = getattr(request, "logit_bias", None)
     if logit_bias is not None and isinstance(logit_bias, dict):
         logit_bias = {int(k): v for k, v in logit_bias.items()}
+    enable_thinking = _request_field_or_default(
+        request,
+        "enable_thinking",
+        get_server_enable_thinking(),
+    )
     args = GenerationArguments(
         max_tokens=max_tokens,
         temperature=getattr(request, "temperature", DEFAULT_TEMPERATURE),
@@ -973,7 +986,7 @@ def _build_gen_args(
         min_p=getattr(request, "min_p", 0.0),
         repetition_penalty=getattr(request, "repetition_penalty", None),
         logit_bias=logit_bias,
-        enable_thinking=getattr(request, "enable_thinking", True),
+        enable_thinking=enable_thinking,
         thinking_budget=getattr(request, "thinking_budget", None),
         thinking_start_token=getattr(request, "thinking_start_token", None),
         tenant_id=tenant_id,
@@ -981,6 +994,14 @@ def _build_gen_args(
     if processor is not None:
         args.logits_processors = _build_structured_logits_processors(request, processor)
     return args
+
+
+def _request_field_or_default(request, field_name: str, default):
+    fields_set = getattr(request, "model_fields_set", None)
+    if fields_set is not None and field_name not in fields_set:
+        return default
+    value = getattr(request, field_name, default)
+    return default if value is None else value
 
 
 def _read_tenant_id(http_request) -> Optional[str]:
@@ -1412,7 +1433,13 @@ class OpenAIRequest(FlexibleBaseModel):
     min_p: float = Field(0.0, description="Min-p sampling.")
     repetition_penalty: Optional[float] = Field(None, description="Repetition penalty.")
     logit_bias: Optional[Any] = Field(None, description="Logit bias dict.")
-    enable_thinking: bool = Field(True, description="Enable thinking mode.")
+    enable_thinking: Optional[bool] = Field(
+        None,
+        description=(
+            "Override server thinking mode for this request. If omitted, the "
+            "server default set by --enable-thinking is used."
+        ),
+    )
     thinking_budget: Optional[int] = Field(None, description="Max thinking tokens.")
     thinking_start_token: Optional[str] = Field(
         None, description="Thinking start token."
@@ -1606,7 +1633,13 @@ class VLMRequest(FlexibleBaseModel):
     seed: int = Field(DEFAULT_SEED, description="Seed for random generation.")
     repetition_penalty: Optional[float] = Field(None, description="Repetition penalty.")
     logit_bias: Optional[Any] = Field(None, description="Logit bias dict.")
-    enable_thinking: bool = Field(True, description="Enable thinking mode.")
+    enable_thinking: Optional[bool] = Field(
+        None,
+        description=(
+            "Override server thinking mode for this request. If omitted, the "
+            "server default set by --enable-thinking is used."
+        ),
+    )
     thinking_budget: Optional[int] = Field(None, description="Max thinking tokens.")
     thinking_start_token: Optional[str] = Field(
         None, description="Thinking start token."
@@ -2876,6 +2909,15 @@ def main():
         help="Maximum number of tokens to generate.",
     )
     parser.add_argument(
+        "--enable-thinking",
+        action="store_true",
+        default=DEFAULT_ENABLE_THINKING,
+        help=(
+            "Enable thinking mode by default for requests that do not set "
+            "enable_thinking explicitly."
+        ),
+    )
+    parser.add_argument(
         "--kv-bits",
         type=float,
         default=None,
@@ -2966,6 +3008,7 @@ def main():
     if args.prefill_step_size:
         os.environ["PREFILL_STEP_SIZE"] = str(args.prefill_step_size)
     os.environ["MLX_VLM_MAX_TOKENS"] = str(args.max_tokens)
+    os.environ["MLX_VLM_ENABLE_THINKING"] = "1" if args.enable_thinking else "0"
     if args.kv_bits is not None:
         os.environ["KV_BITS"] = str(args.kv_bits)
     os.environ["KV_GROUP_SIZE"] = str(args.kv_group_size)
