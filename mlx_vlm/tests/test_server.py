@@ -539,6 +539,46 @@ class TestResponseGenerator:
         gen._cpu_preprocess = lambda prompt, images, audio: {"input_ids": [1, 2, 3]}
         return gen
 
+    def test_generate_rejects_requests_over_configured_context_limit(
+        self, monkeypatch
+    ):
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.wait_until_ready = lambda: None
+        gen.draft_model = None
+        gen._cpu_preprocess = lambda prompt, images, audio: {
+            "input_ids": mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32)
+        }
+        gen.requests = Queue()
+
+        monkeypatch.setenv("MAX_KV_SIZE", "8")
+
+        with pytest.raises(server.PromptTooLongError, match="MAX_KV_SIZE is 8"):
+            gen.generate("prompt", args=server.GenerationArguments(max_tokens=4))
+
+        assert gen.requests.empty()
+
+    def test_server_runtime_snapshot_reports_effective_context_limit(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("MAX_KV_SIZE", "8")
+        monkeypatch.setattr(
+            server,
+            "model_cache",
+            {
+                "config": SimpleNamespace(
+                    text_config=SimpleNamespace(max_position_embeddings=16)
+                )
+            },
+        )
+        monkeypatch.setattr(server, "response_generator", None)
+        monkeypatch.setattr(server, "apc_manager", None)
+
+        runtime = server._server_runtime_snapshot()
+
+        assert runtime["loaded_context_size"] == 16
+        assert runtime["configured_context_limit"] == 8
+        assert runtime["effective_context_limit"] == 8
+
     def test_generate_arguments_defaults(self):
         args = server.GenerationArguments()
         assert args.max_tokens == server.DEFAULT_MAX_TOKENS

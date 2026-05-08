@@ -65,6 +65,10 @@ METRICS_HISTORY_LIMIT = 100
 METRICS_RECENT_LIMIT = 32
 
 
+class PromptTooLongError(ValueError):
+    """Raised when a request exceeds the configured server context budget."""
+
+
 def _get_speculative_rounds_batch(draft_kind: str):
     if draft_kind == "mtp":
         return _mtp_rounds_batch
@@ -153,6 +157,11 @@ def get_max_kv_size(model: str):
         print(f"Model {model} uses QuantizedKVCache, can't set max KV size.")
         return None
     return max_kv_tokens
+
+
+def get_configured_context_limit():
+    max_kv_tokens = int(os.environ.get("MAX_KV_SIZE", 0))
+    return max_kv_tokens or None
 
 
 def get_quantized_kv_start():
@@ -395,6 +404,13 @@ def _build_metrics_envelope(
 def _server_runtime_snapshot() -> dict:
     config = model_cache.get("config")
     text_config = getattr(config, "text_config", None)
+    native_context_size = getattr(text_config, "max_position_embeddings", None)
+    configured_context_limit = get_configured_context_limit()
+    effective_context_limit = (
+        min(native_context_size, configured_context_limit)
+        if native_context_size is not None and configured_context_limit is not None
+        else configured_context_limit or native_context_size
+    )
     queue_depth = 0
     if response_generator is not None and hasattr(response_generator, "requests"):
         try:
@@ -404,7 +420,9 @@ def _server_runtime_snapshot() -> dict:
     return {
         "loaded_model": model_cache.get("model_path", None),
         "loaded_adapter": model_cache.get("adapter_path", None),
-        "loaded_context_size": getattr(text_config, "max_position_embeddings", None),
+        "loaded_context_size": native_context_size,
+        "configured_context_limit": configured_context_limit,
+        "effective_context_limit": effective_context_limit,
         "loaded_tool_parser": (
             _infer_tool_parser_from_processor(model_cache.get("processor"))
             if model_cache.get("processor")
@@ -634,6 +652,15 @@ class ResponseGenerator:
             if hasattr(raw_inputs["input_ids"], "size")
             else len(raw_inputs["input_ids"])
         )
+        context_limit = get_configured_context_limit()
+        requested_tokens = prompt_tokens + max(0, int(args.max_tokens or 0))
+        if context_limit is not None and requested_tokens > context_limit:
+            raise PromptTooLongError(
+                "Request needs "
+                f"{requested_tokens} context tokens "
+                f"({prompt_tokens} prompt + {args.max_tokens} max generation), "
+                f"but MAX_KV_SIZE is {context_limit}."
+            )
 
         self.requests.put((rqueue, raw_inputs, prompt_tokens, args, images))
 
@@ -2632,6 +2659,16 @@ async def responses_endpoint(request: Request):
 
                 return response
 
+            except PromptTooLongError as e:
+                server_metrics.record_failure(
+                    endpoint="/responses",
+                    model=openai_request.model,
+                    stream=False,
+                    error=str(e),
+                )
+                mx.clear_cache()
+                gc.collect()
+                raise HTTPException(status_code=400, detail=str(e))
             except Exception as e:
                 server_metrics.record_failure(
                     endpoint="/responses",
@@ -3308,6 +3345,16 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                 return result
 
+            except PromptTooLongError as e:
+                server_metrics.record_failure(
+                    endpoint="/chat/completions",
+                    model=request.model,
+                    stream=False,
+                    error=str(e),
+                )
+                mx.clear_cache()
+                gc.collect()
+                raise HTTPException(status_code=400, detail=str(e))
             except Exception as e:
                 server_metrics.record_failure(
                     endpoint="/chat/completions",
@@ -3388,6 +3435,8 @@ async def health_check():
         "loaded_model": runtime["loaded_model"],
         "loaded_adapter": runtime["loaded_adapter"],
         "loaded_context_size": runtime["loaded_context_size"],
+        "configured_context_limit": runtime["configured_context_limit"],
+        "effective_context_limit": runtime["effective_context_limit"],
         "loaded_tool_parser": runtime["loaded_tool_parser"],
         "continuous_batching_enabled": runtime["continuous_batching_enabled"],
         "apc_enabled": runtime["apc"]["enabled"],
