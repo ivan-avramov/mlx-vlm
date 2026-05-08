@@ -539,9 +539,7 @@ class TestResponseGenerator:
         gen._cpu_preprocess = lambda prompt, images, audio: {"input_ids": [1, 2, 3]}
         return gen
 
-    def test_generate_rejects_requests_over_configured_context_limit(
-        self, monkeypatch
-    ):
+    def test_generate_rejects_requests_over_configured_context_limit(self, monkeypatch):
         gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
         gen.wait_until_ready = lambda: None
         gen.draft_model = None
@@ -557,9 +555,7 @@ class TestResponseGenerator:
 
         assert gen.requests.empty()
 
-    def test_server_runtime_snapshot_reports_effective_context_limit(
-        self, monkeypatch
-    ):
+    def test_server_runtime_snapshot_reports_effective_context_limit(self, monkeypatch):
         monkeypatch.setenv("MAX_KV_SIZE", "8")
         monkeypatch.setattr(
             server,
