@@ -1,9 +1,9 @@
-import inspect
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 
 from ..base import BaseModelConfig
 from ..qwen3_vl.config import VisionConfig as Qwen3VLVisionConfig
+from ..qwen3_vl.config import _config_kwargs, _maybe_deserialize_config
 
 QWEN_CHAT_EOS_TOKEN_ID = 248046
 
@@ -144,26 +144,10 @@ class ModelConfig(BaseModelConfig):
     @classmethod
     def from_dict(cls, params):
         params = dict(params)
-        if isinstance(params.get("vision_config"), dict):
-            params["vision_config"] = VisionConfig(
-                **{
-                    k: v
-                    for k, v in params["vision_config"].items()
-                    if k in inspect.signature(VisionConfig).parameters
-                }
-            )
-        if isinstance(params.get("text_config"), dict):
-            params["text_config"] = TextConfig(
-                **{
-                    k: v
-                    for k, v in params["text_config"].items()
-                    if k in inspect.signature(TextConfig).parameters
-                }
-            )
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
+        params["vision_config"] = _maybe_deserialize_config(
+            VisionConfig, params.get("vision_config")
         )
+        params["text_config"] = _maybe_deserialize_config(
+            TextConfig, params.get("text_config"), require_all_fields=True
+        )
+        return cls(**_config_kwargs(cls, params))

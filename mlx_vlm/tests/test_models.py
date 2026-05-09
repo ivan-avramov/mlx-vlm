@@ -1271,12 +1271,13 @@ class TestModels(unittest.TestCase):
                     {
                         "model_type": model_module.__name__.rsplit(".", 1)[-1],
                         "text_config": {},
-                        "vision_config": {},
+                        "vision_config": {"patch_size": 16},
                         "quantization": quantization,
                         "quantization_config": quantization,
                     }
                 )
 
+                self.assertEqual(config.vision_config.patch_size, 16)
                 self.assertIn(
                     "language_model.model.layers.0.linear_attn.in_proj_qkv",
                     config.quantization,
@@ -1351,9 +1352,10 @@ class TestModels(unittest.TestCase):
                     {
                         "model_type": model_module.__name__.rsplit(".", 1)[-1],
                         "text_config": {"eos_token_id": 248044},
-                        "vision_config": {},
+                        "vision_config": {"patch_size": 16},
                     }
                 )
+                self.assertEqual(config_from_dict.vision_config.patch_size, 16)
                 self.assertEqual(config_from_dict.eos_token_id, [248044, 248046])
 
                 explicit = model_module.ModelConfig(
