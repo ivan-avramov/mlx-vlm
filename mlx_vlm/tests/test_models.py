@@ -1844,6 +1844,53 @@ class TestModels(unittest.TestCase):
         # TODO: Add vision test runner for lfm2_vl
         # Rewrite inputs to be defined by the test classes
 
+    def test_lfm2_vl_initializes_projector_layernorm_even_when_disabled(self):
+        from mlx_vlm.models import lfm2_vl
+
+        text_config = lfm2_vl.TextConfig(layer_types=["full_attention"])
+        vision_config = lfm2_vl.VisionConfig()
+        config = lfm2_vl.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            projector_use_layernorm=False,
+        )
+        model = lfm2_vl.Model(config)
+
+        self.assertIsInstance(model.multi_modal_projector.layer_norm, nn.LayerNorm)
+        self.assertIn("weight", model.multi_modal_projector.layer_norm.parameters())
+        self.assertIn("bias", model.multi_modal_projector.layer_norm.parameters())
+
+    def test_lfm2_vl_projector_skips_disabled_layernorm_branch(self):
+        from mlx_vlm.models import lfm2_vl
+        from mlx_vlm.models.lfm2_vl.lfm2_vl import Lfm2VlMultiModalProjector
+
+        class ExplodingLayerNorm(nn.Module):
+            def __call__(self, x):
+                raise AssertionError("layernorm branch should be disabled")
+
+        text_config = lfm2_vl.TextConfig(
+            hidden_size=4,
+            num_hidden_layers=1,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            intermediate_size=8,
+            layer_types=["full_attention"],
+        )
+        vision_config = lfm2_vl.VisionConfig(hidden_size=2)
+        config = lfm2_vl.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            downsample_factor=1,
+            projector_hidden_size=3,
+            projector_use_layernorm=False,
+        )
+        projector = Lfm2VlMultiModalProjector(config)
+        projector.layer_norm = ExplodingLayerNorm()
+
+        output = projector(mx.zeros((1, 1, 1, 2)))
+
+        self.assertEqual(output.shape, (1, 1, 1, 4))
+
     def test_mllama(self):
         from mlx_vlm.models import mllama
 
