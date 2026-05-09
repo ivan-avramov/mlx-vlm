@@ -1406,6 +1406,22 @@ class TestModels(unittest.TestCase):
             deepstack_visual_indexes=[],
         )
 
+        config_from_dict = qwen3_vl_moe.ModelConfig.from_dict(
+            {
+                "model_type": "qwen3_vl_moe",
+                "text_config": vars(text_config).copy(),
+                "vision_config": {**vars(vision_config), "patch_size": 16},
+                "image_token_id": 151655,
+                "video_token_id": 151656,
+                "vocab_size": 10_000,
+            }
+        )
+        self.assertIsInstance(config_from_dict.text_config, qwen3_vl_moe.TextConfig)
+        self.assertIsInstance(config_from_dict.vision_config, qwen3_vl_moe.VisionConfig)
+        self.assertEqual(config_from_dict.vision_config.patch_size, 16)
+        model_from_dict = qwen3_vl_moe.Model(config_from_dict)
+        self.assertEqual(model_from_dict.vision_tower.patch_embed.patch_size, 16)
+
         config = qwen3_vl_moe.ModelConfig(
             text_config=text_config,
             vision_config=vision_config,
