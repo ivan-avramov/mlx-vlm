@@ -306,6 +306,112 @@ def test_responses_endpoint_forwards_new_sampling_args(client):
     assert mock_generate.call_args.kwargs["thinking_start_token"] == "<think>"
 
 
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        (
+            "/v1/chat/completions",
+            {
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": 4,
+                "stream": True,
+            },
+        ),
+        (
+            "/v1/responses",
+            {
+                "model": "demo",
+                "input": "Hello",
+                "max_output_tokens": 4,
+                "stream": True,
+            },
+        ),
+    ],
+)
+def test_v1_stream_endpoints_reject_over_context_before_sse(
+    client, monkeypatch, path, payload
+):
+    class OverBudgetResponseGenerator:
+        generate_called = False
+
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
+            raise server.PromptTooLongError(
+                "Request needs 9 context tokens "
+                "(5 prompt + 4 max generation), but MAX_KV_SIZE is 8."
+            )
+
+        def generate(self, *args, **kwargs):
+            self.generate_called = True
+            raise AssertionError("streaming should not start")
+
+    response_generator = OverBudgetResponseGenerator()
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+
+    monkeypatch.setattr(server, "server_metrics", server.ServerMetricsStore())
+    monkeypatch.setattr(server, "response_generator", response_generator)
+    monkeypatch.setattr(
+        server, "get_cached_model", MagicMock(return_value=(model, processor, config))
+    )
+    monkeypatch.setattr(server, "apply_chat_template", MagicMock(return_value="prompt"))
+
+    response = client.post(path, json=payload)
+
+    assert response.status_code == 400
+    assert "MAX_KV_SIZE is 8" in response.json()["detail"]
+    assert response_generator.generate_called is False
+
+
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        (
+            "/v1/chat/completions",
+            {
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": 4,
+            },
+        ),
+        (
+            "/v1/responses",
+            {
+                "model": "demo",
+                "input": "Hello",
+                "max_output_tokens": 4,
+            },
+        ),
+    ],
+)
+def test_v1_non_stream_endpoints_reject_over_context(
+    client, monkeypatch, path, payload
+):
+    class OverBudgetResponseGenerator:
+        def generate(self, *args, **kwargs):
+            raise server.PromptTooLongError(
+                "Request needs 9 context tokens "
+                "(5 prompt + 4 max generation), but MAX_KV_SIZE is 8."
+            )
+
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+
+    monkeypatch.setattr(server, "server_metrics", server.ServerMetricsStore())
+    monkeypatch.setattr(server, "response_generator", OverBudgetResponseGenerator())
+    monkeypatch.setattr(
+        server, "get_cached_model", MagicMock(return_value=(model, processor, config))
+    )
+    monkeypatch.setattr(server, "apply_chat_template", MagicMock(return_value="prompt"))
+
+    response = client.post(path, json=payload)
+
+    assert response.status_code == 400
+    assert "MAX_KV_SIZE is 8" in response.json()["detail"]
+
+
 def test_chat_completions_endpoint_forwards_explicit_sampling_args(client):
     model = SimpleNamespace()
     processor = SimpleNamespace()

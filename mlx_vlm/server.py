@@ -164,6 +164,23 @@ def get_configured_context_limit():
     return max_kv_tokens or None
 
 
+def _count_prompt_tokens(raw_inputs: dict) -> int:
+    input_ids = raw_inputs["input_ids"]
+    return input_ids.size if hasattr(input_ids, "size") else len(input_ids)
+
+
+def _check_configured_context_budget(prompt_tokens: int, max_tokens: int):
+    context_limit = get_configured_context_limit()
+    requested_tokens = prompt_tokens + max(0, int(max_tokens or 0))
+    if context_limit is not None and requested_tokens > context_limit:
+        raise PromptTooLongError(
+            "Request needs "
+            f"{requested_tokens} context tokens "
+            f"({prompt_tokens} prompt + {max_tokens} max generation), "
+            f"but MAX_KV_SIZE is {context_limit}."
+        )
+
+
 def get_quantized_kv_start():
     return int(os.environ.get("QUANTIZED_KV_START", DEFAULT_QUANTIZED_KV_START))
 
@@ -647,20 +664,8 @@ class ResponseGenerator:
         # CPU preprocessing (tokenize, load images) on caller thread.
         # GPU work (vision encoder) deferred to GPU thread.
         raw_inputs = self._cpu_preprocess(prompt, images, audio)
-        prompt_tokens = (
-            raw_inputs["input_ids"].size
-            if hasattr(raw_inputs["input_ids"], "size")
-            else len(raw_inputs["input_ids"])
-        )
-        context_limit = get_configured_context_limit()
-        requested_tokens = prompt_tokens + max(0, int(args.max_tokens or 0))
-        if context_limit is not None and requested_tokens > context_limit:
-            raise PromptTooLongError(
-                "Request needs "
-                f"{requested_tokens} context tokens "
-                f"({prompt_tokens} prompt + {args.max_tokens} max generation), "
-                f"but MAX_KV_SIZE is {context_limit}."
-            )
+        prompt_tokens = _count_prompt_tokens(raw_inputs)
+        _check_configured_context_budget(prompt_tokens, args.max_tokens)
 
         self.requests.put((rqueue, raw_inputs, prompt_tokens, args, images))
 
@@ -1214,6 +1219,23 @@ class ResponseGenerator:
         while batch_gen.has_pending_prompts:
             self._step(batch_gen, active)
 
+    def validate_context_budget(
+        self,
+        prompt: str,
+        images: Optional[List] = None,
+        audio: Optional[List] = None,
+        args: Optional[GenerationArguments] = None,
+    ):
+        """Validate request size before opening a streaming response."""
+        if get_configured_context_limit() is None:
+            return
+        self.wait_until_ready()
+        args = args or GenerationArguments(max_tokens=get_server_max_tokens())
+        raw_inputs = self._cpu_preprocess(prompt, images, audio)
+        _check_configured_context_budget(
+            _count_prompt_tokens(raw_inputs), args.max_tokens
+        )
+
 
 def suppress_tool_call_content(
     full_output: str,
@@ -1338,6 +1360,38 @@ def _read_tenant_id(http_request) -> Optional[str]:
         return None
     h = http_request.headers
     return h.get("x-apc-tenant") or h.get("x-tenant-id") or None
+
+
+async def _preflight_stream_context_budget(
+    *,
+    endpoint: str,
+    model: str,
+    prompt: str,
+    images: Optional[List] = None,
+    audio: Optional[List] = None,
+    args: GenerationArguments,
+):
+    """Reject over-budget streaming requests before the HTTP stream starts."""
+    if response_generator is None:
+        return
+    try:
+        await asyncio.to_thread(
+            response_generator.validate_context_budget,
+            prompt,
+            images,
+            audio,
+            args,
+        )
+    except PromptTooLongError as e:
+        server_metrics.record_failure(
+            endpoint=endpoint,
+            model=model,
+            stream=True,
+            error=str(e),
+        )
+        mx.clear_cache()
+        gc.collect()
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 def _as_plain_dict(value):
@@ -2261,6 +2315,14 @@ async def responses_endpoint(request: Request):
                 model=openai_request.model,
                 stream=True,
             )
+            await _preflight_stream_context_budget(
+                endpoint="/responses",
+                model=openai_request.model,
+                prompt=formatted_prompt,
+                images=images if images else None,
+                audio=None,
+                args=gen_args,
+            )
 
             async def stream_generator():
                 token_iterator = None
@@ -2815,6 +2877,14 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                 endpoint="/chat/completions",
                 model=request.model,
                 stream=True,
+            )
+            await _preflight_stream_context_budget(
+                endpoint="/chat/completions",
+                model=request.model,
+                prompt=formatted_prompt,
+                images=images if images else None,
+                audio=audio if audio else None,
+                args=gen_args,
             )
 
             async def stream_generator():
