@@ -143,6 +143,23 @@ class ModelConfig(BaseModelConfig):
 
     @classmethod
     def from_dict(cls, params):
+        params = dict(params)
+        if isinstance(params.get("vision_config"), dict):
+            params["vision_config"] = VisionConfig(
+                **{
+                    k: v
+                    for k, v in params["vision_config"].items()
+                    if k in inspect.signature(VisionConfig).parameters
+                }
+            )
+        if isinstance(params.get("text_config"), dict):
+            params["text_config"] = TextConfig(
+                **{
+                    k: v
+                    for k, v in params["text_config"].items()
+                    if k in inspect.signature(TextConfig).parameters
+                }
+            )
         return cls(
             **{
                 k: v
