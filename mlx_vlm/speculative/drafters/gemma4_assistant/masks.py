@@ -166,13 +166,17 @@ def make_drafter_masks(
                 query_offset,
                 kv_len,
                 sliding_window,
-                kv_valid_len,
-                key_offset,
-                dtype,
+                kv_valid_len=kv_valid_len,
+                key_offset=key_offset,
+                dtype=dtype,
             )
         else:
             masks[layer_type] = bidirectional_full_mask(
-                query_len, kv_len, kv_valid_len, key_offset, dtype
+                query_len,
+                kv_len,
+                kv_valid_len=kv_valid_len,
+                key_offset=key_offset,
+                dtype=dtype,
             )
     return masks
 
