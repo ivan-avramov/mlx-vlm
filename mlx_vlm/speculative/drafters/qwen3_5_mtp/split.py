@@ -58,7 +58,7 @@ def _load_selected_tensors(file: Path, keys: list[str]) -> Dict[str, mx.array]:
     tensors = {}
     with safe_open(file, framework="mlx") as f:
         for key in keys:
-            tensors[key] = f.get_tensor(key)
+            tensors[key] = mx.array(f.get_tensor(key))
     return tensors
 
 

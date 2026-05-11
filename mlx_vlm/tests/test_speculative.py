@@ -15,20 +15,6 @@ import mlx.nn as nn
 import pytest
 
 import mlx_vlm.models.qwen3_5.language as qwen_language
-from mlx_vlm.generate import (
-    _effective_mtp_block_size,
-    _format_speculative_stats,
-    _mtp_draft_block_active,
-    _mtp_draft_hidden,
-    _mtp_next_block_size,
-    _mtp_rounds,
-    _mtp_shared_kv_from_prompt_cache,
-    _mtp_verify_target,
-    _speculative_walk,
-    _speculative_walk_batch,
-    _speculative_walk_batch_deferred_greedy,
-    _speculative_walk_deferred_greedy,
-)
 from mlx_vlm.models.cache import ArraysCache, BufferedRotatingKVCache, RotatingKVCache
 from mlx_vlm.speculative.drafters import (
     DEFAULT_DRAFTER_KIND,
@@ -44,8 +30,23 @@ from mlx_vlm.speculative.drafters.gemma4_assistant.masks import (
 from mlx_vlm.speculative.drafters.qwen3_5_mtp import ModelConfig as Qwen3_5MTPConfig
 from mlx_vlm.speculative.drafters.qwen3_5_mtp import Qwen3_5MTPDraftModel
 from mlx_vlm.speculative.drafters.qwen3_5_mtp.split import split_qwen3_5_mtp
+from mlx_vlm.speculative.utils import (
+    _effective_mtp_block_size,
+    _format_speculative_stats,
+    _mtp_draft_block_active,
+    _mtp_draft_hidden,
+    _mtp_next_block_size,
+    _mtp_rounds,
+    _mtp_shared_kv_from_prompt_cache,
+    _mtp_verify_target,
+    _speculative_walk,
+    _speculative_walk_batch,
+    _speculative_walk_batch_deferred_greedy,
+    _speculative_walk_batch_uniform_acceptance,
+    _speculative_walk_deferred_greedy,
+)
 
-generate_module = importlib.import_module("mlx_vlm.generate")
+speculative_utils = importlib.import_module("mlx_vlm.speculative.utils")
 
 
 def _make_conv_input(batch_size: int, layer_offset: int, length: int = 5) -> mx.array:
@@ -190,6 +191,91 @@ def test_qwen_rollback_speculative_cache_zero_inits_missing_state():
     assert float(mx.sum(mx.abs(captured["state"])).item()) == 0.0
 
 
+def test_qwen_gdn_sink_skips_intermediate_states_for_batched_verify():
+    config = SimpleNamespace(
+        hidden_size=16,
+        linear_num_value_heads=2,
+        linear_num_key_heads=2,
+        linear_key_head_dim=4,
+        linear_value_head_dim=4,
+        linear_conv_kernel_dim=4,
+        rms_norm_eps=1e-6,
+    )
+    layer = qwen_language.Qwen3_5GatedDeltaNet(config)
+    sink = []
+
+    def fake_update(q, k, v, a, b, A_log, dt_bias, state, mask, use_kernel=True):
+        del k, v, a, b, A_log, dt_bias, state, mask, use_kernel
+        B, S = q.shape[:2]
+        out = mx.zeros((B, S, 2, 4), dtype=mx.float32)
+        next_state = mx.zeros((B, 2, 4, 4), dtype=mx.float32)
+        return out, next_state
+
+    with (
+        patch.object(
+            qwen_language,
+            "gated_delta_update_with_states",
+            side_effect=AssertionError("batched verify must not capture states"),
+        ),
+        patch.object(qwen_language, "gated_delta_update", side_effect=fake_update),
+    ):
+        out = layer(
+            mx.zeros((2, 3, 16), dtype=mx.float32),
+            cache=ArraysCache(size=2),
+            gdn_sink=sink,
+        )
+
+    mx.eval(out)
+    assert out.shape == (2, 3, 16)
+    assert sink[0][11] is None
+
+
+def test_qwen_gdn_sink_keeps_intermediate_states_for_singleton_verify():
+    config = SimpleNamespace(
+        hidden_size=16,
+        linear_num_value_heads=2,
+        linear_num_key_heads=2,
+        linear_key_head_dim=4,
+        linear_value_head_dim=4,
+        linear_conv_kernel_dim=4,
+        rms_norm_eps=1e-6,
+    )
+    layer = qwen_language.Qwen3_5GatedDeltaNet(config)
+    sink = []
+    intermediate = mx.zeros((1, 3, 2, 4, 4), dtype=mx.float32)
+
+    def fake_update_with_states(
+        q, k, v, a, b, A_log, dt_bias, state, mask, use_kernel=True
+    ):
+        del k, v, a, b, A_log, dt_bias, state, mask, use_kernel
+        B, S = q.shape[:2]
+        out = mx.zeros((B, S, 2, 4), dtype=mx.float32)
+        next_state = mx.zeros((B, 2, 4, 4), dtype=mx.float32)
+        return out, next_state, intermediate
+
+    with (
+        patch.object(
+            qwen_language,
+            "gated_delta_update",
+            side_effect=AssertionError("singleton verify should use state capture"),
+        ),
+        patch.object(
+            qwen_language,
+            "gated_delta_update_with_states",
+            side_effect=fake_update_with_states,
+        ),
+    ):
+        out = layer(
+            mx.zeros((1, 3, 16), dtype=mx.float32),
+            cache=ArraysCache(size=2),
+            gdn_sink=sink,
+        )
+
+    mx.eval(out)
+    assert out.shape == (1, 3, 16)
+    assert sink[0][11] is intermediate
+
+
 def test_speculative_walk_accepts_until_first_mismatch():
     accepted, new_tokens = _speculative_walk(
         mx.array([[11, 12, 13]], dtype=mx.int32),
@@ -255,6 +341,21 @@ def test_mtp_drafter_sliding_mask_accounts_for_tail_offset():
     assert row[3:] == [0.0, 0.0, 0.0]
 
 
+def test_mtp_drafter_sliding_mask_uses_local_rotating_cache_offset():
+    kv = (mx.zeros((1, 1, 8, 4)), mx.zeros((1, 1, 8, 4)))
+
+    masks = make_drafter_masks(
+        {"sliding_attention": kv},
+        query_len=1,
+        query_offset=128,
+        sliding_window=4,
+    )
+
+    mask = masks["sliding_attention"].tolist()[0][0][0]
+    assert mask[:5] == [-float("inf")] * 5
+    assert mask[5:] == [0.0, 0.0, 0.0]
+
+
 def test_mtp_drafter_sliding_mask_accepts_single_row_array_offsets():
     kv = (mx.zeros((1, 1, 6, 4)), mx.zeros((1, 1, 6, 4)))
 
@@ -289,21 +390,6 @@ def test_buffered_rotating_cache_matches_temporal_multitoken_tail_and_trim():
     assert buffered.trim(2) == 2
     assert buffered.offset == 5
     assert buffered.state[0].reshape(-1).tolist() == [0.0, 1.0, 2.0, 3.0, 4.0]
-
-
-def test_mtp_drafter_sliding_mask_uses_local_rotating_cache_offset():
-    kv = (mx.zeros((1, 1, 8, 4)), mx.zeros((1, 1, 8, 4)))
-
-    masks = make_drafter_masks(
-        {"sliding_attention": kv},
-        query_len=1,
-        query_offset=128,
-        sliding_window=4,
-    )
-
-    mask = masks["sliding_attention"].tolist()[0][0][0]
-    assert mask[:5] == [-float("inf")] * 5
-    assert mask[5:] == [0.0, 0.0, 0.0]
 
 
 def test_normalize_batched_shared_kv_states_repacks_left_padded_rows():
@@ -531,16 +617,16 @@ def test_mtp_rounds_rolls_back_gemma_without_gdn_states():
 
     lm = LM()
     model = SimpleNamespace(language_model=lm)
-    verify = generate_module._MTPVerifyResult(
+    verify = speculative_utils._MTPVerifyResult(
         hidden=mx.zeros((1, 3, 2), dtype=mx.float32),
         shared_kv_states={},
         gdn_states=None,
     )
 
     with (
-        patch.object(generate_module, "_mtp_verify_target", return_value=verify),
+        patch.object(speculative_utils, "_mtp_verify_target", return_value=verify),
         patch.object(
-            generate_module,
+            speculative_utils,
             "_mtp_acceptance_walk",
             return_value=(0, [9]),
         ),
@@ -625,6 +711,36 @@ def test_format_speculative_stats_includes_variable_draft_rate():
         stats == "Speculative decoding: 1.00 accepted tokens/round "
         "(60.0% of drafted, avg draft 1.67) over 3 rounds"
     )
+
+
+def test_dflash_block_total_uses_runtime_default_but_honors_override():
+    draft_model = SimpleNamespace(
+        config=SimpleNamespace(block_size=16, runtime_block_size=14)
+    )
+
+    assert speculative_utils._dflash_block_total(draft_model, None) == 14
+    assert speculative_utils._dflash_block_total(draft_model, 16) == 16
+
+
+def test_dflash_block_total_falls_back_to_configured_block_size():
+    draft_model = SimpleNamespace(
+        config=SimpleNamespace(block_size=16, runtime_block_size=None)
+    )
+
+    assert speculative_utils._dflash_block_total(draft_model, None) == 16
+
+
+def test_dflash_committed_hidden_segments_keep_per_row_lengths():
+    hidden = mx.arange(12, dtype=mx.float32).reshape(2, 3, 2)
+
+    segments = speculative_utils._dflash_committed_hidden_segments(
+        hidden, [[1, 2], [3]]
+    )
+
+    assert segments[0].shape == (1, 2, 2)
+    assert segments[0].tolist() == [[[0.0, 1.0], [2.0, 3.0]]]
+    assert segments[1].shape == (1, 1, 2)
+    assert segments[1].tolist() == [[[6.0, 7.0]]]
 
 
 def test_effective_mtp_block_size_respects_requested_block_size():
@@ -756,6 +872,54 @@ def test_mtp_draft_block_active_uses_batched_path_for_aligned_positions():
 
     assert drafted.tolist() == [[3, 4], [7, 8]]
     assert draft_model.calls == [((2,), (2, 1, 1))]
+
+
+def test_mtp_draft_block_active_uses_batched_path_for_mixed_positions_without_shared_kv():
+    class FakeDraftModel:
+        def __init__(self):
+            self.calls = []
+
+        def draft_block(
+            self,
+            last_bonus,
+            hidden,
+            cache,
+            block_size,
+            sampler,
+            token_dtype,
+        ):
+            del cache, sampler
+            self.calls.append((last_bonus.shape, hidden.shape))
+            return last_bonus[:, None].astype(token_dtype) + mx.arange(block_size - 1)
+
+    draft_model = FakeDraftModel()
+
+    drafted = _mtp_draft_block_active(
+        draft_model,
+        bonus_tokens=[3, 7],
+        hidden=mx.zeros((2, 1, 1), dtype=mx.float32),
+        block_size=3,
+        sampler=lambda x: x,
+        token_dtype=mx.int32,
+        positions=[11, 12],
+    )
+
+    assert drafted.tolist() == [[3, 4], [7, 8]]
+    assert draft_model.calls == [((2,), (2, 1, 1))]
+
+
+def test_speculative_walk_batch_uniform_acceptance_keeps_exact_tokens():
+    draft_tokens = mx.array([[10, 11, 12], [20, 21, 22]], dtype=mx.int32)
+    target_tokens = mx.array([[10, 99, 98, 97], [20, 21, 77, 76]], dtype=mx.int32)
+    accepted, new_tokens = _speculative_walk_batch_uniform_acceptance(
+        draft_tokens,
+        target_tokens,
+        accepted_list=[1, 2],
+        budgets=[4, 4],
+    )
+
+    assert accepted == [1, 1]
+    assert new_tokens == [[10, 99], [20, 21]]
 
 
 def test_gemma4_assistant_overrides_dflash_to_mtp(tmp_path, caplog):
@@ -890,6 +1054,93 @@ def test_qwen3_5_mtp_advances_draft_cache_positions():
 
     assert drafter._position_ids(0).tolist() == [[4]]
     assert drafter._position_ids(1).tolist() == [[5]]
+
+
+def test_qwen3_5_mtp_batch_accept_updates_uniform_cache():
+    text_config = _tiny_qwen3_5_text_config()
+    text_config.mtp_num_hidden_layers = 1
+    drafter = Qwen3_5MTPDraftModel(
+        Qwen3_5MTPConfig(text_config=text_config, block_size=3)
+    )
+    target = SimpleNamespace(
+        language_model=SimpleNamespace(
+            model=SimpleNamespace(embed_tokens=nn.Embedding(32, 16))
+        )
+    )
+    drafter.reset(target)
+    drafter.set_shared_kv({}, kv_offset=4, position=3, kv_valid_len=4)
+    hidden = mx.zeros((2, 1, 16), dtype=mx.float32)
+    draft_tokens = drafter.draft_block(
+        mx.array([7, 8], dtype=mx.int32),
+        hidden,
+        None,
+        3,
+        lambda logits: mx.argmax(logits, axis=-1),
+        mx.int32,
+        greedy=True,
+    )
+    verify_hidden = mx.zeros((2, 3, 16), dtype=mx.float32)
+    drafter.accept_verified_tokens_batch(
+        verify_hidden,
+        draft_tokens,
+        accepted=[0, 0],
+        new_tokens=[[3], [4]],
+        sampler=lambda logits: mx.argmax(logits, axis=-1),
+        token_dtype=mx.int32,
+        greedy=True,
+    )
+
+    mx.eval(drafter._seed_token)
+    assert drafter._seed_token.shape == (2, 1)
+    assert drafter._round_appended == 0
+    assert drafter._cache[0].offset == 1
+    assert drafter._next_position == 5
+
+
+def test_qwen3_5_mtp_filter_batch_keeps_drafter_state_aligned():
+    text_config = _tiny_qwen3_5_text_config()
+    text_config.mtp_num_hidden_layers = 1
+    drafter = Qwen3_5MTPDraftModel(
+        Qwen3_5MTPConfig(text_config=text_config, block_size=3)
+    )
+    target = SimpleNamespace(
+        language_model=SimpleNamespace(
+            model=SimpleNamespace(embed_tokens=nn.Embedding(32, 16))
+        )
+    )
+    drafter.reset(target)
+    drafter.set_shared_kv(
+        {},
+        kv_offset=4,
+        position=mx.array([3, 3], dtype=mx.int32),
+        kv_valid_len=mx.array([4, 4], dtype=mx.int32),
+    )
+    hidden = mx.zeros((2, 1, 16), dtype=mx.float32)
+    draft_tokens = drafter.draft_block(
+        mx.array([7, 8], dtype=mx.int32),
+        hidden,
+        None,
+        3,
+        lambda logits: mx.argmax(logits, axis=-1),
+        mx.int32,
+        greedy=True,
+    )
+    verify_hidden = mx.zeros((2, 3, 16), dtype=mx.float32)
+    drafter.accept_verified_tokens_batch(
+        verify_hidden,
+        draft_tokens,
+        accepted=[1, 1],
+        new_tokens=[[3, 5], [4, 6]],
+        sampler=lambda logits: mx.argmax(logits, axis=-1),
+        token_dtype=mx.int32,
+        greedy=True,
+    )
+
+    drafter.filter_batch(mx.array([1], dtype=mx.int32))
+    mx.eval(drafter._cache[0].keys, drafter._seed_token)
+    assert drafter._cache[0].keys.shape[0] == 1
+    assert drafter._seed_token.shape == (1, 1)
+    assert drafter._next_position.tolist() == [6]
 
 
 def test_qwen3_5_mtp_sanitize_strips_prefix_and_offsets_norms():

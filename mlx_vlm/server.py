@@ -40,18 +40,20 @@ from .generate import (
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,
     BatchGenerator,
-    _dflash_rounds_batch,
     _make_cache,
     _merge_prefill_prompt_kwargs,
-    _mtp_rounds,
-    _mtp_rounds_batch,
     generate,
     normalize_resize_shape,
     stream_generate,
 )
-from .models import cache
 from .prompt_utils import apply_chat_template, extract_text_from_content
 from .sample_utils import top_p_sampling
+from .speculative.utils import (
+    make_speculative_prompt_cache,
+    run_speculative_server_rounds,
+    speculative_hidden_state,
+    speculative_prefill_kwargs,
+)
 from .structured import build_json_schema_logits_processor
 from .tokenizer_utils import _ServerTokenStreamer, make_streaming_detokenizer
 from .tool_parsers import _infer_tool_parser_from_processor, load_tool_module
@@ -70,38 +72,6 @@ METRICS_RECENT_LIMIT = 32
 
 class PromptTooLongError(ValueError):
     """Raised when a request exceeds the configured server context budget."""
-
-
-def _get_speculative_rounds_batch(draft_kind: str):
-    if draft_kind == "mtp":
-        return _mtp_rounds_batch
-    if draft_kind == "dflash":
-        return _dflash_rounds_batch
-    raise ValueError(f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'mtp']")
-
-
-def _speculative_prefill_kwargs(draft_kind: str, drafter) -> dict:
-    if draft_kind == "mtp":
-        return {"return_hidden": True, "return_shared_kv": True}
-    if draft_kind == "dflash":
-        return {"capture_layer_ids": list(drafter.config.target_layer_ids)}
-    raise ValueError(f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'mtp']")
-
-
-def _speculative_hidden_state(draft_kind: str, outputs):
-    if draft_kind == "mtp":
-        return outputs.hidden_states[-1]
-    if draft_kind == "dflash":
-        return mx.concatenate(outputs.hidden_states, axis=-1)
-    raise ValueError(f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'mtp']")
-
-
-def _make_speculative_prompt_cache(
-    lm, *, draft_kind: str, batch_size: int, left_padding
-):
-    if draft_kind == "mtp" and batch_size == 1:
-        return cache.make_prompt_cache(lm)
-    return _make_cache(lm, left_padding)
 
 
 def _get_draft_block_size_from_env():
@@ -978,13 +948,14 @@ class ResponseGenerator:
         drafter = self.draft_model
         draft_kind = self.draft_kind
         is_mtp = draft_kind == "mtp"
-        rounds_batch = _get_speculative_rounds_batch(draft_kind)
-        prefill_kwargs = _speculative_prefill_kwargs(draft_kind, drafter)
+        prefill_kwargs = speculative_prefill_kwargs(draft_kind, drafter)
         eos_set = set(self.stop_tokens) if is_mtp else None
         sampler = _make_sampler(temp=0)
         draft_block_size = _get_draft_block_size_from_env()
 
         while not self._stop:
+            pending = []
+            rqueues = {}
             try:
                 # --- Phase 1: collect pending requests ---
                 pending, should_stop = self._collect_pending_requests(
@@ -996,7 +967,6 @@ class ResponseGenerator:
 
                 if not pending:
                     continue
-
                 # --- Phase 2: prefill new batch ---
                 uids = []
                 rqueues = {}
@@ -1044,11 +1014,12 @@ class ResponseGenerator:
                     prompt_kwargs_list, all_input_ids
                 )
 
-                prompt_cache = _make_speculative_prompt_cache(
+                prompt_cache = make_speculative_prompt_cache(
                     lm,
                     draft_kind=draft_kind,
                     batch_size=B,
                     left_padding=left_padding,
+                    make_cache=_make_cache,
                 )
 
                 lm_call_kwargs = {**prefill_kwargs, **prompt_kwargs}
@@ -1057,7 +1028,7 @@ class ResponseGenerator:
                 prompt_started = time.perf_counter()
                 with mx.stream(generation_stream):
                     out = lm(input_mx, cache=prompt_cache, **lm_call_kwargs)
-                hidden = _speculative_hidden_state(draft_kind, out)
+                hidden = speculative_hidden_state(draft_kind, out)
                 shared_kv_states = out.shared_kv_states if is_mtp else None
                 first_bonus = sampler(out.logits[:, -1:]).squeeze(-1)
                 mx.eval(first_bonus, hidden, out.logits)
@@ -1111,7 +1082,12 @@ class ResponseGenerator:
                         return True
                     return False
 
-                rounds_kwargs = dict(
+                rounds_iter = run_speculative_server_rounds(
+                    self.model,
+                    drafter,
+                    prompt_cache,
+                    hidden,
+                    draft_kind=draft_kind,
                     first_bonus=first_bonus,
                     max_tokens=max_tok,
                     sampler=sampler,
@@ -1122,43 +1098,9 @@ class ResponseGenerator:
                         pending_args.temperature == 0
                         for _, _, _, pending_args, _ in pending
                     ),
+                    shared_kv_states=shared_kv_states,
+                    eos_token_ids=eos_set,
                 )
-                if is_mtp and B == 1:
-                    uid = uids[0]
-                    rounds_iter = (
-                        ([tok], state)
-                        for tok, state in _mtp_rounds(
-                            self.model,
-                            drafter,
-                            prompt_cache,
-                            hidden,
-                            shared_kv_states,
-                            first_bonus=int(first_bonus.reshape(-1).item()),
-                            max_tokens=max_tokens_map[uid],
-                            sampler=sampler,
-                            draft_block_size=draft_block_size,
-                            token_dtype=mx.int32,
-                            greedy_sampling=rounds_kwargs["greedy_sampling"],
-                        )
-                    )
-                elif is_mtp:
-                    rounds_iter = rounds_batch(
-                        self.model,
-                        drafter,
-                        prompt_cache,
-                        hidden,
-                        shared_kv_states,
-                        eos_token_ids=eos_set,
-                        **rounds_kwargs,
-                    )
-                else:
-                    rounds_iter = rounds_batch(
-                        self.model,
-                        drafter,
-                        prompt_cache,
-                        hidden,
-                        **rounds_kwargs,
-                    )
                 for tok_list, _ in rounds_iter:
                     for j, tok in enumerate(tok_list):
                         if tok is None:
@@ -1221,6 +1163,11 @@ class ResponseGenerator:
             except Exception as e:
                 print(f"Error in speculative generation thread: {e}")
                 traceback.print_exc()
+                error_queues = {id(rqueue): rqueue for rqueue in rqueues.values()}
+                error_queues.update({id(rqueue): rqueue for rqueue, *_ in pending})
+                for rqueue in error_queues.values():
+                    rqueue.put(e)
+                    rqueue.put(None)
 
     def _step(self, batch_gen, active, gen_kwargs=None):
         """One batch generation step: prefill + decode."""
