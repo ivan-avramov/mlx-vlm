@@ -135,9 +135,25 @@ def get_model_and_args(config: dict):
             last_err = e
             continue
 
+    if _is_text_only_config(config):
+        arch = importlib.import_module("mlx_vlm.models.text_only")
+        return arch, "text_only"
+
     msg = f"Model type {model_type} not supported. Error: {last_err}"
     logging.error(msg)
     raise ValueError(msg)
+
+
+def _has_config(config: dict, key: str) -> bool:
+    value = config.get(key)
+    return value is not None and value != {}
+
+
+def _is_text_only_config(config: dict) -> bool:
+    return not any(
+        _has_config(config, key)
+        for key in ("vision_config", "audio_config", "dflash_config")
+    )
 
 
 def get_model_path(
@@ -311,6 +327,11 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         # Handle legacy models which may or may not have vision quantized
         # TODO: Re-upload the models with the new quantization config and remove this
         skip_vision = config.get("vision_config", {}).get("skip_vision", False)
+        quantized_model = (
+            model.language_model._model
+            if getattr(model, "_is_text_model", False)
+            else model
+        )
 
         def get_class_predicate(p, m):
             # Always skip vision and audio models
@@ -328,7 +349,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             return f"{p}.scales" in weights
 
         nn.quantize(
-            model,
+            quantized_model,
             group_size=quantization["group_size"],
             bits=quantization["bits"],
             mode=quantization.get("mode", "affine"),
@@ -421,7 +442,14 @@ def load(
     )
     model = load_model(model_path, lazy, **kwargs)
     if adapter_path is not None:
-        model = apply_lora_layers(model, adapter_path)
+        if getattr(model, "_is_text_model", False):
+            from mlx_lm.utils import load_adapters
+
+            model.language_model._model = load_adapters(
+                model.language_model._model, adapter_path
+            )
+        else:
+            model = apply_lora_layers(model, adapter_path)
         model.eval()
 
     image_processor = load_image_processor(model_path, **kwargs)
@@ -545,7 +573,10 @@ def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImagePro
     else:
         config = load_config(model_path, **kwargs)
 
-    model_class, _ = get_model_and_args(config)
+    try:
+        model_class, _ = get_model_and_args(config)
+    except ValueError:
+        return None
     image_processor = None
 
     if hasattr(model_class, "ImageProcessor"):
@@ -577,7 +608,9 @@ def load_processor(
 
         # Determine the EOS token IDs, prioritizing the function argument
         final_eos_token_ids = (
-            eos_token_ids if eos_token_ids is not None else tokenizer_obj.eos_token_ids
+            eos_token_ids
+            or getattr(tokenizer_obj, "eos_token_ids", None)
+            or getattr(tokenizer_obj, "eos_token_id", None)
         )
 
         # Create and assign the StoppingCriteria
