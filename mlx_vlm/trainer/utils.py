@@ -204,6 +204,14 @@ def apply_lora_layers(model: nn.Module, adapter_path: str) -> nn.Module:
     Returns:
         nn.Module: The updated model with LoRA layers applied.
     """
+    if getattr(model, "_is_text_model", False):
+        from mlx_lm.utils import load_adapters
+
+        model.language_model._model = load_adapters(
+            model.language_model._model, adapter_path
+        )
+        return model
+
     adapter_path = Path(adapter_path)
 
     if not adapter_path.exists():

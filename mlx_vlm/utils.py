@@ -442,14 +442,7 @@ def load(
     )
     model = load_model(model_path, lazy, **kwargs)
     if adapter_path is not None:
-        if getattr(model, "_is_text_model", False):
-            from mlx_lm.utils import load_adapters
-
-            model.language_model._model = load_adapters(
-                model.language_model._model, adapter_path
-            )
-        else:
-            model = apply_lora_layers(model, adapter_path)
+        model = apply_lora_layers(model, adapter_path)
         model.eval()
 
     image_processor = load_image_processor(model_path, **kwargs)
