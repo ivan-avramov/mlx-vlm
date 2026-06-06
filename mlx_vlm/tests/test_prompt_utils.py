@@ -1,6 +1,19 @@
 """Tests for prompt_utils module, specifically multimodal content handling."""
 
-from mlx_vlm.prompt_utils import apply_chat_template, extract_text_from_content
+import pytest
+
+from mlx_vlm.prompt_utils import (
+    CACHE_ALIGNMENT_KWARGS,
+    THINKING_FORMATS,
+    USER_TURN_OPEN_MARKERS,
+    MessageBuilder,
+    MessageFormatter,
+    apply_chat_template,
+    detect_thinking_format,
+    extract_text_from_content,
+    get_cache_alignment_kwargs,
+    get_chat_template,
+)
 
 
 class TestExtractTextFromContent:
@@ -601,3 +614,430 @@ class TestModelSpecificPromptContracts:
             "text",
         ]
         assert result[0]["content"][-1]["text"] == "OCR:"
+
+
+class TestCacheAlignmentKwargs:
+    """memory.md #27 — cache-friendly chat-template kwargs registry.
+
+    Invariant: every kwarg here is a true no-op on templates that don't
+    reference it (Jinja's `is defined` guard makes that safe). The
+    registry is consumed by the server when a per-chat PromptCacheState
+    is active to keep multi-turn renderings byte-aligned.
+    """
+
+    def test_registry_returns_a_copy(self):
+        # Mutating the result must not poison subsequent calls — server
+        # threads merge this into apply_chat_template kwargs, and one
+        # request mutating the dict would affect every other.
+        first = get_cache_alignment_kwargs()
+        first["intruder"] = True
+        second = get_cache_alignment_kwargs()
+        assert "intruder" not in second
+        assert "intruder" not in CACHE_ALIGNMENT_KWARGS
+
+    def test_registry_includes_preserve_thinking_for_unsloth_qwen(self):
+        # Specific entry guard — losing this regresses cache reuse on
+        # `unsloth/Qwen3.6-*` ports without producing any visible error
+        # (just ~10x slower multi-turn prefill on hybrid models).
+        kwargs = get_cache_alignment_kwargs()
+        assert kwargs.get("preserve_thinking") is True
+
+    def test_all_values_are_truthy_or_explicit_false(self):
+        # Boolean toggles only; any None value would make the no-op
+        # invariant unverifiable (`{% if x is defined %}` evaluates
+        # `None` as defined).
+        for key, value in get_cache_alignment_kwargs().items():
+            assert value is not None, f"{key} must not be None in registry"
+
+
+class TestThinkingFormatRegistry:
+    """memory.md #29 — centralized opener/closer literals per family.
+
+    Drift between sites (detection, splitter, streaming state machine,
+    budget enforcer, prefilled-opener guard) was the root cause of the
+    Gemma 4 leading-content-token-eating artifact. Tests pin the
+    registry's contract: every consumer must agree on the tags.
+    """
+
+    def test_registry_has_known_families(self):
+        names = [f.name for f in THINKING_FORMATS]
+        assert names == ["gemma", "qwen", "gpt-oss"], (
+            "ordering matters — first-match-wins resolves ambiguous "
+            "prompts; specificity is encoded in the tuple order."
+        )
+
+    def test_each_format_is_frozen(self):
+        # Frozen dataclass = registry entries can't be mutated at runtime
+        # without raising, which guards against accidental drift if a
+        # caller patches openers in-place.
+        for fmt in THINKING_FORMATS:
+            with pytest.raises(Exception):
+                fmt.openers = ("hacked",)  # type: ignore[misc]
+
+    def test_each_format_has_at_least_one_opener_and_closer(self):
+        for fmt in THINKING_FORMATS:
+            assert fmt.openers, f"{fmt.name} has no openers"
+            assert fmt.closers, f"{fmt.name} has no closers"
+            assert fmt.tag_token_count >= 1, f"{fmt.name} tag_token_count <= 0"
+
+    def test_partial_buffers_are_prefixes_of_real_tags(self):
+        # The streaming state-machine uses `partial_buffers` to suppress
+        # mid-token leakage. Each entry must be a prefix of either an
+        # opener or a closer; otherwise it'd never match a partial-tag
+        # arrival and we'd leak bytes.
+        for fmt in THINKING_FORMATS:
+            all_tags = fmt.openers + fmt.closers
+            for partial in fmt.partial_buffers:
+                assert any(tag.startswith(partial) for tag in all_tags), (
+                    f"{fmt.name}: partial_buffer {partial!r} is not a prefix "
+                    f"of any opener/closer"
+                )
+
+    def test_gemma_carries_both_global_and_per_turn_openers(self):
+        # Gemma 4 is trained on both shapes: `<|think|>` is the global
+        # marker injected at the system block when enable_thinking=True,
+        # and `<|channel>thought` is the per-turn opener the model emits
+        # for in-line thinking blocks. Both must be in the registry's
+        # openers tuple so the streaming state machine recognizes
+        # either one.
+        gemma = next(f for f in THINKING_FORMATS if f.name == "gemma")
+        assert "<|think|>" in gemma.openers
+        assert "<|channel>thought" in gemma.openers
+        # Likewise, the model emits both `</think>` and `<channel|>`
+        # as closers (cross-format trained); both must match.
+        assert "</think>" in gemma.closers
+        assert "<channel|>" in gemma.closers
+
+    def test_qwen_uses_plain_think_opener(self):
+        qwen = next(f for f in THINKING_FORMATS if f.name == "qwen")
+        assert qwen.openers == ("<think>",)
+        assert qwen.closers == ("</think>",)
+
+
+class TestDetectThinkingFormat:
+    """`detect_thinking_format` is the single entry point all server-side
+    helpers use to learn what tags to expect. Tests pin both positive
+    matches per family and the first-match-wins ambiguity resolution."""
+
+    def test_detects_gemma_native_opener(self):
+        assert detect_thinking_format("foo <|think|> bar").name == "gemma"
+
+    def test_detects_qwen_open_tag(self):
+        assert detect_thinking_format("hello <think>\n").name == "qwen"
+
+    def test_channel_thought_opener_resolves_to_gemma(self):
+        # Gemma 4 lists `<|channel>thought` among its openers (per-turn
+        # inline thinking syntax) and is registry-listed first, so an
+        # input containing only that opener resolves to gemma rather
+        # than gpt-oss. Streaming-wise both formats use the same closer
+        # so the behavior is identical; only the format-name brand
+        # changes.
+        assert detect_thinking_format("ms <|channel>thought x").name == "gemma"
+
+    def test_returns_none_for_plain_text(self):
+        assert detect_thinking_format("just a plain prompt") is None
+
+    def test_returns_none_when_only_closer_present(self):
+        # Closer-only outputs are handled at split-time (the prefilled-
+        # opener case), but the detection-from-prompt path requires an
+        # opener to identify the family unambiguously.
+        assert detect_thinking_format("trailing </think> only") is None
+
+    def test_first_match_wins_for_ambiguous_prompts(self):
+        # `<|think|>` (gemma) listed before `<think>` (qwen). A prompt
+        # that contains both literals resolves to gemma.
+        prompt = "<|think|> first ... <think> second"
+        assert detect_thinking_format(prompt).name == "gemma"
+
+    def test_qwen_match_does_not_steal_from_channel_format(self):
+        # `<think>` vs `<|channel>thought` are unrelated literals; Qwen
+        # detection must not match a channel-formatted prompt. With
+        # the merged Gemma registry, channel-formatted prompts now
+        # resolve to gemma (Gemma 4 includes the channel openers).
+        prompt = "<|channel>thought reasoning <channel|>"
+        assert detect_thinking_format(prompt).name == "gemma"
+
+
+class TestUserTurnOpenMarkers:
+    """The user-turn-open marker registry feeds the asymmetric-rendering
+    cache anchor: we cache up to BEFORE the latest user message so the
+    next request's re-rendering of that user turn (e.g. OpenWebUI
+    wrapping it with a RAG `<context>` block once a search-style tool
+    returns citation content) doesn't trigger a backward trim.
+
+    Tests pin (a) the registry contains markers for every family the
+    server currently advertises asymmetric-rendering support for, and
+    (b) consumers of the registry can correctly identify the LAST
+    occurrence of any marker when several user messages are present.
+    """
+
+    def test_registry_covers_known_families(self):
+        # All listed markers should be distinct, non-empty, and end
+        # with a newline OR an explicit message delimiter — the asym
+        # cache anchor relies on splitting AT this position so the
+        # following user content begins on the right side of the cut.
+        seen = set()
+        for marker in USER_TURN_OPEN_MARKERS:
+            assert marker, "empty marker in registry"
+            assert marker not in seen, f"duplicate marker: {marker!r}"
+            seen.add(marker)
+
+    def test_gemma4_marker_present(self):
+        assert "<|turn>user\n" in USER_TURN_OPEN_MARKERS
+
+    def test_gemma3_marker_present(self):
+        assert "<start_of_turn>user\n" in USER_TURN_OPEN_MARKERS
+
+    def test_qwen_chatml_marker_present(self):
+        assert "<|im_start|>user\n" in USER_TURN_OPEN_MARKERS
+
+    def test_gpt_oss_marker_present(self):
+        assert "<|start|>user<|message|>" in USER_TURN_OPEN_MARKERS
+
+    def test_llama_marker_present(self):
+        assert "<|start_header_id|>user<|end_header_id|>\n" in USER_TURN_OPEN_MARKERS
+
+    def test_consumer_picks_last_occurrence_in_multi_user_prompt(self):
+        # Consumer pattern: rfind across all markers, take the rightmost
+        # position. With two user turns in the rendered prompt, the
+        # anchor must land at the SECOND turn so the cache only covers
+        # tokens through the end of the prior asst response.
+        prompt = (
+            "[system]\n"
+            "<|turn>user\nfirst question<turn|>\n"
+            "<|turn>model\nfirst answer<turn|>\n"
+            "<|turn>user\nsecond question<turn|>\n"
+            "<|turn>model\n"
+        )
+        last_pos = -1
+        for marker in USER_TURN_OPEN_MARKERS:
+            idx = prompt.rfind(marker)
+            if idx > last_pos:
+                last_pos = idx
+        # Expected: position of the SECOND `<|turn>user\n`. Verify by
+        # checking the prompt[last_pos:] starts with the marker AND
+        # the substring up to last_pos contains exactly ONE earlier
+        # occurrence.
+        assert prompt[last_pos:].startswith("<|turn>user\n")
+        assert prompt[:last_pos].count("<|turn>user\n") == 1
+
+    def test_consumer_returns_negative_for_no_marker_present(self):
+        # Plain prompt with no user-turn marker — caller should treat
+        # negative result as "fallback to old anchor behavior".
+        prompt = "just some plain text with no chat template at all"
+        last_pos = -1
+        for marker in USER_TURN_OPEN_MARKERS:
+            idx = prompt.rfind(marker)
+            if idx > last_pos:
+                last_pos = idx
+        assert last_pos == -1
+
+    def test_consumer_handles_mixed_template_families(self):
+        # Edge case: prompt contains markers from different families
+        # (shouldn't happen in practice but the registry shouldn't
+        # care). The rightmost marker still wins.
+        prompt = (
+            "<|im_start|>user\nq1<|im_end|>\n"
+            "<|im_start|>assistant\na1<|im_end|>\n"
+            "<|turn>user\nq2<turn|>\n"
+        )
+        last_pos = -1
+        last_marker = None
+        for marker in USER_TURN_OPEN_MARKERS:
+            idx = prompt.rfind(marker)
+            if idx > last_pos:
+                last_pos = idx
+                last_marker = marker
+        # Rightmost is the Gemma 4 marker for q2.
+        assert last_marker == "<|turn>user\n"
+        assert prompt[last_pos:].startswith("<|turn>user\nq2")
+
+
+class TestMessageFormatterTextOnlyFallback:
+    """memory.md #20 — pure text models (Qwen 2.5, gemma3_text) load via
+    mlx_lm and aren't in MODEL_CONFIG. MessageFormatter must return a
+    plain text dict instead of raising.
+    """
+
+    def test_unknown_model_returns_plain_dict(self):
+        formatter = MessageFormatter("definitely-not-a-real-model")
+        msg = formatter.format_message(prompt="hello", role="user")
+        assert msg == {"role": "user", "content": "hello"}
+
+    def test_unknown_model_preserves_role(self):
+        formatter = MessageFormatter("ghost_model")
+        msg = formatter.format_message(prompt="sys text", role="system")
+        assert msg["role"] == "system"
+        assert msg["content"] == "sys text"
+
+    def test_unknown_model_format_type_is_none(self):
+        # Internal invariant: the fallback path is gated on
+        # `format_type is None` (the formatter_map .get returns None).
+        formatter = MessageFormatter("nonexistent_vlm")
+        assert formatter.format_type is None
+
+    def test_unknown_model_ignores_image_request(self):
+        # No image tokens to insert for text-only models — the
+        # num_images > 0 path must NOT crash.
+        formatter = MessageFormatter("unknown_model")
+        msg = formatter.format_message(prompt="hi", role="user", num_images=1)
+        assert msg == {"role": "user", "content": "hi"}
+
+
+class TestMessageFormatterImageSchema:
+    """memory.md #3 — Gemma's chat template (and several others) require
+    multimodal content as a list with `{type: image}` items, not OpenAI's
+    `{type: image_url}`. The vision schema rewrite happens inside
+    MessageFormatter._format_list_with_image, not in server.py.
+    """
+
+    def test_gemma_produces_type_image_dict(self):
+        # gemma4 uses LIST_WITH_IMAGE per MODEL_CONFIG; vision content
+        # must be `{type: image}` (NOT `{type: image_url}`).
+        formatter = MessageFormatter("gemma4")
+        msg = formatter.format_message(prompt="describe", role="user", num_images=1)
+        assert msg["role"] == "user"
+        types = [item.get("type") for item in msg["content"] if isinstance(item, dict)]
+        assert "image" in types
+        # Must be the bare `image` form, not `image_url`.
+        assert "image_url" not in types
+
+    def test_image_url_preferring_model_uses_image_url_schema(self):
+        # Some models (e.g. ERNIE) actually want `{type: image_url}`.
+        # The MessageFormatter switches on use_image_url; this guards
+        # against accidentally rewriting their schema as well.
+        msg = MessageBuilder.image_url_message()
+        assert msg == {"type": "image_url"}
+
+    def test_user_role_skip_image_token_omits_image(self):
+        # Multi-message conversations skip image tokens on prior user
+        # turns (only the latest user message gets the image).
+        formatter = MessageFormatter("gemma4")
+        msg = formatter.format_message(
+            prompt="prior turn", role="user", num_images=1, skip_image_token=True
+        )
+        types = [item.get("type") for item in msg["content"] if isinstance(item, dict)]
+        assert "image" not in types
+
+    def test_assistant_role_never_gets_image(self):
+        formatter = MessageFormatter("gemma4")
+        msg = formatter.format_message(
+            prompt="response", role="assistant", num_images=1
+        )
+        types = [item.get("type") for item in msg["content"] if isinstance(item, dict)]
+        assert "image" not in types
+
+
+class TestGetChatTemplateProcessorFallback:
+    """memory.md #5 — AutoProcessor sometimes loads without exposing
+    chat_template; get_chat_template must fall back to processor.tokenizer.
+    """
+
+    class _StubTokenizer:
+        """Tokenizer with a real chat_template; records what it received."""
+
+        def __init__(self, chat_template="dummy template"):
+            self.chat_template = chat_template
+            self.last_call = None
+
+        def apply_chat_template(self, messages, **kwargs):
+            self.last_call = {"messages": messages, "kwargs": kwargs}
+            # Return something deterministic so callers can assert the
+            # fallback ran.
+            return f"RENDERED({len(messages)} msgs)"
+
+    def test_processor_with_template_used_directly(self):
+        # Happy path: processor itself has chat_template + apply_chat_template.
+        proc = self._StubTokenizer(chat_template="proc_template")
+        result = get_chat_template(
+            proc, [{"role": "user", "content": "hi"}], add_generation_prompt=True
+        )
+        assert result == "RENDERED(1 msgs)"
+
+    def test_falls_back_to_tokenizer_when_processor_lacks_template(self):
+        # Processor exposes apply_chat_template but no chat_template;
+        # the helper should walk through to processor.tokenizer.
+        class _ProcessorWithoutTemplate:
+            chat_template = None
+
+            def __init__(self, tk):
+                self.tokenizer = tk
+
+            def apply_chat_template(self, messages, **kwargs):
+                raise AssertionError("processor path should have been skipped")
+
+        tk = self._StubTokenizer(chat_template="tokenizer_template")
+        proc = _ProcessorWithoutTemplate(tk)
+        result = get_chat_template(
+            proc, [{"role": "user", "content": "hi"}], add_generation_prompt=True
+        )
+        assert result == "RENDERED(1 msgs)"
+        # Confirms it actually went through the tokenizer.
+        assert tk.last_call is not None
+
+    def test_falls_back_to_plain_prompt_when_no_template_anywhere(self):
+        # Both processor and tokenizer lack chat_template — the helper
+        # builds a Role: content style flat prompt rather than crashing.
+        class _BlankProcessor:
+            chat_template = None
+
+            class _BlankTokenizer:
+                chat_template = None
+
+                def apply_chat_template(self, *args, **kwargs):
+                    raise AssertionError("plain path should bypass tokenizer")
+
+            tokenizer = _BlankTokenizer()
+
+            def apply_chat_template(self, *args, **kwargs):
+                raise AssertionError("plain path should bypass processor")
+
+        result = get_chat_template(
+            _BlankProcessor(),
+            [
+                {"role": "system", "content": "you are helpful"},
+                {"role": "user", "content": "hi"},
+            ],
+            add_generation_prompt=True,
+        )
+        assert isinstance(result, str)
+        assert "hi" in result
+        # Multi-message conversations render with Role: content prefixes
+        # and terminate with `Assistant:` when add_generation_prompt is
+        # set. Single-user-message conversations short-circuit to bare
+        # content (covered by the next test).
+        assert result.rstrip().endswith("Assistant:")
+        assert "you are helpful" in result
+
+    def test_plain_prompt_single_user_message_returns_bare_content(self):
+        # Special-case in _messages_to_plain_prompt: a single user
+        # message renders as just its content, no Role: prefix or
+        # trailing Assistant: marker. Models that lack a chat template
+        # entirely behave most predictably this way.
+        class _BlankProcessor:
+            chat_template = None
+
+            class _BlankTokenizer:
+                chat_template = None
+
+            tokenizer = _BlankTokenizer()
+
+        result = get_chat_template(
+            _BlankProcessor(),
+            [{"role": "user", "content": "hi"}],
+            add_generation_prompt=True,
+        )
+        assert result == "hi"
+
+    def test_chat_template_override_kwarg_respected(self):
+        # `chat_template` kwarg lets callers override even when the
+        # processor exposes its own template.
+        proc = self._StubTokenizer(chat_template="builtin")
+        get_chat_template(
+            proc,
+            [{"role": "user", "content": "hi"}],
+            add_generation_prompt=True,
+            chat_template="custom override",
+        )
+        # The override is forwarded to apply_chat_template via **kwargs.
+        assert proc.last_call["kwargs"].get("chat_template") == "custom override"
