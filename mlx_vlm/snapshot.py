@@ -214,9 +214,7 @@ def capture_rotating(layer, layer_index: int) -> RotatingKVSnapshot:
         offset=int(
             layer.offset.item() if hasattr(layer.offset, "item") else layer.offset
         ),
-        idx=int(
-            layer._idx.item() if hasattr(layer._idx, "item") else layer._idx
-        ),
+        idx=int(layer._idx.item() if hasattr(layer._idx, "item") else layer._idx),
         max_size=int(layer.max_size),
         keep=int(getattr(layer, "keep", 0)),
     )
