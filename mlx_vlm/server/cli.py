@@ -10,7 +10,10 @@ from ..generate import (
     DEFAULT_PREFILL_STEP_SIZE,
     DEFAULT_QUANTIZED_KV_START,
 )
+from ..snapshot import DEFAULT_RING_SIZE
 from .generation import DEFAULT_ENABLE_THINKING, get_server_max_tokens
+from .session_manager import _env_choice, _env_int
+from .session_manager import configure as _configure_session_manager
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
@@ -146,6 +149,65 @@ def main():
         help="Enable auto-reload for development.",
     )
     parser.add_argument(
+        "--cache-session-max",
+        type=int,
+        default=_env_int("MLX_VLM_CACHE_SESSION_MAX", 8),
+        help=(
+            "Maximum number of per-chat PromptCacheState sessions retained "
+            "concurrently. Used for prefix-cache reuse across turns and "
+            "DeltaNet snapshot rewind on hybrid models. LRU eviction at this "
+            "cap. Set to 0 to disable per-chat caching entirely. Env fallback: "
+            "MLX_VLM_CACHE_SESSION_MAX. Default: 8."
+        ),
+    )
+    parser.add_argument(
+        "--cache-chat-id-header",
+        type=str,
+        default=os.environ.get("MLX_VLM_CACHE_CHAT_ID_HEADER", "X-MLX-VLM-Chat-Id"),
+        help=(
+            "HTTP header name carrying the chat_id used to key per-chat "
+            "PromptCacheState. Falls back to body fields chat_id / "
+            "metadata.chat_id if the header is absent. Env fallback: "
+            "MLX_VLM_CACHE_CHAT_ID_HEADER. Default: X-MLX-VLM-Chat-Id."
+        ),
+    )
+    parser.add_argument(
+        "--cache-anon-sessions",
+        type=str,
+        default=_env_choice("MLX_VLM_CACHE_ANON_SESSIONS", "on", ["on", "off"]),
+        choices=["on", "off"],
+        help=(
+            "Route requests that arrive without an explicit chat_id to the "
+            "per-chat session whose stored turn-hash chain shares the longest "
+            "prefix with this request. Default: on. Turn off in multi-user "
+            "deployments where cache-hit timing could be a side-channel. Env "
+            "fallback: MLX_VLM_CACHE_ANON_SESSIONS."
+        ),
+    )
+    parser.add_argument(
+        "--deltanet-rewind",
+        type=str,
+        default=_env_choice("MLX_VLM_DELTANET_REWIND", "auto", ["on", "off", "auto"]),
+        choices=["on", "off", "auto"],
+        help=(
+            "Hybrid-cache rewind master switch for models with non-trimmable "
+            "layers (Qwen 3.5/3.6 GatedDeltaNet, Mamba-style, etc.). 'auto' and "
+            "'on' enable the snapshot-restore path; 'off' forces full re-prefill "
+            "on every hybrid-model rewind. Env fallback: MLX_VLM_DELTANET_REWIND. "
+            "Default: auto."
+        ),
+    )
+    parser.add_argument(
+        "--deltanet-ring-size",
+        type=int,
+        default=_env_int("MLX_VLM_DELTANET_RING_SIZE", DEFAULT_RING_SIZE),
+        help=(
+            "Number of DeltaNet state snapshots retained per session (FIFO). "
+            "Set to 0 to disable snapshots (forces full re-prefill on hybrid "
+            "rewind). Env fallback: MLX_VLM_DELTANET_RING_SIZE. Default: 3."
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         type=str,
         default="INFO",
@@ -179,6 +241,25 @@ def main():
     os.environ["QUANTIZED_KV_START"] = str(args.quantized_kv_start)
     if args.top_logprobs_k is not None:
         os.environ["TOP_LOGPROBS_K"] = str(args.top_logprobs_k)
+
+    # Publish per-chat / DeltaNet config to the session manager. argparse has
+    # already resolved the CLI-arg > env-var > default precedence chain.
+    _configure_session_manager(
+        deltanet_ring_size=max(0, int(args.deltanet_ring_size)),
+        deltanet_rewind_enabled=args.deltanet_rewind.lower() != "off",
+        session_cache_max=max(0, int(args.cache_session_max)),
+        chat_id_header=args.cache_chat_id_header,
+        cache_anon_sessions=args.cache_anon_sessions.lower() != "off",
+    )
+    logger.info(
+        "Per-chat cache: explicit-chat-id %s, anonymous hash-chain matching %s",
+        "enabled" if args.cache_session_max > 0 else "disabled",
+        (
+            "enabled"
+            if args.cache_anon_sessions.lower() != "off" and args.cache_session_max > 0
+            else "disabled"
+        ),
+    )
 
     log_level = getattr(logging, args.log_level.upper(), logging.INFO)
     logging.basicConfig(

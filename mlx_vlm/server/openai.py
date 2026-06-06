@@ -9,6 +9,7 @@ import re
 import time
 import traceback
 import uuid
+from collections import OrderedDict
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -23,10 +24,17 @@ from ..generate.edit_image import ImageEditRequest as CoreImageEditRequest
 from ..generate.edit_image import edit_image
 from ..generate.image import ImageGenerationRequest as CoreImageGenerationRequest
 from ..generate.image import generate_image, parse_size
-from ..prompt_utils import apply_chat_template, extract_text_from_content
+from ..prompt_utils import (
+    THINKING_FORMATS,
+    apply_chat_template,
+    detect_thinking_format,
+    extract_text_from_content,
+    get_cache_alignment_kwargs,
+)
 from ..tool_parsers import _infer_tool_parser_from_processor, load_tool_module
-from ..utils import prepare_inputs
+from ..utils import prepare_inputs, sanitize_strict_json
 from .generation import (
+    THINKING_TRUNCATION_MSG,
     GenerationMetrics,
     PromptTooLongError,
     _build_metrics_envelope,
@@ -42,6 +50,7 @@ from .responses_state import (
 )
 from .responses_state import _sse_event as _response_sse_event
 from .responses_state import (
+    _step_thinking_state,
     _store_response,
     process_tool_calls,
     response_store,
@@ -81,6 +90,10 @@ from .schemas import (
     ResponseOutputTextDoneEvent,
     UsageStats,
 )
+from .session_manager import (  # noqa: F401
+    _append_session_assistant_hash,
+    _resolve_session,
+)
 
 logger = logging.getLogger("mlx_vlm.server")
 
@@ -100,6 +113,200 @@ def _looks_like_audio_reference(value: str) -> bool:
     return value.startswith(_AUDIO_REFERENCE_PREFIXES) or value.lower().endswith(
         _AUDIO_REFERENCE_SUFFIXES
     )
+
+
+# --- Thinking prefill / asymmetry detection -------------------------------
+#
+# Used to seed the streaming SSE state machine and to mark a session's
+# PromptCacheState as asymmetric so stream_generate can anchor the cache at
+# end-of-user on multi-turn thinking conversations. Driven entirely by
+# prompt_utils.THINKING_FORMATS so the tag literals stay in one place.
+
+_PREFILL_FLAG_CACHE_MAX = 16
+_PREFILL_FLAG_CACHE: "OrderedDict[Tuple[int, frozenset], bool]" = OrderedDict()
+
+
+def _all_thinking_openers() -> Tuple[str, ...]:
+    return tuple(op for fmt in THINKING_FORMATS for op in fmt.openers)
+
+
+def _compute_prefill_flag(processor, template_kwargs: dict) -> bool:
+    canonical_msgs = [{"role": "user", "content": "x"}]
+    tk = getattr(processor, "tokenizer", processor)
+    try:
+        actual = tk.apply_chat_template(
+            canonical_msgs,
+            tokenize=False,
+            add_generation_prompt=True,
+            **template_kwargs,
+        )
+        no_gen = tk.apply_chat_template(
+            canonical_msgs,
+            tokenize=False,
+            add_generation_prompt=False,
+            **template_kwargs,
+        )
+    except Exception as e:
+        logger.debug(
+            "prefill-opener detection: render failed (%s); assuming no prefill", e
+        )
+        return False
+
+    suffix = actual[len(no_gen) :] if actual.startswith(no_gen) else actual[-200:]
+    return suffix.rstrip().endswith(_all_thinking_openers())
+
+
+def _has_prefilled_opener(processor, template_kwargs: dict) -> bool:
+    """Detect whether the chat template prefills a thinking opener in the
+    assistant continuation.
+
+    Some templates (notably unsloth Qwen ports with enable_thinking=True) end
+    the rendered prompt with an opener like ``<think>\\n``, leaving the model
+    already inside a reasoning block. The model emits the closer but never the
+    opener, which breaks the streaming SSE state machine that detects thinking
+    boundaries by scanning the output stream. Result is a property of
+    (processor, template_kwargs), cached in a small LRU.
+    """
+    try:
+        cache_key = (id(processor), frozenset(template_kwargs.items()))
+    except TypeError:
+        cache_key = None
+
+    if cache_key is not None and cache_key in _PREFILL_FLAG_CACHE:
+        _PREFILL_FLAG_CACHE.move_to_end(cache_key)
+        return _PREFILL_FLAG_CACHE[cache_key]
+
+    flag = _compute_prefill_flag(processor, template_kwargs)
+
+    if cache_key is not None:
+        _PREFILL_FLAG_CACHE[cache_key] = flag
+        if len(_PREFILL_FLAG_CACHE) > _PREFILL_FLAG_CACHE_MAX:
+            _PREFILL_FLAG_CACHE.popitem(last=False)
+    return flag
+
+
+def _is_prompt_inside_thinking(formatted_prompt: str) -> bool:
+    """Return True if generation will start *inside* an unclosed thinking
+    block.
+
+    Structural check on the rendered prompt: locate the latest opener and the
+    latest closer. If an opener exists and no closer follows it, the model is
+    in thinking-mode at gen-start — the SSE state machine must seed
+    ``in_thinking=True`` so the continuation routes to delta.reasoning until
+    the closer arrives. Captures both tail-prefilled openers (unsloth Qwen
+    ``<think>\\n``) and global openers (Gemma 4 ``<|think|>`` in the system
+    block when enable_thinking=True).
+    """
+    last_opener = -1
+    for fmt in THINKING_FORMATS:
+        for op in fmt.openers:
+            idx = formatted_prompt.rfind(op)
+            if idx > last_opener:
+                last_opener = idx
+    if last_opener < 0:
+        return False
+    last_closer = -1
+    for fmt in THINKING_FORMATS:
+        for cl in fmt.closers:
+            idx = formatted_prompt.rfind(cl)
+            if idx > last_closer:
+                last_closer = idx
+    return last_closer < last_opener
+
+
+def _union_thinking_format(
+    thinking_start_token: Optional[str] = None,
+    thinking_end_token: Optional[str] = None,
+) -> "ThinkingFormat":
+    """Build a ThinkingFormat covering all registry families (plus any
+    explicit start/end tokens) for output-driven streaming detection.
+
+    The prompt may not carry a family-specific opener (e.g. when the chat
+    template is mocked or the global marker is absent), so the streaming
+    state machine needs a format whose openers/closers union every family it
+    might encounter in the *output* stream — mirroring the always-on default
+    markers of ThinkingStreamState.
+    """
+    from ..prompt_utils import ThinkingFormat as _TF
+
+    openers: List[str] = []
+    closers: List[str] = []
+    partials: List[str] = []
+    tag_token_count = 2
+    if thinking_start_token and thinking_end_token:
+        openers.append(thinking_start_token)
+        closers.append(thinking_end_token)
+    for fmt in THINKING_FORMATS:
+        for op in fmt.openers:
+            if op not in openers:
+                openers.append(op)
+        for cl in fmt.closers:
+            if cl not in closers:
+                closers.append(cl)
+        for pb in fmt.partial_buffers:
+            if pb not in partials:
+                partials.append(pb)
+        tag_token_count = max(tag_token_count, fmt.tag_token_count)
+    return _TF(
+        name="union",
+        openers=tuple(openers),
+        closers=tuple(closers),
+        partial_buffers=tuple(partials),
+        tag_token_count=tag_token_count,
+    )
+
+
+def _resolve_streaming_thinking_format(
+    formatted_prompt: str,
+    thinking_start_token: Optional[str] = None,
+    thinking_end_token: Optional[str] = None,
+) -> "ThinkingFormat":
+    """Pick the ThinkingFormat the streaming state machine runs with.
+
+    Precedence:
+      1. The family detected in the rendered prompt (Gemma's global
+         ``<|think|>``, etc.) — most specific.
+      2. A union of all registry families (plus explicit start/end tokens)
+         so output-emitted tags from a model whose prompt lacked a marker
+         are still split out of visible content.
+    """
+    fmt = detect_thinking_format(formatted_prompt)
+    if fmt is not None:
+        return fmt
+    return _union_thinking_format(thinking_start_token, thinking_end_token)
+
+
+def _strip_assistant_thinking(content: str) -> str:
+    """Remove reasoning blocks from a prior assistant message's content.
+
+    Strips complete ``opener...closer`` blocks for every family in
+    THINKING_FORMATS, plus stray closer-only blocks (the prefilled-opener
+    case where the model emitted only the closer in its reply).
+    """
+    for fmt in THINKING_FORMATS:
+        for op in fmt.openers:
+            for cl in fmt.closers:
+                pattern = re.escape(op) + r".*?" + re.escape(cl) + r"\n*"
+                content = re.sub(pattern, "", content, flags=re.DOTALL)
+    for fmt in THINKING_FORMATS:
+        for cl in fmt.closers:
+            if cl in content and not any(op in content for op in fmt.openers):
+                content = content.split(cl, 1)[1]
+    return content.strip()
+
+
+def _is_template_thinking_asymmetric(formatted_prompt: str) -> bool:
+    """Return True if this request's effective rendering will mismatch what
+    was cached during generation — driving the cache-vs-prompt asymmetry that
+    forces a backwards trim on multi-turn requests.
+
+    The model emits thinking content the KV cache absorbs, but thinking-aware
+    clients (OpenWebUI, OpenAI SDK) strip reasoning before echoing the
+    assistant message back. The simplest correct heuristic is "if a thinking
+    format is in play, assume the client will strip" — true of every commonly
+    deployed thinking-aware UI.
+    """
+    return detect_thinking_format(formatted_prompt) is not None
 
 
 def _adapter_path_or_inherit(request):
@@ -1344,6 +1551,13 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             else:
                 msg["content"] = message.content
 
+            # Strip thinking blocks from previous assistant messages to
+            # prevent token bloat from accumulated thought content in
+            # multi-turn chats. Uses the same registry tags the streaming
+            # state machine and _split_thinking recognize.
+            if message.role == "assistant" and isinstance(msg["content"], str):
+                msg["content"] = _strip_assistant_thinking(msg["content"])
+
             # Preserve tool-calling metadata.
             # Ensure arguments are dicts (not JSON strings) for Jinja templates
             # that iterate them with |items (e.g. Qwen3.5).
@@ -1381,6 +1595,20 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
         except Exception as e:
             raise HTTPException(status_code=400, detail=str(e))
 
+        # Per-chat PromptCacheState for prefix-cache reuse across turns.
+        # Resolve the session BEFORE rendering the chat template — when
+        # caching is active, merge cache-alignment template kwargs (e.g.
+        # preserve_thinking for unsloth-modified Qwen templates) so prior-turn
+        # renderings stay token-aligned with what was previously cached. The
+        # kwargs are silent no-ops on templates that don't reference them.
+        chat_id, prompt_cache_state, request_turn_hashes = _resolve_session(
+            http_request, request
+        )
+
+        template_kwargs = gen_args.to_template_kwargs()
+        if prompt_cache_state is not None:
+            template_kwargs.update(get_cache_alignment_kwargs())
+
         formatted_prompt = apply_chat_template(
             processor,
             config,
@@ -1388,19 +1616,41 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             num_images=len(images),
             num_audios=len(audio),
             tools=tools,
-            **gen_args.to_template_kwargs(),
+            **template_kwargs,
         )
 
         logger.debug(
             "chat/completions request: model=%s images=%d audio=%d "
-            "max_tokens=%s temp=%s stream=%s",
+            "max_tokens=%s temp=%s stream=%s chat_id=%s",
             request.model,
             len(images),
             len(audio),
             gen_args.max_tokens,
             gen_args.temperature,
             request.stream,
+            chat_id or "<none>",
         )
+
+        # Resolve the thinking format for the SSE state machine. Prefer the
+        # family detected in the rendered prompt; fall back to a union of all
+        # registry families (+ explicit tokens) so output-emitted tags are
+        # still split out of visible content. Seed in_thinking when the
+        # rendered prompt ends inside an (unclosed) thinking block.
+        thinking_format = _resolve_streaming_thinking_format(
+            formatted_prompt,
+            gen_args.thinking_start_token,
+            gen_args.thinking_end_token,
+        )
+        thinking_prefilled = _has_prefilled_opener(
+            processor, template_kwargs
+        ) or _is_prompt_inside_thinking(formatted_prompt)
+
+        # Mark the session's cache as asymmetric so stream_generate can anchor
+        # the cache at end-of-user on multi-turn thinking conversations.
+        if prompt_cache_state is not None:
+            prompt_cache_state.is_asymmetric_rendering = (
+                _is_template_thinking_asymmetric(formatted_prompt)
+            )
 
         if request.stream:
             # Streaming response using ResponseGenerator for continuous batching
@@ -1436,22 +1686,36 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                     # Use ResponseGenerator if available, otherwise fall back to stream_generate
                     if runtime.response_generator is not None:
-                        # generate() does blocking Queue.get — run off event loop
+                        # generate() does blocking Queue.get — run off event
+                        # loop. prompt_cache_state routes the request through
+                        # the cached-request handler on the GPU thread when
+                        # non-None (per-chat prefix reuse + snapshot rewind).
+                        # Forward prompt_cache_state only when a session is
+                        # active so callers/fakes with the base 4-arg generate
+                        # signature stay compatible.
+                        _gen_extra = (
+                            {"prompt_cache_state": prompt_cache_state}
+                            if prompt_cache_state is not None
+                            else {}
+                        )
                         ctx, token_iter = await asyncio.to_thread(
-                            runtime.response_generator.generate,
-                            formatted_prompt,
-                            images if images else None,
-                            audio if audio else None,
-                            gen_args,
+                            lambda: runtime.response_generator.generate(
+                                formatted_prompt,
+                                images if images else None,
+                                audio if audio else None,
+                                gen_args,
+                                **_gen_extra,
+                            )
                         )
 
                         output_tokens = 0
                         request_id = f"chatcmpl-{uuid.uuid4()}"
-                        thinking_state = ThinkingStreamState(
-                            gen_args.enable_thinking,
-                            gen_args.thinking_start_token,
-                            gen_args.thinking_end_token,
-                        )
+                        # Thinking-state machine driven by the THINKING_FORMATS
+                        # registry. Seeded in_thinking=True when the rendered
+                        # prompt ends inside a thinking block (Gemma 4 global
+                        # opener / unsloth-Qwen tail-prefilled opener).
+                        in_thinking = thinking_prefilled
+                        accumulated = ""
                         full_output = ""  # raw output for tool call parsing
                         # Track tool-call state to suppress markup from content
                         in_tool_call = False
@@ -1472,10 +1736,21 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             full_output += token.text
                             metrics.record_chunk(token)
 
-                            # Detect thinking boundaries
-                            thinking_delta = thinking_state.feed(token.text)
-                            delta_reasoning = thinking_delta.reasoning
-                            delta_content = thinking_delta.content
+                            # Detect thinking boundaries. The helper appends
+                            # the token to `accumulated` internally — callers
+                            # pass the *previous* accumulated and the *new*
+                            # token only.
+                            (
+                                in_thinking,
+                                accumulated,
+                                delta_reasoning,
+                                delta_content,
+                            ) = _step_thinking_state(
+                                token.text,
+                                in_thinking,
+                                accumulated,
+                                thinking_format,
+                            )
 
                             # Suppress tool-call markup from content
                             in_tool_call, delta_content = suppress_tool_call_content(
@@ -1525,6 +1800,30 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                             if token.finish_reason:
                                 finish_reason = token.finish_reason
+                                # Emit a truncation indicator if generation hit
+                                # max_tokens while still inside a thinking block
+                                # (no visible answer would otherwise reach the
+                                # user).
+                                if in_thinking and token.finish_reason == "length":
+                                    logger.warning(
+                                        "Generation hit max_tokens while in "
+                                        "thinking. Emitting truncation indicator."
+                                    )
+                                    trunc_choices = [
+                                        ChatStreamChoice(
+                                            delta=ChatMessage(
+                                                role="assistant",
+                                                content=THINKING_TRUNCATION_MSG,
+                                            ),
+                                        )
+                                    ]
+                                    trunc_chunk = ChatStreamChunk(
+                                        id=request_id,
+                                        created=int(time.time()),
+                                        model=request.model,
+                                        choices=trunc_choices,
+                                    )
+                                    yield f"data: {trunc_chunk.model_dump_json()}\n\n"
                                 break
 
                         # Parse tool calls from full output and emit final chunk
@@ -1762,11 +2061,17 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         text = ""
                         pt = gt = 0
                         fr = None
+                        _gen_extra = (
+                            {"prompt_cache_state": prompt_cache_state}
+                            if prompt_cache_state is not None
+                            else {}
+                        )
                         ctx, token_iter = runtime.response_generator.generate(
                             prompt=formatted_prompt,
                             images=images if images else None,
                             audio=audio if audio else None,
                             args=gen_args,
+                            **_gen_extra,
                         )
                         pt = ctx.prompt_tokens
                         for token in token_iter:
@@ -1822,6 +2127,12 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     gen_args.thinking_end_token,
                 )
 
+                # Thinking consumed the whole budget without producing a
+                # visible answer — surface a user-visible indicator instead of
+                # an empty content field.
+                if thinking_format is not None and not content and reasoning:
+                    content = THINKING_TRUNCATION_MSG
+
                 # Count raw generated tokens minus thinking tag tokens
                 completion_tokens = output_tokens - _count_thinking_tag_tokens(
                     full_text,
@@ -1876,6 +2187,12 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             for tid, lp, top_lps in collected_logprobs
                         ]
                     )
+
+                # Repair model-emitted strict-JSON that slipped a trailing
+                # comma / unquoted key past the logits processor (or when no
+                # structured constraint was active but a JSON response is
+                # expected). No-op on plain prose.
+                content = sanitize_strict_json(content) if content else content
 
                 choices = [
                     ChatChoice(

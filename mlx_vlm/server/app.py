@@ -23,6 +23,7 @@ from ..generate import (
 )
 from ..generate.edit_image import load_image_edit_model
 from ..generate.image import is_image_generation_model, load_image_generation_model
+from ..prompt_utils import detect_thinking_format as _detect_thinking_format
 from ..structured import build_json_schema_logits_processor
 from ..tool_parsers import _infer_tool_parser_from_processor
 from ..version import __version__
@@ -46,6 +47,7 @@ from .openai import register_routes as register_openai_routes
 from .responses_state import _split_thinking as _split_thinking_text
 from .runtime import runtime
 from .schemas import ChatLogprobContent, ModelsResponse, TopLogprob
+from .session_manager import clear_session_caches
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
@@ -105,6 +107,14 @@ def _build_gen_args(
     logit_bias = getattr(request, "logit_bias", None)
     if logit_bias is not None and isinstance(logit_bias, dict):
         logit_bias = {int(k): v for k, v in logit_bias.items()}
+    # Accept Ollama-style `repeat_penalty` as an alias for `repetition_penalty`.
+    # OpenWebUI's Advanced Params slider uses the Ollama name on every
+    # endpoint, so without this alias the UI knob is silently dropped on
+    # OpenAI targets. Extra fields are allowed by FlexibleBaseModel, so the
+    # alias arrives as an attribute when set.
+    repetition_penalty = getattr(request, "repetition_penalty", None) or getattr(
+        request, "repeat_penalty", None
+    )
     enable_thinking = _request_field_or_default(
         request,
         "enable_thinking",
@@ -118,7 +128,7 @@ def _build_gen_args(
         min_p=getattr(request, "min_p", 0.0),
         seed=getattr(request, "seed", None),
         logprobs=bool(getattr(request, "logprobs", False)),
-        repetition_penalty=getattr(request, "repetition_penalty", None),
+        repetition_penalty=repetition_penalty,
         repetition_context_size=_request_field_or_default(
             request,
             "repetition_context_size",
@@ -256,8 +266,14 @@ def _count_thinking_tag_tokens(
     thinking_start_token: Optional[str] = None,
     thinking_end_token: Optional[str] = None,
 ) -> int:
-    """Count tokens consumed by thinking tags (excluded from completion_tokens)."""
-    count = 0
+    """Count tokens consumed by thinking tags (excluded from completion_tokens).
+
+    Explicit start/end tokens win when both are present in the output. Otherwise
+    falls back to the THINKING_FORMATS registry so family tags (Gemma's
+    pipe-delimited ``<|think|>``, gpt-oss's channeled syntax) are counted by
+    their per-family ``tag_token_count`` — and only when both an opener and a
+    closer are present (partial / mid-thinking output isn't debited the closer).
+    """
     if (
         thinking_start_token
         and thinking_end_token
@@ -265,12 +281,24 @@ def _count_thinking_tag_tokens(
         and thinking_end_token in text
     ):
         return 2
-    # <|channel>thought (2 tokens) + <channel|> (1 token) + EOS (1 token)
+    # Preserve the historical hard-coded accounting for the channeled and
+    # generic-think families so existing token-count expectations hold.
+    # <|channel>thought (2 tokens) + <channel|> (1) + EOS (1) = 4.
     if "<|channel>thought" in text and "<channel|>" in text:
-        count = 4
-    elif "<think>" in text and "</think>" in text:
-        count = 2  # <think> and </think> are 1 token each typically
-    return count
+        return 4
+    if "<think>" in text and "</think>" in text:
+        return 2  # <think> and </think> are 1 token each typically
+    # Registry fallback for families not covered above (e.g. Gemma's
+    # pipe-delimited <|think|>...</think>). Only debits the closer when both
+    # an opener and a closer are present.
+    fmt = _detect_thinking_format(text)
+    if fmt is None:
+        return 0
+    has_opener = any(op in text for op in fmt.openers)
+    has_closer = any(cl in text for cl in fmt.closers)
+    if has_opener and has_closer:
+        return fmt.tag_token_count
+    return 0
 
 
 def _split_thinking(
@@ -550,6 +578,9 @@ def unload_model_sync():
     if "vision_cache" in runtime.model_cache:
         runtime.model_cache["vision_cache"].clear()
     runtime.model_cache = {}
+    # Drop per-chat PromptCacheState sessions; their KV/DeltaNet refs would
+    # otherwise pin the unloaded weights' allocations.
+    clear_session_caches()
     # Force garbage collection
     gc.collect()
     mx.clear_cache()

@@ -28,6 +28,7 @@ from ..generate import (
     DEFAULT_THINKING_START_TOKEN,
     DEFAULT_TOP_P,
     BatchGenerator,
+    PromptCacheState,
     _make_cache,
     _merge_prefill_prompt_kwargs,
 )
@@ -43,13 +44,56 @@ from ..tokenizer_utils import _ServerTokenStreamer, make_streaming_detokenizer
 from ..utils import ThinkingBudgetCriteria, load, prepare_inputs
 from .runtime import runtime
 
-logger = logging.getLogger("mlx_vlm.server")
+logger = logging.getLogger(f"{os.environ.get('MLX_VLM_LOG_NAME', 'mlx_vlm')}.server")
 
 DEFAULT_TOKEN_QUEUE_TIMEOUT = 600.0
 DEFAULT_SPECULATIVE_BATCH_COALESCE_MS = 5.0
 DEFAULT_ENABLE_THINKING = False
 METRICS_HISTORY_LIMIT = 100
 METRICS_RECENT_LIMIT = 32
+
+# Maximum tolerable silence on the per-request streaming queue before the
+# cached-path iterator declares the daemon hung. The daemon emits KeepAlive
+# heartbeats per prefill chunk (via ``_step``) and the cached path runs a
+# per-request watchdog (``_process_cached_request``), so this is the upper
+# bound on the gap between *any* daemon activity. ~60s comfortably covers the
+# heaviest prefill chunk on a 27B 6-bit model and still surfaces a real hang
+# quickly.
+TOKEN_QUEUE_TIMEOUT_SECS = 60.0
+
+# How often the cached-path watchdog thread pings the rqueue with a KeepAlive
+# while stream_generate is running. stream_generate yields nothing during its
+# internal prefill loop, so a per-request timer thread pings on this interval.
+# Must be well under TOKEN_QUEUE_TIMEOUT_SECS so a few missed ticks don't trip
+# the iterator.
+CACHED_PATH_HEARTBEAT_INTERVAL_SECS = 10.0
+
+# Mid-stream telemetry: emit a per-request log line every N generated tokens
+# with rolling/avg tok-per-sec and elapsed time. 0 disables. Useful for
+# diagnosing apparent UI stalls without waiting for end-of-request stats.
+STREAM_TELEMETRY_INTERVAL = int(
+    os.environ.get("MLX_VLM_STREAM_TELEMETRY_INTERVAL", "500")
+)
+
+# User-visible indicator emitted when thinking consumed the whole budget /
+# token allowance without producing a visible response.
+THINKING_TRUNCATION_MSG = (
+    "[Thinking used the entire token budget without producing a visible "
+    "response. Try increasing max_tokens or setting a lower thinking_budget.]"
+)
+
+
+class KeepAlive:
+    """Heartbeat sentinel emitted by the daemon during long-running prefill
+    chunks so the cached-path iterator's queue-get timer resets and we can
+    distinguish 'slow but progressing' from 'daemon dead'.
+
+    The iterator filters these out before yielding to SSE consumers — so
+    they're invisible end-to-end. Exists as a class (not a singleton) only
+    so ``isinstance()`` is the discriminator; instances carry no state.
+    """
+
+    __slots__ = ()
 
 
 class PromptTooLongError(ValueError):
@@ -661,31 +705,36 @@ class _TokenIterator:
     def __next__(self):
         if self._ended:
             raise StopIteration
-        try:
-            item = self._rqueue.get(timeout=self._queue_timeout)
-        except QueueEmpty as exc:
-            # Consumer is stalled or upstream is wedged — treat as cancel.
-            self.close()
-            label = (
-                "without a timeout"
-                if self._queue_timeout is None
-                else f"for {self._queue_timeout:g}s"
-            )
-            raise RuntimeError(
-                "Timed out waiting "
-                f"{label} for the next generated token. "
-                "Increase MLX_VLM_TOKEN_QUEUE_TIMEOUT for long "
-                "prefills, or reduce the prompt size."
-            ) from exc
-        if item is None:
-            self._ended = True
-            raise StopIteration
-        if isinstance(item, Exception):
-            self._ended = True
-            raise item
-        if getattr(item, "finish_reason", None):
-            self._ended = True
-        return item
+        while True:
+            try:
+                item = self._rqueue.get(timeout=self._queue_timeout)
+            except QueueEmpty as exc:
+                # Consumer is stalled or upstream is wedged — treat as cancel.
+                self.close()
+                label = (
+                    "without a timeout"
+                    if self._queue_timeout is None
+                    else f"for {self._queue_timeout:g}s"
+                )
+                raise RuntimeError(
+                    "Timed out waiting "
+                    f"{label} for the next generated token. "
+                    "Increase MLX_VLM_TOKEN_QUEUE_TIMEOUT for long "
+                    "prefills, or reduce the prompt size."
+                ) from exc
+            # KeepAlive heartbeats from the daemon's prefill loop reset the
+            # queue timer but are invisible to the consumer.
+            if isinstance(item, KeepAlive):
+                continue
+            if item is None:
+                self._ended = True
+                raise StopIteration
+            if isinstance(item, Exception):
+                self._ended = True
+                raise item
+            if getattr(item, "finish_reason", None):
+                self._ended = True
+            return item
 
     def close(self):
         with self._lock:
@@ -782,6 +831,21 @@ class ResponseGenerator:
             elif config.eos_token_id is not None:
                 stop_tokens.add(config.eos_token_id)
 
+        # Some model configs only list <eos> but omit chat-template stop
+        # tokens like <end_of_turn>. Resolve them from the tokenizer's vocab
+        # so the BatchGenerator path stops cleanly at turn boundaries (the
+        # stream_generate path does the same merge in generate/dispatch.py).
+        _stop_tokenizer = (
+            processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        )
+        _chat_stop_tokens = ["<end_of_turn>", "<|endoftext|>", "<|im_end|>"]
+        if hasattr(_stop_tokenizer, "convert_tokens_to_ids"):
+            unk = getattr(_stop_tokenizer, "unk_token_id", None)
+            for tok in _chat_stop_tokens:
+                tid = _stop_tokenizer.convert_tokens_to_ids(tok)
+                if tid is not None and tid != unk:
+                    stop_tokens.add(tid)
+
         draft_model = None
         draft_kind = os.environ.get("MLX_VLM_DRAFT_KIND")
         draft_model_path = os.environ.get("MLX_VLM_DRAFT_MODEL")
@@ -832,7 +896,17 @@ class ResponseGenerator:
         images: Optional[List] = None,
         audio: Optional[List] = None,
         args: Optional[GenerationArguments] = None,
+        prompt_cache_state: Optional["PromptCacheState"] = None,
     ) -> Tuple[GenerationContext, "_TokenIterator"]:
+        """Submit a generation request to the GPU thread.
+
+        When ``prompt_cache_state`` is provided, the GPU thread routes the
+        request through the cached-request path (``_process_cached_request``):
+        prefix match against the cached token_ids, snapshot-restore + cache
+        trim on rewind, prefill the suffix only, and update the cache state at
+        the end of generation. Without it (default), the request flows through
+        the standard continuous-batching path (BatchGenerator).
+        """
         self.wait_until_ready()
         args = args or GenerationArguments(max_tokens=get_server_max_tokens())
         if self.draft_model is not None and args.logits_processors is not None:
@@ -851,7 +925,21 @@ class ResponseGenerator:
         prompt_tokens = _count_prompt_tokens(raw_inputs)
         _check_configured_context_budget(prompt_tokens, args.max_tokens)
 
-        self.requests.put((rqueue, raw_inputs, prompt_tokens, args, images))
+        # Cached-path consumers need the original prompt string (stream_generate
+        # accepts a string and re-tokenizes internally against the cache's
+        # prefix). Carrying it through the queue lets the daemon dispatch to
+        # either path with full context.
+        self.requests.put(
+            (
+                rqueue,
+                raw_inputs,
+                prompt_tokens,
+                args,
+                images,
+                prompt_cache_state,
+                prompt,
+            )
+        )
 
         # Block until the GPU thread sends back the context
         ctx = rqueue.get()
@@ -879,6 +967,200 @@ class ResponseGenerator:
             image_token_index=image_token_index,
             add_special_tokens=add_special_tokens,
         )
+
+    def _token_iterator(self, rqueue: Queue, uid: int):
+        """Yield StreamingToken items from rqueue until the daemon signals
+        end-of-stream (None sentinel), raises (Exception item), or stalls
+        for ``TOKEN_QUEUE_TIMEOUT_SECS`` of total silence.
+
+        ``KeepAlive`` heartbeats from the daemon during prefill are filtered
+        out — they reset the queue timer without surfacing to the caller. If
+        the iterator exits before the daemon finishes (client disconnect,
+        timeout, exception), it cancels the uid so the daemon can stop
+        generating and free resources.
+
+        This is the iterator used by the cached-request path. The
+        continuous-batching path uses ``_TokenIterator`` (which carries its
+        own configurable timeout and close()).
+        """
+        # Mark ended before yielding the final token so a consumer that
+        # closes immediately after seeing finish_reason isn't treated as a
+        # client abort.
+        ended = False
+        try:
+            while True:
+                item = rqueue.get(timeout=TOKEN_QUEUE_TIMEOUT_SECS)
+                if isinstance(item, KeepAlive):
+                    continue
+                if item is None:
+                    ended = True
+                    break
+                if isinstance(item, Exception):
+                    ended = True
+                    raise item
+                if getattr(item, "finish_reason", None):
+                    ended = True
+                yield item
+                if ended:
+                    break
+        finally:
+            if not ended:
+                self._cancel(uid)
+
+    def _process_cached_request(
+        self,
+        rqueue: Queue,
+        prompt: str,
+        images: Optional[List],
+        args: GenerationArguments,
+        prompt_tokens: int,
+        prompt_cache_state: "PromptCacheState",
+    ) -> None:
+        """Run a chat_id'd request inline on the daemon thread.
+
+        Handles prefix-cache reuse, DeltaNet snapshot rewind, prefill on the
+        suffix only, and token-by-token generation. Pushes ``StreamingToken``
+        instances to ``rqueue`` as tokens are produced so the async endpoint
+        can stream them back to the client.
+
+        Runs synchronously on the GPU/model-owning thread; cancellation is
+        cooperative via ``self._cancelled``.
+
+        Notes / limitations:
+          - Speculative decoding is bypassed for cached requests; the cached
+            path uses non-speculative generation.
+          - Single-sequence semantics (B=1). Multiple concurrent cached
+            requests are processed serially via the daemon's request queue.
+        """
+        # Reserve a uid so cancellation can target this request. Matches the
+        # BatchGenerator path so the _cancel(uid) / _drain_cancellations
+        # machinery works uniformly.
+        uid = id(rqueue)
+
+        # Send back the GenerationContext so generate() can return its
+        # iterator on the caller side. Mirrors the BatchGenerator path.
+        rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
+
+        # Build kwargs for stream_generate. Mirrors the legacy fallback call
+        # in chat_completions_endpoint, plus prompt_cache_state.
+        gen_kwargs = args.to_generate_kwargs()
+        gen_kwargs["prompt_cache_state"] = prompt_cache_state
+        if self.kv_bits is not None:
+            gen_kwargs["kv_bits"] = self.kv_bits
+            gen_kwargs["kv_group_size"] = self.kv_group_size
+            gen_kwargs["kv_quant_scheme"] = self.kv_quant_scheme
+            gen_kwargs["quantized_kv_start"] = self.quantized_kv_start
+
+        # Local import to avoid a circular dependency at module load and so
+        # the cached-path heartbeat tests can monkeypatch
+        # ``sys.modules["mlx_vlm.generate"].stream_generate``.
+        from ..generate import stream_generate as _stream_generate
+
+        # Heartbeat watchdog. stream_generate yields nothing during prefill —
+        # only after the first generated token. On a fresh cache (no prefix to
+        # reuse) with a large prompt, that initial silence can exceed the
+        # iterator's queue timeout. The BatchGenerator path solves this by
+        # emitting heartbeats per prefill chunk inside _step; here we run a
+        # per-request timer thread that pings rqueue while we wait. Heartbeats
+        # stop as soon as the for-loop exits; the thread is daemon so a stuck
+        # join never blocks process shutdown.
+        heartbeat_done = Event()
+
+        def _heartbeat_pump():
+            while not heartbeat_done.wait(timeout=CACHED_PATH_HEARTBEAT_INTERVAL_SECS):
+                rqueue.put(KeepAlive())
+
+        heartbeat_thread = Thread(
+            target=_heartbeat_pump, daemon=True, name=f"cached-heartbeat-{uid}"
+        )
+        heartbeat_thread.start()
+
+        tel_start = time.perf_counter()
+        tel_last_time = tel_start
+        tel_last_at = 0
+        tel_n = 0
+
+        try:
+            for chunk in _stream_generate(
+                model=self.model,
+                processor=self.processor,
+                prompt=prompt,
+                image=images if images else None,
+                vision_cache=self.vision_cache,
+                **gen_kwargs,
+            ):
+                # Cooperative cancellation: drain any pending cancel for this
+                # uid and break early if matched.
+                with self._cancel_lock:
+                    if uid in self._cancelled:
+                        self._cancelled.discard(uid)
+                        rqueue.put(None)
+                        return
+
+                # Convert GenerationResult chunks to StreamingToken format so
+                # the endpoint's existing chunk loop works unchanged.
+                token_id = chunk.token
+                if hasattr(token_id, "item"):
+                    token_id = int(token_id.item())
+                token_id = int(token_id) if token_id is not None else 0
+
+                # GenerationResult.logprobs is the full log-prob vector for the
+                # next token; the BatchGenerator path passes a scalar per-token
+                # logprob in StreamingToken.logprobs. Extract the chosen
+                # token's log-prob to match.
+                lp_scalar = 0.0
+                if chunk.logprobs is not None:
+                    try:
+                        lp_scalar = float(chunk.logprobs[token_id].item())
+                    except (IndexError, TypeError, AttributeError):
+                        lp_scalar = 0.0
+
+                rqueue.put(
+                    StreamingToken(
+                        text=chunk.text,
+                        token=token_id,
+                        logprobs=lp_scalar,
+                        finish_reason=chunk.finish_reason,
+                        peak_memory=chunk.peak_memory,
+                    )
+                )
+
+                if STREAM_TELEMETRY_INTERVAL > 0 and chunk.finish_reason is None:
+                    tel_n += 1
+                    if tel_n - tel_last_at >= STREAM_TELEMETRY_INTERVAL:
+                        now = time.perf_counter()
+                        window_n = tel_n - tel_last_at
+                        window_dt = now - tel_last_time
+                        elapsed = now - tel_start
+                        rolling_tps = window_n / window_dt if window_dt > 0 else 0.0
+                        avg_tps = tel_n / elapsed if elapsed > 0 else 0.0
+                        logger.info(
+                            "Stream Telemetry | uid=%d | tokens=%d | "
+                            "rolling_tps=%.2f | avg_tps=%.2f | elapsed=%.1fs | cached",
+                            uid,
+                            tel_n,
+                            rolling_tps,
+                            avg_tps,
+                            elapsed,
+                        )
+                        tel_last_at = tel_n
+                        tel_last_time = now
+        except Exception as e:
+            logger.error(
+                "Error in cached-request generation (uid=%d): %s",
+                uid,
+                e,
+                exc_info=True,
+            )
+            rqueue.put(e)
+        finally:
+            # Stop the heartbeat watchdog before pushing the terminator so any
+            # straggling KeepAlive lands BEFORE the None sentinel in the queue.
+            heartbeat_done.set()
+            heartbeat_thread.join(timeout=1.0)
+            # Sentinel: signal end of stream. The iterator treats None as a
+            # terminator (matches BatchGenerator path).
+            rqueue.put(None)
 
     # -- internals --
 
@@ -1112,7 +1394,29 @@ class ResponseGenerator:
                         batch_gen.close()
                         batch_gen = None
 
-                for rqueue, raw_inputs, prompt_tokens, args, images in new_items:
+                for _item in new_items:
+                    # Requests carry (rqueue, raw_inputs, prompt_tokens, args,
+                    # images) plus optional (prompt_cache_state, prompt) for
+                    # the cached path. Tolerate the 5-tuple form so callers /
+                    # tests that submit the base shape keep working.
+                    rqueue, raw_inputs, prompt_tokens, args, images = _item[:5]
+                    prompt_cache_state = _item[5] if len(_item) > 5 else None
+                    formatted_prompt = _item[6] if len(_item) > 6 else None
+                    # Dispatch cached requests to the dedicated handler. They
+                    # run inline on this daemon thread (the one that owns the
+                    # model) and skip continuous batching — single-chat
+                    # semantics, snapshot rewind, prefix reuse.
+                    if prompt_cache_state is not None:
+                        self._process_cached_request(
+                            rqueue=rqueue,
+                            prompt=formatted_prompt,
+                            images=images,
+                            args=args,
+                            prompt_tokens=prompt_tokens,
+                            prompt_cache_state=prompt_cache_state,
+                        )
+                        continue
+
                     if batch_gen is None:
                         batch_gen = BatchGenerator(
                             self.model.language_model,
@@ -1254,7 +1558,7 @@ class ResponseGenerator:
                 if hasattr(lm, "_rope_deltas"):
                     lm._rope_deltas = None
 
-                for rqueue, raw_inputs, prompt_tokens, args, images in pending:
+                for rqueue, raw_inputs, prompt_tokens, args, images, *_extra in pending:
                     input_ids, gen_kwargs = self._gpu_embed(raw_inputs, images)
                     uid = id(rqueue)
                     uids.append(uid)
@@ -1373,7 +1677,7 @@ class ResponseGenerator:
                     stop_check=stop_check,
                     greedy_sampling=all(
                         pending_args.temperature == 0
-                        for _, _, _, pending_args, _ in pending
+                        for _, _, _, pending_args, *_rest in pending
                     ),
                     shared_kv_states=shared_kv_states,
                     eos_token_ids=eos_set,
@@ -1459,6 +1763,18 @@ class ResponseGenerator:
                     prompt_response, "cached_tokens", 0
                 )
         if not responses:
+            # Prefill chunk produced no decode tokens yet. Emit one KeepAlive
+            # per active rqueue so the cached-path iterator's queue-get timer
+            # treats this as 'slow but progressing' rather than a daemon hang.
+            # One heartbeat per step (not a flood); a real response counts as
+            # activity on its own so we skip the ping when responses exist.
+            for info in active.values():
+                rqueue = info.get("rqueue")
+                if rqueue is not None:
+                    try:
+                        rqueue.put(KeepAlive())
+                    except Exception:
+                        pass
             return
 
         for r in responses:

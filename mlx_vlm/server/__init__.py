@@ -42,14 +42,19 @@ from .anthropic import (
     anthropic_messages_endpoint,
 )
 from .generation import (
+    CACHED_PATH_HEARTBEAT_INTERVAL_SECS,
     DEFAULT_ENABLE_THINKING,
     DEFAULT_SPECULATIVE_BATCH_COALESCE_MS,
     DEFAULT_TOKEN_QUEUE_TIMEOUT,
     METRICS_HISTORY_LIMIT,
     METRICS_RECENT_LIMIT,
+    STREAM_TELEMETRY_INTERVAL,
+    THINKING_TRUNCATION_MSG,
+    TOKEN_QUEUE_TIMEOUT_SECS,
     BatchGenerator,
     GenerationArguments,
     GenerationContext,
+    KeepAlive,
     PromptTooLongError,
     ResponseGenerator,
     ServerMetricsStore,
@@ -76,6 +81,14 @@ from .generation import (
     run_speculative_server_rounds,
 )
 from .openai import (
+    _PREFILL_FLAG_CACHE,
+    _all_thinking_openers,
+    _compute_prefill_flag,
+    _has_prefilled_opener,
+    _is_prompt_inside_thinking,
+    _is_template_thinking_asymmetric,
+    _resolve_streaming_thinking_format,
+    _strip_assistant_thinking,
     chat_completions_endpoint,
     responses_cancel_endpoint,
     responses_delete_endpoint,
@@ -90,13 +103,16 @@ from .responses_state import (
     ThinkingStreamDelta,
     ThinkingStreamState,
     _normalize_response_input,
+    _partial_tag_start_pos,
     _response_chain_items,
     _response_items_to_chat,
     _response_output_items_from_text,
     _response_tool_registry,
+    _split_thinking,
 )
 from .responses_state import _sse_event as _response_sse_event
 from .responses_state import (
+    _step_thinking_state,
     _store_response,
     process_tool_calls,
     response_store,
@@ -156,9 +172,31 @@ from .schemas import (
     UsageStats,
     VLMRequest,
 )
+from .session_manager import (
+    _append_session_assistant_hash,
+    _canonical_message,
+    _compute_turn_hashes,
+    _env_choice,
+    _env_int,
+    _find_session_by_hash_prefix,
+    _hash_assistant_turn,
+    _resolve_chat_id,
+    _resolve_session,
+    _sync_session_hashes,
+    clear_session_caches,
+    get_or_create_prompt_cache_state,
+)
 
 
 def __getattr__(name):
+    # Per-chat session config holders live on session_manager (the tests
+    # mutate them there). Proxy read access so ``mlx_vlm.server.<name>``
+    # still resolves to the live value; mutation must target
+    # ``mlx_vlm.server.session_manager`` directly.
+    from . import session_manager as _session_manager
+
+    if hasattr(_session_manager, name):
+        return getattr(_session_manager, name)
     return getattr(_app_module, name)
 
 

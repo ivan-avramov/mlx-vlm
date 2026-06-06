@@ -9,6 +9,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import HTTPException
 
+from ..prompt_utils import THINKING_FORMATS, ThinkingFormat, detect_thinking_format
+
 RESPONSE_STORE_LIMIT = int(os.environ.get("MLX_VLM_RESPONSE_STORE_LIMIT", "1024"))
 _CONTENT_MARKERS = ("<|START_TEXT|>", "<|END_TEXT|>")
 
@@ -42,6 +44,27 @@ class ThinkingStreamState:
         ("<think>", "</think>"),
         ("<|START_THINKING|>", "<|END_THINKING|>"),
     )
+
+    @staticmethod
+    def _registry_open_close_markers() -> Tuple[Tuple[str, str], ...]:
+        """Open/close marker pairs sourced from prompt_utils.THINKING_FORMATS.
+
+        Every consumer of thinking tags (this streaming state machine,
+        ``_split_thinking``, the budget enforcer) reads the same registry
+        so the family tag literals (Gemma's pipe-delimited ``<|think|>``,
+        Qwen's ``<think>``, gpt-oss's ``<|channel>thought``) can't drift
+        out of sync. Each format's openers x closers are expanded into
+        pairs so any listed opener flips into thinking and any listed
+        closer flips back out.
+        """
+        pairs: List[Tuple[str, str]] = []
+        for fmt in THINKING_FORMATS:
+            for opener in fmt.openers:
+                for closer in fmt.closers:
+                    pair = (opener, closer)
+                    if pair not in pairs:
+                        pairs.append(pair)
+        return tuple(pairs)
 
     def __init__(
         self,
@@ -124,6 +147,15 @@ class ThinkingStreamState:
         markers = []
         if thinking_start_token and thinking_end_token:
             markers.append((thinking_start_token, thinking_end_token))
+        # Registry-sourced family literals first (most-specific ordering
+        # from THINKING_FORMATS). This puts Gemma's pipe-delimited
+        # ``<|think|>`` ahead of the generic ``<think>`` default so a
+        # ``<|think|>...</think>`` block isn't mis-split by the looser
+        # ``<think>`` pair (which never matches the opener but does match
+        # the shared ``</think>`` closer, stranding the real opener).
+        for marker_pair in cls._registry_open_close_markers():
+            if marker_pair not in markers:
+                markers.append(marker_pair)
         for marker_pair in cls._DEFAULT_OPEN_CLOSE_MARKERS:
             if marker_pair not in markers:
                 markers.append(marker_pair)
@@ -263,13 +295,84 @@ def _clean_reasoning(reasoning: str, start_marker: str) -> str:
     return reasoning.strip()
 
 
+def _strip_thinking_quirks(fmt: ThinkingFormat, reasoning: str) -> str:
+    """Apply per-format reasoning-text fixups after opener removal.
+
+    gpt-oss leaves a literal "thought" word right after the opener even
+    when the opener literal ``<|channel>thought`` is stripped (the
+    tokenization splits the channel name). Other formats are clean.
+    """
+    cleaned = reasoning.strip()
+    if fmt.name == "gpt-oss":
+        if cleaned.startswith("thought"):
+            cleaned = cleaned[len("thought") :].lstrip()
+    return cleaned
+
+
+def _split_thinking_by_format(
+    text: str, fmt: ThinkingFormat
+) -> Tuple[Optional[str], str]:
+    """Split using a single resolved ThinkingFormat's tag literals.
+
+    Mirrors the fork's registry-driven splitter: strips all of the
+    family's openers from the reasoning span and splits at the earliest
+    closer occurrence. Handles the prefilled-opener case (closer present
+    with no opener) by treating everything up to the closer as reasoning.
+    """
+    closer_idx = -1
+    closer_used = ""
+    for cl in fmt.closers:
+        idx = text.find(cl)
+        if idx >= 0 and (closer_idx < 0 or idx < closer_idx):
+            closer_idx = idx
+            closer_used = cl
+
+    if closer_idx < 0:
+        # Opener present but no closer — entire text is in-progress reasoning.
+        reasoning = text
+        for op in fmt.openers:
+            reasoning = reasoning.replace(op, "")
+        return _strip_thinking_quirks(fmt, reasoning) or None, ""
+
+    reasoning = text[:closer_idx]
+    content = text[closer_idx + len(closer_used) :]
+    for op in fmt.openers:
+        reasoning = reasoning.replace(op, "")
+    return (
+        _strip_thinking_quirks(fmt, reasoning) or None,
+        _strip_content_markers(content).strip(),
+    )
+
+
 def _split_thinking(
     text: str,
     thinking_start_token: Optional[str] = None,
     thinking_end_token: Optional[str] = None,
 ) -> Tuple[Optional[str], str]:
+    """Split thinking tags from content. Returns (reasoning, content).
+
+    When no explicit start/end tokens are supplied, prefer the
+    THINKING_FORMATS registry (most-specific-first) so family literals
+    like Gemma's pipe-delimited ``<|think|>`` resolve correctly and don't
+    collide with the generic ``<think>`` default. Falls back to the
+    hard-coded marker-pair loop for explicit tokens or the
+    ``<|START_THINKING|>`` style defaults that aren't in the registry.
+    """
     if not text:
         return None, text
+
+    # Registry path: only when the caller didn't pin explicit tokens.
+    if not (thinking_start_token and thinking_end_token):
+        fmt = detect_thinking_format(text)
+        if fmt is None:
+            # Prefilled-opener case: a closer is present without any
+            # opener (chat template seeded the model mid-thinking).
+            for candidate in THINKING_FORMATS:
+                if any(cl in text for cl in candidate.closers):
+                    fmt = candidate
+                    break
+        if fmt is not None:
+            return _split_thinking_by_format(text, fmt)
 
     for start_marker, end_marker in ThinkingStreamState._build_open_close_markers(
         thinking_start_token, thinking_end_token
@@ -293,6 +396,145 @@ def _split_thinking(
             return reasoning or None, ""
 
     return None, _strip_content_markers(text).strip()
+
+
+def _partial_tag_start_pos(
+    accumulated: str, partial_buffers: Tuple[str, ...]
+) -> Optional[int]:
+    """Return the earliest position in ``accumulated`` where a partial
+    tag prefix starts, OR None if accumulated does not end with a
+    partial-tag prefix.
+
+    A "partial tag" is any non-empty proper prefix of a known partial
+    buffer literal that ``accumulated`` ends with. Crucially uses
+    ENDSWITH a prefix rather than CONTAINS substring — the substring
+    check would never fire until accumulated had grown large enough to
+    contain the full partial, by which point the partial-tag bytes had
+    already leaked into delta.content as multiple short tokens.
+    """
+    earliest: Optional[int] = None
+    for p in partial_buffers:
+        # Try every prefix length from longest to shortest so we get
+        # the earliest start position when multiple lengths match.
+        for k in range(len(p), 0, -1):
+            tail_start = len(accumulated) - k
+            if tail_start < 0:
+                continue
+            if accumulated[tail_start:] == p[:k]:
+                if earliest is None or tail_start < earliest:
+                    earliest = tail_start
+                break
+    return earliest
+
+
+def _step_thinking_state(
+    token_text: str,
+    in_thinking: bool,
+    accumulated: str,
+    fmt: Optional[ThinkingFormat],
+) -> Tuple[bool, str, Optional[str], Optional[str]]:
+    """Process one streamed token through the thinking-state machine.
+
+    Returns ``(new_in_thinking, new_accumulated, delta_reasoning,
+    delta_content)``. Each returned delta is either ``None`` (no emission
+    of that kind for this token) or a non-empty string ready to send to
+    the SSE consumer.
+
+    Handles three classes of bug that the inline branch chain accumulated:
+
+      1. Token-spanning tags eating content — splits at the tag boundary,
+         emits pre-tag content under the OLD state, transitions, then
+         emits post-tag content under the NEW state.
+      2. Partial-buffer matching via ends-with-prefix (``_partial_tag_start_pos``)
+         instead of substring, so tag prefixes never leak as content.
+      3. Multiple transitions in one token — the internal ``while`` loop
+         re-enters at the new state with the residual accumulated.
+
+    A ``None`` ``fmt`` means no thinking format is detected; pass the
+    token through as content unchanged (non-thinking models).
+    """
+    if fmt is None:
+        return in_thinking, accumulated, None, (token_text or None)
+
+    accumulated = accumulated + token_text
+    reasoning_parts: List[str] = []
+    content_parts: List[str] = []
+
+    while True:
+        # Scan ALL tags, distinguishing state-changing vs structural
+        # markers. Closers are state-changing while in_thinking; openers
+        # are state-changing while not in_thinking. The other direction
+        # (e.g. an opener while already in_thinking) is a redundant
+        # structural marker elided without a transition — needed for
+        # Gemma 4's global ``<|think|>`` seeding, where the model emits a
+        # per-turn opener ``<|channel>thought`` while already in_thinking.
+        if in_thinking:
+            state_tags = fmt.closers
+            marker_tags = fmt.openers
+        else:
+            state_tags = fmt.openers
+            marker_tags = fmt.closers
+
+        best_idx = -1
+        best_tag = ""
+        best_changes_state = False
+        for tag in state_tags:
+            idx = accumulated.find(tag)
+            if idx >= 0 and (best_idx < 0 or idx < best_idx):
+                best_idx = idx
+                best_tag = tag
+                best_changes_state = True
+        for tag in marker_tags:
+            idx = accumulated.find(tag)
+            if idx >= 0 and (best_idx < 0 or idx < best_idx):
+                best_idx = idx
+                best_tag = tag
+                best_changes_state = False
+
+        if best_idx >= 0:
+            pre = accumulated[:best_idx]
+            if pre:
+                if in_thinking:
+                    reasoning_parts.append(pre)
+                else:
+                    content_parts.append(pre)
+            entering_thinking = best_changes_state and not in_thinking
+            if best_changes_state:
+                in_thinking = not in_thinking
+            accumulated = accumulated[best_idx + len(best_tag) :]
+            # Strip a leading newline immediately after an opener that enters
+            # thinking — chat templates emit `<opener>\n` and the newline is
+            # template noise, not reasoning content (matches the leading-\n
+            # trim ThinkingStreamState applies).
+            if entering_thinking:
+                accumulated = accumulated.lstrip("\n")
+            continue
+
+        # No complete tag in accumulated. Check whether accumulated ENDS
+        # with a partial-tag prefix; if so, emit everything before that
+        # partial under the current state and keep the partial buffered
+        # for the next token.
+        partial_start = _partial_tag_start_pos(accumulated, fmt.partial_buffers)
+        if partial_start is not None:
+            pre = accumulated[:partial_start]
+            if pre:
+                if in_thinking:
+                    reasoning_parts.append(pre)
+                else:
+                    content_parts.append(pre)
+            accumulated = accumulated[partial_start:]
+        else:
+            if accumulated:
+                if in_thinking:
+                    reasoning_parts.append(accumulated)
+                else:
+                    content_parts.append(accumulated)
+            accumulated = ""
+        break
+
+    delta_reasoning = "".join(reasoning_parts) if reasoning_parts else None
+    delta_content = "".join(content_parts) if content_parts else None
+    return in_thinking, accumulated, delta_reasoning, delta_content
 
 
 def _response_output_items_from_text(
