@@ -1,7 +1,215 @@
 import json
+from dataclasses import dataclass
 from enum import Enum
 from functools import partial
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+# ---------------------------------------------------------------------------
+# Chat-template kwargs for prefix-cache-friendly multi-turn rendering.
+#
+# Some chat templates render the LATEST assistant turn differently from
+# PRIOR assistant turns in the conversation history. For example, the
+# unsloth-modified Qwen 3.6 template injects an empty `<think>\n\n</think>\n\n`
+# block in the latest-assistant header but renders prior assistant turns as
+# bare `<|im_start|>assistant\n{content}` — i.e. without the think wrapper.
+#
+# That asymmetry breaks prefix-cache reuse: turn N's CACHED tokens (which
+# contain the think wrapper because it was in the prefill prompt) won't
+# match turn N+1's RENDERED tokens (which omit the wrapper for the now-
+# "prior" assistant turn). Hybrid models (DeltaNet, Mamba, etc.) — whose
+# non-trimmable recurrent state can't be safely rewound across the divergence
+# point without a snapshot — fall back to full re-prefill on every multi-turn
+# request, costing ~10x in prefill time.
+#
+# Templates that are aware of this issue expose escape-hatch kwargs that
+# force symmetric rendering across turns. This registry is the canonical
+# list of such kwargs; the server merges them into apply_chat_template
+# calls when a per-chat PromptCacheState is active.
+#
+# Invariant: every kwarg here has been verified to be a TRUE NO-OP on
+# templates that don't reference it. Jinja's `{% if X is defined %}` guard
+# is what makes that work — passing an undefined kwarg silently does
+# nothing. Verification was done empirically by rendering identical
+# multi-turn conversations with and without each kwarg on canonical
+# templates (Qwen3-Next, Qwen3-32B): tokens were byte-identical.
+#
+# Adding a new entry:
+#   1. Discover a chat template that breaks cache reuse via a new
+#      asymmetric pattern.
+#   2. Confirm the template exposes a kwarg that toggles symmetric
+#      rendering (search the template source for `is defined` patterns).
+#   3. Verify the new kwarg is a no-op on the official templates we care
+#      about by tokenizing a multi-turn conversation with and without it
+#      and checking the token sequences are identical.
+#   4. Add the entry below with a comment naming the template family it
+#      addresses.
+# ---------------------------------------------------------------------------
+CACHE_ALIGNMENT_KWARGS: Dict[str, Any] = {
+    # Unsloth Qwen 3.x ports (e.g. `unsloth/Qwen3.6-27B-UD-MLX-6bit`):
+    # latest-assistant header injects `<think>\n\n</think>\n\n` while prior
+    # assistants render bare. `preserve_thinking=True` forces the same
+    # wrapper on prior assistants. No-op on official Qwen templates
+    # (Qwen3-Next, Qwen3-32B, Qwen3-30B-A3B-2507, Qwen3-235B-A22B-2507) —
+    # they don't reference the kwarg.
+    "preserve_thinking": True,
+}
+
+
+def get_cache_alignment_kwargs() -> Dict[str, Any]:
+    """Return chat-template kwargs known to enable cache-friendly rendering.
+
+    Callers pass these to `apply_chat_template` whenever a per-chat
+    PromptCacheState is active. See CACHE_ALIGNMENT_KWARGS for the
+    invariant and entry-addition criteria.
+    """
+    return dict(CACHE_ALIGNMENT_KWARGS)
+
+
+# ---------------------------------------------------------------------------
+# Thinking-format registry.
+#
+# Different model families wrap their reasoning blocks in different tag
+# pairs. The streaming SSE state machine (`server.py:chat_completions_endpoint`)
+# uses these tags to split outgoing tokens between `delta.reasoning`
+# (thinking content) and `delta.content` (visible output). The same tags
+# also drive `_compute_thinking_budget`, `_count_thinking_tag_tokens`,
+# `_split_thinking`, and `_has_prefilled_opener`.
+#
+# Centralizing the tags here avoids the drift bug we hit before (multiple
+# call sites hardcoding their own subsets — e.g. `_detect_thinking_format`
+# recognized Gemma's `<|think|>` opener but `_split_thinking` and the
+# streaming state machine looked only for `<think>`/`</think>` and
+# `<|channel>thought`/`<channel|>`, so Gemma's reasoning block leaked
+# into `delta.content` and the leading content token was eaten at the
+# `</think>` boundary).
+#
+# Adding a new format:
+#   1. Inspect the model's chat template + a sample completion to identify
+#      the opener and closer literals.
+#   2. List any prefixes the streaming state machine should buffer
+#      mid-token to avoid leaking partial-tag bytes into delta.content
+#      (typically the `<` or `<|` prefix of each tag).
+#   3. Estimate `tag_token_count` — the per-turn token cost of the
+#      opener+closer pair, used to debit `completion_tokens`. For most
+#      formats this is 2 (one token each); gpt-oss splits the channel
+#      marker, hence its higher count.
+#   4. Add an entry to THINKING_FORMATS, ordered most-specific first.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ThinkingFormat:
+    """Tag literals for one model family's reasoning-block wrapper.
+
+    All consumers (detection, streaming state machine, splitter, budget
+    enforcer, prefilled-opener guard) read the same tag tuples here so
+    they can't drift out of sync.
+    """
+
+    name: str
+    openers: Tuple[str, ...]
+    closers: Tuple[str, ...]
+    # Substrings to suppress mid-token in the streaming state machine.
+    # Without this, a single token like `</think>` (or its byte-prefix
+    # split across two tokens) leaks into delta.content while the state
+    # machine is still deciding whether it's a tag. Each entry should
+    # be the longest unambiguous prefix of an opener or closer.
+    partial_buffers: Tuple[str, ...]
+    # Estimated token count consumed by one opener+closer pair on this
+    # family's tokenizer. Used to subtract from `completion_tokens` so
+    # the count reflects user-visible content only.
+    tag_token_count: int
+
+
+THINKING_FORMATS: Tuple[ThinkingFormat, ...] = (
+    # Gemma 4: the chat template injects `<|think|>` at the system
+    # block when enable_thinking=True (a global "thinking on" marker,
+    # not a per-turn delimiter). The model's actual per-turn thinking
+    # content is bracketed by `<|channel>thought ... <channel|>` —
+    # same syntax as gpt-oss. Empirically the model also emits a bare
+    # `</think>` as a closer in some samples, so both closer literals
+    # are listed. The streaming state machine matches ANY listed opener
+    # to enter thinking and ANY listed closer to exit.
+    ThinkingFormat(
+        name="gemma",
+        openers=("<|think|>", "<|channel>thought"),
+        closers=("</think>", "<channel|>"),
+        partial_buffers=("<|think", "<|channel", "</think", "<channel"),
+        tag_token_count=2,
+    ),
+    # Qwen 3.x family + most generic `<think>...</think>` thinkers.
+    # Distinct opener from Gemma; the registry's first-match-wins
+    # ordering puts Gemma above Qwen so prompts containing both
+    # literals resolve to the more specific one.
+    ThinkingFormat(
+        name="qwen",
+        openers=("<think>",),
+        closers=("</think>",),
+        partial_buffers=("<think", "</think"),
+        tag_token_count=2,
+    ),
+    # gpt-oss / OpenAI-style channeled thought. Distinct from Gemma
+    # in detection only (it doesn't use the `<|think|>` global marker).
+    # Tag literals overlap with Gemma's per-turn syntax — both are
+    # listed so the streaming state machine works either way once the
+    # family is identified.
+    ThinkingFormat(
+        name="gpt-oss",
+        openers=("<|channel>thought",),
+        closers=("<channel|>",),
+        partial_buffers=("<|channel>", "<channel"),
+        tag_token_count=4,
+    ),
+)
+
+
+USER_TURN_OPEN_MARKERS: Tuple[str, ...] = (
+    # Gemma 4 — uses `<|turn>user\n` (no `<` because the family's chat
+    # template renders the role inside the bespoke turn delimiter).
+    "<|turn>user\n",
+    # Gemma 3 — uses the older `<start_of_turn>user\n` form.
+    "<start_of_turn>user\n",
+    # Qwen 2.x / 3.x and most ChatML-style templates.
+    "<|im_start|>user\n",
+    # gpt-oss / OpenAI-style channeled chat template.
+    "<|start|>user<|message|>",
+    # Llama 3.x family.
+    "<|start_header_id|>user<|end_header_id|>\n",
+    # Phi / DeepSeek-Chat-style.
+    "<|user|>\n",
+)
+"""Per-template literals that mark the start of a user turn in the
+rendered prompt. Used by the asymmetric-cache anchoring path to find
+the position BEFORE the latest user message — the cache is anchored
+there so subsequent re-renders of that user message (e.g. OpenWebUI
+wrapping the latest user query with a RAG `<context>` block once a
+search-style tool returns citation-worthy content) don't trigger a
+backward trim of the cache.
+
+Ordered first-match-wins: callers should iterate and use the LAST
+position of any marker in the rendered prompt. Each entry is a
+distinct literal — there's no overlap between families' user-turn
+delimiters.
+"""
+
+
+def detect_thinking_format(text: str) -> Optional[ThinkingFormat]:
+    """Match a chat-template prompt or model output against the registry.
+
+    Returns the first format whose opener literal appears in `text`, or
+    None if no known thinking format is detected. First-match-wins
+    ordering is determined by the THINKING_FORMATS tuple — most-specific
+    formats appear first.
+
+    Used both at request time (against the rendered prompt) and at
+    output time (against accumulated generation, e.g. by `_split_thinking`
+    when the format wasn't already known).
+    """
+    for fmt in THINKING_FORMATS:
+        for opener in fmt.openers:
+            if opener in text:
+                return fmt
+    return None
 
 
 class MessageFormat(Enum):
@@ -233,8 +441,10 @@ class MessageFormatter:
     def __init__(self, model_name: str):
         self.model_name = model_name.lower()
         self.format_type = MODEL_CONFIG.get(self.model_name)
+        # Unknown models (e.g. text-only models loaded via mlx_lm fallback)
+        # get plain text formatting — no image/audio tokens to insert.
         if not self.format_type:
-            raise ValueError(f"Unsupported model: {model_name}")
+            self.format_type = None
 
     def format_message(
         self,
@@ -318,6 +528,9 @@ class MessageFormatter:
         }
 
         formatter = formatter_map.get(self.format_type)
+        if formatter is None:
+            # Unknown model type — return plain text message
+            return {"role": role, "content": prompt}
         return formatter(
             prompt,
             role,
