@@ -12,7 +12,7 @@ import mlx.nn as nn
 from transformers import PreTrainedTokenizer
 
 from ..tokenizer_utils import make_streaming_detokenizer
-from .common import GenerationResult, generation_stream, wired_limit
+from .common import GenerationResult, _get_generation_stream, wired_limit
 
 logger = logging.getLogger("mlx_vlm.generate")
 
@@ -615,7 +615,7 @@ def stream_diffusion_generate(
             diffusion_canvas_index=diffusion_canvas_index,
         )
 
-    with mx.stream(generation_stream):
+    with mx.stream(_get_generation_stream()):
         canvas_index = 0
         while generated_tokens < max_new_tokens:
             canvas_index += 1
@@ -896,7 +896,7 @@ def stream_diffusion_generate_from_kwargs(
     diffusion_unmasking_width = kwargs.pop(
         "diffusion_unmasking_width", DEFAULT_DIFFUSION_UNMASKING_WIDTH
     )
-    with wired_limit(model, [generation_stream]):
+    with wired_limit(model, [_get_generation_stream()]):
         yield from stream_diffusion_generate(
             model,
             processor,

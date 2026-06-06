@@ -33,12 +33,18 @@ from .common import (
     DEFAULT_KV_GROUP_SIZE,
     DEFAULT_KV_QUANT_SCHEME,
     DEFAULT_QUANTIZED_KV_START,
-    generation_stream,
+    _adjust_chunk_for_snapshot_landing,
+    _anchor_within_loop_range,
+    _capture_anchor_state,
+    _classify_snapshot_action,
+    _first_kv_offset,
+    _get_generation_stream,
+    _should_capture_anchor_pre_prefill,
     maybe_quantize_kv_cache,
     wired_limit,
 )
 
-logger = logging.getLogger("mlx_vlm.generate")
+logger = logging.getLogger(f"{os.environ.get('MLX_VLM_LOG_NAME', 'mlx_vlm')}.generate")
 
 DEFAULT_MAX_TOKENS = 2048
 DEFAULT_TEMPERATURE = 0.0
@@ -221,6 +227,10 @@ def generate_step(
     prompt_cache_checkpoint_len: Optional[int] = None,
     seed: Optional[int] = None,
     verbose: bool = False,
+    snapshot_at_offset: Optional[int] = None,
+    rotating_snapshot_capture: Optional[List[Any]] = None,
+    arrays_snapshot_capture: Optional[List[Optional[List[mx.array]]]] = None,
+    anchor_capture_offset: Optional[List[int]] = None,
     **kwargs,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
@@ -280,12 +290,15 @@ def generate_step(
           one token and a vector of log probabilities.
     """
 
+    serialize_kv_quantization = kwargs.pop("serialize_kv_quantization", False)
     quantize_cache_fn = functools.partial(
         _generate_module_override("maybe_quantize_kv_cache", maybe_quantize_kv_cache),
         quantized_kv_start=quantized_kv_start,
         kv_group_size=kv_group_size,
         kv_bits=kv_bits,
         kv_quant_scheme=kv_quant_scheme,
+        max_kv_size=max_kv_size,
+        serialize_kv_quantization=serialize_kv_quantization,
     )
 
     sampler_is_greedy = sampler is None and temperature == 0
@@ -367,7 +380,7 @@ def generate_step(
     def _step(y, inputs_embeds=None):
         nonlocal tokens, kwargs, last_outputs, target_sample_position
 
-        with mx.stream(generation_stream):
+        with mx.stream(_get_generation_stream()):
             if "decoder_input_ids" in kwargs:
                 outputs = model.language_model(
                     cache=prompt_cache,
@@ -415,7 +428,7 @@ def generate_step(
 
             return y, logprobs.squeeze(0) if logprobs.shape[0] == 1 else logprobs
 
-    with mx.stream(generation_stream):
+    with mx.stream(_get_generation_stream()):
         # Get input embeddings (handles both multimodal and text-only)
         embedding_output = model.get_input_embeddings(
             input_ids, pixel_values, mask=mask, **kwargs
@@ -447,15 +460,55 @@ def generate_step(
             else None
         )
         checkpoint_done = False
+
+        # Cumulative offset of "tokens already in the cache": the prior turn's
+        # cached tokens (if any) plus tokens processed so far in this prefill
+        # loop. ``_first_kv_offset`` skips layers without ``.offset``
+        # (``ArraysCache`` in Qwen 3.5/3.6 hybrid + Mamba-style models) and
+        # reads any KV layer's offset — all KV layers advance in lockstep
+        # during prefill, so any one is correct.
+        initial_cache_offset = _first_kv_offset(prompt_cache)
+
+        # Pre-prefill anchor capture: when the latest-user-turn marker is at
+        # or before the current cache offset (typical for OWUI tool-
+        # continuation calls), the live cache state at start of this turn IS
+        # the anchor we want to persist. The in-loop capture won't fire at
+        # this offset because ``cumulative_offset`` advances past
+        # ``snapshot_at_offset`` on the first chunk.
+        if _should_capture_anchor_pre_prefill(
+            snapshot_at_offset=snapshot_at_offset,
+            initial_cache_offset=initial_cache_offset,
+            prompt_cache_present=bool(prompt_cache),
+        ):
+            _capture_anchor_state(
+                prompt_cache,
+                offset=initial_cache_offset,
+                rotating_capture=rotating_snapshot_capture,
+                arrays_capture=arrays_snapshot_capture,
+                anchor_offset_list=anchor_capture_offset,
+            )
+
+        # Enter the loop if (a) the prompt is too long for a single forward
+        # pass, (b) an exact-cache checkpoint must land mid-prefill, or (c) an
+        # asymmetric-template anchor capture is pending whose offset falls
+        # inside the loop's reachable range. Case (c) catches the short-
+        # prefill regression: when prior cache reuse leaves a small delta
+        # (< prefill_step_size), the anchor would otherwise be skipped and the
+        # next turn's asymmetric re-render would force a full re-prefill.
+        anchor_in_loop_range = _anchor_within_loop_range(
+            initial_cache_offset, inputs_embeds.shape[1], snapshot_at_offset
+        )
         should_chunk = (
             prefill_step_size is not None and inputs_embeds.shape[1] > prefill_step_size
         ) or (
             checkpoint_len is not None and 0 < checkpoint_len < inputs_embeds.shape[1]
         )
-        if prefill_step_size is not None and should_chunk:
+        if prefill_step_size is not None and (should_chunk or anchor_in_loop_range):
             # Chunked prefill with embeddings
             total_tokens = inputs_embeds.shape[1]
             processed_tokens = 0
+            cumulative_offset = initial_cache_offset
+            snapshot_done = False
             with tqdm(
                 total=total_tokens, desc="Prefill", unit="tok", disable=not verbose
             ) as pbar:
@@ -468,6 +521,17 @@ def generate_step(
                         and processed_tokens + n_to_process > checkpoint_len
                     ):
                         n_to_process = checkpoint_len - processed_tokens
+                    # Asymmetric-rendering snapshot landing: shrink the chunk
+                    # so it ends EXACTLY on ``snapshot_at_offset`` when
+                    # crossing it. ``cumulative_offset`` is absolute (includes
+                    # prior cached tokens), matching how ``snapshot_at_offset``
+                    # is computed from the full rendered prompt.
+                    n_to_process = _adjust_chunk_for_snapshot_landing(
+                        cumulative_offset,
+                        n_to_process,
+                        snapshot_at_offset,
+                        snapshot_done,
+                    )
                     model.language_model(
                         inputs=input_ids[:, :n_to_process],
                         inputs_embeds=inputs_embeds[:, :n_to_process],
@@ -478,6 +542,7 @@ def generate_step(
                     quantize_cache_fn(prompt_cache)
                     mx.eval([c.state for c in prompt_cache])
                     processed_tokens += n_to_process
+                    cumulative_offset += n_to_process
                     if (
                         checkpoint_len is not None
                         and not checkpoint_done
@@ -485,6 +550,29 @@ def generate_step(
                     ):
                         prompt_cache_checkpoint(processed_tokens, prompt_cache)
                         checkpoint_done = True
+
+                    # Asymmetric-anchor snapshot decision per chunk boundary.
+                    #   - "capture_and_finalize": exact target landed, capture
+                    #     and stop scanning.
+                    #   - "capture_as_fallback": pre-target chunk boundary,
+                    #     capture as best-available; later iterations may
+                    #     replace with a closer one.
+                    action = _classify_snapshot_action(
+                        cumulative_offset,
+                        snapshot_at_offset,
+                        snapshot_done,
+                    )
+                    if action != "skip":
+                        _capture_anchor_state(
+                            prompt_cache,
+                            offset=cumulative_offset,
+                            rotating_capture=rotating_snapshot_capture,
+                            arrays_capture=arrays_snapshot_capture,
+                            anchor_offset_list=anchor_capture_offset,
+                        )
+                        if action == "capture_and_finalize":
+                            snapshot_done = True
+
                     inputs_embeds = inputs_embeds[:, n_to_process:]
                     input_ids = input_ids[:, n_to_process:]
                     mx.clear_cache()
@@ -2159,7 +2247,7 @@ class BatchGenerator:
         self.prefill_batch_size = prefill_batch_size
         self.completion_batch_size = completion_batch_size
 
-        self._stream = stream or generation_stream
+        self._stream = stream or _get_generation_stream()
 
         self.tokenizer.stopping_criteria.add_eos_token_ids(stop_tokens)
 

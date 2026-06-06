@@ -1,17 +1,14 @@
 import argparse
 import codecs
-import contextlib
 import json
 import logging
+import os
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass
 from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_reduce
-from mlx_lm.generate import maybe_quantize_kv_cache as mlx_maybe_quantize_kv_cache
 from transformers import PreTrainedTokenizer
 
 from .. import apc as _apc
@@ -19,7 +16,6 @@ from ..models import cache
 from ..prompt_utils import apply_chat_template
 from ..speculative.utils import format_speculative_stats
 from ..tokenizer_utils import make_streaming_detokenizer
-from ..turboquant import TurboQuantKVCache, turboquant_enabled
 from ..utils import StoppingCriteria, ThinkingBudgetCriteria, load, prepare_inputs
 from .image import (
     DEFAULT_IMAGE_GUIDANCE,
@@ -29,7 +25,7 @@ from .image import (
     run_image_generation_cli,
 )
 
-logger = logging.getLogger("mlx_vlm.generate")
+logger = logging.getLogger(f"{os.environ.get('MLX_VLM_LOG_NAME', 'mlx_vlm')}.generate")
 
 DEFAULT_MODEL_PATH = "mlx-community/nanoLLaVA-1.5-8bit"
 DEFAULT_IMAGE = None
@@ -467,146 +463,20 @@ def normalize_resize_shape(
     return (values[0], values[0]) if len(values) == 1 else tuple(values)
 
 
-# A stream on the default device just for generation
-generation_stream = mx.new_thread_local_stream(mx.default_device())
-
-
-def maybe_quantize_kv_cache(
-    prompt_cache,
-    quantized_kv_start,
-    kv_group_size,
-    kv_bits,
-    kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
-):
-    if kv_bits is None:
-        return
-
-    if turboquant_enabled(kv_bits, kv_quant_scheme):
-
-        def quantize_entry(entry):
-            if isinstance(entry, TurboQuantKVCache):
-                return entry
-            if isinstance(entry, cache.RotatingKVCache):
-                return entry
-            if isinstance(entry, cache.KVCache):
-                if entry.offset == 0:
-                    # Empty: replace so update_and_fetch quantizes on the fly
-                    return TurboQuantKVCache(bits=kv_bits)
-                if entry.offset < quantized_kv_start:
-                    return entry
-                return TurboQuantKVCache.from_cache(entry, bits=kv_bits)
-            if isinstance(entry, cache.CacheList):
-                entry.caches = [quantize_entry(sub_entry) for sub_entry in entry.caches]
-                return entry
-            if isinstance(entry, list):
-                for i, sub_entry in enumerate(entry):
-                    entry[i] = quantize_entry(sub_entry)
-                return entry
-            if isinstance(entry, tuple):
-                return tuple(quantize_entry(sub_entry) for sub_entry in entry)
-            return entry
-
-        # Skip the last layer (before final norm/LM head) — it's highly
-        # sensitive to quantization in deep models (e.g. gemma-4-31b).
-        last_idx = len(prompt_cache) - 1 if len(prompt_cache) > 2 else -1
-        for index, layer_cache in enumerate(prompt_cache):
-            if index == last_idx:
-                continue
-            prompt_cache[index] = quantize_entry(layer_cache)
-        return
-
-    mlx_maybe_quantize_kv_cache(
-        prompt_cache,
-        quantized_kv_start=quantized_kv_start,
-        kv_group_size=kv_group_size,
-        kv_bits=int(kv_bits),
-    )
-
-
-@contextlib.contextmanager
-def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
-    """
-    A context manager to temporarily change the wired limit.
-
-    Note, the wired limit should not be changed during an async eval.  If an
-    async eval could be running pass in the streams to synchronize with prior
-    to exiting the context manager.
-    """
-    if not mx.metal.is_available():
-        yield
-        return
-
-    model_bytes = tree_reduce(
-        lambda acc, x: acc + x.nbytes if isinstance(x, mx.array) else acc, model, 0
-    )
-    max_rec_size = mx.device_info()["max_recommended_working_set_size"]
-    if model_bytes > 0.9 * max_rec_size:
-        model_mb = model_bytes // 2**20
-        max_rec_mb = max_rec_size // 2**20
-        print(
-            f"[WARNING] Generating with a model that requires {model_mb} MB "
-            f"which is close to the maximum recommended size of {max_rec_mb} "
-            "MB. This can be slow. See the documentation for possible work-arounds: "
-            "https://github.com/ml-explore/mlx-lm/tree/main#large-models"
-        )
-    old_limit = mx.set_wired_limit(max_rec_size)
-    try:
-        yield
-    finally:
-        if streams is not None:
-            for s in streams:
-                mx.synchronize(s)
-        else:
-            mx.synchronize()
-        mx.set_wired_limit(old_limit)
-
-
-@dataclass
-class GenerationResult:
-    text: str = ""
-    token: Optional[int] = None
-    logprobs: Optional[List[float]] = None
-    prompt_tokens: int = 0
-    generation_tokens: int = 0
-    total_tokens: int = 0
-    prompt_tps: float = 0.0
-    generation_tps: float = 0.0
-    peak_memory: float = 0.0
-    cached_tokens: int = 0
-    # Populated only on the terminal chunk yielded by ``stream_generate``:
-    # ``"stop"`` for eos/stop-sequence, ``"length"`` for max_tokens.
-    finish_reason: Optional[str] = None
-
-
-class PromptCacheState:
-    """Holds KV cache and token history across conversation turns.
-
-    Pass this to stream_generate via the ``prompt_cache_state`` kwarg to
-    reuse the KV cache from previous turns.  Only the new tokens (after
-    the common prefix) are processed, avoiding redundant prefill.
-    """
-
-    def __init__(self):
-        self.cache: Optional[List[Any]] = None
-        self.token_ids: Optional[List[int]] = None
-
-    def find_prefix_length(self, new_ids: list) -> int:
-        """Return the number of leading tokens that match the cached ids."""
-        if self.token_ids is None:
-            return 0
-        max_len = min(len(self.token_ids), len(new_ids))
-        for i in range(max_len):
-            if self.token_ids[i] != new_ids[i]:
-                return i
-        return max_len
-
-    def update(self, token_ids: list, kv_cache: list):
-        """Store the full token sequence and corresponding KV cache."""
-        self.token_ids = list(token_ids)
-        self.cache = kv_cache
-
-
-from .common import GenerationResult, generation_stream, wired_limit
+from .common import (
+    GenerationResult,
+    _capture_rotating_layers_for_snapshot,
+    _compute_anchor_before_latest_user_offset,
+    _get_generation_stream,
+    _has_non_trimmable,
+    _is_rotating_kv_layer,
+    _restore_arrays_layers_from_snapshots,
+    _restore_deltanet_state,
+    _restore_rotating_layers_from_snapshots,
+    _rotating_rewind_safe,
+    _trim_cache,
+    wired_limit,
+)
 from .diffusion import (
     DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH,
     DiffusionOutputHandler,
@@ -711,6 +581,40 @@ def stream_generate(
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
     verbose = kwargs.pop("verbose", False)
 
+    # Ensure stopping criteria reflects the model's EOS token IDs.
+    # generate() does this before calling us, but direct callers (e.g. the
+    # server) skip generate() and would otherwise use stale criteria. Guarded
+    # on the criteria object's API so minimal/callable-only criteria keep
+    # working unchanged.
+    _stopping_criteria = getattr(tokenizer, "stopping_criteria", None)
+    eos_tokens = kwargs.pop("eos_tokens", None)
+    # Respect a caller-provided custom stopping_criteria (set by generate())
+    # — don't clobber it with a reset.
+    _custom_stopping_criteria = kwargs.get("stopping_criteria", None) is not None
+    if _stopping_criteria is not None and not _custom_stopping_criteria:
+        if eos_tokens is not None and hasattr(_stopping_criteria, "add_eos_token_ids"):
+            _stopping_criteria.add_eos_token_ids(eos_tokens)
+        elif eos_tokens is None and hasattr(_stopping_criteria, "reset"):
+            _stopping_criteria.reset(model.config.eos_token_id)
+
+            # Some model configs only list <eos> but omit chat-template stop
+            # tokens like <end_of_turn>.  Resolve them from the tokenizer's
+            # vocab and merge so generation stops at the right place.
+            _chat_stop_tokens = ["<end_of_turn>", "<|endoftext|>", "<|im_end|>"]
+            if hasattr(tokenizer, "convert_tokens_to_ids") and hasattr(
+                _stopping_criteria, "eos_token_ids"
+            ):
+                for tok in _chat_stop_tokens:
+                    tid = tokenizer.convert_tokens_to_ids(tok)
+                    # convert_tokens_to_ids returns unk_token_id for unknowns
+                    unk = getattr(tokenizer, "unk_token_id", None)
+                    if (
+                        tid is not None
+                        and tid != unk
+                        and tid not in _stopping_criteria.eos_token_ids
+                    ):
+                        _stopping_criteria.eos_token_ids.append(tid)
+
     # Set up thinking budget criteria if requested
     thinking_budget = kwargs.pop("thinking_budget", None)
     thinking_end_token = kwargs.pop("thinking_end_token", DEFAULT_THINKING_END_TOKEN)
@@ -742,6 +646,18 @@ def stream_generate(
     image = image or None
     audio = audio or None
     video = video or None
+
+    # Asymmetric-template detection result (from the server's
+    # _is_template_thinking_asymmetric on the (processor, template_kwargs)
+    # pair). When True the chat template strips thinking content from prior
+    # assistant messages → cache must anchor BEFORE the latest user message.
+    # Read from PromptCacheState (server sets it once per session) with an
+    # explicit kwarg override for tests / callers without a PromptCacheState.
+    is_asymmetric_rendering = bool(kwargs.pop("is_asymmetric_rendering", False))
+    if prompt_cache_state is not None and not is_asymmetric_rendering:
+        is_asymmetric_rendering = bool(
+            getattr(prompt_cache_state, "is_asymmetric_rendering", False)
+        )
 
     if kwargs.get("input_ids", None) is not None:
         input_ids = kwargs.pop("input_ids")
@@ -896,6 +812,7 @@ def stream_generate(
 
     # Prompt cache reuse: skip common prefix from previous turn
     reused_prefix_len = 0
+    original_prompt_length = input_ids.size
     full_input_ids_list = input_ids.flatten().tolist()
     apc_blocks_in_use: List[_apc.APCBlock] = []
     apc_extra_hash = 0
@@ -946,6 +863,56 @@ def stream_generate(
 
     if prompt_cache_state is not None and prompt_cache_state.cache is not None:
         prefix_len = prompt_cache_state.find_prefix_length(full_input_ids_list)
+
+        # SWA Ring Buffer Corruption Guard: a RotatingKVCache that wrapped
+        # during a prior turn can't be rewound into its overwritten region.
+        # Falling back to full re-prefill is the only safe option.
+        if prefix_len > 0 and prefix_len < len(prompt_cache_state.token_ids):
+            if not _rotating_rewind_safe(prompt_cache_state.cache, prefix_len):
+                logger.debug(
+                    "SWA Ring Buffer Corruption Guard: rewind to token %d "
+                    "is in the overwritten region. Forcing full re-prefill.",
+                    prefix_len,
+                )
+                prefix_len = 0
+
+        # Hybrid-Cache Rewind Guard: models with non-trimmable recurrent
+        # layers (GatedDeltaNet/Mamba via ArraysCache) can only rewind via a
+        # captured snapshot. Restore from the nearest snapshot and replay from
+        # there, or fall back to full re-prefill when none is available.
+        if prefix_len > 0 and prefix_len < len(prompt_cache_state.token_ids):
+            if _has_non_trimmable(prompt_cache_state.cache):
+                ring = getattr(prompt_cache_state, "snapshot_ring", None)
+                rewind_enabled = getattr(prompt_cache_state, "rewind_enabled", True)
+                snap = (
+                    ring.find_nearest(prefix_len)
+                    if (ring is not None and ring.enabled and rewind_enabled)
+                    else None
+                )
+                if snap is None:
+                    logger.warning(
+                        "Hybrid-Cache Rewind Guard: no snapshot available "
+                        "for rewind to %d (ring=%s, rewind_enabled=%s). "
+                        "Forcing full re-prefill.",
+                        prefix_len,
+                        len(ring) if ring else "none",
+                        rewind_enabled,
+                    )
+                    prefix_len = 0
+                else:
+                    _restore_deltanet_state(prompt_cache_state.cache, snap.states)
+                    logger.warning(
+                        "DeltaNet snapshot rewind: restored from offset %d, "
+                        "replaying %d tokens to reach prefix %d.",
+                        snap.offset,
+                        prefix_len - snap.offset,
+                        prefix_len,
+                    )
+                    # Treat the snapshot offset as the new prefix point; the
+                    # trim+prefill below advances both KV and DeltaNet state
+                    # from the restored snapshot.
+                    prefix_len = snap.offset
+
         if prefix_len > 0 and prefix_len < input_ids.shape[1]:
             if _apc_suffix_is_text_only(prefix_len) and _prime_cached_prefix_rope_state(
                 model, input_ids, mask, kwargs
@@ -953,20 +920,34 @@ def stream_generate(
                 reused_prefix_len = prefix_len
                 # Trim to only new tokens
                 input_ids = input_ids[:, prefix_len:]
-                pixel_values = None
-                kwargs.pop("cached_image_features", None)
-                # Reuse the saved KV cache (trimmed to prefix length)
+                # Only skip vision if the new (trimmed) tokens carry no image
+                # tokens — otherwise the trimmed prefill still needs them.
+                image_token_id = getattr(
+                    model.config, "image_token_id", None
+                ) or getattr(model.config, "image_token_index", None)
+                new_ids = input_ids.flatten().tolist()
+                has_image_in_new = (
+                    image_token_id is not None and image_token_id in new_ids
+                )
+                if not has_image_in_new:
+                    pixel_values = None
+                    kwargs.pop("cached_image_features", None)
+                # Reuse the saved KV cache (recursively trimmed to prefix_len;
+                # handles hybrid/rotating/quantized layouts correctly, unlike a
+                # blind physical slice).
                 kv_cache = prompt_cache_state.cache
-                # Trim cache to prefix_len in case it includes generated tokens
                 for c in kv_cache:
-                    if hasattr(c, "keys") and c.keys is not None:
-                        cached_len = c.keys.shape[2]
-                        if cached_len > prefix_len:
-                            c.keys = c.keys[:, :, :prefix_len, :]
-                            c.values = c.values[:, :, :prefix_len, :]
-                            if hasattr(c, "offset"):
-                                c.offset = prefix_len
+                    _trim_cache(c, prefix_len)
                 kwargs["prompt_cache"] = kv_cache
+
+    if prompt_cache_state is not None:
+        logger.info(
+            "Prefix Cache Telemetry | Total Prompt: %d | Skipped Context: %d "
+            "| Prompt Delta: %d",
+            original_prompt_length,
+            reused_prefix_len,
+            input_ids.size,
+        )
 
     # APC: cross-request, hash-based prefix lookup. Only consulted if a per-turn
     # PromptCacheState didn't already produce a hit.
@@ -1094,7 +1075,33 @@ def stream_generate(
 
     total_prompt_tokens = reused_prefix_len + input_ids.size
 
-    with wired_limit(model, [generation_stream]):
+    # Asymmetric-rendering anchor: compute the token offset of the LAST
+    # user-turn-open marker in the rendered prompt and ask generate_step to
+    # capture cache state at that boundary during chunked prefill. Persisting
+    # the cache anchored at this offset (instead of end-of-user) means the next
+    # request's re-rendering of the latest user message (e.g. OpenWebUI RAG
+    # `<context>` wrapping once a search tool returns) won't trigger a backward
+    # trim. Three parallel side-channels:
+    #   * rotating — RotatingKVCache (Gemma 4 SWA layers)
+    #   * arrays   — ArraysCache (Qwen 3.5/3.6 DeltaNet layers, Mamba)
+    #   * offset   — single-entry list holding the actual offset reached
+    # The offset marker is what the post-gen branch keys on — it fires the
+    # anchor path even on pure plain-attention models (just trim KV layers).
+    snapshot_at_offset: Optional[int] = None
+    mid_prefill_rotating_capture: List[Any] = []
+    mid_prefill_arrays_capture: List[Optional[List[mx.array]]] = []
+    mid_prefill_anchor_offset: List[int] = []
+    if is_asymmetric_rendering and prompt_cache_state is not None:
+        snapshot_at_offset = _compute_anchor_before_latest_user_offset(
+            prompt, tokenizer
+        )
+        if snapshot_at_offset is not None:
+            kwargs["snapshot_at_offset"] = snapshot_at_offset
+            kwargs["rotating_snapshot_capture"] = mid_prefill_rotating_capture
+            kwargs["arrays_snapshot_capture"] = mid_prefill_arrays_capture
+            kwargs["anchor_capture_offset"] = mid_prefill_anchor_offset
+
+    with wired_limit(model, [_get_generation_stream()]):
         detokenizer = make_streaming_detokenizer(processor)
         thinking_criteria = getattr(tokenizer, "thinking_budget_criteria", None)
         exact_checkpoint_len = None
@@ -1130,6 +1137,10 @@ def stream_generate(
 
         generated_tokens = []
         finish_reason: Optional[str] = None
+        # Rotating-layer snapshots captured at end-of-prefill, used at
+        # post-generation to restore the SWA layers' state to the end-of-user
+        # boundary (fallback when the mid-prefill anchor wasn't reached).
+        rotating_snapshots: List[Any] = []
         for n, (token, logprobs) in enumerate(gen):
             if n == 0:
                 prompt_time = time.perf_counter() - tic
@@ -1148,6 +1159,24 @@ def stream_generate(
                         )
                     except Exception as e:
                         logger.warning("APC exact-cache store failed: %s", e)
+
+                # End-of-prefill cache state has just been produced (the first
+                # yielded token is sampled from post-prefill logits but not yet
+                # written into the cache). Capture rotating-layer state now if
+                # the chat template renders prior asst turns asymmetrically; we
+                # restore after generation so the cache anchors at end-of-user.
+                if is_asymmetric_rendering and prompt_cache_state is not None:
+                    from ..snapshot import capture_rotating
+
+                    rotating_snapshots = _capture_rotating_layers_for_snapshot(
+                        tracked_cache, capture_rotating
+                    )
+                    if rotating_snapshots:
+                        logger.debug(
+                            "Captured %d rotating-layer snapshot(s) at "
+                            "end-of-prefill for asymmetric-rendering session.",
+                            len(rotating_snapshots),
+                        )
 
             generated_tokens.append(token)
 
@@ -1212,21 +1241,16 @@ def stream_generate(
             finish_reason=finish_reason,
         )
 
-        # Save cache state for potential reuse on next turn
-        all_ids: Optional[List[int]] = None
-        if prompt_cache_state is not None:
-            all_ids = full_input_ids_list + [
-                t.item() if hasattr(t, "item") else t for t in generated_tokens
-            ]
-            prompt_cache_state.update(all_ids, tracked_cache)
+        all_ids: Optional[List[int]] = full_input_ids_list + [
+            t.item() if hasattr(t, "item") else t for t in generated_tokens
+        ]
 
-        # APC: harvest new blocks from the post-generation KV state.
+        # APC: harvest new blocks from the post-generation KV state. Runs
+        # BEFORE the PromptCacheState asymmetric anchoring below, because that
+        # path restores/trims ``tracked_cache`` in-place and would desync the
+        # layer offsets from ``all_ids``.
         if apc_manager is not None and apc_mode == "block":
             try:
-                if all_ids is None:
-                    all_ids = full_input_ids_list + [
-                        t.item() if hasattr(t, "item") else t for t in generated_tokens
-                    ]
                 # Snapshot keys/values up to the live offset for each layer.
                 layer_keys: List[mx.array] = []
                 layer_values: List[mx.array] = []
@@ -1254,6 +1278,67 @@ def stream_generate(
             except Exception as e:
                 logger.warning("APC store failed: %s", e)
                 apc_manager.release(apc_blocks_in_use)
+
+        # Save cache state for potential reuse on next turn. Two paths,
+        # selected by ``is_asymmetric_rendering`` (computed in the server via
+        # ``_is_template_thinking_asymmetric`` and passed in via kwargs /
+        # PromptCacheState).
+        #
+        # ASYMMETRIC (e.g. Gemma 4 — chat template strips thinking content
+        # from prior assistant messages on every render): anchor the cache
+        # BEFORE the latest user message. Prefer the mid-prefill snapshot at
+        # ``snapshot_at_offset``; fall back to end-of-user (= end-of-prefill)
+        # when that boundary wasn't located or chunked prefill didn't run.
+        #
+        # SYMMETRIC (e.g. Qwen 3.x official, Gemma 3, Llama): persist the FULL
+        # end-of-asst state; the next request's prefix-match extends naturally.
+        if prompt_cache_state is not None:
+            prefill_len = len(full_input_ids_list)
+            if is_asymmetric_rendering:
+                if mid_prefill_anchor_offset and snapshot_at_offset is not None:
+                    # Anchor at the captured offset (authoritative; may differ
+                    # from ``snapshot_at_offset`` by a few tokens when chunked
+                    # prefill couldn't land exactly). Three independent restore
+                    # steps, each a no-op when its snapshot list is empty.
+                    anchor_offset = mid_prefill_anchor_offset[0]
+                    _restore_rotating_layers_from_snapshots(
+                        tracked_cache, mid_prefill_rotating_capture
+                    )
+                    _restore_arrays_layers_from_snapshots(
+                        tracked_cache, mid_prefill_arrays_capture
+                    )
+                    for c in tracked_cache:
+                        if not _is_rotating_kv_layer(c):
+                            _trim_cache(c, anchor_offset)
+                    anchor_token_ids = full_input_ids_list[:anchor_offset]
+                    prompt_cache_state.update(anchor_token_ids, tracked_cache)
+                    logger.debug(
+                        "Asymmetric path: persisted cache BEFORE latest user "
+                        "message (anchor=%d [%s of target %d] / prefill_len %d).",
+                        anchor_offset,
+                        "exact" if anchor_offset == snapshot_at_offset else "fallback",
+                        snapshot_at_offset,
+                        prefill_len,
+                    )
+                else:
+                    # Fallback: anchor at end-of-user (= end-of-prefill).
+                    if rotating_snapshots:
+                        _restore_rotating_layers_from_snapshots(
+                            tracked_cache, rotating_snapshots
+                        )
+                    for c in tracked_cache:
+                        if not _is_rotating_kv_layer(c):
+                            _trim_cache(c, prefill_len)
+                    prompt_cache_state.update(full_input_ids_list, tracked_cache)
+                    logger.debug(
+                        "Asymmetric path (fallback): persisted cache at "
+                        "end-of-user (offset %d); restored %d rotating layer(s).",
+                        prefill_len,
+                        len(rotating_snapshots),
+                    )
+            else:
+                # Symmetric: persist full end-of-asst state.
+                prompt_cache_state.update(all_ids, tracked_cache)
 
         # Cleanup after generation
         mx.clear_cache()

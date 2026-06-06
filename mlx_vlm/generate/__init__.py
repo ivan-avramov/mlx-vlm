@@ -12,7 +12,25 @@ from .cli import main, parse_arguments
 from .common import (
     GenerationResult,
     PromptCacheState,
-    generation_stream,
+    _adjust_chunk_for_snapshot_landing,
+    _anchor_within_loop_range,
+    _capture_anchor_state,
+    _capture_arrays_layers_for_snapshot,
+    _capture_rotating_layers_for_snapshot,
+    _classify_snapshot_action,
+    _compute_anchor_before_latest_user_offset,
+    _first_kv_offset,
+    _get_generation_stream,
+    _has_non_trimmable,
+    _is_rotating_kv_layer,
+    _kv_seq_axis,
+    _restore_arrays_layers_from_snapshots,
+    _restore_deltanet_state,
+    _restore_rotating_layers_from_snapshots,
+    _rotating_post_gen_trim_safe,
+    _rotating_rewind_safe,
+    _should_capture_anchor_pre_prefill,
+    _trim_cache,
     maybe_quantize_kv_cache,
     wired_limit,
 )
@@ -78,10 +96,14 @@ __all__ = [
 def __getattr__(name):
     import importlib
 
-    from . import ar, dispatch, image
+    from . import ar, common, dispatch, image
 
     edit_image_module = importlib.import_module("mlx_vlm.generate.edit_image")
 
+    if name == "generation_stream":
+        return common._get_generation_stream()
+    if hasattr(common, name):
+        return getattr(common, name)
     if hasattr(dispatch, name):
         return getattr(dispatch, name)
     if hasattr(edit_image_module, name):
@@ -94,13 +116,14 @@ def __getattr__(name):
 def __dir__():
     import importlib
 
-    from . import ar, dispatch, image
+    from . import ar, common, dispatch, image
 
     edit_image_module = importlib.import_module("mlx_vlm.generate.edit_image")
 
     return sorted(
         set(__all__)
         | set(dir(ar))
+        | set(dir(common))
         | set(dir(dispatch))
         | set(dir(edit_image_module))
         | set(dir(image))
