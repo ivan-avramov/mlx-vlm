@@ -1,6 +1,7 @@
 import argparse
 import logging
 import os
+import sys
 
 import uvicorn
 
@@ -18,7 +19,8 @@ from .session_manager import configure as _configure_session_manager
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
 
-logger = logging.getLogger("mlx_vlm.server")
+_LOG_NAME = os.environ.get("MLX_VLM_LOG_NAME", "mlx_vlm")
+logger = logging.getLogger(f"{_LOG_NAME}.server")
 
 
 def main():
@@ -210,11 +212,38 @@ def main():
     parser.add_argument(
         "--log-level",
         type=str,
-        default="INFO",
+        default=None,
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
-        help="Set the logging level (default: INFO).",
+        help="Set the logging level. Env: MLX_VLM_LOG_LEVEL (default: INFO).",
+    )
+    parser.add_argument(
+        "--log-file",
+        type=str,
+        default=None,
+        help="Log output destination. Use '<stdout>' for stdout, or a file path. "
+        "Env: MLX_VLM_LOG_FILE (default: <stdout>).",
     )
     args = parser.parse_args()
+
+    # Configure logging — CLI args override env vars, env vars override defaults
+    log_level_str = args.log_level or os.environ.get("MLX_VLM_LOG_LEVEL", "INFO")
+    log_level = getattr(logging, log_level_str.upper(), logging.INFO)
+    log_file = args.log_file or os.environ.get("MLX_VLM_LOG_FILE", "<stdout>")
+
+    log_kwargs = {
+        "level": log_level,
+        "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    }
+    if log_file == "<stdout>":
+        log_kwargs["stream"] = sys.stdout
+    else:
+        log_kwargs["filename"] = log_file
+
+    logging.basicConfig(**log_kwargs)
+    # Set level on the base logger so all mlx_vlm.* loggers inherit it
+    logging.getLogger(_LOG_NAME).setLevel(log_level)
+    logger.setLevel(log_level)
+
     if args.trust_remote_code:
         os.environ["MLX_TRUST_REMOTE_CODE"] = "true"
     if args.model:
@@ -261,12 +290,10 @@ def main():
         ),
     )
 
-    log_level = getattr(logging, args.log_level.upper(), logging.INFO)
-    logging.basicConfig(
-        level=log_level,
-        format="%(asctime)s - %(levelname)s - %(message)s",
-    )
-    logger.setLevel(log_level)
+    logger.debug("Command-line arguments: %s", args)
+    logger.info("Starting MLX VLM Server")
+    logger.info("Host: %s, Port: %s", args.host, args.port)
+    logger.info("Model: %s, Adapter: %s", args.model, args.adapter_path)
 
     uvicorn.run(
         "mlx_vlm.server:app",
