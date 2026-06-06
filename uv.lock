@@ -922,6 +922,15 @@ wheels = [
 ]
 
 [[package]]
+name = "json-repair"
+version = "0.60.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/5e/a6/d69888cb4ffde30e80db1e6c32caaadd2f984a80067d5ea72c2cb3f61c3f/json_repair-0.60.1.tar.gz", hash = "sha256:841661cdd2df507c9a4e189097f38ca6bc372e06d4b4e36d72e590f68176c290", size = 49451, upload-time = "2026-06-03T17:28:44.451Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/32/1f/2a2b5eea8ef5762a86ad3f8fddddaaba2c0d76dd44e644b9158900868bec/json_repair-0.60.1-py3-none-any.whl", hash = "sha256:ba6ff974f2a8bef2f7768144a7f03f870a816443f03da27a49cdd0ec31a78049", size = 48045, upload-time = "2026-06-03T17:28:43.038Z" },
+]
+
+[[package]]
 name = "llguidance"
 version = "1.7.5"
 source = { registry = "https://pypi.org/simple" }
@@ -1205,6 +1214,7 @@ source = { editable = "." }
 dependencies = [
     { name = "datasets" },
     { name = "fastapi" },
+    { name = "json-repair" },
     { name = "llguidance" },
     { name = "miniaudio" },
     { name = "mlx" },
@@ -1237,6 +1247,7 @@ requires-dist = [
     { name = "datasets", specifier = ">=2.19.1" },
     { name = "fastapi", specifier = ">=0.95.1" },
     { name = "gradio", marker = "extra == 'ui'", specifier = ">=5.19.0" },
+    { name = "json-repair" },
     { name = "llguidance", specifier = ">=1.7.0" },
     { name = "miniaudio", specifier = ">=1.59" },
     { name = "mlx", specifier = ">=0.31.2" },
