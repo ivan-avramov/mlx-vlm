@@ -755,6 +755,14 @@ class ChatStreamChunk(BaseModel):
     usage: Optional[UsageStats] = None
     timings: Optional[GenerationTimings] = None
 
+    def to_sse_json(self) -> str:
+        """Serialize for SSE. Omits the llama.cpp-style `timings` extension
+        when unset: OpenAI chunks never carry the key, and OpenWebUI's stream
+        parser dies on an explicit null (dict.update(None)), silently
+        dropping the chunk."""
+        exclude = {"timings"} if self.timings is None else None
+        return self.model_dump_json(exclude=exclude)
+
 
 # Models for Anthropic-compatible /v1/messages endpoint
 

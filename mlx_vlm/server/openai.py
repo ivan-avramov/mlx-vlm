@@ -1796,7 +1796,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                     choices=choices,
                                 )
 
-                                yield f"data: {chunk_data.model_dump_json()}\n\n"
+                                yield f"data: {chunk_data.to_sse_json()}\n\n"
 
                             if token.finish_reason:
                                 finish_reason = token.finish_reason
@@ -1823,7 +1823,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                         model=request.model,
                                         choices=trunc_choices,
                                     )
-                                    yield f"data: {trunc_chunk.model_dump_json()}\n\n"
+                                    yield f"data: {trunc_chunk.to_sse_json()}\n\n"
                                 break
 
                         # Parse tool calls from full output and emit final chunk
@@ -1849,7 +1849,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                     model=request.model,
                                     choices=choices,
                                 )
-                                yield f"data: {chunk_data.model_dump_json()}\n\n"
+                                yield f"data: {chunk_data.to_sse_json()}\n\n"
                         if not terminal_emitted:
                             finish_reason = finish_reason or "stop"
                             chunk_data = _final_chat_chunk(
@@ -1857,7 +1857,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                 request.model,
                                 finish_reason,
                             )
-                            yield f"data: {chunk_data.model_dump_json()}\n\n"
+                            yield f"data: {chunk_data.to_sse_json()}\n\n"
                         if emit_usage:
                             chunk_data = _chat_usage_chunk(
                                 request_id,
@@ -1866,7 +1866,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                 ctx.prompt_tokens,
                                 output_tokens,
                             )
-                            yield f"data: {chunk_data.model_dump_json()}\n\n"
+                            yield f"data: {chunk_data.to_sse_json()}\n\n"
                     else:
                         # Fallback to stream_generate
                         token_iterator = stream_generate(
@@ -1918,7 +1918,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                     choices=choices,
                                 )
 
-                                yield f"data: {chunk_data.model_dump_json()}\n\n"
+                                yield f"data: {chunk_data.to_sse_json()}\n\n"
                                 await asyncio.sleep(0.01)
 
                         finish_reason = finish_reason or "stop"
@@ -1927,7 +1927,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             request.model,
                             finish_reason,
                         )
-                        yield f"data: {chunk_data.model_dump_json()}\n\n"
+                        yield f"data: {chunk_data.to_sse_json()}\n\n"
                         if emit_usage:
                             chunk_data = _chat_usage_chunk(
                                 request_id,
@@ -1936,7 +1936,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                 stream_prompt_tokens,
                                 output_tokens,
                             )
-                            yield f"data: {chunk_data.model_dump_json()}\n\n"
+                            yield f"data: {chunk_data.to_sse_json()}\n\n"
 
                     metrics_text = full_output or output_text
                     completion_tokens = max(
