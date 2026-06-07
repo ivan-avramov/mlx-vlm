@@ -275,16 +275,76 @@ def _count_prompt_tokens(raw_inputs: dict) -> int:
     return input_ids.size if hasattr(input_ids, "size") else len(input_ids)
 
 
-def _check_configured_context_budget(prompt_tokens: int, max_tokens: int):
+# Floor for the clamped generation budget. When the remaining context
+# (MAX_KV_SIZE - prompt) falls below this, the request is rejected instead
+# of clamped — a budget this small can't hold a meaningful response.
+DEFAULT_MIN_OUTPUT_TOKENS = 2048
+
+# When clamping shrinks the budget, thinking_budget is capped to this share
+# of the effective budget so a thinking model exits its think phase with
+# room left to produce a visible answer.
+THINKING_BUDGET_CLAMP_RATIO = 0.8
+
+
+def get_min_output_tokens():
+    return int(os.environ.get("MIN_OUTPUT_TOKENS", DEFAULT_MIN_OUTPUT_TOKENS))
+
+
+def _resolve_generation_budget(
+    prompt_tokens: int, max_tokens: Optional[int], *, log_clamp: bool = True
+) -> int:
+    """Resolve the effective generation budget for a request.
+
+    Soft-max semantics: ``max_tokens`` expresses intent. When the remaining
+    context (MAX_KV_SIZE - prompt) can't honor it, the budget is clamped to
+    what's left. Raises PromptTooLongError only when the request doesn't fit
+    as asked AND the remaining budget is below MIN_OUTPUT_TOKENS.
+    """
+    requested = max(0, int(max_tokens or 0))
     context_limit = get_configured_context_limit()
-    requested_tokens = prompt_tokens + max(0, int(max_tokens or 0))
-    if context_limit is not None and requested_tokens > context_limit:
+    if context_limit is None:
+        return requested
+    remaining = context_limit - prompt_tokens
+    if requested <= remaining:
+        return requested
+    floor = get_min_output_tokens()
+    if remaining <= 0:
         raise PromptTooLongError(
-            "Request needs "
-            f"{requested_tokens} context tokens "
-            f"({prompt_tokens} prompt + {max_tokens} max generation), "
-            f"but MAX_KV_SIZE is {context_limit}."
+            f"Prompt uses {prompt_tokens} tokens but the context window is only "
+            f"{context_limit} (MAX_KV_SIZE). Start a new chat or shorten the prompt."
         )
+    if remaining < floor:
+        raise PromptTooLongError(
+            f"Prompt uses {prompt_tokens} of {context_limit} context tokens, "
+            f"leaving {remaining} for generation (< MIN_OUTPUT_TOKENS={floor}). "
+            "Start a new chat or shorten the prompt."
+        )
+    if log_clamp:
+        logger.warning(
+            "max_tokens clamped to remaining context: requested=%d prompt=%d "
+            "limit=%d effective=%d",
+            requested,
+            prompt_tokens,
+            context_limit,
+            remaining,
+        )
+    return remaining
+
+
+def _apply_generation_budget(args: "GenerationArguments", prompt_tokens: int) -> None:
+    """Clamp ``args.max_tokens`` in place to fit the configured context window.
+
+    When clamping shrinks the budget, ``thinking_budget`` is scaled down too
+    (see THINKING_BUDGET_CLAMP_RATIO).
+    """
+    requested = max(0, int(args.max_tokens or 0))
+    effective = _resolve_generation_budget(prompt_tokens, requested)
+    if effective < requested and args.thinking_budget is not None:
+        args.thinking_budget = min(
+            args.thinking_budget,
+            max(1, int(effective * THINKING_BUDGET_CLAMP_RATIO)),
+        )
+    args.max_tokens = effective
 
 
 def get_quantized_kv_start():
@@ -923,7 +983,7 @@ class ResponseGenerator:
         # GPU work (vision encoder) deferred to GPU thread.
         raw_inputs = self._cpu_preprocess(prompt, images, audio)
         prompt_tokens = _count_prompt_tokens(raw_inputs)
-        _check_configured_context_budget(prompt_tokens, args.max_tokens)
+        _apply_generation_budget(args, prompt_tokens)
 
         # Cached-path consumers need the original prompt string (stream_generate
         # accepts a string and re-tokenizes internally against the cache's
@@ -1835,6 +1895,9 @@ class ResponseGenerator:
         self.wait_until_ready()
         args = args or GenerationArguments(max_tokens=get_server_max_tokens())
         raw_inputs = self._cpu_preprocess(prompt, images, audio)
-        _check_configured_context_budget(
-            _count_prompt_tokens(raw_inputs), args.max_tokens
+        # Floor-rejection check only; the real clamp mutates args in submit().
+        # log_clamp=False: suppress the clamp WARNING here — it will be logged
+        # at submit time when _apply_generation_budget runs on the streaming path.
+        _resolve_generation_budget(
+            _count_prompt_tokens(raw_inputs), args.max_tokens, log_clamp=False
         )

@@ -2932,7 +2932,7 @@ class TestResponseGenerator:
 
         monkeypatch.setenv("MAX_KV_SIZE", "8")
 
-        with pytest.raises(server.PromptTooLongError, match="MAX_KV_SIZE is 8"):
+        with pytest.raises(server.PromptTooLongError, match="MIN_OUTPUT_TOKENS"):
             gen.generate("prompt", args=server.GenerationArguments(max_tokens=4))
 
         assert gen.requests.empty()
@@ -4765,16 +4765,14 @@ class TestIsPromptInsideThinking:
     def test_qwen_tail_prefilled_opener(self):
         # The unsloth Qwen 3.6 case the original `_has_prefilled_opener`
         # was designed for. Same-direction signal here.
-        prompt = "<|im_start|>user\nhi<|im_end|>\n" "<|im_start|>assistant\n<think>\n"
+        prompt = "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n"
         assert server._is_prompt_inside_thinking(prompt) is True
 
     def test_closed_thinking_block_returns_false(self):
         # Gemma 4 with enable_thinking=False renders an empty block:
         # `<|channel>thought\n<channel|>`. Opener is followed by closer
         # → not in thinking.
-        prompt = (
-            "<|turn>user\nhi<turn|>\n<|turn>model\n" "<|channel>thought\n<channel|>"
-        )
+        prompt = "<|turn>user\nhi<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
         assert server._is_prompt_inside_thinking(prompt) is False
 
     def test_no_thinking_format_in_prompt(self):
@@ -4786,7 +4784,7 @@ class TestIsPromptInsideThinking:
         # fresh opener at the tail. Latest opener has no following
         # closer → in thinking.
         prompt = (
-            "earlier <|channel>thought\nfoo<channel|> done" "\n<|turn>model\n<|think|>"
+            "earlier <|channel>thought\nfoo<channel|> done\n<|turn>model\n<|think|>"
         )
         assert server._is_prompt_inside_thinking(prompt) is True
 
@@ -5063,9 +5061,9 @@ class TestStepThinkingState:
             assert dr is None, f"unexpected reasoning emit on plain token: {dr!r}"
             if dc is not None:
                 emitted.append(dc)
-        assert "".join(emitted) == "".join(
-            tokens
-        ), f"emitted content {''.join(emitted)!r} != input {''.join(tokens)!r}"
+        assert "".join(emitted) == "".join(tokens), (
+            f"emitted content {''.join(emitted)!r} != input {''.join(tokens)!r}"
+        )
 
     def test_helper_appends_token_internally_with_buffered_partial(self, gemma_fmt):
         # Same byte-for-byte invariant when partial buffering is in
@@ -5080,9 +5078,9 @@ class TestStepThinkingState:
         )
         assert dr1 is None and dr2 is None
         emitted = (dc1 or "") + (dc2 or "")
-        assert (
-            emitted == "before < after"
-        ), f"got {emitted!r}, expected 'before < after'"
+        assert emitted == "before < after", (
+            f"got {emitted!r}, expected 'before < after'"
+        )
 
     def test_seeded_in_thinking_elides_per_turn_opener(self, gemma_fmt):
         # Production bug (Gemma 4 26B 8-bit, OWUI first-turn):
@@ -5807,7 +5805,7 @@ class TestCachedPathHeartbeatWatchdog:
         assert items[-1] is None
         none_index = items.index(None)
         assert none_index == len(items) - 1, (
-            f"None terminator must be last; got " f"{[type(i).__name__ for i in items]}"
+            f"None terminator must be last; got {[type(i).__name__ for i in items]}"
         )
 
     def test_exception_in_stream_generate_still_stops_watchdog(self, monkeypatch):

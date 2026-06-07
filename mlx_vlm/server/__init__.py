@@ -60,7 +60,7 @@ from .generation import (
     ServerMetricsStore,
     StreamingToken,
     _build_metrics_envelope,
-    _check_configured_context_budget,
+    _resolve_generation_budget,
     _count_prompt_tokens,
     _get_draft_block_size_from_env,
     _make_cache,
