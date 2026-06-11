@@ -1975,11 +1975,23 @@ class ThinkingBudgetCriteria:
 
     def __call__(self, token_id: int) -> Optional[int]:
         """Process a token and return a forced token ID if budget exceeded, else None."""
+        if not getattr(self, "_dbg_first", False):
+            self._dbg_first = True
+            logger.warning(
+                "[tb-debug] criteria first __call__: seeded in_thinking=%s "
+                "enable_thinking=%s budget=%s start_id=%s end_id=%s first_tok=%s",
+                self.in_thinking, self.enable_thinking, self.thinking_budget,
+                self.thinking_start_token_id, self.thinking_end_token_id, token_id,
+            )
         if self.enable_thinking and token_id == self.thinking_start_token_id:
             self.in_thinking = True
             return None
 
         if token_id == self.thinking_end_token_id:
+            logger.warning(
+                "[tb-debug] criteria saw end-token (in_thinking->False) at count=%s",
+                self.thinking_token_count,
+            )
             self.in_thinking = False
             self.budget_exceeded = False
             self._forced_index = 0
@@ -1987,7 +1999,11 @@ class ThinkingBudgetCriteria:
 
         if self.in_thinking:
             self.thinking_token_count += 1
-            if self.thinking_token_count > self.thinking_budget:
+            if self.thinking_token_count > self.thinking_budget and not self.budget_exceeded:
+                logger.warning(
+                    "[tb-debug] criteria budget EXCEEDED at count=%s (budget=%s) — forcing closer",
+                    self.thinking_token_count, self.thinking_budget,
+                )
                 self.budget_exceeded = True
 
         if self.budget_exceeded and self._forced_index < len(self._forced_sequence):
