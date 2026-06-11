@@ -44,7 +44,7 @@ from ..speculative.utils import (
     speculative_prefill_kwargs,
 )
 from ..structured import ThinkingAwareLogitsProcessor
-from ..prompt_utils import prompt_is_inside_thinking
+from ..prompt_utils import detect_thinking_format, prompt_is_inside_thinking
 from ..tokenizer_utils import _ServerTokenStreamer, make_streaming_detokenizer
 from ..utils import ThinkingBudgetCriteria, load, prepare_inputs
 from .runtime import runtime
@@ -1340,34 +1340,31 @@ class ResponseGenerator:
         self, args: GenerationArguments, input_ids: mx.array
     ) -> Optional[ThinkingBudgetCriteria]:
         if args.thinking_budget is None:
-            logger.warning(
-                "[tb-debug] no criteria: thinking_budget is None (req.enable_thinking=%s)",
-                args.enable_thinking,
-            )
             return None
         tokenizer = self.tokenizer
         thinking_start_token = args.thinking_start_token or DEFAULT_THINKING_START_TOKEN
         thinking_end_token = args.thinking_end_token or DEFAULT_THINKING_END_TOKEN
         enable_thinking = self._prompt_has_open_thinking(args, input_ids)
-        crit = ThinkingBudgetCriteria(
+        # Feed the criteria the model's real delimiters via the registry,
+        # preferring a single-token closer so the forced close sequence is
+        # exact. The hardcoded <think>/</think> are not real tokens for
+        # families like Gemma 4 (opener <|think|>, closer <channel|>); see
+        # prompt_utils.THINKING_FORMATS. Mirrors the dispatch.py path.
+        fmt = detect_thinking_format(tokenizer.decode(input_ids.flatten().tolist()))
+        if fmt is not None:
+            thinking_start_token = fmt.openers[0]
+            thinking_end_token = fmt.closers[0]
+            for _closer in fmt.closers:
+                if len(tokenizer.encode(_closer, add_special_tokens=False)) == 1:
+                    thinking_end_token = _closer
+                    break
+        return ThinkingBudgetCriteria(
             tokenizer=tokenizer,
             thinking_budget=args.thinking_budget,
             thinking_end_token=thinking_end_token,
             thinking_start_token=thinking_start_token,
             enable_thinking=enable_thinking,
         )
-        try:
-            _tail = self.tokenizer.decode(input_ids.flatten().tolist())[-160:]
-        except Exception as _e:  # pragma: no cover - debug only
-            _tail = f"<decode err: {_e}>"
-        logger.warning(
-            "[tb-debug] criteria built: req.enable_thinking=%s thinking_budget=%s "
-            "prompt_open_thinking=%s seeded_in_thinking=%s start_id=%s end_id=%s prompt_tail=%r",
-            args.enable_thinking, args.thinking_budget, enable_thinking,
-            crit.in_thinking, crit.thinking_start_token_id,
-            crit.thinking_end_token_id, _tail,
-        )
-        return crit
 
     def _gpu_embed(self, raw_inputs: dict, images=None) -> Tuple[mx.array, dict]:
         """GPU-only: run vision encoder if needed. Must run on GPU thread."""
