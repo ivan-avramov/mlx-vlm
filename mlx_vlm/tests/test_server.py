@@ -200,6 +200,55 @@ def test_positioned_target_sampler_is_batch_grouping_invariant():
     assert batched.tolist() == [single_0.item(), single_1.item()]
 
 
+def test_positioned_target_sampler_honors_top_k():
+    # top_k=1 collapses each row to its argmax token, regardless of the
+    # position-keyed RNG -> draws are deterministic and equal to argmax.
+    sampler = server_generation._PositionedTargetSampler(
+        temperature=0.7, top_p=1.0, seed=42, top_k=1
+    )
+    logits = mx.array(
+        [
+            [0.0, 1.0, 2.0, 3.0],  # argmax index 3
+            [3.0, 2.0, 1.0, 0.0],  # argmax index 0
+        ],
+        dtype=mx.float32,
+    )
+    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    tokens = sampler.sample_target(logprobs, row_ids=[0, 1], positions=[5, 5])
+    mx.eval(tokens)
+    assert tokens.tolist() == [3, 0]
+
+
+def test_positioned_target_sampler_min_p_filters_tail():
+    # A high min_p prunes the low-probability tail; with these logits only the
+    # top token survives in row 0, so the draw is deterministic.
+    sampler = server_generation._PositionedTargetSampler(
+        temperature=0.7, top_p=1.0, seed=7, min_p=0.9
+    )
+    logits = mx.array([[0.0, 0.1, 0.2, 6.0]], dtype=mx.float32)  # token 3 dominates
+    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    tokens = sampler.sample_target(logprobs, row_ids=[0], positions=[3])
+    mx.eval(tokens)
+    assert tokens.tolist() == [3]
+
+
+def test_positioned_target_sampler_defaults_unchanged():
+    # top_k=0 / min_p=0 / top_p=1 must reproduce the plain keyed categorical
+    # draw -> no behavior change for existing callers.
+    logits = mx.array(
+        [[0.0, 1.0, 2.0, 3.0], [3.0, 2.0, 1.0, 0.0]], dtype=mx.float32
+    )
+    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+    base = server_generation._PositionedTargetSampler(
+        temperature=0.7, top_p=1.0, seed=42
+    ).sample_target(logprobs, row_ids=[0, 1], positions=[5, 5])
+    explicit_defaults = server_generation._PositionedTargetSampler(
+        temperature=0.7, top_p=1.0, seed=42, top_k=0, min_p=0.0
+    ).sample_target(logprobs, row_ids=[0, 1], positions=[5, 5])
+    mx.eval(base, explicit_defaults)
+    assert base.tolist() == explicit_defaults.tolist()
+
+
 def test_speculative_server_dispatches_eagle3_batch_loop():
     assert (
         speculative_utils.get_speculative_rounds_batch("eagle3")

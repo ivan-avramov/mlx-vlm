@@ -12,7 +12,12 @@ from typing import Callable, List, Optional, Tuple
 
 import mlx.core as mx
 from fastapi import HTTPException
-from mlx_lm.sample_utils import make_logits_processors
+from mlx_lm.sample_utils import (
+    apply_min_p,
+    apply_top_k,
+    apply_top_p,
+    make_logits_processors,
+)
 
 from .. import apc as _apc
 from ..generate import (
@@ -32,7 +37,6 @@ from ..generate import (
     _make_cache,
     _merge_prefill_prompt_kwargs,
 )
-from ..sample_utils import top_p_sampling
 from ..speculative.utils import (
     make_speculative_prompt_cache,
     run_speculative_server_rounds,
@@ -170,17 +174,46 @@ def _position_keys(seed: int, row_ids: List[int], positions: List[int]) -> mx.ar
 
 
 class _PositionedTargetSampler:
-    """Server sampler with stateless target draws for ragged verification."""
+    """Server sampler with stateless target draws for ragged verification.
 
-    def __init__(self, *, temperature: float, top_p: float, seed: Optional[int]):
+    Applies top_p / min_p / top_k filtering (mlx_lm logit masks, same chain
+    order as mlx_lm.make_sampler) on the full [B, vocab] batch, then draws per
+    row with a position-keyed RNG so draws are reproducible by
+    (seed, row_id, position) and invariant to how rows are grouped into batches.
+    """
+
+    def __init__(
+        self,
+        *,
+        temperature: float,
+        top_p: float,
+        seed: Optional[int],
+        top_k: int = 0,
+        min_p: float = 0.0,
+    ):
         self.temperature = float(temperature)
         self.top_p = float(top_p)
+        self.top_k = int(top_k)
+        self.min_p = float(min_p)
         self.seed = DEFAULT_SEED if seed is None else int(seed)
 
+    def _filter(self, logprobs: mx.array) -> mx.array:
+        # No active filter -> return unchanged so the default path stays
+        # byte-identical to a plain categorical draw.
+        if not (0.0 < self.top_p < 1.0 or self.min_p != 0.0 or self.top_k > 0):
+            return logprobs
+        if logprobs.dtype == mx.bfloat16:
+            logprobs = logprobs.astype(mx.float32)
+        if 0.0 < self.top_p < 1.0:
+            logprobs = apply_top_p(logprobs, self.top_p)
+        if self.min_p != 0.0:
+            logprobs = apply_min_p(logprobs, self.min_p)
+        if self.top_k > 0:
+            logprobs = apply_top_k(logprobs, self.top_k)
+        return logprobs
+
     def __call__(self, logprobs: mx.array) -> mx.array:
-        if self.top_p > 0 and self.top_p < 1.0:
-            return top_p_sampling(logprobs, self.top_p, self.temperature)
-        return mx.random.categorical(logprobs * (1 / self.temperature))
+        return mx.random.categorical(self._filter(logprobs) * (1 / self.temperature))
 
     def sample_target(
         self,
@@ -192,27 +225,11 @@ class _PositionedTargetSampler:
         if logprobs.shape[0] != len(row_ids) or len(row_ids) != len(positions):
             raise ValueError("row_ids and positions must match logprobs batch size.")
         keys = _position_keys(self.seed, row_ids, positions)
-        if self.top_p > 0 and self.top_p < 1.0:
-            return mx.vmap(self._sample_top_p_one, in_axes=(0, 0))(logprobs, keys)
+        logprobs = self._filter(logprobs)
         return mx.vmap(self._sample_one, in_axes=(0, 0))(logprobs, keys)
 
     def _sample_one(self, logprobs: mx.array, key: mx.array) -> mx.array:
         return mx.random.categorical(logprobs * (1 / self.temperature), key=key)
-
-    def _sample_top_p_one(self, logprobs: mx.array, key: mx.array) -> mx.array:
-        if logprobs.dtype == mx.bfloat16:
-            logprobs = logprobs.astype(mx.float32)
-        probs = mx.softmax(logprobs / self.temperature, axis=-1)
-        sorted_indices = mx.argsort(probs, axis=-1)
-        sorted_probs = mx.take_along_axis(probs, sorted_indices, axis=-1)
-        cumulative_probs = mx.cumsum(sorted_probs, axis=-1)
-        top_probs = mx.where(
-            cumulative_probs > 1 - self.top_p,
-            sorted_probs,
-            mx.zeros_like(sorted_probs),
-        )
-        sampled_pos = mx.random.categorical(mx.log(top_probs), key=key)
-        return mx.take_along_axis(sorted_indices, sampled_pos[..., None], axis=-1)[0]
 
 
 def _sample_last_token(
@@ -1230,6 +1247,8 @@ class ResponseGenerator:
         return _PositionedTargetSampler(
             temperature=args.temperature,
             top_p=args.top_p,
+            top_k=args.top_k,
+            min_p=args.min_p,
             seed=args.seed,
         )
 
