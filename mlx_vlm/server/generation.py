@@ -44,6 +44,7 @@ from ..speculative.utils import (
     speculative_prefill_kwargs,
 )
 from ..structured import ThinkingAwareLogitsProcessor
+from ..prompt_utils import prompt_is_inside_thinking
 from ..tokenizer_utils import _ServerTokenStreamer, make_streaming_detokenizer
 from ..utils import ThinkingBudgetCriteria, load, prepare_inputs
 from .runtime import runtime
@@ -1292,17 +1293,30 @@ class ResponseGenerator:
     ) -> bool:
         if not args.enable_thinking:
             return False
-        thinking_start_token_id, thinking_end_token_id = self._thinking_token_ids(args)
+        # Detect an open thinking block across ALL registered formats, not
+        # just the hardcoded <think>. Gemma 4 opens with <|think|> (system
+        # block) and unsloth-Qwen with a tail <think>; the prior token-scan
+        # looked only for <think>, so for Gemma it never registered as
+        # thinking and the budget criteria silently no-op'd. Decode the
+        # prompt and reuse the registry detector the streaming splitter
+        # uses, so the two can't drift (see prompt_utils.ThinkingFormat).
         tokens = input_ids.flatten().tolist()
         try:
-            last_start = len(tokens) - 1 - tokens[::-1].index(thinking_start_token_id)
-        except ValueError:
+            text = self.tokenizer.decode(tokens)
+        except Exception:
             return False
-        try:
-            last_end = len(tokens) - 1 - tokens[::-1].index(thinking_end_token_id)
-        except ValueError:
-            last_end = -1
-        return last_start > last_end
+        if prompt_is_inside_thinking(text):
+            return True
+        # Preserve the explicit per-request token override path (rare; not
+        # in the registry) — honor a custom opener/closer pair if supplied.
+        start = args.thinking_start_token
+        end = args.thinking_end_token
+        if start:
+            last_start = text.rfind(start)
+            last_end = text.rfind(end) if end else -1
+            if last_start >= 0 and last_end < last_start:
+                return True
+        return False
 
     def _wrap_processors_until_thinking_done(
         self,

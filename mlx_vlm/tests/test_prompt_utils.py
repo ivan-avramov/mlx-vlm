@@ -10,6 +10,7 @@ from mlx_vlm.prompt_utils import (
     MessageFormatter,
     apply_chat_template,
     detect_thinking_format,
+    prompt_is_inside_thinking,
     extract_text_from_content,
     get_cache_alignment_kwargs,
     get_chat_template,
@@ -712,6 +713,31 @@ class TestThinkingFormatRegistry:
         qwen = next(f for f in THINKING_FORMATS if f.name == "qwen")
         assert qwen.openers == ("<think>",)
         assert qwen.closers == ("</think>",)
+
+    def test_prompt_is_inside_thinking_recognizes_non_think_openers(self):
+        # Regression: the thinking-budget enforcer used to scan only for
+        # the hardcoded `<think>`, so a Gemma prompt (which opens thinking
+        # with `<|think|>` in the system block) never registered as
+        # in-thinking and the budget criteria silently no-op'd. The
+        # canonical detector must recognize EVERY registered family's
+        # opener, not just Qwen's `<think>`.
+        # Gemma global marker, unclosed -> inside thinking.
+        assert prompt_is_inside_thinking("sys<|think|>reason<|turn>model") is True
+        # Gemma per-turn channel opener, unclosed -> inside thinking.
+        assert prompt_is_inside_thinking("sys ... <|channel>thought x") is True
+        # unsloth-Qwen tail opener -> inside thinking.
+        assert prompt_is_inside_thinking("user hi\nassistant <think>\n") is True
+
+    def test_prompt_is_inside_thinking_false_when_closed_or_absent(self):
+        # Opener followed by a closer -> not inside thinking.
+        assert prompt_is_inside_thinking("a <|think|> b </think> answer") is False
+        assert prompt_is_inside_thinking("<think> r </think> done") is False
+        # Gemma per-turn block closed by its channel closer.
+        assert (
+            prompt_is_inside_thinking("<|channel>thought x <channel|> out") is False
+        )
+        # No thinking markers at all.
+        assert prompt_is_inside_thinking("plain prompt, no markers") is False
 
 
 class TestDetectThinkingFormat:

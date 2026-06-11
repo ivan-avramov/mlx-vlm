@@ -212,6 +212,35 @@ def detect_thinking_format(text: str) -> Optional[ThinkingFormat]:
     return None
 
 
+def prompt_is_inside_thinking(text: str) -> bool:
+    """True if a rendered prompt ends inside an unclosed thinking block,
+    per ANY registered ThinkingFormat.
+
+    Locate the latest opener and latest closer across all families; the
+    prompt is inside-thinking iff an opener exists and no closer follows
+    it. Captures both tail-prefilled openers (unsloth Qwen ``<think>\\n``)
+    and global openers (Gemma 4 ``<|think|>`` in the system block when
+    enable_thinking=True).
+
+    This is the canonical detector the thinking-budget enforcer and the
+    streaming SSE state machine must share so they cannot drift (see the
+    ThinkingFormat docstring). The budget path previously scanned only for
+    the hardcoded ``<think>``, which silently disabled the budget for
+    families that open with anything else (Gemma's ``<|think|>``).
+    """
+    last_opener = max(
+        (text.rfind(op) for fmt in THINKING_FORMATS for op in fmt.openers),
+        default=-1,
+    )
+    if last_opener < 0:
+        return False
+    last_closer = max(
+        (text.rfind(cl) for fmt in THINKING_FORMATS for cl in fmt.closers),
+        default=-1,
+    )
+    return last_closer < last_opener
+
+
 class MessageFormat(Enum):
     """Enum for different message format types."""
 
