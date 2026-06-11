@@ -13,7 +13,11 @@ from transformers import PreTrainedTokenizer
 
 from .. import apc as _apc
 from ..models import cache
-from ..prompt_utils import apply_chat_template
+from ..prompt_utils import (
+    apply_chat_template,
+    detect_thinking_format,
+    prompt_is_inside_thinking,
+)
 from ..speculative.utils import format_speculative_stats
 from ..tokenizer_utils import make_streaming_detokenizer
 from ..utils import StoppingCriteria, ThinkingBudgetCriteria, load, prepare_inputs
@@ -1048,17 +1052,34 @@ def stream_generate(
                 apc_manager.release(matched_blocks)
 
     if thinking_budget is not None:
-        thinking_start_token_id = tokenizer.encode(
-            thinking_start_token, add_special_tokens=False
-        )[-1]
-        enable_thinking = enable_thinking and (
-            thinking_start_token_id in input_ids.flatten().tolist()
+        # Detect an open thinking block across ALL registered formats, and
+        # feed the criteria the model's REAL delimiters — not the hardcoded
+        # <think>/</think>. For families like Gemma 4 (opener <|think|>,
+        # per-turn closer <channel|>) the defaults are not real tokens — they
+        # tokenize to subword pieces both ending in ">", so the prior
+        # `<think>`-id-in-prompt check forced enable_thinking False and the
+        # forced closer would have been a bare ">". See prompt_utils.THINKING_FORMATS.
+        decoded_prompt = tokenizer.decode(input_ids.flatten().tolist())
+        enable_thinking = bool(enable_thinking) and prompt_is_inside_thinking(
+            decoded_prompt
         )
+        eff_start_token, eff_end_token = thinking_start_token, thinking_end_token
+        fmt = detect_thinking_format(decoded_prompt)
+        if fmt is not None:
+            eff_start_token = fmt.openers[0]
+            # Prefer a single-token closer so the forced close sequence is
+            # exact (the criteria keys the forced/stop token off the LAST
+            # token id of the closer string).
+            eff_end_token = fmt.closers[0]
+            for _closer in fmt.closers:
+                if len(tokenizer.encode(_closer, add_special_tokens=False)) == 1:
+                    eff_end_token = _closer
+                    break
         tokenizer.thinking_budget_criteria = ThinkingBudgetCriteria(
             tokenizer=tokenizer,
             thinking_budget=thinking_budget,
-            thinking_end_token=thinking_end_token,
-            thinking_start_token=thinking_start_token,
+            thinking_end_token=eff_end_token,
+            thinking_start_token=eff_start_token,
             enable_thinking=enable_thinking,
         )
         kwargs["thinking_budget_criteria"] = tokenizer.thinking_budget_criteria
