@@ -23,6 +23,99 @@ _LOG_NAME = os.environ.get("MLX_VLM_LOG_NAME", "mlx_vlm")
 logger = logging.getLogger(f"{_LOG_NAME}.server")
 
 
+def _model_num_attention_heads(model_path):
+    """Read the language model's query-head count from config.json (cheap: only the
+    config file is fetched, not weights). Returns None if it can't be determined."""
+    import json
+
+    try:
+        if model_path and os.path.isdir(model_path):
+            cfg_file = os.path.join(model_path, "config.json")
+        else:
+            from huggingface_hub import hf_hub_download
+
+            cfg_file = hf_hub_download(model_path, "config.json")
+        with open(cfg_file, encoding="utf-8") as f:
+            cfg = json.load(f)
+        tc = cfg.get("text_config", cfg)
+        return tc.get("num_attention_heads") or cfg.get("num_attention_heads")
+    except Exception as e:  # noqa: BLE001 - best-effort; fall back to a safe default
+        logger.warning("cache-limit auto-derive: could not read num_attention_heads (%s)", e)
+        return None
+
+
+def _derive_cache_limit_gb(model_path, max_kv_size, prefill_step):
+    """Auto-size the buffer-pool cap to one full-attention layer's QK^T score tensor at
+    the model's MAX context, so it never undershoots at runtime (real ctx <= max_kv_size).
+
+    cap = ceil( n_heads x prefill_step x max_kv_size x 2 bytes / 1e9 ) + 2 GB margin
+
+    The +2 GB and round-up cover the co-resident transients (Q/MLP/dequant/hidden,
+    measured ~1 GB) and absorb estimation slack. Heads come from the model config;
+    fallback is 32 (the largest in this stack) so the fallback over- rather than
+    under-shoots (undershoot only costs prefill speed, never correctness).
+    """
+    import math
+
+    if not (max_kv_size and prefill_step):
+        return None
+    heads = _model_num_attention_heads(model_path) or 32
+    scores_gb = heads * prefill_step * max_kv_size * 2 / 1e9
+    return math.ceil(scores_gb) + 2.0
+
+
+def _apply_mlx_memory_limits(
+    cache_limit_gb, memory_limit_frac, model_path=None, max_kv_size=None, prefill_step=None
+):
+    """Bound MLX's Metal allocator at server startup.
+
+    Long-context prefill's apparent "memory leak" is reclaimable buffer-pool
+    retention (``get_cache_memory``), not KV/weights: the pool grows toward
+    physical RAM and pages before MLX's default limit (~device size) evicts it.
+    ``cache_limit_gb`` caps the pool (RSS ≈ active_peak + cache_limit_gb); when not
+    given explicitly it is auto-derived from the model's heads x prefill_step x
+    max_kv_size. ``memory_limit_frac`` sets a total-memory backstop so MLX evicts the
+    pool before the OS swaps, and adapts to each machine's physical RAM.
+    """
+    import mlx.core as mx
+
+    GB = 1024**3
+    if not (cache_limit_gb and cache_limit_gb > 0):
+        derived = _derive_cache_limit_gb(model_path, max_kv_size, prefill_step)
+        if derived:
+            logger.info(
+                "MLX buffer-pool cache limit auto-derived: %.0f GB "
+                "(heads x %s step x %s ctx x 2B + 2GB margin)",
+                derived,
+                prefill_step,
+                max_kv_size,
+            )
+            cache_limit_gb = derived
+    if cache_limit_gb and cache_limit_gb > 0:
+        mx.set_cache_limit(int(cache_limit_gb * GB))
+        logger.info("MLX buffer-pool cache limit: %.1f GB", cache_limit_gb)
+    if memory_limit_frac and memory_limit_frac > 0:
+        try:
+            phys = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        except (ValueError, AttributeError, OSError):
+            phys = 0
+        try:
+            rec = int(mx.device_info().get("max_recommended_working_set_size", 0))
+        except Exception:
+            rec = 0
+        candidates = [v for v in (int(memory_limit_frac * phys), rec) if v > 0]
+        if candidates:
+            limit = min(candidates)
+            mx.set_memory_limit(limit)
+            logger.info(
+                "MLX memory limit: %.1f GB (%.2f×%.0f GB phys; rec WSS %.1f GB)",
+                limit / GB,
+                memory_limit_frac,
+                (phys / GB) if phys else 0,
+                (rec / GB) if rec else 0,
+            )
+
+
 def main():
     parser = argparse.ArgumentParser(description="MLX VLM Http Server.")
     parser.add_argument(
@@ -111,6 +204,28 @@ def main():
         type=int,
         default=DEFAULT_QUANTIZED_KV_START,
         help="Start index for quantized KV cache.",
+    )
+    parser.add_argument(
+        "--cache-limit-gb",
+        type=float,
+        default=None,
+        help=(
+            "Cap MLX's Metal buffer-reuse pool (get_cache_memory) at this many GB. "
+            "Bounds RSS to ~= active_peak + cache_limit_gb instead of letting the pool "
+            "grow toward physical RAM during long-context prefill. Should be >= one "
+            "attention layer's score tensor at your max context (~6 GB for <=128K, "
+            "~10 GB for 256K). Default: unset (MLX default ~= device size)."
+        ),
+    )
+    parser.add_argument(
+        "--memory-limit-frac",
+        type=float,
+        default=None,
+        help=(
+            "Set MLX's total-memory limit to this fraction of physical RAM (capped at "
+            "the Metal recommended working-set size). MLX evicts the buffer pool before "
+            "crossing it, preventing OS swap. e.g. 0.85. Default: unset."
+        ),
     )
     parser.add_argument(
         "--draft-model",
@@ -243,6 +358,14 @@ def main():
     # Set level on the base logger so all mlx_vlm.* loggers inherit it
     logging.getLogger(_LOG_NAME).setLevel(log_level)
     logger.setLevel(log_level)
+
+    _apply_mlx_memory_limits(
+        args.cache_limit_gb,
+        args.memory_limit_frac,
+        model_path=args.model,
+        max_kv_size=args.max_kv_size,
+        prefill_step=args.prefill_step_size or DEFAULT_PREFILL_STEP_SIZE,
+    )
 
     if args.trust_remote_code:
         os.environ["MLX_TRUST_REMOTE_CODE"] = "true"
