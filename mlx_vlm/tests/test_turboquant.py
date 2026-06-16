@@ -485,6 +485,46 @@ def test_turboquant_prefill_attention_matches_dequantized_attention():
     assert diff < 1e-4
 
 
+def test_turboquant_prefill_no_dequantize_called(monkeypatch):
+    """quantized_attention must be used for TQ prefill; dequantize must not fire.
+
+    For kv_bits=3 (MSE+MSE codecs) prefill_attention always returns None, so
+    the dispatch must fall through to quantized_attention — never to the
+    full-context dequantize spike path.
+    """
+    keys = mx.random.normal((1, 2, 32, 32))
+    values = mx.random.normal((1, 2, 32, 32))
+    queries = mx.random.normal((1, 4, 8, 32))
+
+    fp_cache = KVCache()
+    fp_cache.update_and_fetch(keys, values)
+    turbo_cache = TurboQuantKVCache.from_cache(fp_cache, bits=3)
+    turbo_keys, turbo_values = turbo_cache.state
+
+    dequantize_called = []
+
+    original_dequantize = turbo_cache.dequantize
+
+    def patched_dequantize(*args, **kwargs):
+        dequantize_called.append(True)
+        return original_dequantize(*args, **kwargs)
+
+    monkeypatch.setattr(turbo_cache, "dequantize", patched_dequantize)
+
+    result = scaled_dot_product_attention(
+        queries,
+        turbo_keys,
+        turbo_values,
+        turbo_cache,
+        scale=32**-0.5,
+        mask="causal",
+    )
+    mx.eval(result)
+
+    assert not dequantize_called, "dequantize must not be called during TQ prefill dispatch"
+    assert result.shape == (1, 4, 8, 32)
+
+
 # ============================================================================
 # Allocation hook lifecycle (memory.md #12)
 # ============================================================================

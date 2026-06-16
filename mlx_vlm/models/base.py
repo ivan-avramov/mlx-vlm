@@ -219,11 +219,12 @@ def scaled_dot_product_attention(
         )
         if result is not None:
             return result
-        dequantized_keys, dequantized_values = cache.dequantize(keys, values)
-        return mx.fast.scaled_dot_product_attention(
+        # quantized_attention chunks over both Q and K with online softmax +
+        # mx.eval between K-tiles, keeping peak memory ~O(chunk) not O(context).
+        return cache.quantized_attention(
             queries,
-            dequantized_keys.astype(queries.dtype),
-            dequantized_values.astype(queries.dtype),
+            keys_state=keys,
+            values_state=values,
             scale=scale,
             mask=mask,
         )
