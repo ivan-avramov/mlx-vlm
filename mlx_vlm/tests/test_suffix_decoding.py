@@ -1012,5 +1012,38 @@ def test_qwen_capture_layer_ids_is_load_bearing_for_gdn_states():
     captured = lm(mx.array([[6, 7, 8]]), cache=c2, **lm.suffix_verify_kwargs())
     assert captured.gdn_states is not None and len(captured.gdn_states) >= 1
     assert captured.hidden_states == []  # capture_layer_ids=[] adds no hidden overhead
+
+
+def test_suffix_decoding_matches_greedy_on_real_tiny_qwen3_5():
+    # THE GATE on hybrid GDN: greedy output token-identical with/without suffix,
+    # using the real SuffixDecodingProposer (mixed accept/reject) on a repetitive
+    # prompt, exercising the real verify, KV + GDN caches, and rollback.
+    lm = _tiny_qwen3_5(seed=0)
+    model = SimpleNamespace(language_model=lm)
+    prompt = [3, 4, 5, 6, 7, 8] * 4
+    n = 24
+
+    ref, _ = _qwen_reference_greedy(lm, prompt, n)
+
+    proposer = SuffixDecodingProposer(min_match=2)
+    spec_cache = cache_mod.make_prompt_cache(lm)
+    out = lm(mx.array([prompt]), cache=spec_cache)
+    first_bonus = int(mx.argmax(out.logits[:, -1, :], axis=-1).item())
+    spec = [first_bonus] + [
+        tok
+        for tok, _ in run_suffix_decoding_rounds(
+            model,
+            proposer,
+            spec_cache,
+            prompt,
+            first_bonus=first_bonus,
+            max_tokens=n,
+            sampler=_ARGMAX,
+            draft_block_size=8,
+        )
+    ]
+
+    assert spec == ref
+    assert len(spec) == n
     assert _suffix_structured_fallback("mtp", [object()]) is False
     assert _suffix_structured_fallback(None, [object()]) is False
