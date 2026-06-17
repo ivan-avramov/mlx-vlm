@@ -4990,10 +4990,25 @@ class TurboQuantKVCache(_BaseCache):
         bits: float,
         seed: int = DEFAULT_TURBOQUANT_SEED,
         max_kv_size: Optional[int] = None,
+        fused_prefill: Optional[bool] = None,
     ):
+        import os as _os
+
         self.bits = _validate_bits(bits)
         self.seed = seed
         self.max_kv_size = max_kv_size
+        # Fused MSE prefill kernel: auto-on for eligible TQ models; the
+        # TQ_FUSED_PREFILL env var / constructor flag is an override (kill-switch).
+        self._fused_prefill_enabled = (
+            fused_prefill
+            if fused_prefill is not None
+            else _os.environ.get("TQ_FUSED_PREFILL", "1").lower()
+            not in ("0", "false", "no")
+        )
+        # Prefill implementation selector for A/B measurement (spec §10):
+        # "decomposed" = dequant + mx.matmul (steel-GEMM on M2-M4, Neural
+        # Accelerators on M5); "fused" = hand-written flash kernel.
+        self._prefill_impl = _os.environ.get("TQ_PREFILL_IMPL", "decomposed").lower()
         self.offset = 0
         self.keys = None
         self.values = None
@@ -5305,6 +5320,86 @@ class TurboQuantKVCache(_BaseCache):
         output = output.reshape(B, n_q_heads, L, value_dim)
         return output.astype(queries.dtype)
 
+    def _fused_prefill_eligible(self, queries, keys_state, values_state) -> bool:
+        """Capability gate for the fused MSE prefill kernel. Primary control is
+        this predicate (TQ + MSE codec + supported dims); the kill-switch is an
+        override layered on top via ``self._fused_prefill_enabled``."""
+        if not self._fused_prefill_enabled:
+            return False
+        D = queries.shape[-1]
+        return (
+            isinstance(self.key_codec, _TurboQuantMSECodec)
+            and isinstance(self.value_codec, _TurboQuantMSECodec)
+            and isinstance(keys_state, TurboQuantMSEState)
+            and isinstance(values_state, TurboQuantMSEState)
+            and D % 8 == 0
+            and int(self.key_codec.bits) in (3, 4)
+            and int(self.value_codec.bits) in (3, 4)
+        )
+
+    def mse_prefill(self, queries, keys_state, values_state, scale=1.0, mask=None):
+        """Fused MSE prefill entry point. Dispatches to the selected backend
+        (``TQ_PREFILL_IMPL``): the decomposed mx.matmul path (default) or the
+        hand-written fused flash kernel."""
+        if self._prefill_impl == "fused":
+            return self._mse_prefill_fused(queries, keys_state, values_state, scale, mask)
+        return self._mse_prefill_decomposed(queries, keys_state, values_state, scale, mask)
+
+    def _mse_prefill_decomposed(self, queries, keys_state, values_state, scale, mask):
+        """Decomposed prefill: dequant K/V to (model-space) unit vectors and run
+        QKᵀ / AV through mx.matmul, which routes to steel-GEMM on M2–M4 and the
+        Neural Accelerators on M5. Norms are applied in fp32 (kept off the fp16
+        operands); softmax is fp32.
+
+        Works entirely in model space: ``_dequantize_unit`` already returns
+        model-space unit vectors (it inverse-rotates internally — verified
+        ``dequantize == norms · _dequantize_unit``), so the query is used as-is
+        (no rotation) and the AV output needs no inverse rotation. Exact by
+        construction: scores = (q·k_unit)·‖k‖, out = Σ_t w_t·‖v_t‖·v_unit_t.
+        """
+        B, n_q, L, D = queries.shape
+        n_kv = keys_state.norms.shape[1]
+        r = n_q // n_kv
+        T = keys_state.norms.shape[2]
+
+        q_s = (queries * scale).reshape(B, n_kv, r, L, D).astype(mx.float16)
+
+        k_unit = self.key_codec._dequantize_unit(keys_state.indices).astype(mx.float16)
+        v_unit = self.value_codec._dequantize_unit(values_state.indices).astype(mx.float16)  # [B,n_kv,T,D]
+        k_norm = keys_state.norms.astype(mx.float32)  # [B,n_kv,T]
+        v_norm = values_state.norms.astype(mx.float32)
+
+        # scores[B,n_kv,r,L,T] = (q · k_unitᵀ) · ‖k‖   (fp32 accumulate)
+        k_t = mx.expand_dims(mx.swapaxes(k_unit, -1, -2), 2)  # [B,n_kv,1,D,T]
+        scores = mx.matmul(q_s, k_t).astype(mx.float32)  # [B,n_kv,r,L,T]
+        scores = scores * mx.reshape(k_norm, (B, n_kv, 1, 1, T))
+
+        if isinstance(mask, str) and mask == "causal":
+            past = T - L
+            q_idx = mx.arange(past, T).reshape(L, 1)
+            k_idx = mx.arange(T).reshape(1, T)
+            keep = (q_idx >= k_idx).reshape(1, 1, 1, L, T)
+            scores = mx.where(keep, scores, mx.array(mx.finfo(mx.float32).min))
+        elif mask is not None and not isinstance(mask, str):
+            m = mask
+            if m.ndim == scores.ndim - 1:  # [B,n_q,L,T] -> [B,n_kv,r,L,T]
+                m = m.reshape(B, n_kv, r, L, T)
+            if m.dtype == mx.bool_:
+                scores = mx.where(m, scores, mx.array(mx.finfo(mx.float32).min))
+            else:
+                scores = scores + m.astype(mx.float32)
+
+        w = mx.softmax(scores, axis=-1)  # [B,n_kv,r,L,T] fp32
+        wv = (w * mx.reshape(v_norm, (B, n_kv, 1, 1, T))).astype(mx.float16)
+        v_b = mx.expand_dims(v_unit, 2)  # [B,n_kv,1,T,D]
+        out = mx.matmul(wv, v_b).astype(mx.float32)  # [B,n_kv,r,L,D] model space
+        return out.reshape(B, n_q, L, D).astype(queries.dtype)
+
+    def _mse_prefill_fused(self, queries, keys_state, values_state, scale, mask):
+        """Hand-written fused flash kernel (Task 3B). Implemented after the
+        decomposed path so the two can be benchmarked head-to-head (spec §10)."""
+        raise NotImplementedError("fused MSE prefill kernel not yet implemented (Task 3B)")
+
     def prefill_attention(
         self,
         queries: mx.array,
@@ -5319,6 +5414,14 @@ class TurboQuantKVCache(_BaseCache):
             keys_state, values_state = self.state
         keys_state = self._unwrap(keys_state)
         values_state = self._unwrap(values_state)
+
+        # MSE fast path: route through the fused/decomposed prefill behind the
+        # capability gate + kill-switch. Returning a value here short-circuits
+        # the Python K-tile quantized_attention fallback in base.py.
+        if self._fused_prefill_eligible(queries, keys_state, values_state):
+            return self.mse_prefill(
+                queries, keys_state, values_state, scale=scale, mask=mask
+            )
 
         if not (
             isinstance(self.key_codec, _TurboQuantProdCodec)

@@ -458,6 +458,10 @@ def test_turboquant_prefill_attention_matches_dequantized_attention():
     fp_cache = KVCache()
     fp_cache.update_and_fetch(keys, values)
     turbo_cache = TurboQuantKVCache.from_cache(fp_cache, bits=3.5)
+    # This test asserts quantized_attention's fp32-tight (1e-4) match; pin it off
+    # the fp16 fused/decomposed MSE prefill path (covered in its own test file
+    # with an fp16-appropriate tolerance).
+    turbo_cache._fused_prefill_enabled = False
     turbo_keys, turbo_values = turbo_cache.state
     dequantized_keys, dequantized_values = turbo_cache.dequantize(
         turbo_keys,
