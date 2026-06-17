@@ -193,6 +193,19 @@ def normalize_resize_shape(values):
     return (values[0], values[0]) if len(values) == 1 else tuple(values)
 
 
+def _suffix_structured_fallback(draft_kind, logits_processors) -> bool:
+    """Whether to skip speculation and decode plainly for this request.
+
+    Drafter-free suffix decoding can't enforce a structured-output grammar — the
+    verify samples raw target logits and never applies the (stateful) mask — so
+    when ``response_format`` / ``logits_processors`` are active we fall back to
+    plain autoregressive decode, which applies the grammar correctly. An n-gram
+    drafter is grammar-blind anyway, so there's no speedup to lose. Other drafter
+    kinds are unaffected here (their structured handling is gated elsewhere).
+    """
+    return draft_kind == "suffix" and bool(logits_processors)
+
+
 def generate_step(
     input_ids: mx.array,
     model: nn.Module,
@@ -592,8 +605,11 @@ def generate_step(
 
     mx.async_eval(y, logprobs)
 
-    # Speculative decoding
-    if draft_model is not None:
+    # Speculative decoding (suffix falls back to plain decode under a structured
+    # grammar so response_format is honored — see _suffix_structured_fallback).
+    if draft_model is not None and not _suffix_structured_fallback(
+        draft_kind, logits_processors
+    ):
         yield from run_speculative_rounds(
             model,
             draft_model,

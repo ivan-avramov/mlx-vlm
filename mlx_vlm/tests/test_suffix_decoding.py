@@ -771,3 +771,21 @@ def test_suffix_no_criteria_is_unaffected():
         )
     ]
     assert out == [1, 2, 3, 4, 5]
+
+
+# --------------------------------------------------------------------------- #
+# Unit — CLI/generate_step structured-output fallback
+# --------------------------------------------------------------------------- #
+from mlx_vlm.generate.ar import _suffix_structured_fallback  # noqa: E402
+
+
+def test_suffix_structured_fallback():
+    # suffix + a structured grammar -> fall back to plain decode
+    assert _suffix_structured_fallback("suffix", [object()]) is True
+    # no grammar -> speculate
+    assert _suffix_structured_fallback("suffix", None) is False
+    assert _suffix_structured_fallback("suffix", []) is False
+    # other drafter kinds are not gated here
+    assert _suffix_structured_fallback("dflash", [object()]) is False
+    assert _suffix_structured_fallback("mtp", [object()]) is False
+    assert _suffix_structured_fallback(None, [object()]) is False
