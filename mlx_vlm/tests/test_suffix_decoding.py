@@ -787,6 +787,8 @@ def test_suffix_structured_fallback():
     assert _suffix_structured_fallback("suffix", []) is False
     # other drafter kinds are not gated here
     assert _suffix_structured_fallback("dflash", [object()]) is False
+    assert _suffix_structured_fallback("mtp", [object()]) is False
+    assert _suffix_structured_fallback(None, [object()]) is False
 
 
 # --------------------------------------------------------------------------- #
@@ -794,6 +796,7 @@ def test_suffix_structured_fallback():
 # --------------------------------------------------------------------------- #
 import mlx_vlm.models.qwen3_5.language as qwen_language  # noqa: E402
 from mlx_vlm.models.cache import ArraysCache  # noqa: E402
+from mlx_vlm.turboquant import BatchTurboQuantKVCache  # noqa: E402
 
 
 def _tiny_qwen3_5(seed=0):
@@ -1045,5 +1048,39 @@ def test_suffix_decoding_matches_greedy_on_real_tiny_qwen3_5():
 
     assert spec == ref
     assert len(spec) == n
-    assert _suffix_structured_fallback("mtp", [object()]) is False
-    assert _suffix_structured_fallback(None, [object()]) is False
+
+
+def _quant_kv_cache():
+    # tiny qwen3_5: layer 0 = GDN (ArraysCache), layer 1 = full attn (quantized KV).
+    # Mirrors Qwen3.6's kv_quant_scheme=turboquant runtime cache.
+    arr = ArraysCache(size=2)
+    arr.left_padding = mx.array([0], dtype=mx.int32)
+    return [arr, BatchTurboQuantKVCache([0], bits=3.5)]
+
+
+def test_qwen_suffix_verify_supports_quantized_kv_cache():
+    # Regression: suffix verify (target_verify, via capture_layer_ids=[]) must not
+    # crash on a turboquant KV cache — Qwen3.6 runs kv_quant_scheme=turboquant. The
+    # target_verify manual attention loop slices cache keys directly, but quantized
+    # caches return a non-subscriptable _QuantizedStateProxy; the fix falls back to
+    # the cache-aware SDPA path. The verify must still select the same tokens a plain
+    # (non-target-verify) forward would, and still capture GDN state for rollback.
+    lm = _tiny_qwen3_5(seed=0)
+    prompt = [3, 4, 5, 6, 7, 8]
+    block = [9, 10, 11, 12]
+
+    cplain = _quant_kv_cache()
+    lm(mx.array([prompt]), cache=cplain)
+    plain = lm(mx.array([block]), cache=cplain)  # plain forward (reference)
+
+    cver = _quant_kv_cache()
+    lm(mx.array([prompt]), cache=cver)
+    ver = lm(mx.array([block]), cache=cver, **lm.suffix_verify_kwargs())
+    mx.eval(plain.logits, ver.logits)
+
+    assert ver.gdn_states is not None and len(ver.gdn_states) >= 1
+    assert ver.logits.shape == plain.logits.shape
+    # The verify path selects the same per-position tokens a plain forward would.
+    assert mx.array_equal(
+        mx.argmax(plain.logits, axis=-1), mx.argmax(ver.logits, axis=-1)
+    ).item()

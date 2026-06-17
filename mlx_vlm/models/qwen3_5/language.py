@@ -1477,7 +1477,12 @@ class Qwen3_5Attention(nn.Module):
         else:
             output = None
 
-        if output is None and target_verify and L > 1:
+        # The manual per-position verify loop slices keys/values directly, which only
+        # works for plain (non-quantized) caches. Quantized caches (turboquant /
+        # BatchQuantizedKVCache) return a non-subscriptable _QuantizedStateProxy from
+        # update_and_fetch, so fall through to the standard SDPA path below (which
+        # consumes the cache and handles dequant) — same result up to FP.
+        if output is None and target_verify and L > 1 and not hasattr(cache, "bits"):
             prefix_len = keys.shape[-2] - L
             output = mx.concatenate(
                 [
