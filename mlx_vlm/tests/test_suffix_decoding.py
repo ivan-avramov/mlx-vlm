@@ -939,5 +939,12 @@ def test_qwen_gdn_state_restored_to_clean_after_rejected_verify():
     assert len(restored_gdn) == len(clean_gdn) and restored_gdn
     for a, b in zip(restored_gdn, clean_gdn):
         assert bool(mx.allclose(a, b, atol=1e-4).item())
+
+
+def test_suffix_verify_kwargs_hook_per_model():
+    # gemma4: KV-only -> no capture kwargs.
+    assert _tiny_gemma4(seed=0).suffix_verify_kwargs() == {}
+    # qwen3_5: GDN -> capture_layer_ids=[] (gdn_sink without hidden capture).
+    assert _tiny_qwen3_5(seed=0).suffix_verify_kwargs() == {"capture_layer_ids": []}
     assert _suffix_structured_fallback("mtp", [object()]) is False
     assert _suffix_structured_fallback(None, [object()]) is False
