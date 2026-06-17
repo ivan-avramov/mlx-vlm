@@ -700,6 +700,13 @@ class LanguageModel(nn.Module):
                 return False
 
         if draft_model is not None:
+            # Drafter-free suffix decoding: gemma4 capture is KV-only
+            # (suffix_verify_kwargs() == {}), so chunked prefill yields the same
+            # post-prefill cache and is safe -- and it avoids the non-chunked
+            # full-prompt forward that crashes / OOMs at long context. Mirrors
+            # qwen3_5. Hidden-state drafters (mtp) still need the single forward.
+            if draft_kind == "suffix":
+                return True
             return (
                 draft_kind == "mtp"
                 and bool(prefill_kwargs.get("return_hidden", False))

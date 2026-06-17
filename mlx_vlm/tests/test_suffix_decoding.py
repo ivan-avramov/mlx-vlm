@@ -953,6 +953,26 @@ def test_suffix_verify_kwargs_hook_per_model():
     assert _tiny_qwen3_5(seed=0).suffix_verify_kwargs() == {"capture_layer_ids": []}
 
 
+def test_gemma4_chunks_prefill_under_suffix_decoding():
+    # Same regression as qwen3_5: gemma4's chunked_prefill_policy returned False
+    # for suffix, forcing a non-chunked full-prompt forward that crashes / OOMs
+    # at long context. gemma4 suffix capture is KV-only (suffix_verify_kwargs()
+    # == {}), so chunked prefill is safe.
+    lm = _tiny_gemma4(seed=0)
+    model = SimpleNamespace(language_model=lm)
+    proposer = SuffixDecodingProposer(min_match=2, max_draft=8, cooldown=2)
+    assert _ar_module._chunked_prefill_enabled(
+        model, draft_model=proposer, draft_kind="suffix", prefill_kwargs={}
+    )
+    # mtp without the hidden/shared-kv capture still needs the single forward.
+    assert not _ar_module._chunked_prefill_enabled(
+        model,
+        draft_model=SimpleNamespace(config=SimpleNamespace(target_layer_ids=[])),
+        draft_kind="mtp",
+        prefill_kwargs={},
+    )
+
+
 def test_qwen3_5_chunks_prefill_under_suffix_decoding():
     # Long-context OOM regression guard. Drafter-free suffix decoding passes a
     # non-None draft_model, which (absent a policy) flips _chunked_prefill_enabled
