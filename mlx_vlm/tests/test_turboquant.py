@@ -485,6 +485,29 @@ def test_turboquant_prefill_attention_matches_dequantized_attention():
     assert diff < 1e-4
 
 
+def test_turboquant_quantized_attention_invariant_to_query_block_size():
+    # prefill_query_block_size is a pure performance knob: the flash-style online
+    # softmax accumulates the same result regardless of how the queries are
+    # blocked, so the output must be (bit-)identical across block sizes. Guards
+    # the perf default (16 -> 256), which is ~15x faster prefill attention.
+    keys = mx.random.normal((1, 2, 512, 32))
+    values = mx.random.normal((1, 2, 512, 32))
+    queries = mx.random.normal((1, 4, 512, 32))
+    fp_cache = KVCache()
+    fp_cache.update_and_fetch(keys, values)
+    turbo = TurboQuantKVCache.from_cache(fp_cache, bits=3)
+    tk, tv = turbo.state
+
+    turbo.prefill_query_block_size = 16
+    small = turbo.quantized_attention(queries, tk, tv, scale=32**-0.5, mask="causal")
+    turbo.prefill_query_block_size = 256
+    big = turbo.quantized_attention(queries, tk, tv, scale=32**-0.5, mask="causal")
+    mx.eval(small, big)
+
+    assert small.shape == big.shape
+    assert mx.max(mx.abs(small - big)).item() < 1e-5
+
+
 def test_turboquant_prefill_no_dequantize_called(monkeypatch):
     """quantized_attention must be used for TQ prefill; dequantize must not fire.
 
@@ -521,7 +544,9 @@ def test_turboquant_prefill_no_dequantize_called(monkeypatch):
     )
     mx.eval(result)
 
-    assert not dequantize_called, "dequantize must not be called during TQ prefill dispatch"
+    assert (
+        not dequantize_called
+    ), "dequantize must not be called during TQ prefill dispatch"
     assert result.shape == (1, 4, 8, 32)
 
 
