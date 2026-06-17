@@ -791,10 +791,12 @@ def test_suffix_structured_fallback():
     assert _suffix_structured_fallback(None, [object()]) is False
 
 
+import mlx_vlm.models.qwen3_5.language as qwen_language  # noqa: E402
+
 # --------------------------------------------------------------------------- #
 # Integration — hybrid GatedDeltaNet (qwen3_5) GDN-state rollback
 # --------------------------------------------------------------------------- #
-import mlx_vlm.models.qwen3_5.language as qwen_language  # noqa: E402
+from mlx_vlm.generate import ar as _ar_module  # noqa: E402
 from mlx_vlm.models.cache import ArraysCache  # noqa: E402
 from mlx_vlm.turboquant import BatchTurboQuantKVCache  # noqa: E402
 
@@ -949,6 +951,57 @@ def test_suffix_verify_kwargs_hook_per_model():
     assert _tiny_gemma4(seed=0).suffix_verify_kwargs() == {}
     # qwen3_5: GDN -> capture_layer_ids=[] (gdn_sink without hidden capture).
     assert _tiny_qwen3_5(seed=0).suffix_verify_kwargs() == {"capture_layer_ids": []}
+
+
+def test_qwen3_5_chunks_prefill_under_suffix_decoding():
+    # Long-context OOM regression guard. Drafter-free suffix decoding passes a
+    # non-None draft_model, which (absent a policy) flips _chunked_prefill_enabled
+    # to False -> the whole prompt runs in ONE forward -> create_causal_mask
+    # materialises an [N, N] mask (~40 GB at 200K) -> OOM. qwen3_5 must expose a
+    # chunked_prefill_policy that keeps chunking ON for suffix, whose GDN capture
+    # is decode-time (suffix_verify_kwargs), so chunked prefill is safe.
+    lm = _tiny_qwen3_5(seed=0)
+    model = SimpleNamespace(language_model=lm)
+    proposer = SuffixDecodingProposer(min_match=2, max_draft=8, cooldown=2)
+
+    assert _ar_module._chunked_prefill_enabled(
+        model, draft_model=proposer, draft_kind="suffix", prefill_kwargs={}
+    )
+    # A hidden-state drafter (mtp) WITHOUT the hidden/shared-kv capture still
+    # needs the single forward, so chunking stays off (mirrors gemma4's policy).
+    assert not _ar_module._chunked_prefill_enabled(
+        model,
+        draft_model=SimpleNamespace(config=SimpleNamespace(target_layer_ids=[])),
+        draft_kind="mtp",
+        prefill_kwargs={},
+    )
+
+
+def test_qwen3_5_chunked_prefill_matches_single_forward():
+    # The invariant that makes chunked prefill safe under suffix: feeding the
+    # prompt in small chunks (as ar.py's chunked loop does -- slice inputs,
+    # accumulate the cache) must leave the GatedDeltaNet recurrent state + KV +
+    # next-token logits identical to one full-prompt forward. Suffix decoding
+    # then operates on this post-prefill cache at decode time, unaffected by how
+    # it was filled. A divergence here would mean chunked prefill is itself unsafe.
+    lm = _tiny_qwen3_5(seed=4)
+    prompt = [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+
+    c_full = cache_mod.make_prompt_cache(lm)
+    logits_full = lm(mx.array([prompt]), cache=c_full).logits[:, -1, :]
+
+    c_chunked = cache_mod.make_prompt_cache(lm)
+    step = 3  # < len(prompt): multiple chunks, crossing GDN chunk boundaries
+    out_chunked = None
+    for i in range(0, len(prompt), step):
+        out_chunked = lm(mx.array([prompt[i : i + step]]), cache=c_chunked)
+    logits_chunked = out_chunked.logits[:, -1, :]
+
+    assert bool(mx.allclose(logits_chunked, logits_full, atol=1e-4).item())
+    full_gdn, chunked_gdn = _gdn_state(c_full), _gdn_state(c_chunked)
+    assert len(chunked_gdn) == len(full_gdn) and chunked_gdn
+    for a, b in zip(chunked_gdn, full_gdn):
+        assert bool(mx.allclose(a, b, atol=1e-4).item())
 
 
 class _KwargRecordingLM:

@@ -1946,6 +1946,43 @@ class LanguageModel(nn.Module):
         """
         return {"capture_layer_ids": []}
 
+    def chunked_prefill_policy(
+        self,
+        *,
+        input_ids=None,
+        inputs_embeds=None,
+        prompt_cache=None,
+        draft_model=None,
+        draft_kind=None,
+        prefill_kwargs=None,
+    ) -> bool:
+        """Whether to chunk this prefill (vs one full-prompt forward).
+
+        Long context REQUIRES chunking: a single full-prompt forward builds a
+        dense ``[N, N]`` causal mask via ``create_causal_mask`` (~40 GB at 200K)
+        and OOMs. Without this hook, ``_chunked_prefill_enabled`` falls back to
+        ``draft_model is None`` and disables chunking for ANY drafter — including
+        drafter-free suffix decoding, which passes a non-None proposer. But
+        suffix decoding captures GatedDeltaNet state at *verify* (decode) time on
+        the post-prefill cache (see ``suffix_verify_kwargs``), so chunked prefill
+        yields the same end-of-prompt state and is safe. Hidden-state drafters
+        (mtp) still need the single forward that returns hidden/shared-kv for the
+        draft head, so they stay non-chunked unless that capture is requested.
+        """
+        del input_ids, inputs_embeds, prompt_cache
+        prefill_kwargs = prefill_kwargs or {}
+        if getattr(self, "no_chunked_prefill", False):
+            return False
+        if draft_model is not None:
+            if draft_kind == "suffix":
+                return True
+            return (
+                draft_kind == "mtp"
+                and bool(prefill_kwargs.get("return_hidden", False))
+                and bool(prefill_kwargs.get("return_shared_kv", False))
+            )
+        return True
+
     def rollback_speculative_cache(
         self,
         caches: List[Any],
