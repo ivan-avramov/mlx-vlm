@@ -413,17 +413,34 @@ def parse_arguments():
         "--draft-kind",
         type=str,
         default=None,
-        choices=["dflash", "eagle3", "mtp"],
+        choices=["dflash", "eagle3", "mtp", "suffix"],
         help="Drafter family. Supported: 'dflash' (Qwen3.5 DFlash), "
         "'eagle3' (Speculators/SGLang EAGLE-3), "
-        "'mtp' (Gemma 4 Multi-Token Prediction / Assistant model). "
+        "'mtp' (Gemma 4 Multi-Token Prediction / Assistant model), "
+        "'suffix' (drafter-free n-gram / prompt-lookup; no --draft-model). "
         "Default: auto-detected from the drafter's HF model_type.",
     )
     parser.add_argument(
         "--draft-block-size",
         type=int,
         default=None,
-        help="Override the drafter's configured block size.",
+        help="Override the drafter's configured block size. For "
+        "--draft-kind suffix, this is the maximum draft (proposal) length.",
+    )
+    parser.add_argument(
+        "--suffix-min-match",
+        type=int,
+        default=2,
+        help="Minimum n-gram match length for drafter-free suffix decoding "
+        "(--draft-kind suffix). Default: 2.",
+    )
+    parser.add_argument(
+        "--draft-cooldown",
+        type=int,
+        default=None,
+        help="For --draft-kind suffix: after N consecutive 0-accept verify "
+        "rounds, pause proposing for a growing window (then probe). Avoids "
+        "wasted verifies on novel text. Default: off (always propose).",
     )
     parser.add_argument(
         "--enable-thinking",
@@ -1556,6 +1573,23 @@ def main():
             )
             draft_model = None
             args.draft_kind = None
+    elif args.draft_kind == "suffix":
+        # Drafter-free speculative decoding: construct the n-gram proposer
+        # internally and pass it as ``draft_model`` so the existing dispatch
+        # fires. No weights, no extra memory.
+        from ..speculative.suffix_decoding import SuffixDecodingProposer
+
+        draft_model = SuffixDecodingProposer(
+            min_match=args.suffix_min_match,
+            max_draft=args.draft_block_size,
+            cooldown=args.draft_cooldown,
+        )
+        print(
+            "Using drafter-free suffix decoding "
+            f"(min_match={args.suffix_min_match}, "
+            f"max_draft={args.draft_block_size or 'default'}, "
+            f"cooldown={args.draft_cooldown or 'off'})."
+        )
 
     prompt = args.prompt
 

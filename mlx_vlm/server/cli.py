@@ -40,7 +40,9 @@ def _model_num_attention_heads(model_path):
         tc = cfg.get("text_config", cfg)
         return tc.get("num_attention_heads") or cfg.get("num_attention_heads")
     except Exception as e:  # noqa: BLE001 - best-effort; fall back to a safe default
-        logger.warning("cache-limit auto-derive: could not read num_attention_heads (%s)", e)
+        logger.warning(
+            "cache-limit auto-derive: could not read num_attention_heads (%s)", e
+        )
         return None
 
 
@@ -65,7 +67,11 @@ def _derive_cache_limit_gb(model_path, max_kv_size, prefill_step):
 
 
 def _apply_mlx_memory_limits(
-    cache_limit_gb, memory_limit_frac, model_path=None, max_kv_size=None, prefill_step=None
+    cache_limit_gb,
+    memory_limit_frac,
+    model_path=None,
+    max_kv_size=None,
+    prefill_step=None,
 ):
     """Bound MLX's Metal allocator at server startup.
 
@@ -240,15 +246,32 @@ def main():
         "--draft-kind",
         type=str,
         default=None,
-        choices=["dflash", "eagle3", "mtp"],
-        help="Drafter family -- 'dflash', 'eagle3', or 'mtp' (Gemma 4). "
+        choices=["dflash", "eagle3", "mtp", "suffix"],
+        help="Drafter family -- 'dflash', 'eagle3', 'mtp' (Gemma 4), or "
+        "'suffix' (drafter-free n-gram / prompt-lookup; needs no --draft-model). "
         "Default: auto-detected from the drafter's HF model_type.",
     )
     parser.add_argument(
         "--draft-block-size",
         type=int,
         default=None,
-        help="Override the drafter's configured block size.",
+        help="Override the drafter's configured block size. For "
+        "--draft-kind suffix, the maximum draft (proposal) length.",
+    )
+    parser.add_argument(
+        "--suffix-min-match",
+        type=int,
+        default=None,
+        help="Drafter-free suffix decoding: minimum n-gram match length "
+        "(--draft-kind suffix). Default: 2.",
+    )
+    parser.add_argument(
+        "--draft-cooldown",
+        type=int,
+        default=None,
+        help="Drafter-free suffix decoding: after N consecutive 0-accept "
+        "rounds, pause proposing for a growing window (then probe). "
+        "Default: off.",
     )
     parser.add_argument(
         "--top-logprobs-k",
@@ -380,6 +403,15 @@ def main():
             os.environ["MLX_VLM_DRAFT_KIND"] = args.draft_kind
         if args.draft_block_size is not None:
             os.environ["MLX_VLM_DRAFT_BLOCK_SIZE"] = str(args.draft_block_size)
+    elif args.draft_kind == "suffix":
+        # Drafter-free suffix decoding: no model path, just the n-gram knobs.
+        os.environ["MLX_VLM_DRAFT_KIND"] = "suffix"
+        if args.draft_block_size is not None:
+            os.environ["MLX_VLM_DRAFT_BLOCK_SIZE"] = str(args.draft_block_size)
+        if args.suffix_min_match is not None:
+            os.environ["MLX_VLM_SUFFIX_MIN_MATCH"] = str(args.suffix_min_match)
+        if args.draft_cooldown is not None:
+            os.environ["MLX_VLM_DRAFT_COOLDOWN"] = str(args.draft_cooldown)
     if args.prefill_step_size:
         os.environ["PREFILL_STEP_SIZE"] = str(args.prefill_step_size)
     os.environ["MLX_VLM_MAX_TOKENS"] = str(args.max_tokens)

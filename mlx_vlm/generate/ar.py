@@ -351,6 +351,10 @@ def generate_step(
 
     # Speculative decoding setup
     last_outputs = None
+    # Full prompt token ids for drafter-free suffix decoding. Captured here,
+    # before chunked prefill can slice ``input_ids`` down to the last token, so
+    # the proposer indexes the whole prompt (including any cached prefix).
+    suffix_prompt_token_ids = None
     if draft_model is not None:
         from ..speculative.drafters import validate_drafter_compatibility
 
@@ -368,6 +372,10 @@ def generate_step(
                     draft_model.config.target_layer_ids,
                 )
             )
+        elif draft_kind == "suffix":
+            # Drafter-free: no hidden/shared-KV/layer captures. The proposer is
+            # a plain Python object, so it has no ``.config``.
+            suffix_prompt_token_ids = [int(t) for t in input_ids.reshape(-1).tolist()]
         else:
             kwargs["capture_layer_ids"] = list(draft_model.config.target_layer_ids)
         # Reset stale mRoPE state from any previous generation.
@@ -599,6 +607,8 @@ def generate_step(
             sampler=sampler,
             draft_block_size=draft_block_size,
             sampler_is_greedy=sampler_is_greedy,
+            prompt_token_ids=suffix_prompt_token_ids,
+            thinking_budget_criteria=thinking_budget_criteria,
         )
         return
 

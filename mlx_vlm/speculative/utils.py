@@ -32,6 +32,7 @@ from .mtp import (
     _speculative_walk_batch_deferred_greedy,
     _speculative_walk_deferred_greedy,
 )
+from .suffix_decoding import run_suffix_decoding_rounds
 
 __all__ = [
     "_MTPVerifyResult",
@@ -59,6 +60,7 @@ __all__ = [
     "make_speculative_prompt_cache",
     "run_speculative_rounds",
     "run_speculative_server_rounds",
+    "run_suffix_decoding_rounds",
     "speculative_hidden_state",
     "speculative_prefill_kwargs",
 ]
@@ -75,6 +77,11 @@ def get_speculative_rounds_batch(draft_kind: str):
         return _mtp_rounds_batch
     if draft_kind == "dflash":
         return _dflash_rounds_batch
+    if draft_kind == "suffix":
+        raise NotImplementedError(
+            "suffix decoding is single-sequence (batch_size == 1) in v1; "
+            "batched rounds are not implemented."
+        )
     raise ValueError(
         f"Unknown draft_kind {draft_kind!r}. Supported: ['dflash', 'eagle3', 'mtp']"
     )
@@ -135,6 +142,33 @@ def run_speculative_server_rounds(
     row_ids: Optional[List[int]] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     batch_size = int(first_bonus.shape[0]) if first_bonus.ndim > 0 else 1
+
+    if draft_kind == "suffix":
+        if batch_size != 1:
+            raise NotImplementedError(
+                "suffix decoding supports batch_size == 1 in v1; "
+                f"got batch_size={batch_size}."
+            )
+        bonus = int(first_bonus.reshape(-1).item())
+        prompt_token_ids = (
+            [int(t) for t in prompt_tokens.reshape(-1).tolist()]
+            if prompt_tokens is not None
+            else []
+        )
+        yield [bonus], None
+        for tok, _ in run_suffix_decoding_rounds(
+            model,
+            draft_model,
+            prompt_cache,
+            prompt_token_ids,
+            first_bonus=bonus,
+            max_tokens=max_tokens,
+            sampler=sampler,
+            draft_block_size=draft_block_size,
+            token_dtype=token_dtype,
+        ):
+            yield [tok], None
+        return
 
     if draft_kind == "eagle3":
         if batch_size == 1:
@@ -226,8 +260,35 @@ def run_speculative_rounds(
     sampler: Callable[[mx.array], mx.array],
     draft_block_size: Optional[int] = None,
     sampler_is_greedy: bool = False,
+    prompt_token_ids: Optional[List[int]] = None,
+    thinking_budget_criteria: Optional[Any] = None,
 ) -> Generator[Tuple[Any, mx.array], None, None]:
     B = input_ids.shape[0]
+
+    if draft_kind == "suffix":
+        if B != 1:
+            raise NotImplementedError(
+                "suffix decoding supports batch_size == 1 in v1; "
+                f"got batch_size={B}."
+            )
+        mx.eval(first_token)
+        bonus = first_token.item()
+        yield bonus, logprobs
+        if prompt_token_ids is None:
+            prompt_token_ids = [int(t) for t in input_ids.reshape(-1).tolist()]
+        yield from run_suffix_decoding_rounds(
+            model,
+            draft_model,
+            prompt_cache,
+            prompt_token_ids,
+            first_bonus=bonus,
+            max_tokens=max_tokens,
+            sampler=sampler,
+            draft_block_size=draft_block_size,
+            token_dtype=input_ids.dtype,
+            thinking_budget_criteria=thinking_budget_criteria,
+        )
+        return
 
     if draft_kind == "mtp":
         shared_kv_states = last_outputs.shared_kv_states

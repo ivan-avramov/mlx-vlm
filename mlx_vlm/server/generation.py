@@ -37,6 +37,7 @@ from ..generate import (
     _make_cache,
     _merge_prefill_prompt_kwargs,
 )
+from ..prompt_utils import detect_thinking_format, prompt_is_inside_thinking
 from ..speculative.utils import (
     make_speculative_prompt_cache,
     run_speculative_server_rounds,
@@ -44,7 +45,6 @@ from ..speculative.utils import (
     speculative_prefill_kwargs,
 )
 from ..structured import ThinkingAwareLogitsProcessor
-from ..prompt_utils import detect_thinking_format, prompt_is_inside_thinking
 from ..tokenizer_utils import _ServerTokenStreamer, make_streaming_detokenizer
 from ..utils import ThinkingBudgetCriteria, load, prepare_inputs
 from .runtime import runtime
@@ -78,13 +78,6 @@ CACHED_PATH_HEARTBEAT_INTERVAL_SECS = 10.0
 # diagnosing apparent UI stalls without waiting for end-of-request stats.
 STREAM_TELEMETRY_INTERVAL = int(
     os.environ.get("MLX_VLM_STREAM_TELEMETRY_INTERVAL", "500")
-)
-
-# User-visible indicator emitted when thinking consumed the whole budget /
-# token allowance without producing a visible response.
-THINKING_TRUNCATION_MSG = (
-    "[Thinking used the entire token budget without producing a visible "
-    "response. Try increasing max_tokens or setting a lower thinking_budget.]"
 )
 
 
@@ -350,19 +343,23 @@ def _resolve_generation_budget(
 
 
 def _apply_generation_budget(args: "GenerationArguments", prompt_tokens: int) -> None:
-    """Clamp ``args.max_tokens`` in place to fit the configured context window.
+    """Clamp ``args.max_tokens`` in place to fit the configured context window,
+    and always reserve answer headroom for thinking.
 
-    When clamping shrinks the budget, ``thinking_budget`` is scaled down too
-    (see THINKING_BUDGET_CLAMP_RATIO).
+    ``thinking_budget`` is both *defaulted* and *capped* to
+    ``THINKING_BUDGET_CLAMP_RATIO * max_tokens`` so a forced close always leaves
+    room to produce an answer (instead of thinking consuming the whole allowance
+    and yielding no visible response). The criteria only actually fires for
+    thinking prompts, so this is a no-op for non-thinking requests.
     """
     requested = max(0, int(args.max_tokens or 0))
     effective = _resolve_generation_budget(prompt_tokens, requested)
-    if effective < requested and args.thinking_budget is not None:
-        args.thinking_budget = min(
-            args.thinking_budget,
-            max(1, int(effective * THINKING_BUDGET_CLAMP_RATIO)),
-        )
     args.max_tokens = effective
+    headroom_cap = max(1, int(effective * THINKING_BUDGET_CLAMP_RATIO))
+    if args.thinking_budget is None:
+        args.thinking_budget = headroom_cap
+    else:
+        args.thinking_budget = min(args.thinking_budget, headroom_cap)
 
 
 def get_quantized_kv_start():
@@ -957,6 +954,25 @@ class ResponseGenerator:
                 draft_kind = None
             else:
                 print("Drafter ready — speculative decoding enabled.")
+        elif draft_kind == "suffix":
+            # Drafter-free n-gram / prompt-lookup speculation: no weights, no
+            # extra memory. Construct the proposer from the same env knobs the
+            # CLI sets (MLX_VLM_SUFFIX_MIN_MATCH / _DRAFT_BLOCK_SIZE / _COOLDOWN).
+            from ..speculative.suffix_decoding import SuffixDecodingProposer
+
+            min_match_env = os.environ.get("MLX_VLM_SUFFIX_MIN_MATCH")
+            cooldown_env = os.environ.get("MLX_VLM_DRAFT_COOLDOWN")
+            draft_model = SuffixDecodingProposer(
+                min_match=int(min_match_env) if min_match_env else 2,
+                max_draft=_get_draft_block_size_from_env(),
+                cooldown=int(cooldown_env) if cooldown_env else None,
+            )
+            print(
+                "Drafter-free suffix decoding enabled "
+                f"(min_match={draft_model.min_match}, "
+                f"max_draft={draft_model.max_draft or 'default'}, "
+                f"cooldown={draft_model.cooldown or 'off'})."
+            )
 
         self.model = model
         self.processor = processor
@@ -987,11 +1003,24 @@ class ResponseGenerator:
         """
         self.wait_until_ready()
         args = args or GenerationArguments(max_tokens=get_server_max_tokens())
-        if self.draft_model is not None and args.logits_processors is not None:
+        # Drafter-free suffix decoding coexists with both features: it honors
+        # thinking_budget (forces the close at the cap) and falls back to plain
+        # decode for structured output (see _process_cached_request). Other
+        # drafter kinds don't implement either, so they still error.
+        _is_suffix = getattr(self, "draft_kind", None) == "suffix"
+        if (
+            self.draft_model is not None
+            and not _is_suffix
+            and args.logits_processors is not None
+        ):
             raise ValueError(
                 "Structured response_format is not supported with speculative decoding."
             )
-        if self.draft_model is not None and args.thinking_budget is not None:
+        if (
+            self.draft_model is not None
+            and not _is_suffix
+            and args.thinking_budget is not None
+        ):
             raise ValueError(
                 "thinking_budget is not supported with speculative decoding in the server."
             )
@@ -1128,6 +1157,21 @@ class ResponseGenerator:
             gen_kwargs["kv_group_size"] = self.kv_group_size
             gen_kwargs["kv_quant_scheme"] = self.kv_quant_scheme
             gen_kwargs["quantized_kv_start"] = self.quantized_kv_start
+        # Drafter-free suffix decoding runs on this inline single-chat path via
+        # generate_step (B==1). Other drafter kinds use the batched paths.
+        # Structured output (logits_processors) falls back to plain decode: an
+        # n-gram drafter is grammar-blind so its drafts get rejected anyway, and
+        # the speculative path doesn't apply the grammar mask.
+        if (
+            getattr(self, "draft_kind", None) == "suffix"
+            and getattr(self, "draft_model", None) is not None
+            and not getattr(args, "logits_processors", None)
+        ):
+            gen_kwargs["draft_model"] = self.draft_model
+            gen_kwargs["draft_kind"] = "suffix"
+            _dbs = _get_draft_block_size_from_env()
+            if _dbs is not None:
+                gen_kwargs["draft_block_size"] = _dbs
 
         # Local import to avoid a circular dependency at module load and so
         # the cached-path heartbeat tests can monkeypatch
@@ -1452,7 +1496,9 @@ class ResponseGenerator:
 
         self._ready.set()
 
-        if self.draft_model is not None and self.draft_kind != "mtp":
+        # 'suffix' is single-sequence (B==1) and runs through the cached/inline
+        # stream_generate path, not the batched _run_speculative loop.
+        if self.draft_model is not None and self.draft_kind not in ("mtp", "suffix"):
             self._run_speculative()
             return
 
@@ -1537,8 +1583,17 @@ class ResponseGenerator:
                             top_logprobs_k=self.top_logprobs_k if args.logprobs else 0,
                             stream=generation_stream,
                             apc_manager=self.apc_manager,
-                            draft_model=self.draft_model,
-                            draft_kind=self.draft_kind,
+                            # suffix decoding is single-sequence and only wired on
+                            # the cached/inline path; non-cached batch requests
+                            # fall back to plain decode (no regression, no crash).
+                            draft_model=(
+                                None
+                                if self.draft_kind == "suffix"
+                                else self.draft_model
+                            ),
+                            draft_kind=(
+                                None if self.draft_kind == "suffix" else self.draft_kind
+                            ),
                             draft_block_size=_get_draft_block_size_from_env(),
                             greedy_sampling=args.temperature == 0,
                         )

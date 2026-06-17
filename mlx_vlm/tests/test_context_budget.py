@@ -58,13 +58,24 @@ def test_apply_without_clamp_leaves_args_untouched(monkeypatch):
     assert args.thinking_budget == 150
 
 
-def test_apply_clamp_without_thinking_budget(monkeypatch):
+def test_apply_clamp_defaults_thinking_budget(monkeypatch):
+    # With no client thinking_budget, default it to the headroom share so a
+    # forced close always leaves room to answer (0.8 * effective max_tokens).
     monkeypatch.setenv("MAX_KV_SIZE", "1000")
     monkeypatch.setenv("MIN_OUTPUT_TOKENS", "100")
     args = GenerationArguments(max_tokens=1000)
     _apply_generation_budget(args, 500)
     assert args.max_tokens == 500
-    assert args.thinking_budget is None
+    assert args.thinking_budget == 400  # 80% of the clamped budget
+
+
+def test_apply_defaults_thinking_budget_even_without_clamp(monkeypatch):
+    # The headroom default/cap applies always, not only when max_tokens clamps.
+    monkeypatch.setenv("MAX_KV_SIZE", "100000")
+    args = GenerationArguments(max_tokens=1000)
+    _apply_generation_budget(args, 100)
+    assert args.max_tokens == 1000
+    assert args.thinking_budget == 800  # 0.8 * 1000
 
 
 def test_resolve_rejects_when_prompt_exceeds_limit(monkeypatch):

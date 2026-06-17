@@ -34,7 +34,6 @@ from ..prompt_utils import (
 from ..tool_parsers import _infer_tool_parser_from_processor, load_tool_module
 from ..utils import prepare_inputs, sanitize_strict_json
 from .generation import (
-    THINKING_TRUNCATION_MSG,
     GenerationMetrics,
     PromptTooLongError,
     _build_metrics_envelope,
@@ -1800,30 +1799,6 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                             if token.finish_reason:
                                 finish_reason = token.finish_reason
-                                # Emit a truncation indicator if generation hit
-                                # max_tokens while still inside a thinking block
-                                # (no visible answer would otherwise reach the
-                                # user).
-                                if in_thinking and token.finish_reason == "length":
-                                    logger.warning(
-                                        "Generation hit max_tokens while in "
-                                        "thinking. Emitting truncation indicator."
-                                    )
-                                    trunc_choices = [
-                                        ChatStreamChoice(
-                                            delta=ChatMessage(
-                                                role="assistant",
-                                                content=THINKING_TRUNCATION_MSG,
-                                            ),
-                                        )
-                                    ]
-                                    trunc_chunk = ChatStreamChunk(
-                                        id=request_id,
-                                        created=int(time.time()),
-                                        model=request.model,
-                                        choices=trunc_choices,
-                                    )
-                                    yield f"data: {trunc_chunk.to_sse_json()}\n\n"
                                 break
 
                         # Parse tool calls from full output and emit final chunk
@@ -2126,12 +2101,6 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     gen_args.thinking_start_token,
                     gen_args.thinking_end_token,
                 )
-
-                # Thinking consumed the whole budget without producing a
-                # visible answer — surface a user-visible indicator instead of
-                # an empty content field.
-                if thinking_format is not None and not content and reasoning:
-                    content = THINKING_TRUNCATION_MSG
 
                 # Count raw generated tokens minus thinking tag tokens
                 completion_tokens = output_tokens - _count_thinking_tag_tokens(
