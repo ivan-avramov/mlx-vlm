@@ -245,9 +245,16 @@ def run_suffix_decoding_rounds(
     if not hasattr(lm, "rollback_speculative_cache"):
         raise RuntimeError(
             f"{type(lm).__name__} does not implement rollback_speculative_cache. "
-            "Suffix decoding currently supports dense standard-attention models "
-            "(e.g. gemma4)."
+            "Suffix decoding supports models with a speculative rollback hook "
+            "(dense gemma4, hybrid GatedDeltaNet qwen3_5)."
         )
+
+    # Per-target capture hook: dense KV-only models (gemma4) need nothing; hybrid
+    # GatedDeltaNet models (qwen3_5) return {"capture_layer_ids": []} so the verify
+    # forward snapshots GDN state for rollback. Detected via the hook, never by
+    # model_type; defaults to no extra kwargs (e.g. fake LMs in tests).
+    _vk_hook = getattr(lm, "suffix_verify_kwargs", None)
+    verify_kwargs = _vk_hook() if callable(_vk_hook) else {}
 
     proposer.reset(prompt_token_ids)
     proposer.observe([first_bonus])  # corpus tail must include the latest token
@@ -349,7 +356,7 @@ def run_suffix_decoding_rounds(
             verify_input = mx.concatenate(
                 [mx.array([[b]], dtype=token_dtype), draft_tokens], axis=1
             )
-            verify_out = lm(verify_input, cache=prompt_cache)
+            verify_out = lm(verify_input, cache=prompt_cache, **verify_kwargs)
             target_tokens = sampler(verify_out.logits)
         mx.async_eval(target_tokens)
 

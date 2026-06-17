@@ -1929,6 +1929,18 @@ class LanguageModel(nn.Module):
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
+    def suffix_verify_kwargs(self) -> dict:
+        """Extra kwargs for the SuffixDecoding verify forward (rollback capture).
+
+        qwen3_5 has GatedDeltaNet recurrent layers whose state advances in-place
+        across the verify block. ``capture_layer_ids=[]`` makes ``__call__`` build
+        a ``gdn_sink`` (and enable target-verify), capturing per-position GDN
+        snapshots for ``rollback_speculative_cache``. The empty list leaves
+        ``capture_set`` empty, so no hidden states are captured — same idiom as
+        ``speculative_verify_logits``/``speculative_verify_hidden``.
+        """
+        return {"capture_layer_ids": []}
+
     def rollback_speculative_cache(
         self,
         caches: List[Any],

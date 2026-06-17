@@ -748,6 +748,14 @@ class LanguageModel(nn.Module):
             shared_kv_states=shared_kv_sink,
         )
 
+    def suffix_verify_kwargs(self) -> dict:
+        """Extra kwargs for the SuffixDecoding verify forward (rollback capture).
+
+        Gemma 4 is KV-only (no SSM/GatedDeltaNet recurrent state), so the verify
+        needs no capture flag — ``rollback_speculative_cache`` trims KV alone.
+        """
+        return {}
+
     def rollback_speculative_cache(
         self,
         caches: List[Any],

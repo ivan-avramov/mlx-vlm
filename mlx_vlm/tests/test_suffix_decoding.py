@@ -787,5 +787,157 @@ def test_suffix_structured_fallback():
     assert _suffix_structured_fallback("suffix", []) is False
     # other drafter kinds are not gated here
     assert _suffix_structured_fallback("dflash", [object()]) is False
+
+
+# --------------------------------------------------------------------------- #
+# Integration — hybrid GatedDeltaNet (qwen3_5) GDN-state rollback
+# --------------------------------------------------------------------------- #
+import mlx_vlm.models.qwen3_5.language as qwen_language  # noqa: E402
+from mlx_vlm.models.cache import ArraysCache  # noqa: E402
+
+
+def _tiny_qwen3_5(seed=0):
+    # Dims chosen so the GatedDeltaNet decode-step Metal kernel builds: 4/4-dim
+    # configs hit "zero-length arrays (float state[n_per_t])". num_hidden_layers=2
+    # + full_attention_interval=2 => layer 0 is GDN (ArraysCache), layer 1 is full
+    # attention (KVCache), so the recurrent-state rollback path is actually exercised.
+    mx.random.seed(seed)
+    cfg = qwen_language.TextConfig(
+        model_type="qwen3_5_text",
+        hidden_size=64,
+        intermediate_size=128,
+        linear_num_value_heads=4,
+        linear_num_key_heads=4,
+        linear_key_head_dim=32,
+        linear_value_head_dim=32,
+        linear_conv_kernel_dim=4,
+        num_hidden_layers=2,
+        full_attention_interval=2,
+        num_attention_heads=4,
+        rms_norm_eps=1e-6,
+        vocab_size=32,
+        num_key_value_heads=2,
+        max_position_embeddings=128,
+        tie_word_embeddings=True,
+        head_dim=16,
+        rope_parameters={
+            "type": "default",
+            "mrope_section": [1, 0, 0],
+            "rope_theta": 10000,
+            "partial_rotary_factor": 0.25,
+        },
+    )
+    lm = qwen_language.LanguageModel(cfg)
+    # get_rope_index reads self.config.vision_config.spatial_merge_size even for
+    # text-only input, so attach a minimal ModelConfig (mirrors test_speculative.py).
+    lm.config = qwen_language.ModelConfig(
+        text_config=cfg,
+        vision_config=SimpleNamespace(spatial_merge_size=2),
+        model_type="qwen3_5",
+        image_token_id=101,
+        video_token_id=102,
+        image_token_index=101,
+        video_token_index=102,
+        vision_start_token_id=100,
+        vision_end_token_id=103,
+        vocab_size=32,
+    )
+    lm.eval()
+    return lm
+
+
+def _qwen_reference_greedy(lm, prompt, n_tokens):
+    c = cache_mod.make_prompt_cache(lm)
+    out = lm(mx.array([prompt]), cache=c)
+    tok = int(mx.argmax(out.logits[:, -1, :], axis=-1).item())
+    toks = [tok]
+    for _ in range(n_tokens - 1):
+        o = lm(mx.array([[tok]]), cache=c)
+        tok = int(mx.argmax(o.logits[:, -1, :], axis=-1).item())
+        toks.append(tok)
+    return toks, c
+
+
+def _gdn_state(cache):
+    """Flattened GDN recurrent + conv arrays from the ArraysCache slots."""
+    arrs = []
+    for c in cache:
+        if isinstance(c, ArraysCache):
+            arrs.extend(s for s in c.state if s is not None)
+    return arrs
+
+
+def test_suffix_decoding_rollback_preserves_gdn_on_real_tiny_qwen3_5():
+    # Forces a verified draft every round so the GDN recurrent state advances
+    # through rejected draft positions and MUST be restored on rollback. Without
+    # capture (gdn_states=None) the qwen rollback cannot restore it -> divergence
+    # (in fact a TypeError on current code). With capture, output stays exactly
+    # greedy AND the GDN state matches a clean autoregressive decode.
+    lm = _tiny_qwen3_5(seed=2)
+    model = SimpleNamespace(language_model=lm)
+    prompt = [3, 4, 5, 6, 7, 8, 9, 10]
+    n = 20
+
+    ref, ref_cache = _qwen_reference_greedy(lm, prompt, n)
+
+    proposer = _ForcingProposer([3, 4, 5])  # unlikely to match random greedy
+    spec_cache = cache_mod.make_prompt_cache(lm)
+    out = lm(mx.array([prompt]), cache=spec_cache)
+    first_bonus = int(mx.argmax(out.logits[:, -1, :], axis=-1).item())
+    spec = [first_bonus] + [
+        tok
+        for tok, _ in run_suffix_decoding_rounds(
+            model,
+            proposer,
+            spec_cache,
+            prompt,
+            first_bonus=first_bonus,
+            max_tokens=n,
+            sampler=_ARGMAX,
+            draft_block_size=8,
+        )
+    ]
+
+    # Token-identical greedy output IS the end-to-end proof that the GDN state was
+    # restored on every rejection: a disabled/None capture crashes (TypeError) or
+    # diverges. Element-wise GDN restoration is asserted at a controlled rollback
+    # boundary in test_qwen_gdn_state_restored_to_clean_after_rejected_verify
+    # (the run's final verify block is intentionally NOT rolled back -- the loop
+    # returns on max_tokens before rollback -- so end-of-run cache state carries an
+    # un-rolled-back tail, which is why the gemma4 gate checks only the offset bound).
+    assert spec == ref
+    assert proposer.accept_lens  # the forcing draft was verified every round
+    # KV cache tracks the clean AR cache to within one (final, un-rolled-back) block.
+    assert _cache_offset(spec_cache) - _cache_offset(ref_cache) <= 8
+
+
+def test_qwen_gdn_state_restored_to_clean_after_rejected_verify():
+    # Targeted, deterministic proof that rollback restores the GatedDeltaNet
+    # recurrent + conv state to exactly what a clean single-token decode produces.
+    # Process the prompt, commit one greedy token t0, snapshot the GDN state; then
+    # on a fresh cache run a verify block [t0, wrong, wrong, wrong] WITH capture and
+    # rollback(accepted=0) -> the GDN state must match the clean "after t0" snapshot.
+    lm = _tiny_qwen3_5(seed=3)
+    prompt = [3, 4, 5, 6, 7, 8]
+
+    cref = cache_mod.make_prompt_cache(lm)
+    o = lm(mx.array([prompt]), cache=cref)
+    t0 = int(mx.argmax(o.logits[:, -1, :], axis=-1).item())
+    lm(mx.array([[t0]]), cache=cref)  # commit t0 via the single-token decode path
+    clean_gdn = _gdn_state(cref)
+
+    cspec = cache_mod.make_prompt_cache(lm)
+    lm(mx.array([prompt]), cache=cspec)
+    drafts = [d for d in (30, 31, 29) if d != t0]  # ensure a genuine rejection
+    verify_in = mx.array([[t0, *drafts]])
+    vout = lm(verify_in, cache=cspec, **lm.suffix_verify_kwargs())
+    mx.eval(vout.logits)
+    assert vout.gdn_states is not None  # capture populated the rollback state
+    lm.rollback_speculative_cache(cspec, vout.gdn_states, 0, verify_in.shape[1])
+    restored_gdn = _gdn_state(cspec)
+
+    assert len(restored_gdn) == len(clean_gdn) and restored_gdn
+    for a, b in zip(restored_gdn, clean_gdn):
+        assert bool(mx.allclose(a, b, atol=1e-4).item())
     assert _suffix_structured_fallback("mtp", [object()]) is False
     assert _suffix_structured_fallback(None, [object()]) is False
