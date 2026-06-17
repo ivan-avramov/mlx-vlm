@@ -4991,6 +4991,7 @@ class TurboQuantKVCache(_BaseCache):
         seed: int = DEFAULT_TURBOQUANT_SEED,
         max_kv_size: Optional[int] = None,
         fused_prefill: Optional[bool] = None,
+        kv_quant_mode: Optional[str] = None,
     ):
         import os as _os
 
@@ -5013,6 +5014,13 @@ class TurboQuantKVCache(_BaseCache):
         # "decomposed" = dequant + mx.matmul (steel-GEMM on M2-M4, Neural
         # Accelerators on M5); "fused" = hand-written flash kernel.
         self._prefill_impl = _os.environ.get("TQ_PREFILL_IMPL", "decomposed").lower()
+        # Codec mode: "mse" (default) or "prod" — Prod adds a 1-bit QJL residual
+        # sketch on keys for higher-fidelity reconstruction at equal storage
+        # (value stays MSE, mirroring the prefill_attention Prod-key contract).
+        # Threaded from the kv_quant_mode arg / TQ_KV_QUANT_MODE env.
+        self._kv_quant_mode = (
+            kv_quant_mode or _os.environ.get("TQ_KV_QUANT_MODE", "mse")
+        ).lower()
         self.offset = 0
         self.keys = None
         self.values = None
@@ -5074,7 +5082,9 @@ class TurboQuantKVCache(_BaseCache):
                 if not math.isclose(self.bits, round(self.bits), abs_tol=1e-6)
                 else self.bits
             )
-            self.key_codec = _build_codec(keys, key_bits, mode="mse", seed=self.seed)
+            self.key_codec = _build_codec(
+                keys, key_bits, mode=self._kv_quant_mode, seed=self.seed
+            )
         if self.value_codec is None:
             val_bits = (
                 math.ceil(self.bits)
