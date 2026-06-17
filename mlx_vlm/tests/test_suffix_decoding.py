@@ -946,5 +946,71 @@ def test_suffix_verify_kwargs_hook_per_model():
     assert _tiny_gemma4(seed=0).suffix_verify_kwargs() == {}
     # qwen3_5: GDN -> capture_layer_ids=[] (gdn_sink without hidden capture).
     assert _tiny_qwen3_5(seed=0).suffix_verify_kwargs() == {"capture_layer_ids": []}
+
+
+class _KwargRecordingLM:
+    """Fake LM exposing a suffix_verify_kwargs hook; records what the verify
+    forward actually received so we can prove the kwargs are threaded through."""
+
+    def __init__(self, nxt, kwargs, vocab=128):
+        self._nxt = nxt
+        self._kwargs = dict(kwargs)
+        self.vocab = vocab
+        self.verify_kwargs_seen = None
+
+    def suffix_verify_kwargs(self):
+        return dict(self._kwargs)
+
+    def __call__(self, inputs, cache=None, **kwargs):
+        ids = [int(x) for x in inputs.reshape(-1).tolist()]
+        if len(ids) > 1:  # the multi-token verify forward (not the 1-token miss path)
+            self.verify_kwargs_seen = kwargs
+        rows = []
+        for x in ids:
+            row = [0.0] * self.vocab
+            row[self._nxt[x]] = 10.0
+            rows.append(row)
+        return SimpleNamespace(logits=mx.array([rows]), gdn_states=None)
+
+    def rollback_speculative_cache(self, caches, gdn_states, accepted, block_size):
+        pass
+
+
+def test_suffix_verify_forward_receives_hook_kwargs():
+    nxt = {0: 1, 1: 2, 2: 3, 3: 4, 7: 50}
+    lm = _KwargRecordingLM(nxt, {"capture_layer_ids": []})
+    model = SimpleNamespace(language_model=lm)
+    _drive(model, _ScriptedProposer([[1, 2, 7]]), first_bonus=0, max_tokens=5)
+    assert lm.verify_kwargs_seen == {"capture_layer_ids": []}
+
+
+def test_suffix_no_hook_passes_no_extra_kwargs():
+    # A fake LM without the hook (the v1 fakes) must see an unchanged verify call.
+    nxt = {0: 1, 1: 2, 2: 3, 3: 4, 7: 50}
+
+    class _NoHookLM(_KwargRecordingLM):
+        suffix_verify_kwargs = None  # attribute is not callable -> default {}
+
+    lm = _NoHookLM(nxt, {})
+    model = SimpleNamespace(language_model=lm)
+    _drive(model, _ScriptedProposer([[1, 2, 7]]), first_bonus=0, max_tokens=5)
+    assert lm.verify_kwargs_seen == {}
+
+
+def test_qwen_capture_layer_ids_is_load_bearing_for_gdn_states():
+    # Direct proof that the hook's kwarg — not the model by itself — is what makes
+    # gdn_states non-None. A disabled/None capture leaves rollback nothing to restore.
+    lm = _tiny_qwen3_5(seed=0)
+    c = cache_mod.make_prompt_cache(lm)
+    lm(mx.array([[3, 4, 5]]), cache=c)
+
+    plain = lm(mx.array([[6, 7, 8]]), cache=c)
+    assert plain.gdn_states is None  # without capture: nothing to roll back
+
+    c2 = cache_mod.make_prompt_cache(lm)
+    lm(mx.array([[3, 4, 5]]), cache=c2)
+    captured = lm(mx.array([[6, 7, 8]]), cache=c2, **lm.suffix_verify_kwargs())
+    assert captured.gdn_states is not None and len(captured.gdn_states) >= 1
+    assert captured.hidden_states == []  # capture_layer_ids=[] adds no hidden overhead
     assert _suffix_structured_fallback("mtp", [object()]) is False
     assert _suffix_structured_fallback(None, [object()]) is False
