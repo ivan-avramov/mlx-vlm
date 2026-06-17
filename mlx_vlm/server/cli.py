@@ -12,7 +12,13 @@ from ..generate import (
     DEFAULT_QUANTIZED_KV_START,
 )
 from ..snapshot import DEFAULT_RING_SIZE
-from .generation import DEFAULT_ENABLE_THINKING, get_server_max_tokens
+from .generation import (
+    DEFAULT_ENABLE_THINKING,
+    get_server_max_tokens,
+    get_server_thinking_budget,
+    get_server_thinking_end_token,
+    get_server_thinking_start_token,
+)
 from .session_manager import _env_choice, _env_int
 from .session_manager import configure as _configure_session_manager
 
@@ -181,6 +187,35 @@ def main():
         ),
     )
     parser.add_argument(
+        "--thinking-budget",
+        type=int,
+        default=get_server_thinking_budget(),
+        help=(
+            "Default maximum number of tokens allowed inside a thinking block. "
+            "Requests can override this with thinking_budget."
+        ),
+    )
+    parser.add_argument(
+        "--thinking-start-token",
+        type=str,
+        default=get_server_thinking_start_token(),
+        help=(
+            "Default token that opens a thinking block. Requests can override "
+            "this with thinking_start_token."
+        ),
+    )
+    parser.add_argument(
+        "--thinking-end-token",
+        "--thinking-eos-token",
+        dest="thinking_end_token",
+        type=str,
+        default=get_server_thinking_end_token(),
+        help=(
+            "Default token that closes a thinking block. Requests can override "
+            "this with thinking_end_token."
+        ),
+    )
+    parser.add_argument(
         "--kv-bits",
         type=float,
         default=None,
@@ -280,6 +315,16 @@ def main():
         help=(
             "Server-side cap for per-token top_logprobs (0-20, default 0 = "
             "disabled). Maps to the TOP_LOGPROBS_K env var."
+        ),
+    )
+    parser.add_argument(
+        "--api-key",
+        type=str,
+        default=None,
+        help=(
+            "Optional bearer token required for management endpoints such as "
+            "/health, /metrics, /cache/stats, /cache/reset, and /unload. "
+            "Maps to the MLX_VLM_SERVER_API_KEY env var."
         ),
     )
     parser.add_argument(
@@ -416,6 +461,12 @@ def main():
         os.environ["PREFILL_STEP_SIZE"] = str(args.prefill_step_size)
     os.environ["MLX_VLM_MAX_TOKENS"] = str(args.max_tokens)
     os.environ["MLX_VLM_ENABLE_THINKING"] = "1" if args.enable_thinking else "0"
+    if args.thinking_budget is not None:
+        os.environ["MLX_VLM_THINKING_BUDGET"] = str(args.thinking_budget)
+    if args.thinking_start_token is not None:
+        os.environ["MLX_VLM_THINKING_START_TOKEN"] = args.thinking_start_token
+    if args.thinking_end_token is not None:
+        os.environ["MLX_VLM_THINKING_END_TOKEN"] = args.thinking_end_token
     if args.kv_bits is not None:
         os.environ["KV_BITS"] = str(args.kv_bits)
     os.environ["KV_GROUP_SIZE"] = str(args.kv_group_size)
@@ -425,6 +476,8 @@ def main():
     os.environ["QUANTIZED_KV_START"] = str(args.quantized_kv_start)
     if args.top_logprobs_k is not None:
         os.environ["TOP_LOGPROBS_K"] = str(args.top_logprobs_k)
+    if args.api_key:
+        os.environ["MLX_VLM_SERVER_API_KEY"] = args.api_key
 
     # Publish per-chat / DeltaNet config to the session manager. argparse has
     # already resolved the CLI-arg > env-var > default precedence chain.

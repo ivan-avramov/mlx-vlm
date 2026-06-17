@@ -1966,22 +1966,25 @@ class LanguageModel(nn.Module):
         suffix decoding captures GatedDeltaNet state at *verify* (decode) time on
         the post-prefill cache (see ``suffix_verify_kwargs``), so chunked prefill
         yields the same end-of-prompt state and is safe. Hidden-state drafters
-        (mtp) still need the single forward that returns hidden/shared-kv for the
-        draft head, so they stay non-chunked unless that capture is requested.
+        (mtp / dflash / eagle3) still need the single forward that returns the
+        captures their draft head consumes, so they stay non-chunked unless that
+        capture is requested.
         """
         del input_ids, inputs_embeds, prompt_cache
         prefill_kwargs = prefill_kwargs or {}
         if getattr(self, "no_chunked_prefill", False):
             return False
-        if draft_model is not None:
-            if draft_kind == "suffix":
-                return True
-            return (
-                draft_kind == "mtp"
-                and bool(prefill_kwargs.get("return_hidden", False))
-                and bool(prefill_kwargs.get("return_shared_kv", False))
+        if draft_model is None:
+            return True
+        if draft_kind == "suffix":
+            return True
+        if draft_kind == "mtp":
+            return bool(prefill_kwargs.get("return_hidden", False)) and bool(
+                prefill_kwargs.get("return_shared_kv", False)
             )
-        return True
+        if draft_kind in ("dflash", "eagle3"):
+            return prefill_kwargs.get("capture_layer_ids") is not None
+        return draft_kind is None
 
     def rollback_speculative_cache(
         self,
@@ -2479,7 +2482,12 @@ class LanguageModel(nn.Module):
             ):
                 cache_offsets = mx.maximum(c0.offset, 0)
 
-        if mask is None and c0 is not None and cache_offset == 0:
+        if (
+            mask is None
+            and c0 is not None
+            and cache_offsets is None
+            and cache_offset == 0
+        ):
             left_padding = getattr(c0, "left_padding", None)
             if (
                 isinstance(left_padding, mx.array)
@@ -2501,7 +2509,7 @@ class LanguageModel(nn.Module):
                 (
                     cache is not None
                     and cache[self.model.fa_idx] is not None
-                    and (cache_offset == 0)
+                    and (cache_offsets is None and cache_offset == 0)
                 )
                 or self._rope_deltas is None
                 or cache is None

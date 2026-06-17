@@ -1,5 +1,7 @@
 import base64
 import json
+import os
+import sys
 import time
 from pathlib import Path
 from queue import Queue
@@ -14,6 +16,7 @@ from fastapi.testclient import TestClient
 from PIL import Image
 
 import mlx_vlm.server as server
+import mlx_vlm.server.cli as server_cli
 import mlx_vlm.server.generation as server_generation
 import mlx_vlm.server.openai as server_openai
 import mlx_vlm.speculative.utils as speculative_utils
@@ -802,6 +805,62 @@ def test_models_endpoint_deduplicates_loaded_model_from_hf_cache(client, monkeyp
     ) == 1
 
 
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("get", "/health"),
+        ("get", "/metrics"),
+        ("get", "/v1/metrics"),
+        ("get", "/cache/stats"),
+        ("get", "/v1/cache/stats"),
+        ("post", "/cache/reset"),
+        ("post", "/v1/cache/reset"),
+        ("post", "/unload"),
+    ],
+)
+def test_management_endpoints_allow_requests_without_configured_api_key(
+    client, monkeypatch, method, path
+):
+    monkeypatch.delenv("MLX_VLM_SERVER_API_KEY", raising=False)
+
+    response = getattr(client, method)(path)
+
+    assert response.status_code == 200
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("get", "/health"),
+        ("get", "/metrics"),
+        ("get", "/v1/metrics"),
+        ("get", "/cache/stats"),
+        ("get", "/v1/cache/stats"),
+        ("post", "/cache/reset"),
+        ("post", "/v1/cache/reset"),
+        ("post", "/unload"),
+    ],
+)
+def test_management_endpoints_require_configured_api_key(
+    client, monkeypatch, method, path
+):
+    monkeypatch.setenv("MLX_VLM_SERVER_API_KEY", "secret-token")
+
+    missing = getattr(client, method)(path)
+    invalid = getattr(client, method)(
+        path,
+        headers={"Authorization": "Bearer wrong-token"},
+    )
+    valid = getattr(client, method)(
+        path,
+        headers={"Authorization": "Bearer secret-token"},
+    )
+
+    assert missing.status_code == 401
+    assert invalid.status_code == 401
+    assert valid.status_code == 200
+
+
 def _fake_image_result(*, seed: int, output_path=None) -> ImageGenerationResult:
     image = Image.new("RGB", (16, 16), (seed % 255, 8, 16))
     data = ImageGenerationResult(
@@ -862,6 +921,21 @@ def test_images_generations_returns_b64_json(client, monkeypatch):
     assert all(item["b64_json"] for item in payload["data"])
     assert [call.seed for call in calls] == [10, 11]
     assert cache_calls == [("bonsai-ternary", {"model_kind": "image_generation"})]
+
+
+def test_image_generation_lock_uses_image_cache_kind(monkeypatch):
+    text_lock = object()
+    image_lock = object()
+    registry = server.ModelCacheRegistry()
+    registry.set("text_generation", {"generation_lock": text_lock})
+    registry.set("image_generation", {"generation_lock": image_lock})
+    monkeypatch.setattr(server.runtime, "model_cache", registry)
+
+    assert server_openai._runtime_cache_get("generation_lock") is text_lock
+    assert (
+        server_openai._runtime_cache_get("generation_lock", kind="image_generation")
+        is image_lock
+    )
 
 
 def test_images_generations_forwards_prompt_expansion_model(client, monkeypatch):
@@ -2223,6 +2297,53 @@ def test_chat_completions_endpoint_flattens_text_content_parts(client):
             "content": "First text block. Second text block.",
         }
     ]
+
+
+def test_chat_completions_endpoint_preserves_assistant_reasoning(client):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = GenerationResult(
+        text="done",
+        prompt_tokens=8,
+        generation_tokens=4,
+        total_tokens=12,
+        prompt_tps=10.0,
+        generation_tps=5.0,
+        peak_memory=0.1,
+    )
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [
+                    {"role": "user", "content": "Hi"},
+                    {
+                        "role": "assistant",
+                        "content": "Hello",
+                        "reasoning": "Prior thought",
+                    },
+                    {"role": "user", "content": "Continue"},
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    assert mock_template.call_args.args[2][1] == {
+        "role": "assistant",
+        "content": "Hello",
+        "reasoning": "Prior thought",
+    }
 
 
 def test_anthropic_messages_endpoint_maps_text_and_images(client, monkeypatch):
@@ -4136,6 +4257,47 @@ class TestResponseGenerator:
         assert args.max_tokens == 256
         assert args.enable_thinking is True
 
+    def test_build_gen_args_uses_model_generation_config_when_omitted(
+        self, monkeypatch
+    ):
+        monkeypatch.setitem(
+            server.runtime.model_cache,
+            "config",
+            SimpleNamespace(temperature=1.0, top_p=0.95, top_k=64),
+        )
+        req = server.ChatRequest(
+            model="demo",
+            messages=[server.ChatMessage(role="user", content="hi")],
+        )
+
+        args = server._build_gen_args(req)
+
+        assert args.temperature == 1.0
+        assert args.top_p == 0.95
+        assert args.top_k == 64
+
+    def test_build_gen_args_request_sampling_overrides_model_generation_config(
+        self, monkeypatch
+    ):
+        monkeypatch.setitem(
+            server.runtime.model_cache,
+            "config",
+            SimpleNamespace(temperature=1.0, top_p=0.95, top_k=64),
+        )
+        req = server.ChatRequest(
+            model="demo",
+            messages=[server.ChatMessage(role="user", content="hi")],
+            temperature=0.0,
+            top_p=1.0,
+            top_k=0,
+        )
+
+        args = server._build_gen_args(req)
+
+        assert args.temperature == 0.0
+        assert args.top_p == 1.0
+        assert args.top_k == 0
+
     def test_build_gen_args_defaults_penalty_context_sizes_when_omitted(self):
         req = server.ChatRequest(
             model="demo",
@@ -4222,6 +4384,26 @@ class TestResponseGenerator:
 
         assert server._build_gen_args(req).enable_thinking is False
 
+    def test_build_gen_args_uses_server_thinking_token_defaults_when_omitted(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("MLX_VLM_THINKING_BUDGET", "256")
+        monkeypatch.setenv("MLX_VLM_THINKING_START_TOKEN", "<analysis>")
+        monkeypatch.setenv("MLX_VLM_THINKING_END_TOKEN", "</analysis>")
+        req = server.ChatRequest(
+            model="demo",
+            messages=[server.ChatMessage(role="user", content="hi")],
+        )
+
+        assert "thinking_budget" not in req.model_fields_set
+        assert "thinking_start_token" not in req.model_fields_set
+        assert "thinking_end_token" not in req.model_fields_set
+        args = server._build_gen_args(req)
+
+        assert args.thinking_budget == 256
+        assert args.thinking_start_token == "<analysis>"
+        assert args.thinking_end_token == "</analysis>"
+
     def test_build_gen_args_request_thinking_overrides_server_default(
         self, monkeypatch
     ):
@@ -4242,6 +4424,95 @@ class TestResponseGenerator:
         )
 
         assert server._build_gen_args(req).enable_thinking is True
+
+    def test_build_gen_args_request_thinking_tokens_override_server_defaults(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("MLX_VLM_THINKING_BUDGET", "256")
+        monkeypatch.setenv("MLX_VLM_THINKING_START_TOKEN", "<analysis>")
+        monkeypatch.setenv("MLX_VLM_THINKING_END_TOKEN", "</analysis>")
+        req = server.ChatRequest(
+            model="demo",
+            messages=[server.ChatMessage(role="user", content="hi")],
+            thinking_budget=32,
+            thinking_start_token="<think>",
+            thinking_end_token="</think>",
+        )
+
+        args = server._build_gen_args(req)
+
+        assert args.thinking_budget == 32
+        assert args.thinking_start_token == "<think>"
+        assert args.thinking_end_token == "</think>"
+
+    def test_server_cli_sets_thinking_defaults(self, monkeypatch):
+        for env_var in (
+            "MLX_VLM_ENABLE_THINKING",
+            "MLX_VLM_PRELOAD_MODEL",
+            "MLX_VLM_PRELOAD_ADAPTER",
+            "MLX_VLM_VISION_CACHE_SIZE",
+            "MLX_VLM_MAX_TOKENS",
+            "MLX_VLM_THINKING_BUDGET",
+            "MLX_VLM_THINKING_START_TOKEN",
+            "MLX_VLM_THINKING_END_TOKEN",
+            "MLX_VLM_SERVER_API_KEY",
+            "PREFILL_STEP_SIZE",
+            "KV_GROUP_SIZE",
+            "KV_QUANT_SCHEME",
+            "QUANTIZED_KV_START",
+        ):
+            monkeypatch.delenv(env_var, raising=False)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "mlx_vlm.server",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "8080",
+                "--model",
+                "demo",
+                "--enable-thinking",
+                "--thinking-budget",
+                "128",
+                "--thinking-start-token",
+                "<|START_THINKING|>",
+                "--thinking-eos-token",
+                "<|END_THINKING|>",
+                "--api-key",
+                "admin-token",
+            ],
+        )
+        run_calls = []
+        monkeypatch.setattr(
+            server_cli.uvicorn,
+            "run",
+            lambda *args, **kwargs: run_calls.append((args, kwargs)),
+        )
+
+        try:
+            server_cli.main()
+
+            assert os.environ["MLX_VLM_ENABLE_THINKING"] == "1"
+            assert os.environ["MLX_VLM_THINKING_BUDGET"] == "128"
+            assert os.environ["MLX_VLM_THINKING_START_TOKEN"] == "<|START_THINKING|>"
+            assert os.environ["MLX_VLM_THINKING_END_TOKEN"] == "<|END_THINKING|>"
+            assert os.environ["MLX_VLM_SERVER_API_KEY"] == "admin-token"
+            assert run_calls[0][1]["host"] == "127.0.0.1"
+        finally:
+            for env_var in (
+                "MLX_VLM_ENABLE_THINKING",
+                "MLX_VLM_PRELOAD_MODEL",
+                "MLX_VLM_PRELOAD_ADAPTER",
+                "MLX_VLM_VISION_CACHE_SIZE",
+                "MLX_VLM_MAX_TOKENS",
+                "MLX_VLM_THINKING_BUDGET",
+                "MLX_VLM_THINKING_START_TOKEN",
+                "MLX_VLM_THINKING_END_TOKEN",
+                "MLX_VLM_SERVER_API_KEY",
+            ):
+                os.environ.pop(env_var, None)
 
     def test_gpu_embed_hashes_pixel_values_without_image_ref(self):
         class Embed:
