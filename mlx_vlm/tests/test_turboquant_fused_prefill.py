@@ -61,8 +61,17 @@ def test_reference_matches_bruteforce_numpy():
     assert mad(out[0, 0, 0], mx.array(ref)) < 1e-4
 
 
+def test_fused_prefill_off_by_default():
+    # Fused prefill is opt-in (OFF) by default after the 16K validation showed it
+    # ties the loop on speed while costing memory; gate must report ineligible.
+    cache, ks, vs = build_cache(1, 1, 64, 256, bits=3)
+    q = mx.zeros((1, 1, 4, 256))
+    assert cache._fused_prefill_eligible(q, cache._unwrap(ks), cache._unwrap(vs)) is False
+
+
 def test_gate_on_for_mse_supported_dims():
     cache, ks, vs = build_cache(1, 1, 64, 256, bits=3)
+    cache._fused_prefill_enabled = True  # opt in (default is off)
     q = mx.zeros((1, 1, 4, 256))
     assert cache._fused_prefill_eligible(q, cache._unwrap(ks), cache._unwrap(vs)) is True
 
@@ -132,6 +141,7 @@ def test_mse_prefill_matrix(D, n_kv, r, bits, L, T):
 
 def test_prefill_attention_uses_fused_for_mse_when_eligible():
     cache, ks, vs = build_cache(1, 1, 256, 256, bits=3, seed=9)
+    cache._fused_prefill_enabled = True  # opt in (default is off)
     q = mx.array(
         np.random.default_rng(10).standard_normal((1, 6, 32, 256)).astype(np.float32) * 0.1
     )

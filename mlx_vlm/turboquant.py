@@ -4997,13 +4997,17 @@ class TurboQuantKVCache(_BaseCache):
         self.bits = _validate_bits(bits)
         self.seed = seed
         self.max_kv_size = max_kv_size
-        # Fused MSE prefill kernel: auto-on for eligible TQ models; the
-        # TQ_FUSED_PREFILL env var / constructor flag is an override (kill-switch).
+        # Fused MSE prefill kernel: OFF by default (opt-in). Real-model 16K
+        # validation showed the decomposed path ties the qb-256 quantized_attention
+        # loop on speed while costing ~+4GB (score materialization) and risking OOM
+        # at 200K, and prefill attention is a minority of prefill cost anyway. The
+        # memory-safe loop stays the default; enable via TQ_FUSED_PREFILL=1 or the
+        # constructor flag (for A/B measurement / future T-tiled kernel).
         self._fused_prefill_enabled = (
             fused_prefill
             if fused_prefill is not None
-            else _os.environ.get("TQ_FUSED_PREFILL", "1").lower()
-            not in ("0", "false", "no")
+            else _os.environ.get("TQ_FUSED_PREFILL", "0").lower()
+            in ("1", "true", "yes")
         )
         # Prefill implementation selector for A/B measurement (spec §10):
         # "decomposed" = dequant + mx.matmul (steel-GEMM on M2-M4, Neural
