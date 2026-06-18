@@ -229,6 +229,16 @@ def main():
         help="KV cache quantization backend.",
     )
     parser.add_argument(
+        "--kv-quant-mode",
+        type=str,
+        choices=("mse", "prod"),
+        default="mse",
+        help=(
+            "TurboQuant key codec mode: 'mse' (default) or 'prod' (MSE coarse + "
+            "1-bit QJL residual; higher attention fidelity at ~equal storage)."
+        ),
+    )
+    parser.add_argument(
         "--kv-group-size",
         type=int,
         default=DEFAULT_KV_GROUP_SIZE,
@@ -471,6 +481,7 @@ def main():
         os.environ["KV_BITS"] = str(args.kv_bits)
     os.environ["KV_GROUP_SIZE"] = str(args.kv_group_size)
     os.environ["KV_QUANT_SCHEME"] = args.kv_quant_scheme
+    os.environ["TQ_KV_QUANT_MODE"] = args.kv_quant_mode
     if args.max_kv_size is not None:
         os.environ["MAX_KV_SIZE"] = str(args.max_kv_size)
     os.environ["QUANTIZED_KV_START"] = str(args.quantized_kv_start)

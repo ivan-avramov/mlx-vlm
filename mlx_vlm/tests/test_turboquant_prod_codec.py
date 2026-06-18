@@ -110,3 +110,22 @@ def test_prod_dispatch_prefill_and_decode_run():
         d = mx.max(mx.abs(out - ref)).item()
         print(f"\nProd dispatch L={L}: max-abs-diff vs Prod-dequant ref = {d:.4f}")
         assert d < 5e-2, f"L={L} diff {d}"
+
+
+def test_kv_quant_mode_from_env():
+    # The server cli sets TQ_KV_QUANT_MODE; the cache __init__ reads it as the
+    # fallback when no explicit kv_quant_mode is passed. Confirms the threading
+    # endpoint (YAML -> mlx-serve -> --kv-quant-mode -> env -> cache).
+    import os
+    prev = os.environ.get("TQ_KV_QUANT_MODE")
+    os.environ["TQ_KV_QUANT_MODE"] = "prod"
+    try:
+        c = TurboQuantKVCache(bits=3, seed=0)  # no explicit mode -> reads env
+        k, v = _kv(64, 256)
+        c.update_and_fetch(k, v)
+        assert isinstance(c.key_codec, _TurboQuantProdCodec)
+    finally:
+        if prev is None:
+            os.environ.pop("TQ_KV_QUANT_MODE", None)
+        else:
+            os.environ["TQ_KV_QUANT_MODE"] = prev
