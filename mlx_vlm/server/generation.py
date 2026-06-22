@@ -1298,6 +1298,12 @@ class ResponseGenerator:
         # in chat_completions_endpoint, plus prompt_cache_state.
         gen_kwargs = args.to_generate_kwargs()
         gen_kwargs["prompt_cache_state"] = prompt_cache_state
+        # L1: thread the server-configured prefill step (--prefill-step-size, e.g.
+        # 512) into the cached path. Without it, generate_step falls back to
+        # DEFAULT_PREFILL_STEP_SIZE (2048), 4x-ing the QK^2 prefill scratch and
+        # OOMing at long context. generate_step nullifies it internally when
+        # chunked prefill isn't enabled, so passing it is always safe.
+        gen_kwargs.setdefault("prefill_step_size", get_prefill_step_size())
         if self.kv_bits is not None:
             gen_kwargs["kv_bits"] = self.kv_bits
             gen_kwargs["kv_group_size"] = self.kv_group_size
@@ -1732,6 +1738,10 @@ class ResponseGenerator:
                             kv_group_size=self.kv_group_size,
                             kv_quant_scheme=self.kv_quant_scheme,
                             quantized_kv_start=self.quantized_kv_start,
+                            # L1: use the server-configured prefill step (e.g. 512),
+                            # not BatchGenerator's DEFAULT_PREFILL_STEP_SIZE (2048),
+                            # to bound long-context prefill scratch (256K OOM fix).
+                            prefill_step_size=get_prefill_step_size(),
                             compute_logprobs=bool(args.logprobs),
                             top_logprobs_k=self.top_logprobs_k if args.logprobs else 0,
                             stream=generation_stream,

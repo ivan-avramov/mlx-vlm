@@ -1113,6 +1113,12 @@ async def responses_endpoint(request: Request):
                                 return None
 
                         while True:
+                            # L2: drop the request if the client disconnected, so
+                            # the daemon stops generating an orphaned request whose
+                            # KV/load would otherwise accumulate. Mirrors audio.py.
+                            if await request.is_disconnected():
+                                token_iter.close()
+                                break
                             token = await asyncio.to_thread(_next_token_resp_stream)
                             if token is None:
                                 break
@@ -1738,6 +1744,14 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                 return None
 
                         while True:
+                            # L2: stop generating if the client has gone away.
+                            # Without this the daemon keeps prefilling/decoding an
+                            # orphaned request (its KV/load accumulating → false
+                            # memory-critical). close() fires the cooperative
+                            # _cancel(uid) so the daemon drops it. Mirrors audio.py.
+                            if await http_request.is_disconnected():
+                                token_iter.close()
+                                break
                             token = await asyncio.to_thread(_next_token)
                             if token is None:
                                 break
