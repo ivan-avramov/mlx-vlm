@@ -668,6 +668,30 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             )
         model = quantize_activations(model)
 
+    # MTP-packaged checkpoints (e.g. Qwen3.6 OptiQ / MTP quants) ship a quantized
+    # ``mtp.*`` head (~29 tensors) for self-speculative drafting. The serving model
+    # has no ``mtp`` submodule — the MTP drafter is loaded separately via
+    # ``split_qwen3_5_mtp`` (it borrows the target's embed_tokens + lm_head). A
+    # strict load would reject these unused tensors ("Received N parameters not in
+    # model"). MLX-format checkpoints skip ``sanitize_weights`` (which would
+    # otherwise drop ``mtp.*``), so filter them here. No-op for models without an
+    # ``mtp.*`` head.
+    if any(k.startswith("mtp.") for k in weights):
+        weights = {k: v for k, v in weights.items() if not k.startswith("mtp.")}
+
+    # Text-only quant of a VLM: some converters (e.g. mlx-optiq) drop the
+    # vision/audio towers, keeping only the language weights for text inference.
+    # The model still instantiates the towers (config kept verbatim), so a strict
+    # load fails on the absent tower weights. They're never called for text-only
+    # inference, so relax strictness in that case (towers stay at init, unused).
+    if strict and hasattr(model, "vision_tower"):
+        if not any(k.startswith("vision_tower") for k in weights):
+            logging.warning(
+                "Text-only quant detected (no vision_tower weights); loading "
+                "non-strict — the vision tower is unused for text inference."
+            )
+            strict = False
+
     model.load_weights(list(weights.items()), strict=strict)
 
     if not lazy:
