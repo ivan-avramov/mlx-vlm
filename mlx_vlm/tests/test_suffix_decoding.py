@@ -789,6 +789,15 @@ def test_suffix_structured_fallback():
     assert _suffix_structured_fallback("dflash", [object()]) is False
     assert _suffix_structured_fallback("mtp", [object()]) is False
     assert _suffix_structured_fallback(None, [object()]) is False
+    # NEW: any active processor (penalties/bias built into the combined
+    # `processors` list) also forces fallback so it isn't silently dropped.
+    assert _suffix_structured_fallback("suffix", None, [object()]) is True
+    assert _suffix_structured_fallback("suffix", None, []) is False
+    assert _suffix_structured_fallback("suffix", None, None) is False
+    # non-suffix drafters remain ungated even with processors present
+    assert _suffix_structured_fallback("dflash", None, [object()]) is False
+    # processors takes precedence as the authoritative signal
+    assert _suffix_structured_fallback("suffix", [], [object()]) is True
 
 
 import mlx_vlm.models.qwen3_5.language as qwen_language  # noqa: E402

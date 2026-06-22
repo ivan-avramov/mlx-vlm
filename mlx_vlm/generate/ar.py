@@ -152,17 +152,32 @@ def normalize_resize_shape(values):
     return (values[0], values[0]) if len(values) == 1 else tuple(values)
 
 
-def _suffix_structured_fallback(draft_kind, logits_processors) -> bool:
+def _suffix_structured_fallback(draft_kind, logits_processors, processors=None) -> bool:
     """Whether to skip speculation and decode plainly for this request.
 
-    Drafter-free suffix decoding can't enforce a structured-output grammar — the
-    verify samples raw target logits and never applies the (stateful) mask — so
-    when ``response_format`` / ``logits_processors`` are active we fall back to
-    plain autoregressive decode, which applies the grammar correctly. An n-gram
-    drafter is grammar-blind anyway, so there's no speedup to lose. Other drafter
-    kinds are unaffected here (their structured handling is gated elsewhere).
+    Drafter-free suffix decoding can't apply *any* logits processor — the verify
+    samples raw target logits over a whole draft block at once (and the miss path
+    samples raw per-token logits), never applying the (stateful) processors — so
+    when ANY processor is active we fall back to plain autoregressive decode,
+    which applies them correctly. This covers two cases:
+
+      * structured output (``response_format`` / explicit ``logits_processors``):
+        the grammar mask is stateful and a block verify can't enforce it; and
+      * sampling penalties (repetition / presence / frequency / ``logit_bias``):
+        these are stateful over the recent token history and would otherwise be
+        silently dropped on the speculative path, changing the distribution.
+
+    ``processors`` is the fully-built processor list (penalties + bias + explicit
+    ``logits_processors``); when supplied it is the authoritative signal. The
+    two-arg form (``logits_processors`` only) is kept for backward compatibility.
+    An n-gram drafter is grammar-blind anyway, so there's no speedup to lose.
+    Other drafter kinds are unaffected here (gated elsewhere).
     """
-    return draft_kind == "suffix" and bool(logits_processors)
+    if draft_kind != "suffix":
+        return False
+    if processors:
+        return True
+    return bool(logits_processors)
 
 
 def generate_step(
@@ -568,7 +583,7 @@ def generate_step(
     # Speculative decoding (suffix falls back to plain decode under a structured
     # grammar so response_format is honored — see _suffix_structured_fallback).
     if draft_model is not None and not _suffix_structured_fallback(
-        draft_kind, logits_processors
+        draft_kind, logits_processors, processors
     ):
         yield from run_speculative_rounds(
             model,
