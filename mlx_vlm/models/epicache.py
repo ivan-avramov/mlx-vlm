@@ -52,7 +52,22 @@ class EpiCacheKVCache:
 
     @property
     def offset(self):
+        # Inner (physical) offset — governs storage indexing + the causal mask / KV length.
         return self.inner.offset
+
+    @property
+    def rope_offset(self):
+        """TRUE absolute sequence position for RoPE / position-id derivation.
+
+        Keys are RoPE'd at store time and kept keys retain that store-time RoPE (correct —
+        it encodes their original absolute position). But after eviction ``inner.offset`` is
+        the SHRUNK physical count, so the next query (and any newly-added keys) must be
+        positioned at the real sequence index = ``evicted + inner.offset``, NOT the shrunk
+        offset — otherwise the query's RoPE phase no longer matches the kept keys' and
+        attention breaks. The attention call site reads this for RoPE while ``offset`` (inner)
+        still drives the mask + storage. Physical storage index ≠ RoPE position is fine: RoPE
+        is baked into the cached values, so only the relative (query_pos − key_pos) matters."""
+        return self.evicted + self.inner.offset
 
     @property
     def state(self):

@@ -221,7 +221,16 @@ class Attention(nn.Module):
             else:
                 values = self.v_proj(x).reshape(B, L, self.n_kv_heads, self.head_dim)
 
-            offset = mx.array(cache.offset) if cache is not None else 0
+            # RoPE position: prefer the cache's true absolute position when it exposes one
+            # (EpiCacheKVCache.rope_offset = evicted + inner.offset). Plain caches have no
+            # rope_offset, so this falls back to .offset — behaviour unchanged off-EpiCache.
+            # Both the new keys (rope'd here, pre-cache) and the query (rope'd below) must use
+            # this true position so kept post-eviction keys and the query share a RoPE frame.
+            offset = (
+                mx.array(getattr(cache, "rope_offset", cache.offset))
+                if cache is not None
+                else 0
+            )
 
             keys = self.k_norm(keys)
             keys = keys.transpose(0, 2, 1, 3)
