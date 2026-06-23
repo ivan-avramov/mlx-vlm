@@ -537,6 +537,15 @@ def generate_step(
                     )
                     quantize_cache_fn(prompt_cache)
                     mx.eval([c.state for c in prompt_cache])
+                    # EpiCache: after each prefill chunk, evict every budget-bounded
+                    # full-attn cache back to its budget, so peak KV stays ~budget+chunk
+                    # regardless of context length. No-op for plain caches (the attribute
+                    # only exists on EpiCacheKVCache); cumulative_offset still tracks TRUE
+                    # tokens (eviction shrinks the physical cache, not the sequence index).
+                    for _c in prompt_cache:
+                        _evict = getattr(_c, "evict_to_budget", None)
+                        if _evict is not None:
+                            _evict()
                     processed_tokens += n_to_process
                     cumulative_offset += n_to_process
                     if (

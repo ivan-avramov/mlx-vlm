@@ -137,14 +137,25 @@ class EpiCacheKVCache:
         keep = mx.concatenate([head, mid_keep, tail])
         return mx.sort(keep)
 
-    def evict_to_budget(self, token_scores) -> int:
-        """Evict the inner KVCache down to ``budget`` using ``token_scores``
-        (1-D, length == current offset). Physically gathers the kept K/V and
-        resets the inner offset. Returns the new offset. No-op if already <= budget."""
+    def _keynorm_scores(self, off: int):
+        """Attention-free importance proxy: per-token mean key L2 norm over heads+batch.
+        High-norm keys tend to attract more attention — a cheap, well-known eviction signal.
+        Used when no external score is supplied; the SnapKV-style attention-mass score
+        (better, from the attention hook) takes precedence when passed to evict_to_budget."""
+        k = self.inner.keys[..., :off, :].astype(mx.float32)  # [B, H, off, D]
+        return mx.sqrt((k * k).sum(axis=-1)).mean(axis=(0, 1))  # [off]
+
+    def evict_to_budget(self, token_scores=None) -> int:
+        """Evict the inner KVCache down to ``budget``. ``token_scores``: 1-D importance vector
+        (length == current offset, higher = keep); if None, falls back to the key-norm proxy.
+        Physically gathers the kept K/V and resets the inner offset. Returns the new offset.
+        No-op if already <= budget."""
         inner = self.inner
         off = int(inner.offset)
         if off <= self.budget or inner.keys is None:
             return off
+        if token_scores is None:
+            token_scores = self._keynorm_scores(off)
         keep = self._select_keep_indices(off, token_scores, self.budget,
                                          self.sink, self.recent)
         inner.keys = mx.take(inner.keys[..., :off, :], keep, axis=2)

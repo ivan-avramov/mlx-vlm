@@ -875,12 +875,24 @@ class LanguageModel(nn.Module):
         return predicate
 
     def make_cache(self):
+        import os
+
+        from ..epicache import EpiCacheKVCache
+
+        # EpiCache (opt-in via MLX_EPICACHE_BUDGET>0): budget-bound ONLY the full-attention
+        # layers (sliding-window layers are already RotatingKVCache-bounded). Per-layer token
+        # budget; eviction is triggered per prefill chunk by the generation loop.
+        budget = int(os.environ.get("MLX_EPICACHE_BUDGET", "0") or "0")
+        block = int(os.environ.get("MLX_EPICACHE_BLOCK", "1024") or "1024")
         caches = []
         for layer_type in self.config.layer_types[
             : self.model.first_kv_shared_layer_idx
         ]:
             if layer_type == "full_attention":
-                caches.append(KVCache())
+                kv = KVCache()
+                if budget > 0:
+                    kv = EpiCacheKVCache(kv, budget=budget, block_size=block)
+                caches.append(kv)
             else:
                 caches.append(
                     RotatingKVCache(
