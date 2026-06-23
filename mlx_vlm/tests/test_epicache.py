@@ -1,7 +1,7 @@
 """Unit tests for EpiCache Phase-A eviction core (no model required).
 
 Run directly (no pytest):
-  PYTHONPATH=../mlx-vlm \
+  PYTHONPATH=. \
     <venv>/bin/python mlx_vlm/tests/test_epicache.py
 """
 import mlx.core as mx

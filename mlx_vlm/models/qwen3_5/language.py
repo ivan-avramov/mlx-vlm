@@ -1354,6 +1354,25 @@ def _target_verify_left_padded_attention(
     return mx.concatenate([row_outputs[i] for i in range(queries.shape[0])], axis=0)
 
 
+def _qwen35_scalar_positions(cache, cache_offset, L):
+    """MRoPE text position-ids + kv-length delta for the scalar (single-sequence) offset path.
+
+    RoPE positions use the cache's TRUE absolute index (``rope_offset`` — present only on
+    EpiCacheKVCache, where the physical offset shrinks after eviction); the kv-length used for
+    causal-mask slicing uses the PHYSICAL ``cache_offset`` (the actual cached KV count). For a
+    plain cache ``rope_offset`` is absent so it falls back to ``cache_offset`` and behaviour is
+    unchanged. Returns ``(position_ids[3,1,L], kv_len_delta)`` (tiled for MRoPE's 3 sections;
+    text positions are identical across sections)."""
+    rope_offset = cache_offset
+    if cache is not None:
+        ro = getattr(cache, "rope_offset", cache_offset)
+        rope_offset = int(ro.item()) if isinstance(ro, mx.array) else int(ro)
+    position_ids = mx.arange(rope_offset, rope_offset + L)
+    position_ids = mx.expand_dims(position_ids, axis=0)
+    position_ids = mx.tile(position_ids, (3, 1, 1))
+    return position_ids, cache_offset + 1
+
+
 class Qwen3_5Attention(nn.Module):
     def __init__(self, args: TextConfig):
         super().__init__()
@@ -1432,10 +1451,11 @@ class Qwen3_5Attention(nn.Module):
             else:
                 if isinstance(cache_offset, mx.array):
                     cache_offset = int(cache_offset.item())
-                kv_seq_len += cache_offset + 1
-                position_ids = mx.arange(cache_offset, cache_offset + L)
-                position_ids = mx.expand_dims(position_ids, axis=0)
-                position_ids = mx.tile(position_ids, (3, 1, 1))
+                # EpiCache: RoPE the query/new-keys at the TRUE absolute index (rope_offset),
+                # not the shrunk physical offset, so post-eviction kept keys + query share a
+                # RoPE frame; mask/kv-length still use the physical offset. No-op for plain caches.
+                position_ids, _kv_delta = _qwen35_scalar_positions(cache, cache_offset, L)
+                kv_seq_len += _kv_delta
         else:
             kv_seq_len += cache.offset + 1 if cache is not None else 0
 
@@ -1506,6 +1526,17 @@ class Qwen3_5Attention(nn.Module):
             output = scaled_dot_product_attention(
                 queries, keys, values, cache=cache, scale=self.scale, mask=mask
             )
+        # EpiCache: record SnapKV-style attention-mass so the eviction the generation loop runs
+        # after this prefill chunk keeps the most-attended middle keys (not just key-norm). Fires
+        # only when this full-attn cache is over budget; no-op for plain caches (no observe attr)
+        # and during decode (offset back <= budget post-evict). Uses the post-RoPE queries.
+        if (
+            cache is not None
+            and getattr(cache, "observe", None) is not None
+            and getattr(cache, "budget", None) is not None
+            and cache.offset > cache.budget
+        ):
+            cache.observe(queries, self.scale)
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
         return _target_verify_linear(
@@ -2652,7 +2683,27 @@ class LanguageModel(nn.Module):
         return self.model.layers
 
     def make_cache(self):
-        return [ArraysCache(size=2) if l.is_linear else KVCache() for l in self.layers]
+        # EpiCache (opt-in via MLX_EPICACHE_BUDGET>0): budget-bound ONLY the full-attention
+        # KVCache layers (the ones whose KV grows with context). The linear GatedDeltaNet
+        # layers carry a bounded ArraysCache (SSM state) and must NOT be wrapped. Mirrors
+        # gemma4's make_cache integration; eviction is triggered per prefill chunk by the
+        # generation loop (generate/ar.py, model-agnostic evict_to_budget hook).
+        import os
+
+        from ..epicache import EpiCacheKVCache
+
+        budget = int(os.environ.get("MLX_EPICACHE_BUDGET", "0") or "0")
+        block = int(os.environ.get("MLX_EPICACHE_BLOCK", "1024") or "1024")
+        caches = []
+        for l in self.layers:
+            if l.is_linear:
+                caches.append(ArraysCache(size=2))
+            else:
+                kv = KVCache()
+                if budget > 0:
+                    kv = EpiCacheKVCache(kv, budget=budget, block_size=block)
+                caches.append(kv)
+        return caches
 
     @property
     def head_dim(self):
