@@ -248,6 +248,12 @@ class Attention(nn.Module):
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
         )
+        # EpiCache: when this full-attn layer's budget-bounded cache is over budget (eviction
+        # fires after the chunk), record the SnapKV-style attention-mass score from this chunk's
+        # observation window so eviction keeps the most-attended middle keys (not just key-norm).
+        if (cache is not None and getattr(cache, "observe", None) is not None
+                and cache.offset > cache.budget):
+            cache.observe(queries, self.scale)
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
         return self.o_proj(output), (keys, values), offset

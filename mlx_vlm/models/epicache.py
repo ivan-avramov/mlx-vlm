@@ -45,6 +45,9 @@ class EpiCacheKVCache:
         self.recent = int(recent)
         # Count of tokens physically dropped so far (telemetry / position bookkeeping).
         self.evicted = 0
+        # Latest per-key attention-mass importance ([offset]-length), set by observe();
+        # consumed (and cleared) by the next evict_to_budget. None -> fall back to key-norm.
+        self._scores = None
 
     # -- delegation: keep base.py SDPA dispatch + attention unchanged ---------- #
     def update_and_fetch(self, keys, values):
@@ -145,17 +148,42 @@ class EpiCacheKVCache:
         k = self.inner.keys[..., :off, :].astype(mx.float32)  # [B, H, off, D]
         return mx.sqrt((k * k).sum(axis=-1)).mean(axis=(0, 1))  # [off]
 
+    def observe(self, queries, scale, obs_window: int = 32):
+        """SnapKV-style attention-mass importance: how much each cached key is attended by the
+        most-recent (observation-window) queries. ``queries`` is [B, n_heads, L, D] (RoPE'd, as
+        fed to SDPA). Stores a per-key [offset] score (replacing any prior) for the next
+        evict_to_budget. Call only when eviction is imminent (it costs an extra obs×offset
+        attention per layer).
+
+        Causal masking is intentionally omitted: the observation queries are the most recent, so
+        every MIDDLE key (the only region eviction actually chooses among) lies strictly before
+        them and is fully attended; only recency-window keys are partially masked, and those are
+        protected unconditionally anyway. GQA handled by repeating K up to the query-head count."""
+        inner = self.inner
+        off = int(inner.offset)
+        if inner.keys is None or off == 0:
+            return
+        k = inner.keys[..., :off, :].astype(mx.float32)       # [B, n_kv, off, D]
+        n_heads, n_kv = queries.shape[1], k.shape[1]
+        if n_heads != n_kv:
+            k = mx.repeat(k, n_heads // n_kv, axis=1)          # GQA -> [B, n_heads, off, D]
+        obs = min(int(obs_window), queries.shape[2])
+        q = queries[:, :, -obs:, :].astype(mx.float32)         # [B, n_heads, obs, D]
+        attn = mx.softmax((q @ k.swapaxes(-1, -2)) * scale, axis=-1)  # [B, n_heads, obs, off]
+        self._scores = attn.sum(axis=(0, 1, 2))                # [off]
+
     def evict_to_budget(self, token_scores=None) -> int:
         """Evict the inner KVCache down to ``budget``. ``token_scores``: 1-D importance vector
-        (length == current offset, higher = keep); if None, falls back to the key-norm proxy.
-        Physically gathers the kept K/V and resets the inner offset. Returns the new offset.
-        No-op if already <= budget."""
+        (length == current offset, higher = keep). If None, use the SnapKV attention-mass score
+        from the last observe() when present, else the key-norm proxy. Physically gathers the kept
+        K/V and resets the inner offset. Returns the new offset. No-op if already <= budget."""
         inner = self.inner
         off = int(inner.offset)
         if off <= self.budget or inner.keys is None:
+            self._scores = None
             return off
         if token_scores is None:
-            token_scores = self._keynorm_scores(off)
+            token_scores = self._scores if self._scores is not None else self._keynorm_scores(off)
         keep = self._select_keep_indices(off, token_scores, self.budget,
                                          self.sink, self.recent)
         inner.keys = mx.take(inner.keys[..., :off, :], keep, axis=2)
@@ -163,4 +191,5 @@ class EpiCacheKVCache:
         new_off = int(keep.shape[0])
         self.evicted += off - new_off
         inner.offset = new_off
+        self._scores = None
         return new_off

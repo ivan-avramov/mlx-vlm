@@ -83,6 +83,44 @@ def test_evict_noop_when_under_budget():
     assert epi.evicted == 0
 
 
+def test_rope_offset_tracks_true_position():
+    # rope_offset must stay at the TRUE absolute position across eviction (evicted+inner.offset),
+    # while offset (inner) shrinks — this is what keeps post-eviction RoPE correct.
+    N = 50
+    c = KVCache()
+    keys = mx.zeros((1, 2, N, 4))
+    c.update_and_fetch(keys, keys)
+    epi = EpiCacheKVCache(c, budget=20, sink=4, recent=8)
+    assert epi.rope_offset == 50 and epi.offset == 50
+    epi.evict_to_budget(mx.zeros(N))  # key-norm fallback (all-zero) still evicts to budget
+    assert epi.offset == 20 and epi.evicted == 30
+    assert epi.rope_offset == 50  # evicted(30) + inner.offset(20) == true position 50
+
+
+def test_observe_attention_mass_drives_eviction():
+    # A GQA cache (4 query heads, 2 kv heads). Give middle key 40 a distinctive direction and
+    # send observation queries aligned to it -> attention-mass concentrates on 40 -> evict (with
+    # no explicit scores) must use the observed mass and KEEP key 40.
+    N, B, nkv, nq, D = 80, 1, 2, 4, 8
+    c = KVCache()
+    keys = mx.zeros((B, nkv, N, D))
+    keys[:, :, 40, 0] = 5.0          # key 40: spike on dim 0
+    c.update_and_fetch(keys, keys)
+    epi = EpiCacheKVCache(c, budget=20, sink=4, recent=8)
+
+    queries = mx.zeros((B, nq, 6, D))
+    queries[:, :, :, 0] = 5.0          # queries aligned to key 40's direction
+    epi.observe(queries, scale=1.0, obs_window=6)
+    assert epi._scores is not None and epi._scores.shape == (N,)
+    assert int(mx.argmax(epi._scores).item()) == 40, int(mx.argmax(epi._scores).item())
+
+    epi.evict_to_budget()              # no explicit scores -> uses observed attention mass
+    assert c.offset == 20
+    kept_dim0 = c.keys[0, 0, :, 0].tolist()
+    assert any(abs(x - 5.0) < 0.1 for x in kept_dim0), kept_dim0  # key 40 survived
+    assert epi._scores is None          # cleared after eviction
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     for t in tests:
