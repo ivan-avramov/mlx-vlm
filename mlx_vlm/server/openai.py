@@ -65,6 +65,11 @@ from .schemas import (
     ChatResponse,
     ChatStreamChoice,
     ChatStreamChunk,
+    CompletionChoice,
+    CompletionRequest,
+    CompletionResponse,
+    CompletionStreamChoice,
+    CompletionStreamChunk,
     ContentPartOutputText,
     GenerationTimings,
     ImageEditRequest,
@@ -390,6 +395,74 @@ def _chat_usage_chunk(
     )
 
 
+def _normalize_stop_sequences(stop) -> List[str]:
+    """Coerce the OpenAI ``stop`` field (str | list[str] | None) to a list."""
+    if stop is None:
+        return []
+    if isinstance(stop, str):
+        return [stop] if stop else []
+    return [s for s in stop if isinstance(s, str) and s]
+
+
+def _truncate_at_stop(
+    text: str, stop_sequences: List[str]
+) -> Tuple[str, Optional[str]]:
+    """Truncate ``text`` at the earliest stop sequence occurrence.
+
+    Returns ``(truncated_text, matched_sequence)``. If no sequence matches,
+    the text is returned unchanged with ``None``. Mirrors the anthropic
+    handler's ``_apply_stop_sequences`` so behaviour stays consistent.
+    """
+    if not text or not stop_sequences:
+        return text, None
+    best_index = None
+    best_sequence = None
+    for sequence in stop_sequences:
+        if not sequence:
+            continue
+        index = text.find(sequence)
+        if index >= 0 and (best_index is None or index < best_index):
+            best_index = index
+            best_sequence = sequence
+    if best_index is None:
+        return text, None
+    return text[:best_index], best_sequence
+
+
+def _completion_final_chunk(
+    request_id: str,
+    model: str,
+    created: int,
+    finish_reason: str,
+) -> CompletionStreamChunk:
+    return CompletionStreamChunk(
+        id=request_id,
+        created=created,
+        model=model,
+        choices=[
+            CompletionStreamChoice(text="", index=0, finish_reason=finish_reason)
+        ],
+    )
+
+
+def _completion_usage_chunk(
+    request_id: str,
+    model: str,
+    created: int,
+    metrics: GenerationMetrics,
+    prompt_tokens: int,
+    output_tokens: int,
+) -> CompletionStreamChunk:
+    return CompletionStreamChunk(
+        id=request_id,
+        created=created,
+        model=model,
+        usage=UsageStats.from_metrics(metrics, prompt_tokens, output_tokens),
+        choices=[],
+        timings=GenerationTimings.from_metrics(metrics, prompt_tokens, output_tokens),
+    )
+
+
 def register_routes(app, deps):
     global _INHERIT_ADAPTER
     global get_cached_model, _build_gen_args, _read_tenant_id
@@ -437,6 +510,10 @@ def register_routes(app, deps):
     app.post("/chat/completions", response_model=None)(chat_completions_endpoint)
     app.post("/v1/chat/completions", response_model=None, include_in_schema=False)(
         chat_completions_endpoint
+    )
+    app.post("/completions", response_model=None)(completions_endpoint)
+    app.post("/v1/completions", response_model=None, include_in_schema=False)(
+        completions_endpoint
     )
     app.post("/images/generations", response_model=ImageGenerationResponse)(
         images_generations_endpoint
@@ -2291,6 +2368,424 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
     except Exception as e:
         # Catch unexpected errors
         print(f"Unexpected error in /generate endpoint: {e}")
+        traceback.print_exc()
+        mx.clear_cache()
+        gc.collect()
+        raise HTTPException(
+            status_code=500, detail=f"An unexpected error occurred: {e}"
+        )
+
+
+async def completions_endpoint(request: Request):
+    """Legacy OpenAI text-completions endpoint (``/v1/completions``).
+
+    The crucial difference from ``/chat/completions``: the ``prompt`` string is
+    fed to the model **verbatim**. There is NO ``apply_chat_template`` call, NO
+    thinking-token injection, and NO tool-call parsing — the raw continuation is
+    returned. It reuses the same generation machinery as chat: ``get_cached_model``,
+    ``_build_gen_args`` for sampling params, ``ResponseGenerator.generate`` (or the
+    ``generate`` fallback), the metrics envelope, and the usage builder.
+
+    Honors ``stop`` (truncate at first match, finish_reason="stop"), ``echo``
+    (prepend the prompt), and streaming. Only ``n==1`` is supported.
+    """
+    request_start = time.perf_counter()
+    body = await request.json()
+    try:
+        completion_request = CompletionRequest(**body)
+    except Exception as e:
+        # Never raise on bad input — return a proper OpenAI-style error body.
+        raise HTTPException(status_code=400, detail=f"Invalid request body: {e}")
+
+    if completion_request.n is not None and completion_request.n != 1:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"n={completion_request.n} is not supported; this endpoint only "
+                "serves a single completion (n=1)."
+            ),
+        )
+
+    # The prompt is fed to the model verbatim — no chat template.
+    raw_prompt = completion_request.first_prompt()
+    stop_sequences = _normalize_stop_sequences(completion_request.stop)
+    echo = bool(completion_request.echo)
+
+    try:
+        model, processor, config = get_cached_model(
+            completion_request.model, _adapter_path_or_inherit(completion_request)
+        )
+
+        try:
+            gen_args = _build_gen_args(
+                completion_request, processor, tenant_id=_read_tenant_id(request)
+            )
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        # Completions are a raw continuation: force thinking OFF so no thinking
+        # budget / wrapper machinery engages and the output is never split.
+        gen_args.enable_thinking = False
+        gen_args.thinking_budget = None
+
+        logger.debug(
+            "completions request: model=%s prompt_len=%d max_tokens=%s temp=%s "
+            "stream=%s echo=%s stops=%d",
+            completion_request.model,
+            len(raw_prompt),
+            gen_args.max_tokens,
+            gen_args.temperature,
+            completion_request.stream,
+            echo,
+            len(stop_sequences),
+        )
+
+        created = int(time.time())
+        request_id = f"cmpl-{uuid.uuid4().hex}"
+
+        if completion_request.stream:
+            runtime.metrics.begin_request(
+                endpoint="/v1/completions",
+                model=completion_request.model,
+                stream=True,
+            )
+            await _preflight_stream_context_budget(
+                endpoint="/v1/completions",
+                model=completion_request.model,
+                prompt=raw_prompt,
+                images=None,
+                audio=None,
+                args=gen_args,
+            )
+
+            async def stream_generator():
+                token_iterator = None
+                token_iter = None
+                metrics_finalized = False
+                metrics = GenerationMetrics()
+                finish_reason = None
+                prompt_tokens = 0
+                output_tokens = 0
+                full_output = ""
+                emitted = ""  # what we've already streamed to the client
+                echo_emitted = not echo  # prompt prefix already sent?
+                try:
+                    if runtime.response_generator is not None:
+                        ctx, token_iter = await asyncio.to_thread(
+                            runtime.response_generator.generate,
+                            raw_prompt,
+                            None,  # images
+                            None,  # audio
+                            gen_args,
+                        )
+                        prompt_tokens = ctx.prompt_tokens
+                        backend = "continuous_batching"
+
+                        def _next_token():
+                            try:
+                                return next(token_iter)
+                            except StopIteration:
+                                return None
+
+                    else:
+                        token_iterator = stream_generate(
+                            model=model,
+                            processor=processor,
+                            prompt=raw_prompt,
+                            vision_cache=runtime.model_cache.get("vision_cache"),
+                            apc_manager=runtime.apc_manager,
+                            **gen_args.to_generate_kwargs(),
+                        )
+                        backend = "generate"
+
+                        def _next_token():
+                            try:
+                                return next(token_iterator)
+                            except StopIteration:
+                                return None
+
+                    if not echo_emitted:
+                        echo_emitted = True
+                        chunk = CompletionStreamChunk(
+                            id=request_id,
+                            created=created,
+                            model=completion_request.model,
+                            choices=[
+                                CompletionStreamChoice(text=raw_prompt, index=0)
+                            ],
+                        )
+                        yield f"data: {chunk.to_sse_json()}\n\n"
+
+                    stop_hit = False
+                    while True:
+                        if await request.is_disconnected():
+                            if token_iter is not None:
+                                token_iter.close()
+                            break
+                        token = await asyncio.to_thread(_next_token)
+                        if token is None:
+                            break
+                        if not hasattr(token, "text"):
+                            continue
+                        # GenerationResult.generation_tokens is cumulative;
+                        # StreamingToken lacks it and is counted per-token.
+                        gen_count = getattr(token, "generation_tokens", None)
+                        if gen_count is not None:
+                            output_tokens = int(gen_count)
+                        else:
+                            output_tokens += getattr(token, "token_count", 1)
+                        if prompt_tokens == 0:
+                            prompt_tokens = int(getattr(token, "prompt_tokens", 0) or 0)
+                        metrics.record_chunk(token)
+                        full_output += token.text
+
+                        # Honor stop sequences: stream only up to the first
+                        # occurrence, then finish. The matched sequence and any
+                        # trailing text are withheld from the output.
+                        truncated, matched = _truncate_at_stop(
+                            full_output, stop_sequences
+                        )
+                        if matched is not None:
+                            stop_hit = True
+                            delta = truncated[len(emitted) :]
+                            emitted = truncated
+                            finish_reason = "stop"
+                        else:
+                            delta = full_output[len(emitted) :]
+                            emitted = full_output
+
+                        if delta:
+                            chunk = CompletionStreamChunk(
+                                id=request_id,
+                                created=created,
+                                model=completion_request.model,
+                                choices=[
+                                    CompletionStreamChoice(text=delta, index=0)
+                                ],
+                            )
+                            yield f"data: {chunk.to_sse_json()}\n\n"
+
+                        if stop_hit:
+                            break
+                        if getattr(token, "finish_reason", None):
+                            finish_reason = token.finish_reason
+                            break
+
+                    finish_reason = finish_reason or "stop"
+                    yield (
+                        "data: "
+                        f"{_completion_final_chunk(request_id, completion_request.model, created, finish_reason).to_sse_json()}"
+                        "\n\n"
+                    )
+
+                    completion_tokens = max(0, output_tokens)
+                    envelope = _build_metrics_envelope(
+                        endpoint="/v1/completions",
+                        model=completion_request.model,
+                        stream=True,
+                        backend=backend,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        generated_tokens=output_tokens,
+                        request_elapsed_s=time.perf_counter() - request_start,
+                        request_started_s=request_start,
+                        token_times=metrics.token_times,
+                        prompt_tps=metrics.prompt_tps,
+                        generation_tps=metrics.generation_tps,
+                        peak_memory_gb=metrics.peak_memory or None,
+                        finish_reason=finish_reason,
+                    )
+                    runtime.metrics.record_success(envelope)
+                    metrics_finalized = True
+
+                    yield (
+                        "data: "
+                        f"{_completion_usage_chunk(request_id, completion_request.model, created, metrics, prompt_tokens, output_tokens).to_sse_json()}"
+                        "\n\n"
+                    )
+                    yield "data: [DONE]\n\n"
+
+                except Exception as e:
+                    if not metrics_finalized:
+                        runtime.metrics.record_failure(
+                            endpoint="/v1/completions",
+                            model=completion_request.model,
+                            stream=True,
+                            error=str(e),
+                        )
+                        metrics_finalized = True
+                    print(f"Error during completion stream generation: {e}")
+                    traceback.print_exc()
+                    error_data = json.dumps({"error": str(e)})
+                    yield f"data: {error_data}\n\n"
+                finally:
+                    if token_iter is not None:
+                        try:
+                            token_iter.close()
+                        except Exception:
+                            pass
+                    if not metrics_finalized:
+                        runtime.metrics.record_failure(
+                            endpoint="/v1/completions",
+                            model=completion_request.model,
+                            stream=True,
+                            error="stream_closed_before_completion",
+                        )
+                    mx.clear_cache()
+                    gc.collect()
+
+            return StreamingResponse(
+                stream_generator(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+
+        # Non-streaming response
+        runtime.metrics.begin_request(
+            endpoint="/v1/completions",
+            model=completion_request.model,
+            stream=False,
+        )
+        try:
+            full_text = ""
+            prompt_tokens = 0
+            output_tokens = 0
+            metrics = GenerationMetrics()
+            finish_reason = None
+
+            if runtime.response_generator is not None:
+
+                def _blocking_generate():
+                    metrics = GenerationMetrics()
+                    text = ""
+                    ot = 0
+                    fr = None
+                    ctx, token_iter = runtime.response_generator.generate(
+                        prompt=raw_prompt,
+                        images=None,
+                        audio=None,
+                        args=gen_args,
+                    )
+                    for tok in token_iter:
+                        text += tok.text
+                        ot += getattr(tok, "token_count", 1)
+                        metrics.record_chunk(tok)
+                        if tok.finish_reason:
+                            fr = tok.finish_reason
+                            break
+                    try:
+                        token_iter.close()
+                    except Exception:
+                        pass
+                    return ctx.prompt_tokens, text, ot, fr, metrics
+
+                (
+                    prompt_tokens,
+                    full_text,
+                    output_tokens,
+                    finish_reason,
+                    metrics,
+                ) = await asyncio.to_thread(_blocking_generate)
+                backend = "continuous_batching"
+            else:
+                gen_result = generate(
+                    model=model,
+                    processor=processor,
+                    prompt=raw_prompt,
+                    verbose=logger.isEnabledFor(logging.DEBUG),
+                    vision_cache=runtime.model_cache.get("vision_cache"),
+                    apc_manager=runtime.apc_manager,
+                    **gen_args.to_generate_kwargs(),
+                )
+                full_text = gen_result.text
+                prompt_tokens = gen_result.prompt_tokens
+                output_tokens = gen_result.generation_tokens
+                metrics.record_result(gen_result)
+                finish_reason = getattr(gen_result, "finish_reason", None) or "stop"
+                backend = "generate"
+
+            mx.clear_cache()
+            gc.collect()
+
+            # Honor stop sequences: truncate at the first occurrence.
+            completion_text, matched_stop = _truncate_at_stop(full_text, stop_sequences)
+            if matched_stop is not None:
+                finish_reason = "stop"
+            output_text = (raw_prompt + completion_text) if echo else completion_text
+
+            completion_tokens = max(0, output_tokens)
+            usage_stats = UsageStats.from_metrics(
+                metrics, prompt_tokens, completion_tokens
+            )
+
+            result = CompletionResponse(
+                id=request_id,
+                created=created,
+                model=completion_request.model,
+                choices=[
+                    CompletionChoice(
+                        text=output_text,
+                        index=0,
+                        finish_reason=finish_reason or "stop",
+                        logprobs=None,
+                    )
+                ],
+                usage=usage_stats,
+                timings=GenerationTimings.from_metrics(
+                    metrics, prompt_tokens, output_tokens
+                ),
+            )
+
+            envelope = _build_metrics_envelope(
+                endpoint="/v1/completions",
+                model=completion_request.model,
+                stream=False,
+                backend=backend,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                generated_tokens=output_tokens,
+                request_elapsed_s=time.perf_counter() - request_start,
+                request_started_s=request_start,
+                token_times=metrics.token_times,
+                prompt_tps=metrics.prompt_tps,
+                generation_tps=metrics.generation_tps,
+                peak_memory_gb=metrics.peak_memory or None,
+                finish_reason=finish_reason or "stop",
+            )
+            runtime.metrics.record_success(envelope)
+            return result
+
+        except PromptTooLongError as e:
+            runtime.metrics.record_failure(
+                endpoint="/v1/completions",
+                model=completion_request.model,
+                stream=False,
+                error=str(e),
+            )
+            mx.clear_cache()
+            gc.collect()
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            runtime.metrics.record_failure(
+                endpoint="/v1/completions",
+                model=completion_request.model,
+                stream=False,
+                error=str(e),
+            )
+            print(f"Error during completion generation: {e}")
+            traceback.print_exc()
+            mx.clear_cache()
+            gc.collect()
+            raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
+
+    except HTTPException as http_exc:
+        raise http_exc
+    except Exception as e:
+        print(f"Unexpected error in /completions endpoint: {e}")
         traceback.print_exc()
         mx.clear_cache()
         gc.collect()

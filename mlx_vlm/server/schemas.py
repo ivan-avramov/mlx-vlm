@@ -764,6 +764,139 @@ class ChatStreamChunk(BaseModel):
         return self.model_dump_json(exclude=exclude)
 
 
+# Models for the legacy OpenAI /v1/completions (text completions) endpoint
+
+
+class CompletionRequest(FlexibleBaseModel):
+    """Legacy OpenAI text-completions request.
+
+    Unlike ``ChatRequest`` there is no chat template, no thinking-token
+    injection, and no tool parsing: ``prompt`` is fed to the model verbatim and
+    the raw continuation is returned. Sampling-parameter field names mirror
+    ``VLMRequest`` so ``app._build_gen_args`` reads them off this object
+    directly.
+    """
+
+    model: str = Field(
+        ...,
+        description="The path to the local model directory or Hugging Face repo.",
+    )
+    prompt: Union[str, List[str]] = Field(
+        "",
+        description=(
+            "Raw prompt string fed to the model verbatim. A list is accepted; "
+            "only the first element is used (n>1 prompt batching is not "
+            "supported)."
+        ),
+    )
+    adapter_path: Optional[str] = Field(
+        None, description="The path to the adapter weights."
+    )
+    max_tokens: int = Field(
+        default_factory=get_server_max_tokens,
+        description="Maximum number of tokens to generate.",
+    )
+    temperature: float = Field(
+        DEFAULT_TEMPERATURE, description="Temperature for sampling."
+    )
+    top_p: float = Field(DEFAULT_TOP_P, description="Top-p sampling.")
+    top_k: int = Field(0, description="Top-k sampling.")
+    min_p: float = Field(0.0, description="Min-p sampling.")
+    seed: Optional[int] = Field(None, description="Seed for random generation.")
+    repetition_penalty: Optional[float] = Field(None, description="Repetition penalty.")
+    repetition_context_size: Optional[int] = Field(
+        None, description="Repetition penalty context size."
+    )
+    presence_penalty: Optional[float] = Field(None, description="Presence penalty.")
+    presence_context_size: Optional[int] = Field(
+        None, description="Presence penalty context size."
+    )
+    frequency_penalty: Optional[float] = Field(None, description="Frequency penalty.")
+    frequency_context_size: Optional[int] = Field(
+        None, description="Frequency penalty context size."
+    )
+    logit_bias: Optional[Any] = Field(None, description="Logit bias dict.")
+    stop: Optional[Union[str, List[str]]] = Field(
+        None,
+        description=(
+            "Up to several sequences where generation stops. The matched "
+            "sequence is truncated from the output and finish_reason is 'stop'."
+        ),
+    )
+    stream: bool = Field(
+        False, description="Whether to stream the response chunk by chunk."
+    )
+    n: int = Field(
+        1,
+        description="Number of completions. Only n=1 is supported; other values 400.",
+    )
+    echo: bool = Field(
+        False, description="Prepend the prompt to the returned completion text."
+    )
+    logprobs: Optional[int] = Field(
+        None,
+        description=(
+            "Legacy completions logprobs count. Accepted for compatibility but "
+            "the logprobs object is always returned as null (not populated)."
+        ),
+    )
+    suffix: Optional[str] = Field(
+        None, description="OpenAI-compatible suffix; accepted but ignored."
+    )
+    user: Optional[str] = Field(
+        None, description="OpenAI-compatible user identifier; currently ignored."
+    )
+    response_format: Optional[Any] = Field(
+        None, description="OpenAI-compatible response_format for structured outputs."
+    )
+
+    def first_prompt(self) -> str:
+        """Return the prompt as a single string (first element of a list)."""
+        if isinstance(self.prompt, list):
+            return self.prompt[0] if self.prompt else ""
+        return self.prompt or ""
+
+
+class CompletionChoice(BaseModel):
+    text: str = ""
+    index: int = 0
+    finish_reason: Optional[str] = "stop"
+    logprobs: Optional[Any] = None
+
+
+class CompletionResponse(BaseModel):
+    id: str = ""
+    object: Literal["text_completion"] = "text_completion"
+    created: int = 0
+    model: str = ""
+    choices: List[CompletionChoice] = []
+    usage: Optional[UsageStats] = None
+    timings: Optional[GenerationTimings] = None
+
+
+class CompletionStreamChoice(BaseModel):
+    text: str = ""
+    index: int = 0
+    finish_reason: Optional[str] = None
+    logprobs: Optional[Any] = None
+
+
+class CompletionStreamChunk(BaseModel):
+    id: str = ""
+    object: Literal["text_completion"] = "text_completion"
+    created: int = 0
+    model: str = ""
+    choices: List[CompletionStreamChoice] = []
+    usage: Optional[UsageStats] = None
+    timings: Optional[GenerationTimings] = None
+
+    def to_sse_json(self) -> str:
+        """Serialize for SSE, omitting the unset llama.cpp-style `timings`
+        extension (see ChatStreamChunk.to_sse_json)."""
+        exclude = {"timings"} if self.timings is None else None
+        return self.model_dump_json(exclude=exclude)
+
+
 # Models for Anthropic-compatible /v1/messages endpoint
 
 

@@ -2299,6 +2299,383 @@ def test_chat_completions_endpoint_flattens_text_content_parts(client):
     ]
 
 
+# ---------------------------------------------------------------------------
+# Legacy OpenAI text-completions endpoint (/v1/completions)
+# ---------------------------------------------------------------------------
+
+
+def _completion_fake_generator(tokens, prompt_tokens=8, captured=None):
+    """Build a FakeResponseGenerator emitting the given StreamingToken list."""
+
+    class FakeResponseGenerator:
+        tokenizer = SimpleNamespace(decode=lambda tokens: "")
+
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
+            return None
+
+        def generate(self, prompt, images=None, audio=None, args=None):
+            if captured is not None:
+                captured["prompt"] = prompt
+                captured["images"] = images
+                captured["audio"] = audio
+                captured["args"] = args
+            return server.GenerationContext(
+                uid=1, prompt_tokens=prompt_tokens
+            ), iter(list(tokens))
+
+    return FakeResponseGenerator()
+
+
+def test_completions_basic_non_streaming(client, monkeypatch):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    captured = {}
+    tokens = [
+        server.StreamingToken(
+            text="Hello", token=1, logprobs=0.0, finish_reason=None, prompt_tps=20.0
+        ),
+        server.StreamingToken(
+            text=" world", token=2, logprobs=0.0, finish_reason="stop", prompt_tps=20.0
+        ),
+    ]
+    monkeypatch.setattr(
+        server.runtime,
+        "response_generator",
+        _completion_fake_generator(tokens, prompt_tokens=6, captured=captured),
+    )
+
+    with patch.object(
+        server, "get_cached_model", return_value=(model, processor, config)
+    ):
+        response = client.post(
+            "/v1/completions",
+            json={"model": "demo", "prompt": "Continue: "},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["object"] == "text_completion"
+    assert body["id"].startswith("cmpl-")
+    assert body["model"] == "demo"
+    assert len(body["choices"]) == 1
+    choice = body["choices"][0]
+    assert choice["text"] == "Hello world"
+    assert choice["index"] == 0
+    assert choice["finish_reason"] == "stop"
+    assert choice["logprobs"] is None
+    # usage accounting
+    assert body["usage"]["prompt_tokens"] == 6
+    assert body["usage"]["completion_tokens"] == 2
+    assert body["usage"]["total_tokens"] == 8
+
+
+def test_completions_prompt_is_not_chat_templated(client, monkeypatch):
+    """The raw prompt must reach the model verbatim — no apply_chat_template."""
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    captured = {}
+    tokens = [
+        server.StreamingToken(
+            text="ok", token=1, logprobs=0.0, finish_reason="stop", prompt_tps=20.0
+        )
+    ]
+    monkeypatch.setattr(
+        server.runtime,
+        "response_generator",
+        _completion_fake_generator(tokens, captured=captured),
+    )
+
+    raw = "<|im_start|>user\nNOT A TEMPLATE\n[INST] verbatim [/INST]"
+    template_mock = MagicMock(return_value="TEMPLATED-PROMPT")
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", template_mock),
+    ):
+        response = client.post(
+            "/v1/completions",
+            json={"model": "demo", "prompt": raw, "enable_thinking": True},
+        )
+
+    assert response.status_code == 200
+    # apply_chat_template is never called on the completions path.
+    template_mock.assert_not_called()
+    # The model receives the prompt byte-for-byte.
+    assert captured["prompt"] == raw
+    # Thinking is forced off regardless of the request asking for it.
+    assert captured["args"].enable_thinking is False
+    assert captured["args"].thinking_budget is None
+
+
+def test_completions_stop_sequence_truncates_non_streaming(client, monkeypatch):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    tokens = [
+        server.StreamingToken(
+            text="keep this", token=1, logprobs=0.0, finish_reason=None
+        ),
+        server.StreamingToken(
+            text="<STOP>drop this", token=2, logprobs=0.0, finish_reason="stop"
+        ),
+    ]
+    monkeypatch.setattr(
+        server.runtime, "response_generator", _completion_fake_generator(tokens)
+    )
+
+    with patch.object(
+        server, "get_cached_model", return_value=(model, processor, config)
+    ):
+        response = client.post(
+            "/v1/completions",
+            json={"model": "demo", "prompt": "p", "stop": "<STOP>"},
+        )
+
+    assert response.status_code == 200
+    choice = response.json()["choices"][0]
+    assert choice["text"] == "keep this"
+    assert choice["finish_reason"] == "stop"
+
+
+def test_completions_echo_prepends_prompt_non_streaming(client, monkeypatch):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    tokens = [
+        server.StreamingToken(
+            text=" answer", token=1, logprobs=0.0, finish_reason="stop"
+        )
+    ]
+    monkeypatch.setattr(
+        server.runtime, "response_generator", _completion_fake_generator(tokens)
+    )
+
+    with patch.object(
+        server, "get_cached_model", return_value=(model, processor, config)
+    ):
+        response = client.post(
+            "/v1/completions",
+            json={"model": "demo", "prompt": "Question:", "echo": True},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["text"] == "Question: answer"
+
+
+def test_completions_streaming_emits_deltas_and_done(client, monkeypatch):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    tokens = [
+        server.StreamingToken(
+            text="foo", token=1, logprobs=0.0, finish_reason=None, prompt_tps=20.0
+        ),
+        server.StreamingToken(
+            text="bar", token=2, logprobs=0.0, finish_reason="stop", prompt_tps=20.0
+        ),
+    ]
+    monkeypatch.setattr(
+        server.runtime,
+        "response_generator",
+        _completion_fake_generator(tokens, prompt_tokens=5),
+    )
+
+    with patch.object(
+        server, "get_cached_model", return_value=(model, processor, config)
+    ):
+        response = client.post(
+            "/v1/completions",
+            json={"model": "demo", "prompt": "p", "stream": True},
+        )
+
+    assert response.status_code == 200
+    assert "data: [DONE]" in response.text
+    chunks = [
+        json.loads(line[len("data: ") :])
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    assert all(chunk["object"] == "text_completion" for chunk in chunks)
+    # Reconstruct streamed text from text-bearing choices.
+    text = "".join(
+        chunk["choices"][0]["text"]
+        for chunk in chunks
+        if chunk.get("choices") and chunk["choices"][0].get("text")
+    )
+    assert text == "foobar"
+    # A terminal choice carries finish_reason="stop".
+    finish_chunks = [
+        chunk
+        for chunk in chunks
+        if chunk.get("choices") and chunk["choices"][0].get("finish_reason") == "stop"
+    ]
+    assert finish_chunks
+    # A trailing usage chunk reports accounting.
+    usage_chunk = next(chunk for chunk in chunks if chunk.get("usage") is not None)
+    assert usage_chunk["choices"] == []
+    assert usage_chunk["usage"]["prompt_tokens"] == 5
+    assert usage_chunk["usage"]["completion_tokens"] == 2
+
+
+def test_completions_streaming_echo_first_chunk(client, monkeypatch):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    tokens = [
+        server.StreamingToken(
+            text="gen", token=1, logprobs=0.0, finish_reason="stop"
+        )
+    ]
+    monkeypatch.setattr(
+        server.runtime, "response_generator", _completion_fake_generator(tokens)
+    )
+
+    with patch.object(
+        server, "get_cached_model", return_value=(model, processor, config)
+    ):
+        response = client.post(
+            "/v1/completions",
+            json={"model": "demo", "prompt": "PROMPT", "echo": True, "stream": True},
+        )
+
+    assert response.status_code == 200
+    chunks = [
+        json.loads(line[len("data: ") :])
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    text = "".join(
+        chunk["choices"][0]["text"]
+        for chunk in chunks
+        if chunk.get("choices") and chunk["choices"][0].get("text")
+    )
+    assert text == "PROMPTgen"
+
+
+def test_completions_streaming_stop_sequence_truncates(client, monkeypatch):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    tokens = [
+        server.StreamingToken(text="abc", token=1, logprobs=0.0, finish_reason=None),
+        server.StreamingToken(
+            text="DEFstop", token=2, logprobs=0.0, finish_reason=None
+        ),
+        server.StreamingToken(
+            text="zzz", token=3, logprobs=0.0, finish_reason="stop"
+        ),
+    ]
+    monkeypatch.setattr(
+        server.runtime, "response_generator", _completion_fake_generator(tokens)
+    )
+
+    with patch.object(
+        server, "get_cached_model", return_value=(model, processor, config)
+    ):
+        response = client.post(
+            "/v1/completions",
+            json={"model": "demo", "prompt": "p", "stop": ["stop"], "stream": True},
+        )
+
+    assert response.status_code == 200
+    chunks = [
+        json.loads(line[len("data: ") :])
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    text = "".join(
+        chunk["choices"][0]["text"]
+        for chunk in chunks
+        if chunk.get("choices") and chunk["choices"][0].get("text")
+    )
+    # "abc" + "DEF" (text before the "stop" sequence); "zzz" never streamed.
+    assert text == "abcDEF"
+    finish_chunks = [
+        chunk
+        for chunk in chunks
+        if chunk.get("choices") and chunk["choices"][0].get("finish_reason") == "stop"
+    ]
+    assert finish_chunks
+
+
+def test_completions_rejects_n_greater_than_one(client, monkeypatch):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    monkeypatch.setattr(
+        server.runtime, "response_generator", _completion_fake_generator([])
+    )
+
+    with patch.object(
+        server, "get_cached_model", return_value=(model, processor, config)
+    ):
+        response = client.post(
+            "/v1/completions",
+            json={"model": "demo", "prompt": "p", "n": 2},
+        )
+
+    assert response.status_code == 400
+    assert "n=2" in response.json()["detail"]
+
+
+def test_completions_requires_model(client):
+    response = client.post("/v1/completions", json={"prompt": "hi"})
+    assert response.status_code == 400
+
+
+def test_completions_generate_fallback_path(client, monkeypatch):
+    """With no ResponseGenerator the endpoint uses generate() with the raw prompt."""
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    captured = {}
+
+    def fake_generate(prompt, image=None, audio=None, **kwargs):
+        captured["prompt"] = prompt
+        return GenerationResult(
+            text="raw continuation",
+            prompt_tokens=4,
+            generation_tokens=3,
+            total_tokens=7,
+            prompt_tps=10.0,
+            generation_tps=5.0,
+            peak_memory=0.1,
+            finish_reason="length",
+        )
+
+    template_mock = MagicMock(return_value="TEMPLATED")
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", template_mock),
+        patch.object(server, "generate", side_effect=fake_generate),
+    ):
+        response = client.post(
+            "/completions",
+            json={"model": "demo", "prompt": "verbatim prompt"},
+        )
+
+    assert response.status_code == 200
+    template_mock.assert_not_called()
+    assert captured["prompt"] == "verbatim prompt"
+    body = response.json()
+    assert body["choices"][0]["text"] == "raw continuation"
+    assert body["choices"][0]["finish_reason"] == "length"
+    assert body["usage"]["prompt_tokens"] == 4
+    assert body["usage"]["completion_tokens"] == 3
+
+
+def test_completions_both_routes_registered():
+    paths = {r.path for r in server.app.routes if hasattr(r, "path")}
+    assert "/completions" in paths
+    assert "/v1/completions" in paths
+
+
 def test_chat_completions_endpoint_preserves_assistant_reasoning(client):
     model = SimpleNamespace()
     processor = SimpleNamespace()
