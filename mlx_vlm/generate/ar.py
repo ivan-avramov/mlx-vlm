@@ -18,6 +18,7 @@ from tqdm import tqdm
 
 from .. import apc as _apc
 from ..models import cache
+from ..models.epicache import EpiCacheKVCache
 from ..prompt_utils import apply_chat_template
 from ..sample_utils import top_p_sampling
 from ..speculative.utils import (
@@ -862,6 +863,24 @@ def _make_cache(
             return cache.CacheList(*(to_batch_cache(sub_c) for sub_c in c.caches))
         elif isinstance(c, tuple):
             return cache.CacheList(*(to_batch_cache(sub_c) for sub_c in c))
+        elif isinstance(c, EpiCacheKVCache):
+            # EpiCache evicts by GLOBAL token index (sink + top-k middle + recent),
+            # which is only meaningful for ONE sequence — with B>1 each sequence is
+            # independently left-padded, so a single global gather would corrupt the
+            # batch. (B>1 long-context is memory-prohibitive anyway.)
+            if len(left_padding) > 1:
+                raise ValueError(
+                    f"EpiCacheKVCache batching is only supported for batch size 1 "
+                    f"(got B={len(left_padding)}); use the single-sequence path for B>1."
+                )
+            # B=1: wrap a batch-aware inner so /v1/completions runs with EpiCache set.
+            # The wrapper stays a transparent passthrough on the batch path (no per-chunk
+            # eviction hook there), so evict never fires and rope_offset == inner.offset.
+            inner_batched = to_batch_cache(c.inner, quantize=quantize)
+            return EpiCacheKVCache(
+                inner_batched, budget=c.budget, block_size=c.block_size,
+                sink=c.sink, recent=c.recent,
+            )
         else:
             raise ValueError(f"{type(c)} does not yet support batching")
 
