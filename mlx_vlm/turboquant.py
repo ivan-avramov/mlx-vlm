@@ -2455,8 +2455,19 @@ def _fused_mse_decode_kernel(key_bits: int, val_bits: int, dim: int = 256):
 
 
 @lru_cache(maxsize=None)
-def _fused_mse_decode_2pass_1_kernel(key_bits: int, val_bits: int, dim: int = 256):
-    """2-pass decode pass 1: block-parallel quantized attention."""
+def _fused_mse_decode_2pass_1_kernel_legacy(
+    key_bits: int, val_bits: int, dim: int = 256
+):
+    """2-pass decode pass 1 (LEGACY): block-parallel quantized attention.
+
+    One simdgroup per query-head (n_repeats simdgroups per threadgroup, one per
+    kv-head). Each simdgroup re-reads the shared kv-head K/V tile from DRAM, so
+    the kv tile is read R= n_repeats times (the GQA-redundant read that the
+    tile-reuse kernel below removes). Retained ONLY as the apples-to-apples
+    baseline for the Task-3 decode micro-bench; production dispatch uses the
+    tile-reuse kernel. Output layout is identical to the tile-reuse kernel, so
+    pass 2 is shared.
+    """
     if not _metal_available() or key_bits <= 0 or val_bits <= 0:
         return None
     if dim < 32 or dim % 32 != 0:
@@ -2544,6 +2555,177 @@ def _fused_mse_decode_2pass_1_kernel(key_bits: int, val_bits: int, dim: int = 25
 
     return mx.fast.metal_kernel(
         name=f"turboquant_mse_sdpa_2pass1_k{key_bits}_v{val_bits}_d{dim}",
+        input_names=[
+            "queries",
+            "key_norms",
+            "key_packed",
+            "key_codebook",
+            "val_norms",
+            "val_packed",
+            "val_codebook",
+        ],
+        output_names=["out_acc", "out_sums", "out_maxs"],
+        source=source,
+    )
+
+
+@lru_cache(maxsize=None)
+def _fused_mse_decode_2pass_1_kernel(
+    key_bits: int, val_bits: int, dim: int = 256, heads_per_group: int = 2
+):
+    """2-pass decode pass 1 with GQA tile-reuse + occupancy block-split (Task 3).
+
+    Each threadgroup is ONE simdgroup (32 lanes) that serves ``heads_per_group``
+    (G) query-heads sharing a kv-head. The packed K/V for a token is dequantized
+    ONCE into registers and reused across all G heads, cutting the legacy
+    R x-redundant DRAM read (one simdgroup per q-head) to R/G x. Occupancy is
+    preserved by the token-block split: grid = B*kv_heads*(R/G)*Blocks
+    simdgroups over CONTIGUOUS per-block token ranges (spike C2's
+    occupancy-preserving layout that won ~1.6x at 200K, peak G=2). Online
+    softmax per head; the cross-block merge stays in pass 2 (unchanged). The
+    per-(head,block) partial layout is identical to the legacy kernel so pass 2
+    is reused verbatim.
+
+    G>2 packs more heads/threadgroup serially -> eats the saving and raises
+    register pressure (spike C), so dispatch defaults G=2 (or 1 when n_repeats
+    is odd). Empty trailing blocks write a finite -1e30 sentinel (not -inf) so
+    pass 2's online-softmax merge stays NaN-free.
+    """
+    if not _metal_available() or key_bits <= 0 or val_bits <= 0:
+        return None
+    if dim < 32 or dim % 32 != 0:
+        return None
+    if heads_per_group < 1:
+        return None
+
+    G = heads_per_group
+    elems_per_lane = dim // 32
+    k_bit_off_var = "k_bit_off" if (elems_per_lane * key_bits) % 8 else ""
+    v_bit_off_var = "v_bit_off" if (elems_per_lane * val_bits) % 8 else ""
+    key_exprs = _gen_unrolled_extract(
+        key_bits, elems_per_lane, "key_codebook", k_bit_off_var
+    )
+    val_exprs = _gen_unrolled_extract(
+        val_bits, elems_per_lane, "val_codebook", v_bit_off_var
+    )
+    val_exprs = [e.replace("kb[", "vb[") for e in val_exprs]
+
+    lines = [
+        "        constexpr int BD = 32;",
+        "        constexpr int qk_per_thread = Dim / BD;",
+        "        constexpr int v_per_thread = Dim / BD;",
+        f"        constexpr int G = {G};",
+        f"        constexpr int k_bits = {key_bits};",
+        f"        constexpr int v_bits = {val_bits};",
+        "        typedef float U;",
+        "",
+        "        // Flat grid: one simdgroup per (batch, kv_head, head-group, block).",
+        "        uint gid = threadgroup_position_in_grid.x;",
+        "        auto simd_lid = thread_index_in_simdgroup;",
+        "",
+        "        auto token_count = key_norms_shape[2];",
+        "        auto kv_heads = key_norms_shape[1];",
+        "        uint groups = RepeatCount / G;  // guaranteed exact by dispatch",
+        "",
+        "        uint block_idx = gid % Blocks;",
+        "        uint rest = gid / Blocks;",
+        "        uint grp = rest % groups;",
+        "        uint rest2 = rest / groups;",
+        "        uint kv_head_idx = rest2 % kv_heads;",
+        "        uint batch_idx = rest2 / kv_heads;",
+        "",
+        "        auto bh = batch_idx * kv_heads + kv_head_idx;",
+        "        uint qbase = (batch_idx * kv_heads + kv_head_idx) * RepeatCount"
+        " + grp * G;",
+        "",
+        "        auto k_nm = key_norms + bh * token_count;",
+        "        auto k_pk = key_packed + bh * token_count * KPackedWidth;",
+        "        auto v_nm = val_norms + bh * token_count;",
+        "        auto v_pk = val_packed + bh * token_count * VPackedWidth;",
+        "",
+        "        // Per-head query registers (constant across the token loop).",
+    ]
+    for r in range(G):
+        lines += [
+            f"        thread U q_{r}[qk_per_thread];",
+            f"        {{ auto qr = queries + (qbase + {r}) * Dim"
+            " + simd_lid * qk_per_thread;",
+            f"          for (int i = 0; i < qk_per_thread; i++)"
+            f" q_{r}[i] = static_cast<U>(qr[i]); }}",
+        ]
+    for r in range(G):
+        lines.append(f"        thread U o_{r}[v_per_thread] = {{}};")
+        lines.append(f"        U max_{r} = -INFINITY;")
+        lines.append(f"        U sum_{r} = 0;")
+    lines += [
+        "",
+        "        int k_bit_start = simd_lid * qk_per_thread * k_bits;",
+        "        int v_bit_start = simd_lid * v_per_thread * v_bits;",
+        "        int k_byte_base = k_bit_start >> 3;",
+        "        int v_byte_base = v_bit_start >> 3;",
+    ]
+    if k_bit_off_var:
+        lines.append("        int k_bit_off = k_bit_start & 7;")
+    if v_bit_off_var:
+        lines.append("        int v_bit_off = v_bit_start & 7;")
+    lines += [
+        "",
+        "        // Contiguous per-block token range (spike C2 streaming reads).",
+        "        uint tpb = (token_count + Blocks - 1) / Blocks;",
+        "        uint t0 = block_idx * tpb;",
+        "        uint t1 = min(t0 + tpb, (uint)token_count);",
+        "        bool blk_empty = (t1 <= t0);",
+        "        for (uint t = t0; t < t1; t++) {",
+        "            U kn = static_cast<U>(k_nm[t]);",
+        "            U vn = static_cast<U>(v_nm[t]);",
+        "            auto kb = (const device uint8_t*)(k_pk + t * KPackedWidth)"
+        " + k_byte_base;",
+        "            auto vb = (const device uint8_t*)(v_pk + t * VPackedWidth)"
+        " + v_byte_base;",
+        "            // Dequantize this lane's K/V slice ONCE; reuse across G heads.",
+        "            U kd[qk_per_thread];",
+        "            U vd[v_per_thread];",
+    ]
+    for i, expr in enumerate(key_exprs):
+        lines.append(f"            kd[{i}] = {expr};")
+    for i, expr in enumerate(val_exprs):
+        lines.append(f"            vd[{i}] = {expr};")
+    for r in range(G):
+        lines += [
+            f"            U score_{r} = 0;",
+            f"            for (int i = 0; i < qk_per_thread; i++)"
+            f" score_{r} += q_{r}[i] * kd[i];",
+            f"            score_{r} = simd_sum(score_{r}) * kn;",
+            f"            U nm_{r} = max(max_{r}, score_{r});",
+            f"            U fac_{r} = fast::exp(max_{r} - nm_{r});",
+            f"            U es_{r} = fast::exp(score_{r} - nm_{r});",
+            f"            max_{r} = nm_{r};",
+            f"            sum_{r} = sum_{r} * fac_{r} + es_{r};",
+            f"            for (int i = 0; i < v_per_thread; i++)"
+            f" o_{r}[i] = o_{r}[i] * fac_{r} + es_{r} * vd[i] * vn;",
+        ]
+    lines += [
+        "        }",
+        "",
+        "        // Per-(head,block) partials (layout identical to the legacy kernel).",
+    ]
+    for r in range(G):
+        lines += [
+            f"        {{ uint qh = qbase + {r};",
+            "          if (simd_lid == 0) {",
+            f"              out_sums[qh * Blocks + block_idx] = sum_{r};",
+            f"              out_maxs[qh * Blocks + block_idx] ="
+            f" blk_empty ? -1e30f : max_{r};",
+            "          }",
+            "          for (int i = 0; i < v_per_thread; i++)",
+            "              out_acc[(qh * Blocks + block_idx) * Dim"
+            f" + simd_lid * v_per_thread + i] = static_cast<U>(o_{r}[i]);",
+            "        }",
+        ]
+
+    source = "\n".join(lines)
+    return mx.fast.metal_kernel(
+        name=f"turboquant_mse_sdpa_2pass1_tr_k{key_bits}_v{val_bits}_d{dim}_g{G}",
         input_names=[
             "queries",
             "key_norms",
@@ -6076,8 +6258,23 @@ class TurboQuantKVCache(_BaseCache):
                         output = self.value_codec._rotate_inverse(out_rotated)
                         return output.reshape(B, n_q_heads, L, value_dim).astype(dtype)
 
-                # 2-pass: split KV across blocks for GPU saturation
-                pass1 = _fused_mse_decode_2pass_1_kernel(key_bits, val_bits, D)
+                # 2-pass: split KV across blocks for GPU saturation.
+                # Default: GQA tile-reuse pass 1 (Task 3) — each simdgroup
+                # dequantizes the kv tile once and serves G=heads_per_group
+                # query-heads (peak G=2 per spike C; G=1 when n_repeats is odd),
+                # cutting the R x-redundant kv read to R/G x. The
+                # ``_decode_2pass_use_legacy`` toggle selects the R x-redundant
+                # legacy kernel for the apples-to-apples micro-bench baseline.
+                use_legacy = getattr(self, "_decode_2pass_use_legacy", False)
+                heads_per_group = 2 if (n_repeats % 2 == 0) else 1
+                if use_legacy:
+                    pass1 = _fused_mse_decode_2pass_1_kernel_legacy(
+                        key_bits, val_bits, D
+                    )
+                else:
+                    pass1 = _fused_mse_decode_2pass_1_kernel(
+                        key_bits, val_bits, D, heads_per_group
+                    )
                 pass2 = _fused_mse_decode_2pass_2_kernel()
                 if pass1 is not None and pass2 is not None:
                     if total_tokens <= 8192:
@@ -6088,32 +6285,50 @@ class TurboQuantKVCache(_BaseCache):
                         num_blocks = 256
                     else:
                         num_blocks = 512
+                    # Tile-reuse serves G heads/simdgroup -> R/G x fewer groups,
+                    # so scale the block count by G to restore occupancy.
+                    if not use_legacy:
+                        num_blocks *= heads_per_group
+                    _nb_override = getattr(self, "_decode_2pass_num_blocks", None)
+                    if _nb_override is not None:
+                        num_blocks = int(_nb_override)
 
                     acc_shape = (BQH * num_blocks, D)
                     sm_shape = (BQH * num_blocks,)
+                    pass1_inputs = [
+                        q_rot_flat,
+                        keys_state.norms,
+                        keys_state.indices,
+                        self.key_codec.codebook,
+                        values_state.norms,
+                        values_state.indices,
+                        self.value_codec.codebook,
+                    ]
+                    pass1_template = [
+                        ("Dim", D),
+                        ("RepeatCount", n_repeats),
+                        ("Blocks", num_blocks),
+                        ("KPackedWidth", keys_state.indices.shape[-1]),
+                        ("VPackedWidth", values_state.indices.shape[-1]),
+                    ]
+                    if use_legacy:
+                        # One simdgroup per q-head; n_repeats simdgroups/threadgroup.
+                        pass1_grid = (n_kv_heads * 32, B * n_repeats, num_blocks)
+                        pass1_threadgroup = (32, n_repeats, 1)
+                    else:
+                        # One simdgroup per (batch, kv_head, head-group, block).
+                        groups = n_repeats // heads_per_group
+                        pass1_grid = (
+                            B * n_kv_heads * groups * num_blocks * 32,
+                            1,
+                            1,
+                        )
+                        pass1_threadgroup = (32, 1, 1)
                     out_acc, out_sums, out_maxs = pass1(
-                        inputs=[
-                            q_rot_flat,
-                            keys_state.norms,
-                            keys_state.indices,
-                            self.key_codec.codebook,
-                            values_state.norms,
-                            values_state.indices,
-                            self.value_codec.codebook,
-                        ],
-                        template=[
-                            ("Dim", D),
-                            ("RepeatCount", n_repeats),
-                            ("Blocks", num_blocks),
-                            ("KPackedWidth", keys_state.indices.shape[-1]),
-                            ("VPackedWidth", values_state.indices.shape[-1]),
-                        ],
-                        grid=(
-                            n_kv_heads * 32,
-                            B * n_repeats,
-                            num_blocks,
-                        ),
-                        threadgroup=(32, n_repeats, 1),
+                        inputs=pass1_inputs,
+                        template=pass1_template,
+                        grid=pass1_grid,
+                        threadgroup=pass1_threadgroup,
                         output_shapes=[acc_shape, sm_shape, sm_shape],
                         output_dtypes=[mx.float32, mx.float32, mx.float32],
                     )

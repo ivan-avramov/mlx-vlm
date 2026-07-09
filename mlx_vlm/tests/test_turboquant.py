@@ -437,6 +437,69 @@ def test_turboquant_decode_attention_separate_path_bypasses_fused_split(monkeypa
     assert output.shape == queries.shape
 
 
+# Reference of record (design spec §8): full fp32 dequant of the KV -> fp32
+# mx.fast.scaled_dot_product_attention. Both the fused kernel and the reference
+# see identical dequantized values, so this bounds pure kernel numerics (fp32
+# accumulation differences), NOT the codec's quantization error.
+_DECODE_GQA_TOL = 2e-2
+
+
+def _build_decode_case(dim, gqa, bits, T, n_kv=2, seed=0):
+    """Build a TurboQuant decode case plus its dequantized-KV reference.
+
+    Returns (queries, turbo_cache, turbo_keys, turbo_values, deq_keys, deq_values).
+    """
+    mx.random.seed(seed)
+    n_q = n_kv * gqa
+    keys = mx.random.normal((1, n_kv, T, dim))
+    values = mx.random.normal((1, n_kv, T, dim))
+    queries = mx.random.normal((1, n_q, 1, dim))
+
+    fp_cache = KVCache()
+    fp_cache.update_and_fetch(keys, values)
+    turbo_cache = TurboQuantKVCache.from_cache(fp_cache, bits=float(bits))
+    turbo_keys, turbo_values = turbo_cache.state
+    deq_keys, deq_values = turbo_cache.dequantize(turbo_keys, turbo_values)
+    return queries, turbo_cache, turbo_keys, turbo_values, deq_keys, deq_values
+
+
+@pytest.mark.parametrize(
+    "dim,gqa,bits,T",
+    [
+        (256, 6, 3, 512),  # single-pass, R=6, 3-bit, head_dim=256 (Qwen decode)
+        (256, 6, 3, 40000),  # 2-pass long-T (256-block ladder), R=6, 3-bit
+        (256, 6, 3, 131072),  # 2-pass 512-block ladder + long-T tile-reuse
+        (256, 4, 4, 4096),  # 2-pass, R=4, 4-bit
+        (128, 1, 3, 512),  # single-pass MHA (R=1), head_dim=128
+        (96, 6, 3, 4096),  # 2-pass, non-pow2-ish head_dim=96 (multiple of 32)
+        (256, 6, 4, 512),  # single-pass, R=6, 4-bit
+        (128, 4, 3, 4096),  # 2-pass, R=4, head_dim=128
+    ],
+)
+def test_decode_gqa_matches_fp32_reference(dim, gqa, bits, T):
+    """Regression net for GQA tile-reuse: the fused decode kernel must match a
+    full-fp32 dequant reference across head_dim / GQA / bits / T. Green on the
+    CURRENT kernel (correct, just slow) and must stay green after tile-reuse."""
+    if not mx.metal.is_available():
+        pytest.skip("Metal kernels are unavailable on this host")
+
+    q, cache, tk, tv, deq_k, deq_v = _build_decode_case(dim, gqa, bits, T)
+    scale = dim**-0.5
+
+    quantized = scaled_dot_product_attention(q, tk, tv, cache, scale=scale, mask=None)
+    reference = mx.fast.scaled_dot_product_attention(
+        q,
+        deq_k.astype(q.dtype),
+        deq_v.astype(q.dtype),
+        scale=scale,
+        mask=None,
+    )
+
+    assert quantized.shape == reference.shape
+    diff = mx.max(mx.abs(quantized - reference)).item()
+    assert diff < _DECODE_GQA_TOL, f"max-abs-diff {diff} >= {_DECODE_GQA_TOL}"
+
+
 def test_turboquant_prod_quantize_skips_mse_dequantize(monkeypatch):
     codec = _TurboQuantProdCodec(32, 4, seed=0)
     vectors = mx.random.normal((1, 2, 8, 32))
