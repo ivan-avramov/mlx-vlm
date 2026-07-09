@@ -14,6 +14,7 @@ from ..generate import (
 from ..snapshot import DEFAULT_RING_SIZE
 from .generation import (
     DEFAULT_ENABLE_THINKING,
+    get_server_generation_defaults,
     get_server_max_tokens,
     get_server_thinking_budget,
     get_server_thinking_end_token,
@@ -213,6 +214,18 @@ def main():
         help=(
             "Default token that closes a thinking block. Requests can override "
             "this with thinking_end_token."
+        ),
+    )
+    parser.add_argument(
+        "--generation-defaults",
+        type=str,
+        default=None,
+        help=(
+            "JSON object of per-model generation defaults (temperature/top_p/top_k/min_p/"
+            "presence_penalty/max_tokens/thinking_budget/enable_thinking/…), applied only "
+            "when a request omits the field (request params always win). Forwarded opaquely "
+            "by mlx-serve from the registry's generation_defaults block. Unknown keys and "
+            "invalid JSON fail at startup."
         ),
     )
     parser.add_argument(
@@ -477,6 +490,10 @@ def main():
         os.environ["MLX_VLM_THINKING_START_TOKEN"] = args.thinking_start_token
     if args.thinking_end_token is not None:
         os.environ["MLX_VLM_THINKING_END_TOKEN"] = args.thinking_end_token
+    if args.generation_defaults is not None:
+        os.environ["MLX_VLM_GENERATION_DEFAULTS"] = args.generation_defaults
+        # Fail loud and fast at startup (not per-request) on invalid JSON / unknown keys.
+        get_server_generation_defaults()
     if args.kv_bits is not None:
         os.environ["KV_BITS"] = str(args.kv_bits)
     os.environ["KV_GROUP_SIZE"] = str(args.kv_group_size)

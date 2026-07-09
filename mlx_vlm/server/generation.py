@@ -1,4 +1,5 @@
 import gc
+import json
 import logging
 import os
 import time
@@ -350,6 +351,33 @@ def get_server_thinking_start_token():
 
 def get_server_thinking_end_token():
     return os.environ.get("MLX_VLM_THINKING_END_TOKEN")
+
+
+def get_server_generation_defaults() -> dict:
+    """Per-model generation defaults forwarded from the registry (``--generation-defaults``,
+    a JSON object stored in ``MLX_VLM_GENERATION_DEFAULTS``). Applied by ``_build_gen_args``
+    only for fields the request omits (request params always win).
+
+    Keys are validated against ``GenerationArguments`` fields and **an unknown key raises**
+    (fail loud and fast — a typo would otherwise mean silently-wrong sampling). Returns ``{}``
+    when unset."""
+    raw = os.environ.get("MLX_VLM_GENERATION_DEFAULTS")
+    if not raw:
+        return {}
+    try:
+        defaults = json.loads(raw)
+    except (ValueError, TypeError) as e:
+        raise ValueError(f"--generation-defaults is not valid JSON: {e}") from e
+    if not isinstance(defaults, dict):
+        raise ValueError("--generation-defaults must be a JSON object (mapping of param -> value)")
+    known = set(GenerationArguments.__dataclass_fields__)
+    unknown = sorted(set(defaults) - known)
+    if unknown:
+        raise ValueError(
+            f"--generation-defaults has unknown key(s) {unknown}; valid generation params: "
+            f"{sorted(known)}"
+        )
+    return defaults
 
 
 def get_quantized_kv_bits(model: str):

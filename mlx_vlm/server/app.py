@@ -43,6 +43,7 @@ from .generation import (
     get_quantized_kv_bits,
     get_quantized_kv_start,
     get_server_enable_thinking,
+    get_server_generation_defaults,
     get_server_max_tokens,
     get_server_thinking_budget,
     get_server_thinking_end_token,
@@ -238,8 +239,31 @@ def _build_gen_args(
         ),
         tenant_id=tenant_id,
     )
+    # Registry-side generation defaults (opaque `generation_defaults` block, forwarded by
+    # mlx-serve as --generation-defaults). Overlay each entry as a default ONLY when the
+    # request omits it -> precedence request > yaml > checkpoint > hardcoded. Detectable only
+    # for Pydantic requests (model_fields_set); non-Pydantic callers (tests/SimpleNamespace)
+    # are left at the base build. max_tokens/max_output_tokens are aliases, so a request
+    # setting either counts as explicit.
+    defaults = get_server_generation_defaults()
+    fields_set = getattr(request, "model_fields_set", None)
+    if defaults and fields_set is not None:
+        for key, value in defaults.items():
+            explicit = key in fields_set or (
+                key == "max_tokens" and "max_output_tokens" in fields_set
+            )
+            if not explicit:
+                setattr(args, key, value)
     if processor is not None:
         args.logits_processors = _build_structured_logits_processors(request, processor)
+    # Log the RESOLVED sampling so runtime pass-through is observable (which registry
+    # generation_defaults / request overrides actually took effect).
+    logger.info(
+        "resolved sampling: temperature=%s top_p=%s top_k=%s min_p=%s presence_penalty=%s "
+        "max_tokens=%s thinking_budget=%s enable_thinking=%s",
+        args.temperature, args.top_p, args.top_k, args.min_p, args.presence_penalty,
+        args.max_tokens, args.thinking_budget, args.enable_thinking,
+    )
     return args
 
 

@@ -1,5 +1,6 @@
 import base64
 import json
+import logging
 import os
 import sys
 import time
@@ -4674,6 +4675,90 @@ class TestResponseGenerator:
         assert args.temperature == 0.0
         assert args.top_p == 1.0
         assert args.top_k == 0
+
+    def test_generation_defaults_applied_when_request_omits(self, monkeypatch):
+        """Registry generation_defaults fill every sampling field the request omits — the
+        VS Code/Zed fix (those clients send no sampling)."""
+        monkeypatch.setenv("MLX_VLM_GENERATION_DEFAULTS", json.dumps({
+            "temperature": 0.3, "top_p": 0.95, "top_k": 20,
+            "min_p": 0.05, "presence_penalty": 0.0, "enable_thinking": True,
+        }))
+        req = server.ChatRequest(
+            model="demo", messages=[server.ChatMessage(role="user", content="hi")],
+        )
+
+        args = server._build_gen_args(req)
+
+        assert args.temperature == 0.3      # base default 0.0 -> yaml
+        assert args.top_p == 0.95           # base default 1.0 -> yaml
+        assert args.top_k == 20             # base default 0 -> yaml
+        assert args.min_p == 0.05           # had NO middle layer before -> yaml
+        assert args.presence_penalty == 0.0  # base None -> yaml
+        assert args.enable_thinking is True
+
+    def test_request_sampling_overrides_generation_defaults(self, monkeypatch):
+        """Explicit request sampling always beats the registry default (request wins)."""
+        monkeypatch.setenv("MLX_VLM_GENERATION_DEFAULTS", json.dumps({"temperature": 0.3}))
+        req = server.ChatRequest(
+            model="demo", messages=[server.ChatMessage(role="user", content="hi")],
+            temperature=0.9,
+        )
+
+        args = server._build_gen_args(req)
+
+        assert args.temperature == 0.9
+
+    def test_generation_defaults_override_checkpoint_config(self, monkeypatch):
+        """Registry default beats the checkpoint's baked generation_config (precedence A):
+        request > yaml > checkpoint > hardcoded. Without this, the distill's baked temp 1.0
+        would still win for a no-sampling client."""
+        monkeypatch.setitem(
+            server.runtime.model_cache, "config",
+            SimpleNamespace(temperature=1.0, top_p=0.95, top_k=64),
+        )
+        monkeypatch.setenv("MLX_VLM_GENERATION_DEFAULTS", json.dumps({"temperature": 0.3}))
+        req = server.ChatRequest(
+            model="demo", messages=[server.ChatMessage(role="user", content="hi")],
+        )
+
+        args = server._build_gen_args(req)
+
+        assert args.temperature == 0.3   # yaml wins over the checkpoint's 1.0
+
+    def test_generation_defaults_max_tokens_alias_not_clobbered(self, monkeypatch):
+        """A request that sets the max_output_tokens alias suppresses the max_tokens
+        default (the two are aliases; the overlay must not override the aliased request value)."""
+        monkeypatch.setenv("MLX_VLM_GENERATION_DEFAULTS", json.dumps({"max_tokens": 102400}))
+        req = server.OpenAIRequest(model="demo", input="hi", max_output_tokens=555)
+
+        args = server._build_gen_args(req)
+
+        assert args.max_tokens == 555
+
+    def test_get_server_generation_defaults_rejects_unknown_key(self, monkeypatch):
+        """An unknown/typo'd key fails loud and fast, not a silent no-op."""
+        monkeypatch.setenv("MLX_VLM_GENERATION_DEFAULTS", json.dumps({"temperatur": 0.3}))
+        with pytest.raises(ValueError, match="temperatur"):
+            server_generation.get_server_generation_defaults()
+
+    def test_get_server_generation_defaults_empty_when_unset(self, monkeypatch):
+        monkeypatch.delenv("MLX_VLM_GENERATION_DEFAULTS", raising=False)
+        assert server_generation.get_server_generation_defaults() == {}
+
+    def test_build_gen_args_logs_resolved_sampling(self, caplog):
+        """The resolved (post-overlay) sampling is logged at INFO so runtime pass-through is
+        observable — the hook the deploy smoke greps to prove every param is applied."""
+        req = server.ChatRequest(
+            model="demo",
+            messages=[server.ChatMessage(role="user", content="hi")],
+            temperature=0.42,
+            top_p=0.91,
+        )
+        with caplog.at_level(logging.INFO, logger="mlx_vlm.server"):
+            server._build_gen_args(req)
+        blob = " ".join(r.getMessage() for r in caplog.records)
+        assert "temperature=0.42" in blob
+        assert "top_p=0.91" in blob
 
     def test_build_gen_args_defaults_penalty_context_sizes_when_omitted(self):
         req = server.ChatRequest(
