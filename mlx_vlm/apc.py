@@ -64,6 +64,22 @@ def _kv_prealloc_floor() -> int:
 
     return int(os.environ.get("KV_PREALLOC_TOKENS", 0) or 0)
 
+
+def _resolve_turn_capacity(content, effective_max_tokens, cap, fixed_floor) -> int:
+    """Per-turn pre-alloc target for a reused (APC) cache. The fixed floor (if set)
+    always wins; otherwise size to this turn's high-water, capped.
+
+    Adaptive primitive only — not yet wired into the fixed-cap deployment path.
+    Wiring it at the ``lookup_exact_cache`` call sites (Task 7's
+    ``min_capacity_tokens=max(len(token_tuple) + 1, _kv_prealloc_floor())``)
+    would need ``effective_max_tokens`` (the turn's requested output length)
+    and ``cap`` (a hard KV ceiling) in scope there; neither is part of that
+    method's signature or of ``APCManager`` state today, so plumbing them in
+    is deferred until a caller actually needs per-turn adaptive sizing.
+    """
+    adaptive = min(int(content) + int(effective_max_tokens), int(cap))
+    return max(adaptive, int(fixed_floor or 0))
+
 DEFAULT_BLOCK_SIZE = 16
 DEFAULT_NUM_BLOCKS = 2048
 SEED_PARENT_HASH = 0

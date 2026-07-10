@@ -285,3 +285,18 @@ def test_prealloc_kvcache_to_quantized_slices_to_offset():
     assert q.offset == 512
     # quantized ONLY the valid prefix, not the full 262144-row pre-allocated buffer:
     assert q.keys[0].shape[2] == 512
+
+
+from mlx_vlm.apc import _resolve_turn_capacity
+
+
+def test_turn_capacity_adaptive_min():
+    # content 5000 + output 102400, cap 262144 -> 107400 (right-sized between turns)
+    assert _resolve_turn_capacity(content=5000, effective_max_tokens=102400,
+                                  cap=262144, fixed_floor=0) == 107400
+
+
+def test_turn_capacity_fixed_floor_wins():
+    # fixed floor at cap -> stays at cap (no per-turn shrink)
+    assert _resolve_turn_capacity(content=5000, effective_max_tokens=102400,
+                                  cap=262144, fixed_floor=262144) == 262144
