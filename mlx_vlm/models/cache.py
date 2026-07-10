@@ -178,6 +178,42 @@ class BufferedRotatingKVCache(RotatingKVCache):
         self.buffer_size = vals[5] if len(vals) > 5 else 64
 
 
+class PreallocKVCache(KVCache):
+    """fp16 KVCache that pre-allocates its buffer to a fixed token floor on the
+    first fill, so later appends write in place (no realloc, no growth transient).
+    Non-rotating. Overflow beyond the floor falls back to the parent's step-256
+    concatenate growth."""
+
+    def __init__(self, prealloc_tokens: int = 0):
+        super().__init__()
+        self.prealloc_tokens = int(prealloc_tokens or 0)
+
+    def update_and_fetch(self, keys, values):
+        if self.keys is None and self.prealloc_tokens > 0:
+            B, n_kv_heads, _, k_head_dim = keys.shape
+            v_head_dim = values.shape[3]
+            prev = self.offset  # 0 on first fill
+            target = max(prev + keys.shape[2], self.prealloc_tokens)
+            cap = ((target + self.step - 1) // self.step) * self.step
+            self.keys = mx.zeros((B, n_kv_heads, cap, k_head_dim), keys.dtype)
+            self.values = mx.zeros((B, n_kv_heads, cap, v_head_dim), values.dtype)
+            self.offset += keys.shape[2]
+            self.keys[..., prev : self.offset, :] = keys
+            self.values[..., prev : self.offset, :] = values
+            return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
+        return super().update_and_fetch(keys, values)
+
+    @classmethod
+    def from_kvcache(cls, src, prealloc_tokens):
+        """Copy a (possibly non-empty) plain KVCache into a pre-allocated one."""
+        c = cls(prealloc_tokens=int(prealloc_tokens or 0))
+        if src.keys is not None and src.offset > 0:
+            c.update_and_fetch(
+                src.keys[..., : src.offset, :], src.values[..., : src.offset, :]
+            )
+        return c
+
+
 class BatchQuantizedKVCache(_BaseCache):
     """Batch-aware quantized KV cache for continuous batching.
 
