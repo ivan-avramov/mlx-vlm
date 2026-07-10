@@ -80,3 +80,22 @@ def test_prealloc_quantized_from_quantized_copies_nonempty():
     c = PreallocQuantizedKVCache.from_quantized(src, prealloc_tokens=262144)
     assert c.keys[0].shape[2] == 262144        # pre-allocated triple
     assert c.offset == 512                      # content preserved
+
+
+from mlx_vlm.turboquant import TurboQuantKVCache, _state_length
+
+
+def test_turboquant_prealloc_floor_and_never_reallocs():
+    c = TurboQuantKVCache(bits=4, prealloc_tokens=262144)
+    c.update_and_fetch(*_fake(1000))
+    assert _state_length(c.keys) == 262144
+    for _ in range(400):
+        c.update_and_fetch(*_fake(1))
+    assert _state_length(c.keys) == 262144    # zero reallocs
+    assert c.offset == 1400
+
+
+def test_turboquant_none_is_backward_compatible():
+    c = TurboQuantKVCache(bits=4, prealloc_tokens=None)
+    c.update_and_fetch(*_fake(1000))
+    assert _state_length(c.keys) == 1000      # grows from new_end (today's behavior)

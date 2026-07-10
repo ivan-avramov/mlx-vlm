@@ -5174,12 +5174,14 @@ class TurboQuantKVCache(_BaseCache):
         max_kv_size: Optional[int] = None,
         fused_prefill: Optional[bool] = None,
         kv_quant_mode: Optional[str] = None,
+        prealloc_tokens: Optional[int] = None,
     ):
         import os as _os
 
         self.bits = _validate_bits(bits)
         self.seed = seed
         self.max_kv_size = max_kv_size
+        self.prealloc_tokens = prealloc_tokens
         # Fused MSE prefill kernel: OFF by default (opt-in). Real-model 16K
         # validation showed the decomposed path ties the qb-256 quantized_attention
         # loop on speed while costing ~+4GB (score materialization) and risking OOM
@@ -5220,8 +5222,14 @@ class TurboQuantKVCache(_BaseCache):
         bits: float,
         seed: int = DEFAULT_TURBOQUANT_SEED,
         max_kv_size: Optional[int] = None,
+        prealloc_tokens: Optional[int] = None,
     ) -> "TurboQuantKVCache":
-        turbo_cache = cls(bits=bits, seed=seed, max_kv_size=max_kv_size)
+        turbo_cache = cls(
+            bits=bits,
+            seed=seed,
+            max_kv_size=max_kv_size,
+            prealloc_tokens=prealloc_tokens,
+        )
 
         # Handle ChunkedKVCache (list-based KV) by merging into continuous array
         keys, values = cache.state
@@ -5348,7 +5356,9 @@ class TurboQuantKVCache(_BaseCache):
             _trigger_allocation_hooks()
             # Pre-allocate to max_kv_size if set, to avoid late-stage
             # double-buffer reallocation spikes
-            initial_alloc = max(new_end, self.max_kv_size or 0)
+            initial_alloc = max(
+                new_end, self.prealloc_tokens or 0, self.max_kv_size or 0
+            )
             self.keys = _allocate_state_like(new_keys, initial_alloc)
             self.values = _allocate_state_like(new_values, initial_alloc)
         else:
