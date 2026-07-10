@@ -172,3 +172,35 @@ def test_batch_turboquant_zero_is_backward_compatible():
     c.update_and_fetch(*_fake(1000))
     assert _state_length(c.keys) == 1000       # grows from new_end (today's behavior)
     assert _state_length(c.keys) < 262144      # grew from the fill, not the floor
+
+
+from mlx_lm.models import cache as lmcache
+from mlx_vlm.generate.common import maybe_preallocate_kv_cache
+from mlx_vlm.models.cache import PreallocKVCache, PreallocQuantizedKVCache
+
+
+def test_maybe_preallocate_converts_empty_plain_and_quantized():
+    pc = [lmcache.KVCache(), lmcache.QuantizedKVCache(group_size=64, bits=4)]
+    maybe_preallocate_kv_cache(pc, 262144)
+    assert isinstance(pc[0], PreallocKVCache) and pc[0].prealloc_tokens == 262144
+    assert isinstance(pc[1], PreallocQuantizedKVCache) and pc[1].prealloc_tokens == 262144
+    assert pc[1].group_size == 64 and pc[1].bits == 4
+
+
+def test_maybe_preallocate_converts_nonempty_by_copy():
+    pc = [lmcache.KVCache()]
+    pc[0].update_and_fetch(*_fake(512))            # mid-prefill (non-empty)
+    maybe_preallocate_kv_cache(pc, 262144)
+    assert isinstance(pc[0], PreallocKVCache)
+    assert pc[0].keys.shape[2] == 262144           # pre-allocated
+    assert pc[0].offset == 512                       # content copied
+
+
+def test_maybe_preallocate_zero_and_idempotent():
+    pc = [lmcache.KVCache()]
+    maybe_preallocate_kv_cache(pc, 0)
+    assert type(pc[0]) is lmcache.KVCache           # untouched when floor is 0
+    maybe_preallocate_kv_cache(pc, 262144)
+    first = pc[0]
+    maybe_preallocate_kv_cache(pc, 262144)          # second call is a no-op
+    assert pc[0] is first

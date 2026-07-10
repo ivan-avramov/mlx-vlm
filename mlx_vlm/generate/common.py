@@ -12,6 +12,7 @@ import mlx.nn as nn
 from mlx.utils import tree_reduce
 
 from ..models import cache
+from ..models.cache import PreallocKVCache, PreallocQuantizedKVCache
 from ..turboquant import TurboQuantKVCache, turboquant_enabled
 
 _LOG_NAME = os.environ.get("MLX_VLM_LOG_NAME", "mlx_vlm")
@@ -267,6 +268,7 @@ def maybe_quantize_kv_cache(
     kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
     max_kv_size: Optional[int] = None,
     serialize_kv_quantization: bool = False,
+    kv_prealloc_tokens: Optional[int] = None,
 ):
     if kv_bits is None:
         return
@@ -285,11 +287,18 @@ def maybe_quantize_kv_cache(
                 current_offset = getattr(entry, "offset", 0)
                 if current_offset == 0:
                     # Empty: replace so update_and_fetch quantizes on the fly
-                    return TurboQuantKVCache(bits=kv_bits, max_kv_size=max_kv_size)
+                    return TurboQuantKVCache(
+                        bits=kv_bits,
+                        max_kv_size=max_kv_size,
+                        prealloc_tokens=kv_prealloc_tokens,
+                    )
                 if current_offset < quantized_kv_start:
                     return entry
                 return TurboQuantKVCache.from_cache(
-                    entry, bits=kv_bits, max_kv_size=max_kv_size
+                    entry,
+                    bits=kv_bits,
+                    max_kv_size=max_kv_size,
+                    prealloc_tokens=kv_prealloc_tokens,
                 )
             if isinstance(entry, cache.CacheList):
                 entry.caches = [quantize_entry(sub_entry) for sub_entry in entry.caches]
@@ -342,6 +351,28 @@ def maybe_quantize_kv_cache(
             keys, values = prompt_cache[index].state
             if keys is not None:
                 mx.eval(keys, values)
+
+
+def maybe_preallocate_kv_cache(prompt_cache, kv_prealloc_tokens):
+    """Convert leftover plain fp16 / uniform-quantized caches to their pre-allocating
+    variants (including non-empty ones — copies content). Runs AFTER
+    maybe_quantize_kv_cache so it never fp16-pre-allocs a to-be-quantized layer.
+    Idempotent: a cache already a Prealloc*/TQ variant is left as-is (only its floor
+    is refreshed)."""
+    if not kv_prealloc_tokens:
+        return
+    floor = int(kv_prealloc_tokens)
+    for i, entry in enumerate(prompt_cache):
+        # Already a pre-alloc variant → just refresh the floor (idempotent).
+        if isinstance(entry, (PreallocKVCache, PreallocQuantizedKVCache)):
+            entry.prealloc_tokens = floor
+        # QuantizedKVCache first (PreallocQuantizedKVCache subclasses it, handled above).
+        elif isinstance(entry, cache.QuantizedKVCache):
+            prompt_cache[i] = PreallocQuantizedKVCache.from_quantized(entry, floor)
+        # Plain KVCache last (PreallocKVCache subclasses it, handled above).
+        elif isinstance(entry, cache.KVCache):
+            prompt_cache[i] = PreallocKVCache.from_kvcache(entry, floor)
+        # TurboQuantKVCache, RotatingKVCache, ChunkedKVCache, linear-attn, CacheList: untouched.
 
 
 @contextlib.contextmanager

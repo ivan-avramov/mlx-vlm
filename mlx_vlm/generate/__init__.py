@@ -31,6 +31,7 @@ from .common import (
     _rotating_rewind_safe,
     _should_capture_anchor_pre_prefill,
     _trim_cache,
+    maybe_preallocate_kv_cache,
     maybe_quantize_kv_cache,
     wired_limit,
 )
@@ -86,6 +87,7 @@ __all__ = [
     "load_image_generation_model",
     "load_image_model",
     "main",
+    "maybe_preallocate_kv_cache",
     "maybe_quantize_kv_cache",
     "parse_arguments",
     "stream_generate",
