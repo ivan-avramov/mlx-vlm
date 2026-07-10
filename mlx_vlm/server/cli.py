@@ -129,6 +129,16 @@ def _apply_mlx_memory_limits(
             )
 
 
+def validate_kv_prealloc_tokens(kv_prealloc_tokens, max_kv_size):
+    if kv_prealloc_tokens is None or max_kv_size is None:
+        return
+    if int(kv_prealloc_tokens) > int(max_kv_size):
+        raise ValueError(
+            f"kv_prealloc_tokens ({kv_prealloc_tokens}) must be <= max_kv_size "
+            f"({max_kv_size}); a floor above the cap can never be honored."
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(description="MLX VLM Http Server.")
     parser.add_argument(
@@ -262,6 +272,13 @@ def main():
         type=int,
         default=None,
         help="Maximum KV cache size in tokens.",
+    )
+    parser.add_argument(
+        "--kv-prealloc-tokens",
+        type=int,
+        default=None,
+        help="Pre-allocate every KV cache to this fixed token floor on first fill "
+             "(no mid-generation realloc). Must be <= --max-kv-size.",
     )
     parser.add_argument(
         "--quantized-kv-start",
@@ -501,6 +518,9 @@ def main():
     os.environ["TQ_KV_QUANT_MODE"] = args.kv_quant_mode
     if args.max_kv_size is not None:
         os.environ["MAX_KV_SIZE"] = str(args.max_kv_size)
+    validate_kv_prealloc_tokens(args.kv_prealloc_tokens, args.max_kv_size)
+    if args.kv_prealloc_tokens is not None:
+        os.environ["KV_PREALLOC_TOKENS"] = str(args.kv_prealloc_tokens)
     os.environ["QUANTIZED_KV_START"] = str(args.quantized_kv_start)
     if args.top_logprobs_k is not None:
         os.environ["TOP_LOGPROBS_K"] = str(args.top_logprobs_k)

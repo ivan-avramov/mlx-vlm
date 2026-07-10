@@ -259,3 +259,18 @@ def test_get_kv_prealloc_tokens_env(monkeypatch):
     assert G.get_kv_prealloc_tokens() == 262144
     monkeypatch.delenv("KV_PREALLOC_TOKENS", raising=False)
     assert G.get_kv_prealloc_tokens() is None
+
+
+import pytest
+from mlx_vlm.server.cli import validate_kv_prealloc_tokens
+
+
+def test_validate_kv_prealloc_rejects_over_cap():
+    with pytest.raises(ValueError, match="kv_prealloc_tokens"):
+        validate_kv_prealloc_tokens(300000, max_kv_size=262144)
+
+
+def test_validate_kv_prealloc_allows_equal_and_none():
+    validate_kv_prealloc_tokens(262144, max_kv_size=262144)  # equal OK
+    validate_kv_prealloc_tokens(None, max_kv_size=262144)    # unset OK
+    validate_kv_prealloc_tokens(1000, max_kv_size=None)      # no cap configured OK
