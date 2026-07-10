@@ -213,3 +213,38 @@ def test_maybe_preallocate_zero_and_idempotent():
     first = pc[0]
     maybe_preallocate_kv_cache(pc, 262144)          # second call is a no-op
     assert pc[0] is first
+
+
+import sys
+from unittest.mock import patch
+from mlx_vlm.generate import generate_step
+from mlx_vlm.models import cache as kvc
+from mlx_vlm.tests.test_kv_cache_quantization import MockModel
+
+
+def test_generate_step_forwards_kv_prealloc_tokens():
+    seen = {"quantize": [], "prealloc": []}
+
+    def spy_quant(cache, **kw):
+        seen["quantize"].append(kw.get("kv_prealloc_tokens", "ABSENT"))
+
+    def spy_prealloc(cache, kv_prealloc_tokens):
+        seen["prealloc"].append(kv_prealloc_tokens)
+
+    def spy_make(model, *a, **kw):
+        return [kvc.KVCache() for _ in range(2)]
+
+    gen_mod = sys.modules["mlx_vlm.generate"]
+    with patch("mlx_vlm.models.cache.make_prompt_cache", spy_make), \
+         patch.object(gen_mod, "maybe_quantize_kv_cache", spy_quant), \
+         patch.object(gen_mod, "maybe_preallocate_kv_cache", spy_prealloc):
+        gen = generate_step(
+            input_ids=mx.array([[1, 2, 3, 4, 5]]), model=MockModel(),
+            pixel_values=mx.random.normal((1, 3, 336, 336)), mask=mx.ones((1, 5)),
+            kv_bits=4, kv_group_size=64, quantized_kv_start=0, max_tokens=3,
+            kv_prealloc_tokens=262144,
+        )
+        for _ in gen:
+            pass
+    assert seen["quantize"] and all(x == 262144 for x in seen["quantize"])
+    assert seen["prealloc"] and all(x == 262144 for x in seen["prealloc"])

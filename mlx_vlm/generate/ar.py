@@ -42,6 +42,7 @@ from .common import (
     _first_kv_offset,
     _get_generation_stream,
     _should_capture_anchor_pre_prefill,
+    maybe_preallocate_kv_cache,
     maybe_quantize_kv_cache,
     wired_limit,
 )
@@ -205,6 +206,7 @@ def generate_step(
     kv_group_size: int = DEFAULT_KV_GROUP_SIZE,
     kv_quant_scheme: str = DEFAULT_KV_QUANT_SCHEME,
     quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
+    kv_prealloc_tokens: Optional[int] = None,
     sampler: Optional[Callable[[mx.array], mx.array]] = None,
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
     prefill_step_size: Optional[int] = DEFAULT_PREFILL_STEP_SIZE,
@@ -287,6 +289,11 @@ def generate_step(
         kv_quant_scheme=kv_quant_scheme,
         max_kv_size=max_kv_size,
         serialize_kv_quantization=serialize_kv_quantization,
+        kv_prealloc_tokens=kv_prealloc_tokens,
+    )
+    preallocate_cache_fn = functools.partial(
+        _generate_module_override("maybe_preallocate_kv_cache", maybe_preallocate_kv_cache),
+        kv_prealloc_tokens=kv_prealloc_tokens,
     )
 
     sampler_is_greedy = sampler is None and temperature == 0
@@ -336,6 +343,8 @@ def generate_step(
             model.language_model,
             max_kv_size=max_kv_size,
         )
+        if kv_bits is None:
+            preallocate_cache_fn(prompt_cache)  # fp16 model: pre-alloc empty caches before prefill
 
     # Speculative decoding setup
     last_outputs = None
@@ -398,6 +407,7 @@ def generate_step(
                     logits = processor(tokens, logits)
 
             quantize_cache_fn(prompt_cache)
+            preallocate_cache_fn(prompt_cache)
 
             logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
             y = _sample_with_positions(
@@ -537,6 +547,7 @@ def generate_step(
                         **kwargs,
                     )
                     quantize_cache_fn(prompt_cache)
+                    preallocate_cache_fn(prompt_cache)
                     mx.eval([c.state for c in prompt_cache])
                     # EpiCache: after each prefill chunk, evict every budget-bounded
                     # full-attn cache back to its budget, so peak KV stays ~budget+chunk
