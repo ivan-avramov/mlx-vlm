@@ -828,6 +828,7 @@ def _make_cache(
     kv_bits=None,
     kv_group_size=64,
     kv_quant_scheme=DEFAULT_KV_QUANT_SCHEME,
+    kv_prealloc_tokens: int = 0,
 ):
     """
     Convert a list of regular caches into their corresponding
@@ -845,24 +846,29 @@ def _make_cache(
 
     def _make_quant_cache(lp):
         if use_turbo:
-            return BatchTurboQuantKVCache(lp, bits=kv_bits)
+            return BatchTurboQuantKVCache(
+                lp, bits=kv_bits, prealloc_tokens=kv_prealloc_tokens
+            )
         return cache.BatchQuantizedKVCache(
-            lp, group_size=kv_group_size, bits=int(kv_bits)
+            lp,
+            group_size=kv_group_size,
+            bits=int(kv_bits),
+            prealloc_tokens=kv_prealloc_tokens,
         )
 
     def to_batch_cache(c, quantize=True):
         if isinstance(c, cache.KVCache):
             if kv_bits is not None and quantize:
                 return _make_quant_cache(left_padding)
-            return cache.BatchKVCache(left_padding)
+            return cache.BatchKVCache(left_padding, prealloc_tokens=kv_prealloc_tokens)
         elif isinstance(c, cache.ChunkedKVCache):
             if kv_bits is not None and quantize:
                 return _make_quant_cache(left_padding)
-            return cache.BatchKVCache(left_padding)
+            return cache.BatchKVCache(left_padding, prealloc_tokens=kv_prealloc_tokens)
         elif isinstance(c, cache.SimpleKVCache):
             if kv_bits is not None and quantize:
                 return _make_quant_cache(left_padding)
-            return cache.BatchKVCache(left_padding)
+            return cache.BatchKVCache(left_padding, prealloc_tokens=kv_prealloc_tokens)
         elif isinstance(c, cache.ArraysCache):
             c.left_padding = mx.array(left_padding)
             return c
@@ -910,11 +916,16 @@ def _make_cache(
                 (
                     _make_quant_cache(left_padding)
                     if i < n - 1 or n <= 2
-                    else cache.BatchKVCache(left_padding)
+                    else cache.BatchKVCache(
+                        left_padding, prealloc_tokens=kv_prealloc_tokens
+                    )
                 )
                 for i in range(n)
             ]
-        return [cache.BatchKVCache(left_padding) for _ in model.layers]
+        return [
+            cache.BatchKVCache(left_padding, prealloc_tokens=kv_prealloc_tokens)
+            for _ in model.layers
+        ]
 
 
 @dataclass

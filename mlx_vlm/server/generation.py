@@ -1,3 +1,4 @@
+import functools
 import gc
 import json
 import logging
@@ -496,6 +497,11 @@ def _apply_generation_budget(args: "GenerationArguments", prompt_tokens: int) ->
 
 def get_quantized_kv_start():
     return int(os.environ.get("QUANTIZED_KV_START", DEFAULT_QUANTIZED_KV_START))
+
+
+def get_kv_prealloc_tokens():
+    n = int(os.environ.get("KV_PREALLOC_TOKENS", 0))
+    return n or None
 
 
 def get_top_logprobs_k():
@@ -1332,6 +1338,12 @@ class ResponseGenerator:
         # OOMing at long context. generate_step nullifies it internally when
         # chunked prefill isn't enabled, so passing it is always safe.
         gen_kwargs.setdefault("prefill_step_size", get_prefill_step_size())
+        # Thread the KV pre-alloc floor independently of kv_bits: fp16 caches
+        # (kv_bits is None, e.g. Ornith) still benefit from pre-allocating the
+        # KV buffer up front to avoid incremental reallocation during decode.
+        _prealloc = get_kv_prealloc_tokens()
+        if _prealloc is not None:
+            gen_kwargs["kv_prealloc_tokens"] = _prealloc
         if self.kv_bits is not None:
             gen_kwargs["kv_bits"] = self.kv_bits
             gen_kwargs["kv_group_size"] = self.kv_group_size
@@ -2135,7 +2147,9 @@ class ResponseGenerator:
                     draft_kind=draft_kind,
                     batch_size=B,
                     left_padding=left_padding,
-                    make_cache=_make_cache,
+                    make_cache=functools.partial(
+                        _make_cache, kv_prealloc_tokens=(get_kv_prealloc_tokens() or 0)
+                    ),
                 )
 
                 prefill_step_size = get_prefill_step_size()

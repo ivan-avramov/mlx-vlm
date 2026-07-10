@@ -58,6 +58,12 @@ import numpy as np
 
 logger = logging.getLogger("mlx_vlm.apc")
 
+
+def _kv_prealloc_floor() -> int:
+    import os
+
+    return int(os.environ.get("KV_PREALLOC_TOKENS", 0) or 0)
+
 DEFAULT_BLOCK_SIZE = 16
 DEFAULT_NUM_BLOCKS = 2048
 SEED_PARENT_HASH = 0
@@ -2956,7 +2962,7 @@ class APCManager:
                 cache_hash, disk_prefix_len = disk_match
                 loaded = disk.load_exact_cache(
                     cache_hash,
-                    min_capacity_tokens=len(token_tuple) + 1,
+                    min_capacity_tokens=max(len(token_tuple) + 1, _kv_prealloc_floor()),
                 )
                 if loaded is not None:
                     stored_tokens, stored_extra_hash, prompt_cache = loaded
@@ -3013,7 +3019,7 @@ class APCManager:
             return None, 0
         prompt_cache = _clone_prompt_cache_for_apc(
             source_cache,
-            min_capacity_tokens=len(token_tuple) + 1,
+            min_capacity_tokens=max(len(token_tuple) + 1, _kv_prealloc_floor()),
         )
         if prompt_cache is None:
             return None, 0

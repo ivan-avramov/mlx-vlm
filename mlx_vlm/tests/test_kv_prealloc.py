@@ -248,3 +248,14 @@ def test_generate_step_forwards_kv_prealloc_tokens():
             pass
     assert seen["quantize"] and all(x == 262144 for x in seen["quantize"])
     assert seen["prealloc"] and all(x == 262144 for x in seen["prealloc"])
+
+
+import os
+from mlx_vlm.server import generation as G
+
+
+def test_get_kv_prealloc_tokens_env(monkeypatch):
+    monkeypatch.setenv("KV_PREALLOC_TOKENS", "262144")
+    assert G.get_kv_prealloc_tokens() == 262144
+    monkeypatch.delenv("KV_PREALLOC_TOKENS", raising=False)
+    assert G.get_kv_prealloc_tokens() is None
