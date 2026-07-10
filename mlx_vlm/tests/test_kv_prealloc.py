@@ -121,3 +121,54 @@ def test_batch_quantized_prealloc():
     c = BatchQuantizedKVCache([0], group_size=64, bits=4, prealloc_tokens=262144)
     c.update_and_fetch(*_fake(1000))
     assert c.keys[0].shape[2] == 262144
+
+
+def test_batch_kvcache_allocs_floor_and_never_reallocs():
+    c = BatchKVCache([0], prealloc_tokens=262144)
+    c.update_and_fetch(*_fake(1000))
+    assert c.keys.shape[2] == 262144           # allocated to the floor, not 1024
+    for _ in range(400):                        # decode
+        c.update_and_fetch(*_fake(1))
+    assert c.keys.shape[2] == 262144           # zero reallocs
+    assert c.offset.item() == 1400
+
+
+def test_batch_kvcache_zero_is_backward_compatible():
+    c = BatchKVCache([0], prealloc_tokens=0)
+    c.update_and_fetch(*_fake(1000))
+    assert c.keys.shape[2] == 1024              # ceil(1000/256)*256, like stock BatchKVCache
+    assert c.keys.shape[2] < 262144             # grew from the fill, not the floor
+
+
+def test_batch_quantized_allocs_floor_and_never_reallocs():
+    c = BatchQuantizedKVCache([0], group_size=64, bits=4, prealloc_tokens=262144)
+    c.update_and_fetch(*_fake(1000))
+    assert c.keys[0].shape[2] == 262144        # packed dim pre-sized to floor
+    for _ in range(400):                        # decode
+        c.update_and_fetch(*_fake(1))
+    assert c.keys[0].shape[2] == 262144        # zero reallocs
+    assert c.offset.item() == 1400
+
+
+def test_batch_quantized_zero_is_backward_compatible():
+    c = BatchQuantizedKVCache([0], group_size=64, bits=4, prealloc_tokens=0)
+    c.update_and_fetch(*_fake(1000))
+    assert c.keys[0].shape[2] == 1024          # step-256, like stock BatchQuantizedKVCache
+    assert c.keys[0].shape[2] < 262144         # grew from the fill, not the floor
+
+
+def test_batch_turboquant_allocs_floor_and_never_reallocs():
+    c = BatchTurboQuantKVCache(left_padding=[0], bits=4, prealloc_tokens=262144)
+    c.update_and_fetch(*_fake(1000))
+    assert _state_length(c.keys) == 262144
+    for _ in range(400):                        # decode
+        c.update_and_fetch(*_fake(1))
+    assert _state_length(c.keys) == 262144     # zero reallocs
+    assert c.offset.item() == 1400
+
+
+def test_batch_turboquant_zero_is_backward_compatible():
+    c = BatchTurboQuantKVCache(left_padding=[0], bits=4, prealloc_tokens=0)
+    c.update_and_fetch(*_fake(1000))
+    assert _state_length(c.keys) == 1000       # grows from new_end (today's behavior)
+    assert _state_length(c.keys) < 262144      # grew from the fill, not the floor
