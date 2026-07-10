@@ -196,6 +196,15 @@ def test_maybe_preallocate_converts_nonempty_by_copy():
     assert pc[0].offset == 512                       # content copied
 
 
+def test_maybe_preallocate_converts_nonempty_quantized_by_copy():
+    pc = [lmcache.QuantizedKVCache(group_size=64, bits=4)]
+    pc[0].update_and_fetch(*_fake(512))            # mid-prefill (non-empty)
+    maybe_preallocate_kv_cache(pc, 262144)
+    assert isinstance(pc[0], PreallocQuantizedKVCache)
+    assert pc[0].keys[0].shape[2] == 262144        # pre-allocated triple
+    assert pc[0].offset == 512                       # content copied
+
+
 def test_maybe_preallocate_zero_and_idempotent():
     pc = [lmcache.KVCache()]
     maybe_preallocate_kv_cache(pc, 0)
