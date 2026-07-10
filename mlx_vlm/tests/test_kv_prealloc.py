@@ -274,3 +274,14 @@ def test_validate_kv_prealloc_allows_equal_and_none():
     validate_kv_prealloc_tokens(262144, max_kv_size=262144)  # equal OK
     validate_kv_prealloc_tokens(None, max_kv_size=262144)    # unset OK
     validate_kv_prealloc_tokens(1000, max_kv_size=None)      # no cap configured OK
+
+
+def test_prealloc_kvcache_to_quantized_slices_to_offset():
+    from mlx_lm.models.cache import QuantizedKVCache
+    c = PreallocKVCache(prealloc_tokens=262144)
+    c.update_and_fetch(*_fake(512))
+    q = c.to_quantized(group_size=64, bits=4)
+    assert isinstance(q, QuantizedKVCache)
+    assert q.offset == 512
+    # quantized ONLY the valid prefix, not the full 262144-row pre-allocated buffer:
+    assert q.keys[0].shape[2] == 512

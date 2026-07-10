@@ -214,6 +214,21 @@ class PreallocKVCache(KVCache):
             )
         return c
 
+    def to_quantized(self, group_size: int = 64, bits: int = 4):
+        """Quantize only the valid prefix (offset-sliced), not the full
+        pre-allocated buffer, so converting a large-floor pre-alloc cache never
+        quantizes zero-padding."""
+        quant_cache = QuantizedKVCache(group_size=group_size, bits=bits)
+        quant_cache.offset = self.offset
+        if self.keys is not None and self.offset > 0:
+            quant_cache.keys = mx.quantize(
+                self.keys[..., : self.offset, :], group_size=group_size, bits=bits
+            )
+            quant_cache.values = mx.quantize(
+                self.values[..., : self.offset, :], group_size=group_size, bits=bits
+            )
+        return quant_cache
+
 
 class PreallocQuantizedKVCache(QuantizedKVCache):
     """QuantizedKVCache that pre-allocates the quantized triple (packed uint32 +
