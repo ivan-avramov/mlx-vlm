@@ -1,4 +1,5 @@
 import mlx.core as mx
+from mlx_lm.models import cache as lmcache
 from mlx_vlm.models.cache import PreallocKVCache
 
 H, D = 8, 128
@@ -52,3 +53,30 @@ def test_prealloc_kvcache_from_kvcache_copies_nonempty():
     for _ in range(400):
         c.update_and_fetch(*_fake(1))
     assert c.keys.shape[2] == 262144           # zero reallocs after copy
+
+
+from mlx_vlm.models.cache import PreallocQuantizedKVCache
+
+
+def test_prealloc_quantized_allocs_floor_and_never_reallocs():
+    c = PreallocQuantizedKVCache(group_size=64, bits=4, prealloc_tokens=262144)
+    c.update_and_fetch(*_fake(1000))
+    assert c.keys[0].shape[2] == 262144       # packed dim pre-sized to floor
+    for _ in range(400):
+        c.update_and_fetch(*_fake(1))
+    assert c.keys[0].shape[2] == 262144       # zero reallocs
+    assert c.offset == 1400
+
+
+def test_prealloc_quantized_zero_is_backward_compatible():
+    c = PreallocQuantizedKVCache(group_size=64, bits=4, prealloc_tokens=0)
+    c.update_and_fetch(*_fake(1000))
+    assert c.keys[0].shape[2] == 1024         # step-256, like stock QuantizedKVCache
+
+
+def test_prealloc_quantized_from_quantized_copies_nonempty():
+    src = lmcache.QuantizedKVCache(group_size=64, bits=4)
+    src.update_and_fetch(*_fake(512))          # a mid-prefill quantized cache
+    c = PreallocQuantizedKVCache.from_quantized(src, prealloc_tokens=262144)
+    assert c.keys[0].shape[2] == 262144        # pre-allocated triple
+    assert c.offset == 512                      # content preserved

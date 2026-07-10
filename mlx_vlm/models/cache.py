@@ -2,6 +2,7 @@ from typing import Any, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.utils import tree_map
 from mlx_lm.models.cache import ArraysCache  # noqa: F401
 from mlx_lm.models.cache import BatchKVCache  # noqa: F401
 from mlx_lm.models.cache import BatchRotatingKVCache  # noqa: F401
@@ -211,6 +212,69 @@ class PreallocKVCache(KVCache):
             c.update_and_fetch(
                 src.keys[..., : src.offset, :], src.values[..., : src.offset, :]
             )
+        return c
+
+
+class PreallocQuantizedKVCache(QuantizedKVCache):
+    """QuantizedKVCache that pre-allocates the quantized triple (packed uint32 +
+    scales + biases) to a fixed token floor on first fill. Later appends write in
+    place; overflow falls back to the parent's step-256 growth."""
+
+    def __init__(self, group_size: int = 64, bits: int = 8, prealloc_tokens: int = 0):
+        super().__init__(group_size=group_size, bits=bits)
+        self.prealloc_tokens = int(prealloc_tokens or 0)
+
+    def update_and_fetch(self, keys, values):
+        if self.keys is None and self.prealloc_tokens > 0:
+            B, n_kv_heads, num_steps, k_head_dim = keys.shape
+            v_head_dim = values.shape[-1]
+            prev = self.offset
+            el_per_int = 8 * mx.uint32.size // self.bits
+            target = max(prev + num_steps, self.prealloc_tokens)
+            new_steps = ((target + self.step - 1) // self.step) * self.step
+            shape = (B, n_kv_heads, new_steps)
+
+            def init_quant(dim):
+                return (
+                    mx.zeros((*shape, dim // el_per_int), dtype=mx.uint32),
+                    mx.zeros((*shape, dim // self.group_size), dtype=keys.dtype),
+                    mx.zeros((*shape, dim // self.group_size), dtype=keys.dtype),
+                )
+
+            self.keys, self.values = init_quant(k_head_dim), init_quant(v_head_dim)
+            self.offset += num_steps
+            qk = mx.quantize(keys, group_size=self.group_size, bits=self.bits)
+            qv = mx.quantize(values, group_size=self.group_size, bits=self.bits)
+            for i in range(len(self.keys)):
+                self.keys[i][..., prev : self.offset, :] = qk[i]
+                self.values[i][..., prev : self.offset, :] = qv[i]
+            return tree_map(lambda x: x[..., : self.offset, :], (self.keys, self.values))
+        return super().update_and_fetch(keys, values)
+
+    @classmethod
+    def from_quantized(cls, src, prealloc_tokens):
+        """Copy a (possibly non-empty) QuantizedKVCache's triple into a pre-allocated
+        buffer. Copies quantized arrays directly (no re-quantization)."""
+        c = cls(group_size=src.group_size, bits=src.bits,
+                prealloc_tokens=int(prealloc_tokens or 0))
+        c.offset = src.offset
+        if src.keys is not None:
+            n = src.offset
+            cap = max(n, c.prealloc_tokens)
+            cap = ((cap + c.step - 1) // c.step) * c.step
+
+            def _grow(triple):
+                out = []
+                for arr in triple:
+                    shp = list(arr.shape)
+                    shp[2] = cap
+                    buf = mx.zeros(tuple(shp), dtype=arr.dtype)
+                    buf[..., :n, :] = arr[..., :n, :]
+                    out.append(buf)
+                return tuple(out)
+
+            c.keys = _grow(src.keys)
+            c.values = _grow(src.values)
         return c
 
 
