@@ -5354,8 +5354,9 @@ class TurboQuantKVCache(_BaseCache):
         new_end = self.offset + keys.shape[2]
         if self.keys is None:
             _trigger_allocation_hooks()
-            # Pre-allocate to max_kv_size if set, to avoid late-stage
-            # double-buffer reallocation spikes
+            # Pre-allocate to the largest of new_end, kv_prealloc_tokens, and
+            # max_kv_size (if set), to avoid late-stage double-buffer
+            # reallocation spikes
             initial_alloc = max(
                 new_end, self.prealloc_tokens or 0, self.max_kv_size or 0
             )

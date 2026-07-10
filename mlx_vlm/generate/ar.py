@@ -257,6 +257,10 @@ def generate_step(
         kv_group_size (int): Group size for uniform KV cache quantization.
         kv_quant_scheme (str): KV cache quantization backend.
         quantized_kv_start (int): Start index for quantized KV cache.
+        kv_prealloc_tokens (int, optional): Pre-allocate every KV cache to this
+          fixed token floor on first fill so generation never reallocs. Applied
+          at cache creation for fp16 models (kv_bits is None) and after
+          quantization for quantized models; must be <= max_kv_size.
         sampler (Callable[mx.array, mx.array], optional): A sampler for sampling a
           token from a vector of log probabilities.
         logits_processors (List[Callable[[mx.array, mx.array], mx.array]], optional):

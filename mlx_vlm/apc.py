@@ -60,8 +60,6 @@ logger = logging.getLogger("mlx_vlm.apc")
 
 
 def _kv_prealloc_floor() -> int:
-    import os
-
     return int(os.environ.get("KV_PREALLOC_TOKENS", 0) or 0)
 
 

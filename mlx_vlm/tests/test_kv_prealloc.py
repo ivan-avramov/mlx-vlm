@@ -1,6 +1,26 @@
+import os
+import sys
+from unittest.mock import patch
+
 import mlx.core as mx
+import pytest
 from mlx_lm.models import cache as lmcache
-from mlx_vlm.models.cache import PreallocKVCache
+
+from mlx_vlm.apc import _resolve_turn_capacity
+from mlx_vlm.generate import generate_step
+from mlx_vlm.generate.ar import _make_cache
+from mlx_vlm.generate.common import maybe_preallocate_kv_cache
+from mlx_vlm.models import cache as kvc
+from mlx_vlm.models.cache import (
+    BatchKVCache,
+    BatchQuantizedKVCache,
+    PreallocKVCache,
+    PreallocQuantizedKVCache,
+)
+from mlx_vlm.server import generation as G
+from mlx_vlm.server.cli import validate_kv_prealloc_tokens
+from mlx_vlm.tests.test_kv_cache_quantization import MockModel
+from mlx_vlm.turboquant import BatchTurboQuantKVCache, TurboQuantKVCache, _state_length
 
 H, D = 8, 128
 
@@ -55,9 +75,6 @@ def test_prealloc_kvcache_from_kvcache_copies_nonempty():
     assert c.keys.shape[2] == 262144           # zero reallocs after copy
 
 
-from mlx_vlm.models.cache import PreallocQuantizedKVCache
-
-
 def test_prealloc_quantized_allocs_floor_and_never_reallocs():
     c = PreallocQuantizedKVCache(group_size=64, bits=4, prealloc_tokens=262144)
     c.update_and_fetch(*_fake(1000))
@@ -66,6 +83,12 @@ def test_prealloc_quantized_allocs_floor_and_never_reallocs():
         c.update_and_fetch(*_fake(1))
     assert c.keys[0].shape[2] == 262144       # zero reallocs
     assert c.offset == 1400
+
+
+def test_prealloc_quantized_floor_below_prefill_uses_prefill():
+    c = PreallocQuantizedKVCache(group_size=64, bits=4, prealloc_tokens=512)
+    c.update_and_fetch(*_fake(1000))
+    assert c.keys[0].shape[2] == 1024   # ceil(1000/256)*256; floor 512 < prefill
 
 
 def test_prealloc_quantized_zero_is_backward_compatible():
@@ -82,9 +105,6 @@ def test_prealloc_quantized_from_quantized_copies_nonempty():
     assert c.offset == 512                      # content preserved
 
 
-from mlx_vlm.turboquant import TurboQuantKVCache, _state_length
-
-
 def test_turboquant_prealloc_floor_and_never_reallocs():
     c = TurboQuantKVCache(bits=4, prealloc_tokens=262144)
     c.update_and_fetch(*_fake(1000))
@@ -99,10 +119,6 @@ def test_turboquant_none_is_backward_compatible():
     c = TurboQuantKVCache(bits=4, prealloc_tokens=None)
     c.update_and_fetch(*_fake(1000))
     assert _state_length(c.keys) == 1000      # grows from new_end (today's behavior)
-
-
-from mlx_vlm.turboquant import BatchTurboQuantKVCache
-from mlx_vlm.models.cache import BatchKVCache, BatchQuantizedKVCache
 
 
 def test_batch_turboquant_prealloc():
@@ -174,11 +190,6 @@ def test_batch_turboquant_zero_is_backward_compatible():
     assert _state_length(c.keys) < 262144      # grew from the fill, not the floor
 
 
-from mlx_lm.models import cache as lmcache
-from mlx_vlm.generate.common import maybe_preallocate_kv_cache
-from mlx_vlm.models.cache import PreallocKVCache, PreallocQuantizedKVCache
-
-
 def test_maybe_preallocate_converts_empty_plain_and_quantized():
     pc = [lmcache.KVCache(), lmcache.QuantizedKVCache(group_size=64, bits=4)]
     maybe_preallocate_kv_cache(pc, 262144)
@@ -215,13 +226,6 @@ def test_maybe_preallocate_zero_and_idempotent():
     assert pc[0] is first
 
 
-import sys
-from unittest.mock import patch
-from mlx_vlm.generate import generate_step
-from mlx_vlm.models import cache as kvc
-from mlx_vlm.tests.test_kv_cache_quantization import MockModel
-
-
 def test_generate_step_forwards_kv_prealloc_tokens():
     seen = {"quantize": [], "prealloc": []}
 
@@ -250,8 +254,16 @@ def test_generate_step_forwards_kv_prealloc_tokens():
     assert seen["prealloc"] and all(x == 262144 for x in seen["prealloc"])
 
 
-import os
-from mlx_vlm.server import generation as G
+def test_make_cache_forwards_kv_prealloc_tokens():
+    class _FakeModelWithMakeCache:
+        def make_cache(self):
+            return [kvc.KVCache()]
+
+    caches = _make_cache(
+        _FakeModelWithMakeCache(), left_padding=[0], kv_prealloc_tokens=262144
+    )
+    assert isinstance(caches[0], kvc.BatchKVCache)
+    assert caches[0].prealloc_tokens == 262144
 
 
 def test_get_kv_prealloc_tokens_env(monkeypatch):
@@ -259,10 +271,6 @@ def test_get_kv_prealloc_tokens_env(monkeypatch):
     assert G.get_kv_prealloc_tokens() == 262144
     monkeypatch.delenv("KV_PREALLOC_TOKENS", raising=False)
     assert G.get_kv_prealloc_tokens() is None
-
-
-import pytest
-from mlx_vlm.server.cli import validate_kv_prealloc_tokens
 
 
 def test_validate_kv_prealloc_rejects_over_cap():
@@ -285,9 +293,6 @@ def test_prealloc_kvcache_to_quantized_slices_to_offset():
     assert q.offset == 512
     # quantized ONLY the valid prefix, not the full 262144-row pre-allocated buffer:
     assert q.keys[0].shape[2] == 512
-
-
-from mlx_vlm.apc import _resolve_turn_capacity
 
 
 def test_turn_capacity_adaptive_min():
