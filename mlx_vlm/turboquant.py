@@ -6515,6 +6515,7 @@ class BatchTurboQuantKVCache(_BaseCache):
         left_padding: list,
         bits: float,
         seed: int = DEFAULT_TURBOQUANT_SEED,
+        prealloc_tokens: int = 0,
     ):
         self.bits = _validate_bits(bits)
         self.seed = seed
@@ -6525,6 +6526,7 @@ class BatchTurboQuantKVCache(_BaseCache):
         self.left_padding = mx.array(left_padding)
         self.offset = mx.array([-lp for lp in left_padding])
         self._idx = 0
+        self.prealloc_tokens = int(prealloc_tokens or 0)
 
     # ------------------------------------------------------------------
     # Codec initialisation (deferred until first update)
@@ -6553,8 +6555,9 @@ class BatchTurboQuantKVCache(_BaseCache):
 
         new_end = prev + keys.shape[2]
         if self.keys is None:
-            self.keys = _allocate_state_like(new_keys, new_end)
-            self.values = _allocate_state_like(new_values, new_end)
+            _cap = max(new_end, self.prealloc_tokens or 0)
+            self.keys = _allocate_state_like(new_keys, _cap)
+            self.values = _allocate_state_like(new_values, _cap)
         else:
             self.keys = _reserve_state_capacity(
                 self.keys, prev, new_end, self.cache_step

@@ -99,3 +99,25 @@ def test_turboquant_none_is_backward_compatible():
     c = TurboQuantKVCache(bits=4, prealloc_tokens=None)
     c.update_and_fetch(*_fake(1000))
     assert _state_length(c.keys) == 1000      # grows from new_end (today's behavior)
+
+
+from mlx_vlm.turboquant import BatchTurboQuantKVCache
+from mlx_vlm.models.cache import BatchKVCache, BatchQuantizedKVCache
+
+
+def test_batch_turboquant_prealloc():
+    c = BatchTurboQuantKVCache(left_padding=[0], bits=4, prealloc_tokens=262144)
+    c.update_and_fetch(*_fake(1000))
+    assert _state_length(c.keys) == 262144
+
+
+def test_batch_kvcache_prealloc():
+    c = BatchKVCache([0], prealloc_tokens=262144)
+    c.update_and_fetch(*_fake(1000))
+    assert c.keys.shape[2] == 262144
+
+
+def test_batch_quantized_prealloc():
+    c = BatchQuantizedKVCache([0], group_size=64, bits=4, prealloc_tokens=262144)
+    c.update_and_fetch(*_fake(1000))
+    assert c.keys[0].shape[2] == 262144

@@ -4,7 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_map
 from mlx_lm.models.cache import ArraysCache  # noqa: F401
-from mlx_lm.models.cache import BatchKVCache  # noqa: F401
+from mlx_lm.models.cache import BatchKVCache as _MLXLMBatchKVCache
 from mlx_lm.models.cache import BatchRotatingKVCache  # noqa: F401
 from mlx_lm.models.cache import CacheList  # noqa: F401
 from mlx_lm.models.cache import ChunkedKVCache  # noqa: F401
@@ -278,6 +278,36 @@ class PreallocQuantizedKVCache(QuantizedKVCache):
         return c
 
 
+class BatchKVCache(_MLXLMBatchKVCache):
+    """Batch-aware fp16 KVCache that pre-allocates its buffer to a fixed token
+    floor on the first fill, so later appends write in place (no realloc, no
+    growth transient). Overflow beyond the floor falls back to the parent's
+    step-256 concatenate growth. Only the first-fill path is overridden; all
+    other behavior (filter/extend/merge/state/trim/...) is inherited
+    unchanged from ``mlx_lm``'s ``BatchKVCache``."""
+
+    def __init__(self, left_padding: List[int], prealloc_tokens: int = 0):
+        super().__init__(left_padding)
+        self.prealloc_tokens = int(prealloc_tokens or 0)
+
+    def update_and_fetch(self, keys, values):
+        if self.keys is None and self.prealloc_tokens > 0:
+            prev = self._idx  # 0 on first fill
+            B, n_kv_heads, incoming, k_head_dim = keys.shape
+            v_head_dim = values.shape[3]
+            new_end = prev + incoming
+            target = max(new_end, self.prealloc_tokens)
+            cap = ((target + self.step - 1) // self.step) * self.step
+            self.keys = mx.zeros((B, n_kv_heads, cap, k_head_dim), keys.dtype)
+            self.values = mx.zeros((B, n_kv_heads, cap, v_head_dim), values.dtype)
+            self.offset += incoming
+            self._idx = new_end
+            self.keys[..., prev:new_end, :] = keys
+            self.values[..., prev:new_end, :] = values
+            return self.keys[..., :new_end, :], self.values[..., :new_end, :]
+        return super().update_and_fetch(keys, values)
+
+
 class BatchQuantizedKVCache(_BaseCache):
     """Batch-aware quantized KV cache for continuous batching.
 
@@ -294,6 +324,7 @@ class BatchQuantizedKVCache(_BaseCache):
         left_padding: List[int],
         group_size: int = 64,
         bits: int = 8,
+        prealloc_tokens: int = 0,
     ):
         self.keys = None  # tuple (packed, scales, biases) or None
         self.values = None
@@ -302,6 +333,7 @@ class BatchQuantizedKVCache(_BaseCache):
         self._idx = 0
         self.group_size = group_size
         self.bits = bits
+        self.prealloc_tokens = int(prealloc_tokens or 0)
 
     def update_and_fetch(self, keys: mx.array, values: mx.array):
         """Quantize incoming keys/values and append to the cache.
@@ -319,7 +351,12 @@ class BatchQuantizedKVCache(_BaseCache):
         el_per_int = 8 * mx.uint32.size // self.bits
 
         if self.keys is None or (prev + num_steps) > self.keys[0].shape[-2]:
-            new_steps = (self.step + num_steps - 1) // self.step * self.step
+            _target = (
+                num_steps
+                if self.keys is not None
+                else max(num_steps, prev + num_steps, self.prealloc_tokens or 0)
+            )
+            new_steps = (self.step + _target - 1) // self.step * self.step
             shape = (B, n_kv_heads, new_steps)
 
             def _init(dim):
