@@ -29,6 +29,21 @@ def _weight_map(model_path: Path) -> Dict[str, str]:
     return data.get("weight_map", {})
 
 
+def _config_mtp_file(model_path: Path) -> Optional[Path]:
+    config_path = model_path / "config.json"
+    if not config_path.exists():
+        return None
+    with open(config_path) as f:
+        config = json.load(f)
+    mtp_file = config.get("mtp_file") or (config.get("mlx_lm_extra_tensors") or {}).get(
+        "mtp_file"
+    )
+    if not mtp_file:
+        return None
+    path = model_path / mtp_file
+    return path if path.exists() else None
+
+
 def _iter_mtp_keys(model_path: Path) -> Iterable[tuple[Path, list[str]]]:
     weight_map = _weight_map(model_path)
     if weight_map:
@@ -41,7 +56,13 @@ def _iter_mtp_keys(model_path: Path) -> Iterable[tuple[Path, list[str]]]:
                 yield model_path / filename, keys
             return
 
-    for file in _safetensor_files(model_path):
+    # Some converters (e.g. mlx-optiq) relocate the mtp sidecar out of the
+    # repo root (so non-recursive *.safetensors globs skip it) and record
+    # its real path in config.json instead.
+    sidecar = _config_mtp_file(model_path)
+    candidates = [sidecar] if sidecar else _safetensor_files(model_path)
+
+    for file in candidates:
         with safe_open(file, framework="mlx") as f:
             keys = [key for key in f.keys() if key.startswith("mtp.")]
         if keys:

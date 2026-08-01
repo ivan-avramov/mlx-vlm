@@ -2981,6 +2981,47 @@ def test_split_qwen3_5_mtp_writes_sidecar_without_index_mtp_entries(tmp_path):
     assert weights["pre_fc_norm_hidden.weight"][0].item() == 1.0
 
 
+def test_split_qwen3_5_mtp_finds_sidecar_via_config_mtp_file(tmp_path):
+    # mlx-optiq packages some quants with the mtp sidecar moved into a
+    # subfolder (e.g. optiq/mtp.safetensors) so non-recursive *.safetensors
+    # globs (mlx-vlm's load_model, LM Studio) don't choke on the extra
+    # tensors. config.json's mtp_file points at the real location.
+    source = tmp_path / "source"
+    output = tmp_path / "mtp"
+    (source / "optiq").mkdir(parents=True)
+    text_config = _tiny_qwen3_5_text_config()
+    text_config.mtp_num_hidden_layers = 1
+    (source / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3_5",
+                "text_config": text_config.to_dict(),
+                "mtp_file": "optiq/mtp.safetensors",
+            }
+        )
+    )
+    mx.save_safetensors(
+        str(source / "optiq" / "mtp.safetensors"),
+        {
+            "mtp.fc.weight": mx.ones((16, 32)),
+            "mtp.pre_fc_norm_hidden.weight": mx.zeros((16,)),
+        },
+        metadata={},
+    )
+    (source / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"model.foo": "model.safetensors"}})
+    )
+
+    split_qwen3_5_mtp(str(source), str(output))
+
+    with open(output / "config.json") as f:
+        cfg = json.load(f)
+    weights = mx.load(str(output / "model.safetensors"))
+    assert cfg["model_type"] == "qwen3_5_mtp"
+    assert "fc.weight" in weights
+    assert weights["pre_fc_norm_hidden.weight"][0].item() == 1.0
+
+
 def test_deepseek_v4_returns_mtp_hidden_and_trims_without_snapshot():
     cfg = _tiny_deepseek_v4_config()
     lm = deepseek_language.LanguageModel(cfg)
