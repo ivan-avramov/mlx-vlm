@@ -2331,6 +2331,14 @@ class LanguageModel(nn.Module):
                     for token, keep in zip(input_ids.tolist(), row_mask)
                     if keep == 1
                 ]
+                if not input_tokens:
+                    # Fully masked row (e.g. an inactive/padding-only batch slot):
+                    # no real tokens to place. position_ids for this row keeps the
+                    # all-ones placeholder set at init above; skip straight to the
+                    # next row instead of falling through into an empty-array
+                    # concatenate/max below.
+                    mrope_position_deltas.append(0)
+                    continue
                 image_nums, video_nums = 0, 0
                 vision_tokens = [
                     input_tokens[idx + 1]
