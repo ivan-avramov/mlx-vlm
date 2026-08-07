@@ -469,7 +469,7 @@ On prompts with 10+ independent constraints, Gemma 4 reasoning can enter a runaw
 
 **Change Log Over Upstream**
 
-Refresh authoritative commit list with `git log --pretty=format:"%h|%ad|%s" --date=short upstream..HEAD`.
+Refresh authoritative commit list with `git log --pretty=format:"%h|%ad|%s" --date=short upstream/main..HEAD`.
 
 **Upstream base:** `c2058a5` *Fix Kimi VL concurrent Metal crash and mixed-batch text degradation (#1039)*
 
@@ -496,7 +496,7 @@ Refresh authoritative commit list with `git log --pretty=format:"%h|%ad|%s" --da
 | `e48ef69` | 2026-05-02 | feat(server): SSE thinking-state-machine rewrite — `_step_thinking_state` helper, `_partial_tag_start_pos` ends-with-prefix detection. Fixes for token-spanning tags, partial-buffer leak, multi-transition-per-token, double-append regression, per-turn-opener leak while seeded `in_thinking=True`. | #29, #29b, #29c, #29d, #29e |
 | `2d5feec` | 2026-05-02 → 2026-05-03 | feat(generate,snapshot,server): asymmetric-template caching with hybrid-cache rewind. `RotatingKVSnapshot` for SWA layers (post-gen-trim wrap-detection guard); `_compute_anchor_before_latest_user_offset` for OWUI RAG-context wrapping; `_first_kv_offset` for hybrid topology; mid-prefill capture with three side-channels (rotating + arrays + offset marker); pre-prefill capture for OWUI tool-continuation flow; `_trim_cache` skip-list fix for `QuantizedKVCache` / `BatchQuantizedKVCache`; cache-trim-back to end-of-user post-generation. Squashes the four progressive fixes #31a–#31d (originally `e2a567f`, `53ca424`, `5817e82`, `925ff11`) plus the diagnostic-add/revert pair (`bb323f2` + `5ffdbb7`, net-zero). | #28, #30, #31, #31a, #31b, #31c, #31d |
 
-Sections #1–#16 (the pre-port architecture work — StreamingTranslator, MultiCacheManager, prefill-step tuning, RoPE desync fix, ghost-prompt removal, etc.) predate the current `upstream` branch tip and are not individually itemized in this commit table; they're reflected in the cumulative diff `git diff upstream..HEAD`.
+Sections #1–#16 (the pre-port architecture work — StreamingTranslator, MultiCacheManager, prefill-step tuning, RoPE desync fix, ghost-prompt removal, etc.) predate the last-merged upstream tip and are not individually itemized in this commit table; they're reflected in the cumulative diff `git diff upstream/main...HEAD` (three dots — diffs from the merge base).
 
 ---
 

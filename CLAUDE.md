@@ -8,9 +8,21 @@ MLX-VLM is a Python package for inference and fine-tuning of Vision Language Mod
 
 ## Fork & Branches
 
-This repo is a fork of the upstream project (Blaizzy/mlx-vlm). The `upstream`
-branch is kept in sync with the upstream project; `main` carries local custom
-changes on top. There is no `upstream` git remote — only `origin` (the fork).
+This repo is a fork of the upstream project (Blaizzy/mlx-vlm). `main` is the
+only branch on the fork and carries local custom changes on top of upstream.
+
+Two remotes: `origin` (the fork, `ivan-avramov/mlx-vlm`) and `upstream`
+(`Blaizzy/mlx-vlm`, fetch-only — its push URL is `no_push`).
+
+Sync upstream changes with a merge (never rebase — `main` is published):
+```bash
+git fetch upstream
+git merge upstream/main
+git push origin main
+```
+
+Use `upstream/main` to refer to upstream, and `upstream/main...HEAD` (three
+dots, i.e. from the merge base) for the cumulative diff of local changes.
 See `memory.md` for the change log over upstream.
 
 ## Common Commands
