@@ -349,6 +349,16 @@ def main():
         "Default: off.",
     )
     parser.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=None,
+        help=(
+            "Maximum number of sequences decoded concurrently in the continuous "
+            "batch. Requests beyond this wait in the queue (backpressure), bounding "
+            "peak memory. Default: unbounded. Maps to MLX_VLM_MAX_NUM_SEQS."
+        ),
+    )
+    parser.add_argument(
         "--top-logprobs-k",
         type=int,
         default=None,
@@ -484,19 +494,19 @@ def main():
     os.environ["MLX_VLM_VISION_CACHE_SIZE"] = str(args.vision_cache_size)
     if args.draft_model:
         os.environ["MLX_VLM_DRAFT_MODEL"] = args.draft_model
-        if args.draft_kind is not None:
-            os.environ["MLX_VLM_DRAFT_KIND"] = args.draft_kind
-        if args.draft_block_size is not None:
-            os.environ["MLX_VLM_DRAFT_BLOCK_SIZE"] = str(args.draft_block_size)
-    elif args.draft_kind == "suffix":
-        # Drafter-free suffix decoding: no model path, just the n-gram knobs.
-        os.environ["MLX_VLM_DRAFT_KIND"] = "suffix"
-        if args.draft_block_size is not None:
-            os.environ["MLX_VLM_DRAFT_BLOCK_SIZE"] = str(args.draft_block_size)
-        if args.suffix_min_match is not None:
-            os.environ["MLX_VLM_SUFFIX_MIN_MATCH"] = str(args.suffix_min_match)
-        if args.draft_cooldown is not None:
-            os.environ["MLX_VLM_DRAFT_COOLDOWN"] = str(args.draft_cooldown)
+    # draft_kind/draft_block_size are set unconditionally (not gated on
+    # draft_model) so drafter-free suffix decoding (no model path, just the
+    # n-gram knobs) can also configure itself here.
+    if args.draft_kind is not None:
+        os.environ["MLX_VLM_DRAFT_KIND"] = args.draft_kind
+    if args.draft_block_size is not None:
+        os.environ["MLX_VLM_DRAFT_BLOCK_SIZE"] = str(args.draft_block_size)
+    if args.suffix_min_match is not None:
+        os.environ["MLX_VLM_SUFFIX_MIN_MATCH"] = str(args.suffix_min_match)
+    if args.draft_cooldown is not None:
+        os.environ["MLX_VLM_DRAFT_COOLDOWN"] = str(args.draft_cooldown)
+    if args.max_num_seqs is not None:
+        os.environ["MLX_VLM_MAX_NUM_SEQS"] = str(args.max_num_seqs)
     if args.prefill_step_size:
         os.environ["PREFILL_STEP_SIZE"] = str(args.prefill_step_size)
     os.environ["MLX_VLM_MAX_TOKENS"] = str(args.max_tokens)

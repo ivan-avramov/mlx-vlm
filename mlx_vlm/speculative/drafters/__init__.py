@@ -2,6 +2,7 @@ import json
 import logging
 from typing import Any, Optional, Tuple
 
+from .laguna_dflash import LagunaDFlashDraftModel
 from .qwen3_dflash import DFlashDraftModel
 
 KNOWN_DRAFTER_KINDS = {"dflash", "mtp", "eagle3"}
@@ -14,6 +15,7 @@ DRAFTER_KIND_BY_MODEL_TYPE = {
     "gemma4_assistant": "mtp",
     "gemma4_unified_assistant": "mtp",
     "qwen3_5_mtp": "mtp",
+    "laguna": "dflash",
 }
 
 DEFAULT_DRAFTER_KIND = "dflash"
@@ -29,6 +31,19 @@ def _cfg_get(config: Any, key: str, default: Any = None) -> Any:
 
 def _hidden_size(config: Any) -> Any:
     return _cfg_get(_cfg_get(config, "text_config", config), "hidden_size")
+
+
+def _noop_target_compatibility(target_model: Any) -> None:
+    del target_model
+
+
+def _validate_model_specific_compatibility(target_model: Any, draft_model: Any) -> None:
+    validator = getattr(
+        draft_model,
+        "validate_target_compatibility",
+        _noop_target_compatibility,
+    )
+    validator(target_model)
 
 
 def validate_drafter_compatibility(
@@ -54,6 +69,8 @@ def validate_drafter_compatibility(
             f"Drafter model_type={model_type!r} requires draft_kind={expected_kind!r}. "
             f"Got draft_kind={draft_kind!r}."
         )
+
+    _validate_model_specific_compatibility(target_model, draft_model)
 
     if draft_kind != "mtp":
         return
@@ -152,6 +169,7 @@ def load_drafter(
 
 __all__ = [
     "DFlashDraftModel",
+    "LagunaDFlashDraftModel",
     "KNOWN_DRAFTER_KINDS",
     "DRAFTER_KIND_BY_MODEL_TYPE",
     "DEFAULT_DRAFTER_KIND",
