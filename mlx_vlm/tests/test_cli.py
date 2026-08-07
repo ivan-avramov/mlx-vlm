@@ -58,7 +58,9 @@ def test_chat_verbose_flag_uses_boolean_optional_action():
 
 
 def test_video_generate_verbose_flag_uses_boolean_optional_action():
-    _assert_verbose_uses_boolean_optional_action("mlx_vlm/video_generate.py")
+    _assert_verbose_uses_boolean_optional_action(
+        "mlx_vlm/video_generate.py", expected_default=True
+    )
 
 
 def test_generate_verbose_flag_semantics():

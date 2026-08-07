@@ -122,6 +122,7 @@ from .responses_state import (
     _response_output_items_from_text,
     _response_tool_registry,
     _split_thinking,
+    prompt_has_open_thinking,
 )
 from .responses_state import _sse_event as _response_sse_event
 from .responses_state import (
