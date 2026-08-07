@@ -1,0 +1,16 @@
+# File-parity exclusions for dev/check_upstream_parity.py
+#
+# Format: path_glob  # reason
+#
+# List a path here only when a file that exists in upstream/main is
+# *intentionally* absent from this fork. Every entry needs a reason; the check
+# fails on an entry without one.
+#
+# This file is currently empty on purpose: as of the 0c846ef merge every file in
+# upstream/main is present here. The 16 test files an earlier merge silently
+# dropped were restored rather than excused -- see docs/upstream-gaps.md for why
+# a dropped file never comes back on its own.
+#
+# Prefer restoring over excluding. `git checkout upstream/main -- <path>` is
+# almost always the right answer; an exclusion permanently blinds this check for
+# that path.

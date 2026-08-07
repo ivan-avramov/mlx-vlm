@@ -46,13 +46,13 @@ from .responses_state import (
     _response_items_to_chat,
     _response_output_items_from_text,
     _response_tool_registry,
-    prompt_has_open_thinking,
 )
 from .responses_state import _sse_event as _response_sse_event
 from .responses_state import (
     _step_thinking_state,
     _store_response,
     process_tool_calls,
+    prompt_has_open_thinking,
     response_store,
     response_store_lock,
     suppress_tool_call_content,
@@ -440,9 +440,7 @@ def _completion_final_chunk(
         id=request_id,
         created=created,
         model=model,
-        choices=[
-            CompletionStreamChoice(text="", index=0, finish_reason=finish_reason)
-        ],
+        choices=[CompletionStreamChoice(text="", index=0, finish_reason=finish_reason)],
     )
 
 
@@ -2517,9 +2515,7 @@ async def completions_endpoint(request: Request):
                             id=request_id,
                             created=created,
                             model=completion_request.model,
-                            choices=[
-                                CompletionStreamChoice(text=raw_prompt, index=0)
-                            ],
+                            choices=[CompletionStreamChoice(text=raw_prompt, index=0)],
                         )
                         yield f"data: {chunk.to_sse_json()}\n\n"
 
@@ -2566,9 +2562,7 @@ async def completions_endpoint(request: Request):
                                 id=request_id,
                                 created=created,
                                 model=completion_request.model,
-                                choices=[
-                                    CompletionStreamChoice(text=delta, index=0)
-                                ],
+                                choices=[CompletionStreamChoice(text=delta, index=0)],
                             )
                             yield f"data: {chunk.to_sse_json()}\n\n"
 

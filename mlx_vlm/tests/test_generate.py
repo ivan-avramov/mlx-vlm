@@ -26,7 +26,9 @@ from mlx_vlm.generate import (
 from mlx_vlm.generate import ar as ar_module
 from mlx_vlm.generate import common as common_module
 from mlx_vlm.generate import dispatch as dispatch_module
-from mlx_vlm.generate import normalize_resize_shape
+from mlx_vlm.generate import (
+    normalize_resize_shape,
+)
 from mlx_vlm.models.cache import BufferedRotatingKVCache
 from mlx_vlm.utils import ThinkingBudgetCriteria
 
@@ -1822,7 +1824,6 @@ def test_generate_cli_smoke(capsys):
     assert capsys.readouterr().out.strip() == "done"
 
 
-
 def test_generate_cli_forwards_video_to_template_and_generate(capsys):
     args = Namespace(
         model="demo",
@@ -2142,9 +2143,7 @@ class TestPrefixCacheReuseTrim:
         unsafe = self._ring(36, start_position=20)
         assert common_module._rotating_rewind_safe([[unsafe]], 5) is False
         assert (
-            common_module._rotating_rewind_safe(
-                [SimpleNamespace(caches=[unsafe])], 5
-            )
+            common_module._rotating_rewind_safe([SimpleNamespace(caches=[unsafe])], 5)
             is False
         )
 

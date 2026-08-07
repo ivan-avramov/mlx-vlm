@@ -14,12 +14,31 @@ only branch on the fork and carries local custom changes on top of upstream.
 Two remotes: `origin` (the fork, `ivan-avramov/mlx-vlm`) and `upstream`
 (`Blaizzy/mlx-vlm`, fetch-only — its push URL is `no_push`).
 
-Sync upstream changes with a merge (never rebase — `main` is published):
+Merge, never rebase. `main` is published, and it carries ~818 local commits and
+91 merge commits — a rebase would replay all of them and silently flatten the
+merge topology, to reach the same tree a merge reaches in a handful of hunks.
+
 ```bash
 git fetch upstream
 git merge upstream/main
+python dev/check_upstream_parity.py     # no upstream file silently dropped
+python dev/check_upstream_symbols.py    # no upstream def/class silently dropped
+cd mlx_vlm/ && pytest ./tests --ignore=tests/test_smoke.py --ignore=tests/test_utils.py
 git push origin main
 ```
+
+**Run both checks after every merge — this is not optional.** A merge resolution
+that drops an upstream file or hunk is permanent and self-healing-proof: the
+upstream commit still becomes an ancestor of `main`, so git treats the content
+as deliberately deleted and no later merge re-offers it. An earlier merge lost 16
+upstream test files exactly this way, invisibly. `docs/upstream-gaps.md` explains
+the mechanism and is the current gap list; `docs/post-merge-gaps-2026-08-06.md`
+is superseded.
+
+When resolving conflicts, prefer a **union** over picking a side. The fork and
+upstream both add to shared lists (`__all__`, lazy import tuples, skip-lists);
+taking one side drops the other's contribution and often only fails at runtime,
+not at import.
 
 Use `upstream/main` to refer to upstream, and `upstream/main...HEAD` (three
 dots, i.e. from the merge base) for the cumulative diff of local changes.
@@ -32,10 +51,26 @@ See `memory.md` for the change log over upstream.
 pip install -e .
 ```
 
+A local venv with test deps (used by the commands below):
+```bash
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python -e . pytest pytest-asyncio
+```
+
 ### Run tests
 ```bash
 cd mlx_vlm/ && pytest -s ./tests --ignore=tests/test_smoke.py --ignore=tests/test_utils.py
 ```
+
+The suite is **not green** and has not been for a while: 76 failed / 1924 passed
+as of the `0c846ef` merge. Compare against that number rather than expecting
+zero — `docs/upstream-gaps.md` breaks the failures down by cause. Most are
+unported upstream features, surfaced by test files that used to be missing.
+
+`mlx_vlm/tests/conftest.py` skips 6 restored upstream test files that import
+symbols this fork never ported, each with a reason. Restored upstream tests are
+kept byte-identical to upstream so future merges apply cleanly to them; put skip
+decisions in `conftest.py`, not in the test files.
 
 ### Run a single test file
 ```bash

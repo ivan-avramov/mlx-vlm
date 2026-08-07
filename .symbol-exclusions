@@ -1,0 +1,551 @@
+# Symbol-parity baseline for dev/check_upstream_symbols.py
+#
+# Format: path_glob::symbol_glob  # reason
+#
+# Every line below is an upstream symbol that is absent from our copy of the
+# same file, captured as a BASELINE on 2026-08-07 against upstream/main.
+# It is a snapshot of existing divergence, NOT an assertion that each line is
+# correct. The mix is roughly:
+#
+#   * upstream features this fork never ported
+#   * modules the fork deliberately rewrote (sample_utils, apc, cache,
+#     server/generation) where upstream's helper names simply do not apply
+#   * genuine hunks dropped by past merges -- the failure mode documented in
+#     docs/upstream-gaps.md
+#
+# Entries are listed per symbol rather than per file on purpose: a file-wide
+# `apc.py::*` would also hide the NEXT symbol silently lost from apc.py, which
+# is exactly what this check exists to catch.
+#
+# Shrinking this file is good. When you port or restore something, delete its
+# line. Nothing should ever be ADDED here without a specific reason replacing
+# the generic one.
+
+
+# --- mlx_vlm/apc.py
+mlx_vlm/apc.py::APCSelfCheckResult  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/apc.py::LayerSupport  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/apc.py::_adapter_schema_version  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/apc.py::_align_exact_batch_caches_to_kv_policy  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/apc.py::_empty_quant_batch_cache  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/apc.py::_env_truthy  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/apc.py::_fill_batch_layer_cache  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/apc.py::_fill_stream_layer_cache  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/apc.py::_hash_payload  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/apc.py::_layer_capability  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/apc.py::_prompt_cache_is_batch_shaped  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/apc.py::_resident_bytes_locked  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/apc.py::_tensor_content_hash  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/apc.py::apc_disk_namespace  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/apc.py::apc_lookup_plan  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/apc.py::apc_trace  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/apc.py::apc_trace_enabled  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/apc.py::classify_layer_for_apc  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/apc.py::commit_prefix_blocks  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/apc.py::layer_kv_for_apc  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/apc.py::lock_count  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/apc.py::model_key_dependencies  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/apc.py::node_key  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/apc.py::parent_key  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/apc.py::prefix_len  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/apc.py::record_reject  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/apc.py::resident_bytes  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/apc.py::self_check_model_apc  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/apc.py::semantic_extra_hash  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/apc.py::snapshot_prompt_cache_row  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/apc.py::validate_prompt_cache_layout  # baseline: pre-existing divergence, unreviewed
+
+# --- mlx_vlm/convert.py
+mlx_vlm/convert.py::_apply_awq_calibration  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/convert.py::_build_multimodal_awq_run  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/convert.py::_has_decoder  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/convert.py::run  # baseline: pre-existing divergence, unreviewed
+
+# --- mlx_vlm/generate/ar.py
+mlx_vlm/generate/ar.py::_capture_rope_deltas_from_prompt_kwargs  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/generate/ar.py::_concat_prompt_kwarg_rows  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/generate/ar.py::_ensure_logits_processor_slots  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/generate/ar.py::_fused_greedy_step  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/generate/ar.py::_is_mrope_position_ids_prompt_kwarg  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/generate/ar.py::_mrope_position_ids_row  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/generate/ar.py::_normalize_rope_deltas  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/generate/ar.py::_prompt_kwarg_batch_size  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/generate/ar.py::_slice_sequence_aligned_prompt_kwarg  # baseline: pre-existing divergence, unreviewed
+
+# --- mlx_vlm/generate/diffusion.py
+mlx_vlm/generate/diffusion.py::_diffusion_initial_canvas  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/generate/diffusion.py::_diffusion_stream_strategy  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/generate/diffusion.py::_has_engine_diffusion_config  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/generate/diffusion.py::_has_model_diffusion_generator  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/generate/diffusion.py::_normalize_decoder_input_ids  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/generate/diffusion.py::_stream_model_diffusion_from_kwargs  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/generate/diffusion.py::_stream_model_diffusion_generate  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/generate/diffusion.py::_uses_model_diffusion_generator  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/generate/diffusion.py::emit  # baseline: pre-existing divergence, unreviewed
+
+# --- mlx_vlm/generate/dispatch.py
+mlx_vlm/generate/dispatch.py::GenerationResult  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/generate/dispatch.py::PromptCacheState  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/generate/dispatch.py::__init__  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/generate/dispatch.py::_cache_fully_retained  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/generate/dispatch.py::_prefix_cache_trim_amount  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/generate/dispatch.py::find_prefix_length  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/generate/dispatch.py::maybe_quantize_kv_cache  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/generate/dispatch.py::quantize_entry  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/generate/dispatch.py::update  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/generate/dispatch.py::wired_limit  # baseline: pre-existing divergence, unreviewed
+
+# --- mlx_vlm/generate/image.py
+mlx_vlm/generate/image.py::_image_generation_model_class_from_path  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/generate/image.py::_image_model_type_from_component_indexes  # baseline: pre-existing divergence, unreviewed
+
+# --- mlx_vlm/models/base.py
+mlx_vlm/models/base.py::align_attention_mask_to_scores  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/base.py::create_attention_mask  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/base.py::create_ssm_mask  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/base.py::quantized_scaled_dot_product_attention  # baseline: pre-existing divergence, unreviewed
+
+# --- mlx_vlm/models/cache.py
+mlx_vlm/models/cache.py::ArraysCache  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/cache.py::BatchRotatingKVCache  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/cache.py::CacheList  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/cache.py::ChunkedKVCache  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/cache.py::KVCache  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/cache.py::QuantizedKVCache  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/cache.py::RotatingKVCache  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/cache.py::_BaseCache  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/cache.py::__getitem__  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/cache.py::__new__  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/cache.py::__setitem__  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/cache.py::_dequantize_uniform  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/cache.py::_temporal_order  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/cache.py::_trim  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/cache.py::_update_concat  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/cache.py::_update_in_place  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/cache.py::advance  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/cache.py::batch_size  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/cache.py::cat  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/cache.py::create_attention_mask  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/cache.py::create_causal_mask  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/cache.py::dequantize_for_apc  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/cache.py::dynamic_roll  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/cache.py::expand_quant  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/cache.py::from_state  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/cache.py::is_single_row  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/cache.py::maybe_trim_front  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/cache.py::pad  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/cache.py::prefix_cache_merge  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/cache.py::prefix_cache_restore  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/cache.py::prefix_cache_snapshot  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/cache.py::should_quantize_kv_layer  # baseline: pre-existing divergence, unreviewed
+
+# --- mlx_vlm/models/deepseek_v4/language.py
+mlx_vlm/models/deepseek_v4/language.py::_hisa_select  # baseline: pre-existing divergence, unreviewed
+
+# --- mlx_vlm/models/gemma4/gemma4.py
+mlx_vlm/models/gemma4/gemma4.py::_encode_image  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/gemma4/gemma4.py::_encode_video  # baseline: pre-existing divergence, unreviewed
+
+# --- mlx_vlm/models/gemma4/processing_gemma4.py
+mlx_vlm/models/gemma4/processing_gemma4.py::_convert_video_to_patches  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/gemma4/processing_gemma4.py::_pad_video_patches  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/gemma4/processing_gemma4.py::check_argument_for_proper_class  # baseline: pre-existing divergence, unreviewed
+
+# --- mlx_vlm/models/gemma4/vision.py
+mlx_vlm/models/gemma4/vision.py::embed_patches  # baseline: pre-existing divergence, unreviewed
+
+# --- mlx_vlm/models/qwen3_5/gated_delta.py
+mlx_vlm/models/qwen3_5/gated_delta.py::_gated_delta_step_ops  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/qwen3_5/gated_delta.py::_invert_unit_lower  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/qwen3_5/gated_delta.py::_make_gated_delta_kernel  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/qwen3_5/gated_delta.py::gated_delta_chunked  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/qwen3_5/gated_delta.py::gated_delta_kernel  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/qwen3_5/gated_delta.py::gated_delta_ops  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/qwen3_5/gated_delta.py::rc  # baseline: pre-existing divergence, unreviewed
+
+# --- mlx_vlm/models/qwen3_5/language.py
+mlx_vlm/models/qwen3_5/language.py::_is_ssm_cache  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/models/qwen3_5/language.py::_restore_batch_padding_metadata  # baseline: pre-existing divergence, unreviewed
+
+# --- mlx_vlm/models/text_only.py
+mlx_vlm/models/text_only.py::_resolve_text_model_classes  # baseline: pre-existing divergence, unreviewed
+
+# --- mlx_vlm/prompt_utils.py
+mlx_vlm/prompt_utils.py::_get_video_token  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/prompt_utils.py::_template_references_kw  # baseline: pre-existing divergence, unreviewed
+
+# --- mlx_vlm/sample_utils.py
+mlx_vlm/sample_utils.py::_apply_min_p  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/sample_utils.py::_apply_top_k  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/sample_utils.py::_top_n_sigma  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/sample_utils.py::_typical_p  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/sample_utils.py::apply_min_p  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/sample_utils.py::apply_p_less  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/sample_utils.py::apply_top_k  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/sample_utils.py::apply_top_n_sigma  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/sample_utils.py::apply_top_p  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/sample_utils.py::apply_typical_p  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/sample_utils.py::apply_xtc  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/sample_utils.py::categorical_sampling  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/sample_utils.py::frequency_penalty_processor  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/sample_utils.py::logit_bias_processor  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/sample_utils.py::make_frequency_penalty  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/sample_utils.py::make_logits_processors  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/sample_utils.py::make_presence_penalty  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/sample_utils.py::make_repetition_penalty  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/sample_utils.py::make_sampler  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/sample_utils.py::presence_penalty_processor  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/sample_utils.py::repetition_penalty_processor  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/sample_utils.py::sampler  # baseline: pre-existing divergence, unreviewed
+
+# --- mlx_vlm/server/generation.py
+mlx_vlm/server/generation.py::QueuedGenerationRequest  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/server/generation.py::_DiffusionBlockEmitter  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/server/generation.py::_check_configured_context_budget  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/server/generation.py::_log_decode_progress  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/server/generation.py::_log_prefill_completed  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/server/generation.py::_log_prefill_progress  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/server/generation.py::_log_prefill_started  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/server/generation.py::_preprocess_request  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/server/generation.py::_request_log_id  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/server/generation.py::_sample_top_p_one  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/server/generation.py::diffusion_kwargs  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/server/generation.py::feed  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/server/generation.py::get_log_progress_interval  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/server/generation.py::on_result  # baseline: pre-existing divergence, unreviewed
+
+# --- mlx_vlm/server/openai.py
+mlx_vlm/server/openai.py::_content_has_effective_input  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/server/openai.py::_ensure_effective_input  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/server/openai.py::_extract_video_reference  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/server/openai.py::_has_non_empty_text  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/server/openai.py::_message_has_effective_input  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/server/openai.py::_normalize_response_instruction_messages  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/server/openai.py::_prepare_chat_tool_choice  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/server/openai.py::_tool_function_name  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/server/openai.py::_with_tool_choice_instruction  # baseline: pre-existing divergence, unreviewed
+
+# --- mlx_vlm/server/responses_state.py
+mlx_vlm/server/responses_state.py::_reasoning_output_items  # baseline: pre-existing divergence, unreviewed
+
+# --- mlx_vlm/server/schemas.py
+mlx_vlm/server/schemas.py::ResponseInputVideoParam  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/server/schemas.py::ResponseVideoParam  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/server/schemas.py::ResponseVideoUrlParam  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/server/schemas.py::StreamingTimings  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/server/schemas.py::VideoUrl  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/server/schemas.py::sync_reasoning_aliases  # baseline: pre-existing divergence, unreviewed
+
+# --- mlx_vlm/speculative/drafters/qwen3_dflash/dflash.py
+mlx_vlm/speculative/drafters/qwen3_dflash/dflash.py::Qwen3MLP  # baseline: pre-existing divergence, unreviewed
+
+# --- mlx_vlm/structured.py
+mlx_vlm/structured.py::_allocate_shared_bitmask  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/structured.py::_apply_llguidance_mask  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/structured.py::_fill_next_token_mask  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/structured.py::prepare_next_token_mask  # baseline: pre-existing divergence, unreviewed
+
+# --- mlx_vlm/tests/test_batch_quantized_cache.py
+mlx_vlm/tests/test_batch_quantized_cache.py::FakeModelDeep  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_batch_quantized_cache.py::FakeModelShallow  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_batch_quantized_cache.py::TestPrepareFinalize  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_batch_quantized_cache.py::TestShouldQuantizeKvLayerPolicy  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_batch_quantized_cache.py::test_deep_stack_boundary  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_batch_quantized_cache.py::test_deep_stack_skips_last  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_batch_quantized_cache.py::test_finalize_noop_without_prepare  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_batch_quantized_cache.py::test_finalize_updates_left_padding_like_batch_kv  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_batch_quantized_cache.py::test_make_cache_uses_should_quantize_kv_layer_policy  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_batch_quantized_cache.py::test_prepare_finalize_methods_exist  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_batch_quantized_cache.py::test_prepare_stores_right_padding  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_batch_quantized_cache.py::test_shallow_stack_quantizes_all  # baseline: pre-existing divergence, unreviewed
+
+# --- mlx_vlm/tests/test_cli.py
+mlx_vlm/tests/test_cli.py::_assert_thinking_mode_flag  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_cli.py::_find_add_argument  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_cli.py::_literal_values  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_cli.py::test_chat_thinking_mode_flag  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_cli.py::test_generate_thinking_mode_flag  # baseline: pre-existing divergence, unreviewed
+
+# --- mlx_vlm/tests/test_gemma4_tool_parser.py
+mlx_vlm/tests/test_gemma4_tool_parser.py::test_bare_call_syntax  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_gemma4_tool_parser.py::test_bare_function_syntax  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_gemma4_tool_parser.py::test_bare_namespaced_function_syntax  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_gemma4_tool_parser.py::test_process_tool_calls_handles_raw_diffusion_gemma_output  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_gemma4_tool_parser.py::test_process_tool_calls_ignores_non_call_prose  # baseline: pre-existing divergence, unreviewed
+
+# --- mlx_vlm/tests/test_generate.py
+mlx_vlm/tests/test_generate.py::FallbackArgmaxModel  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_generate.py::TestBatchTurboQuantizedKVStart  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_generate.py::_cache_kinds  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_generate.py::_fill  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_generate.py::fused_greedy_decode  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_generate.py::make_batch  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_generate.py::pop_forced_token_id  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_generate.py::record_async_eval  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_generate.py::test_batch_generate_optional_input_annotations_match_defaults  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_generate.py::test_batch_generator_apc_media_token_ids_handles_text_only_model  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_generate.py::test_capture_rope_deltas_prefers_prompt_kwargs  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_generate.py::test_cold_batch_merges_mixed_text_and_mrope_position_ids  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_generate.py::test_default_preserves_immediate_quantization  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_generate.py::test_defers_to_float_below_threshold  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_generate.py::test_empty_cache_is_reusable  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_generate.py::test_flat_cache_trims_to_prefix  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_generate.py::test_full_prefix_needs_no_trim  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_generate.py::test_generate_step_schedules_final_prefill_async  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_generate.py::test_generation_batch_extend_discards_inactive_stale_processor_state  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_generate.py::test_generation_batch_extend_expands_compact_processor_state  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_generate.py::test_generation_batch_ignores_speculative_argmax_without_fused_decode  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_generate.py::test_generation_batch_thinking_budget_does_not_sync_next_token  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_generate.py::test_generation_batch_uses_fused_greedy_decode_without_logprobs  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_generate.py::test_immediate_when_start_zero  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_generate.py::test_mixed_flat_and_wrapped_rotating_is_not_reusable  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_generate.py::test_pop_forced_token_id_consumes_pending_token_id  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_generate.py::test_pop_forced_token_id_emits_forced_token_when_budget_exceeded  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_generate.py::test_pop_forced_token_id_safe_after_end_delimiter  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_generate.py::test_pop_forced_token_id_safe_after_start_delimiter  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_generate.py::test_pop_forced_token_id_safe_before_first_call  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_generate.py::test_prompt_processing_batch_slices_native_mrope_position_ids  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_generate.py::test_prompt_step_keeps_exact_apc_checkpoint_async  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_generate.py::test_prompt_step_schedules_cache_evaluation_asynchronously  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_generate.py::test_public_generation_annotations_match_runtime_results  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_generate.py::test_quantizes_at_or_above_threshold  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_generate.py::test_split_prompt_kwargs_handles_native_mrope_position_ids  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_generate.py::test_unwrapped_buffered_rotating_trims  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_generate.py::test_unwrapped_rotating_trims_and_stays_usable  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_generate.py::test_wrapped_buffered_rotating_declined_and_survives_next_step  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_generate.py::test_wrapped_rotating_is_not_reusable  # baseline: pre-existing divergence, unreviewed
+
+# --- mlx_vlm/tests/test_models.py
+mlx_vlm/tests/test_models.py::TestMRoPETrainingVJP  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::TestQwen35GatedDeltaTraining  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::_StubCache  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::_Tokenizer  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::_assert_qwen_chunked_prefill_slices_mrope_position_ids  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::_assert_qwen_request_owned_mrope_kwargs  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::_grads  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::_qk  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::_sum_loss  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::_tiny_inkling_config  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::image  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::loss  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::make_projector  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_chunked_update_allows_value_and_grad  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_deepseek_v32_language_model  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_deepseek_v3_language_model  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_deepseekocr_2_language_model  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_fused_apply_rotary_vjp  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_gemma3_text_language_model  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_gemma4_unified_audio_tokens_keep_vision_overlay  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_glm_moe_dsa_language_model  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_inkling_language_model  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_inkling_towers_and_multimodal  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_kimi_k3  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_laguna_folds_nvfp4_shared_experts  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_laguna_fuses_split_switch_gate_up  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_laguna_nvfp4_compressed_tensors_config  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_laguna_sanitize_drops_input_global_scale  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_laguna_sanitize_fuses_prefixed_split_switch_gate_up  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_laguna_stacks_nvfp4_experts_before_scale_folding  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_lfm2_vl_projector_creates_layernorm_only_when_enabled  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_llada2_moe_language_model  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_llama_language_model  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_llmjpvl  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_mage_vl  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_minicpmv4_6_sanitize_offsets_source_norm_weights_when_needed  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_minicpmv4_6_sanitize_preserves_converted_norm_weights  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_minimax_m3_vl_language_model  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_mistral_language_model  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_molmo_point_config_accepts_eos_token_id  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_moondream2  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_nemotron_h_language_model  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_nemotron_labs_diffusion_language_model  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_paddleocr_vl_sanitize_idempotent  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_plamo2vl  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_precomputed_rotary_vjp_matches_pure_mlx  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_qwen2_language_model  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_qwen3_5_input_embeddings_owns_mrope_kwargs  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_qwen3_5_moe_chunked_prefill_slices_mrope_position_ids  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_qwen3_5_sanitize_offsets_source_norm_weights_when_needed  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_qwen3_5_sanitize_preserves_converted_norm_weights  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_qwen3_language_model  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_qwen3_omni_audio_sanitize_is_idempotent_for_conv2d_weights  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_qwen3_omni_code2wav_sanitize_is_idempotent_for_conv_weights  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_rfdetr_forward  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_sam3_1_config_and_model  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_sam3d_body_model  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_step3p7_language_model  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_unlimited_ocr  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_models.py::test_unlimited_ocr_input_embeddings  # baseline: pre-existing divergence, unreviewed
+
+# --- mlx_vlm/tests/test_processors.py
+mlx_vlm/tests/test_processors.py::TestLagunaProcessor  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_processors.py::TestPixtralImageProcessor  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_processors.py::TestQwen3OmniMoePatch  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_processors.py::_fast_tokenizer  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_processors.py::test_auto_processor_patch_intercepts_laguna  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_processors.py::test_chat_template_owns_laguna_special_tokens  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_processors.py::test_from_pretrained_loads_fast_tokenizer_directly  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_processors.py::test_from_pretrained_uses_torch_free_pixtral_image_processor  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_processors.py::test_gemma4_video_processor_outputs_padded_patches_and_positions  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_processors.py::test_patch_intercepts_without_hf_video_processor  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_processors.py::test_preprocess_resizes_to_patch_multiple_and_pads  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_processors.py::test_processor_init_declares_video_processor_attribute  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_processors.py::test_split_image_sizes_by_sample_handles_flat_sizes  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_processors.py::test_video_processor_accepts_channel_last_arrays  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_processors.py::test_video_processor_accepts_pil_frame_lists  # baseline: pre-existing divergence, unreviewed
+
+# --- mlx_vlm/tests/test_prompt_utils.py
+mlx_vlm/tests/test_prompt_utils.py::EnableThinkingProcessor  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_prompt_utils.py::ThinkingModeProcessor  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_prompt_utils.py::test_apply_chat_template_keeps_enable_thinking_only_for_other_templates  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_prompt_utils.py::test_apply_chat_template_maps_enable_thinking_for_thinking_mode_templates  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_prompt_utils.py::test_gemma4_unified_formats_video_and_audio_messages  # baseline: pre-existing divergence, unreviewed
+
+# --- mlx_vlm/tests/test_sample_utils.py
+mlx_vlm/tests/test_sample_utils.py::TestPLess  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_sample_utils.py::TestTopNSigma  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_sample_utils.py::TestTypicalP  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_sample_utils.py::TestValidationDoesNotCorruptCompile  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_sample_utils.py::_apply  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_sample_utils.py::_kept  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_sample_utils.py::_np_p_less_keep  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_sample_utils.py::_np_typical_keep  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_sample_utils.py::_p_less_kept  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_sample_utils.py::test_argmax_always_survives  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_sample_utils.py::test_batched_rows_independent  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_sample_utils.py::test_disabled_by_default  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_sample_utils.py::test_disabled_keeps_all  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_sample_utils.py::test_float16_large_vocab  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_sample_utils.py::test_higher_temp_keeps_more  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_sample_utils.py::test_invalid_raises  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_sample_utils.py::test_large_n_keeps_all  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_sample_utils.py::test_make_sampler_selects_survivor  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_sample_utils.py::test_make_sampler_survivor_only  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_sample_utils.py::test_matches_numpy_reference  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_sample_utils.py::test_min_p_error_then_sampler_works  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_sample_utils.py::test_negative_raises  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_sample_utils.py::test_peaked_keeps_top_only  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_sample_utils.py::test_smaller_keeps_fewer  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_sample_utils.py::test_threshold_masks_below  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_sample_utils.py::test_top_k_error_then_sampler_works  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_sample_utils.py::test_wider_threshold_keeps_more  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_sample_utils.py::test_zero_keeps_only_max  # baseline: pre-existing divergence, unreviewed
+
+# --- mlx_vlm/tests/test_server.py
+mlx_vlm/tests/test_server.py::_sse_events  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::fake_apply_chat_template  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::fake_stream_diffusion_generate_from_kwargs  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::generate_one  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::make_criteria  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::preprocess  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::reject_model  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::run_lifespan  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::test_build_gen_args_explicit_thinking_overrides_standard_reasoning  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::test_build_gen_args_maps_chat_reasoning_effort  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::test_build_gen_args_maps_none_reasoning_effort_to_disabled  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::test_build_gen_args_maps_responses_reasoning_configuration  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::test_build_gen_args_preserves_diffusion_options  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::test_chat_completions_endpoint_forwards_video_content  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::test_chat_completions_endpoint_preserves_assistant_reasoning_content  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::test_chat_completions_endpoint_rejects_empty_effective_input  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::test_chat_completions_forced_tool_choice_filters_tools  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::test_chat_completions_rejects_invalid_tool_choice  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::test_chat_completions_required_tool_choice_adds_instruction  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::test_chat_completions_response_uses_reasoning_content  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::test_chat_completions_streaming_keeps_plain_output_as_content_when_thinking_enabled  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::test_chat_completions_streaming_uses_prompt_opened_thinking_without_flag  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::test_chat_completions_tool_choice_none_disables_tools  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::test_chat_request_schema_declares_tool_choice_fields  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::test_chunked_prefill_logging_reports_partial_progress  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::test_debug_decode_logging_adds_token_details  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::test_decode_logging_uses_one_rate_field  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::test_generate_serializes_budget_criteria_with_tokenizer_preprocessing  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::test_gpu_embed_drops_none_embedding_fields  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::test_inference_endpoint_accepts_configured_api_key  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::test_inference_endpoints_require_configured_api_key  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::test_info_decode_logging_uses_interval_without_token_details  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::test_lifespan_preloads_configured_model_kinds  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::test_load_model_resources_returns_load_failure_as_bad_request  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::test_log_progress_interval_is_configurable  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::test_metrics_store_logs_request_lifecycle  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::test_prompt_must_end_with_open_thinking_marker_to_start_in_thinking  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::test_prompt_open_marker_is_authoritative_when_flag_is_disabled  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::test_reasoning_content_field  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::test_response_generator_diffusion_forwards_generation_options  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::test_responses_endpoint_rejects_empty_effective_input  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::test_responses_endpoint_returns_reasoning_items  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::test_responses_streaming_emits_function_call_arguments_done  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::test_responses_streaming_emits_reasoning_events  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::test_responses_streaming_uses_prompt_opened_thinking_without_flag  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::test_stream_endpoints_do_not_clear_mlx_cache_on_close  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::test_unsupported_model_request_does_not_crash_server  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_server.py::tokenizer_work  # baseline: pre-existing divergence, unreviewed
+
+# --- mlx_vlm/tests/test_speculative.py
+mlx_vlm/tests/test_speculative.py::Model  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_speculative.py::_qwen3_5_batch_cache  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_speculative.py::_qwen3_5_hybrid_batch_model  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_speculative.py::speculative_logits_from_hidden  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_speculative.py::test_deepseek_v4_rollback_speculative_cache_handles_turboquant_batch_tail_zero  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_speculative.py::test_gemma4_rollback_speculative_cache_handles_turboquant_batch_tail_zero  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_speculative.py::test_kind_none_autodetects_mtp_for_glm4_moe_lite_mtp  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_speculative.py::test_qwen3_5_all_rows_fully_padded_prefill  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_speculative.py::test_qwen3_5_fully_padded_prefill_row_survives_chunks  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_speculative.py::test_qwen3_5_partially_padded_rows_match_unbatched  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_speculative.py::test_qwen3_5_rollback_speculative_cache_handles_turboquant_batch_kv  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_speculative.py::test_qwen_fused_greedy_decode_support_matches_lm_head  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_speculative.py::test_qwen_fused_greedy_decode_uses_quantized_argmax  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_speculative.py::test_split_glm4_moe_lite_mtp_flattens_nextn_layer  # baseline: pre-existing divergence, unreviewed
+
+# --- mlx_vlm/tests/test_tokenizer_utils.py
+mlx_vlm/tests/test_tokenizer_utils.py::test_invalid_byte_sequence_before_space_does_not_raise  # baseline: pre-existing divergence, unreviewed
+
+# --- mlx_vlm/tests/test_trainer.py
+mlx_vlm/tests/test_trainer.py::CaptureModel  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_trainer.py::FixedLogitsModel  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_trainer.py::fake_apply_chat_template  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_trainer.py::fake_prepare_inputs  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_trainer.py::test_completion_mask_is_used_without_passing_to_model  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_trainer.py::test_completion_mask_loss_denominator_uses_masked_token_count  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_trainer.py::test_dataset_adds_completion_mask_from_chat_template  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_trainer.py::test_dataset_skips_completion_mask_when_not_training_on_completions  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_trainer.py::test_gemma4_unified_loss_lets_model_build_internal_masks  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_trainer.py::test_iterate_batches_concatenates_mixed_image_grid_rows  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_trainer.py::test_iterate_batches_pads_completion_mask  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_trainer.py::test_iterate_batches_preserves_multi_image_grid_rows  # baseline: pre-existing divergence, unreviewed
+
+# --- mlx_vlm/tests/test_turboquant.py
+mlx_vlm/tests/test_turboquant.py::test_batch_turboquant_cache_supports_uniform_right_trim  # baseline: pre-existing divergence, unreviewed
+
+# --- mlx_vlm/tests/test_utils.py
+mlx_vlm/tests/test_utils.py::Processor  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_utils.py::consume_attention_mask  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_utils.py::test_get_model_and_args_remaps_mistral_to_llama  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_utils.py::test_pil_image_input  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_utils.py::test_prepare_inputs_preserves_mlx_attention_mask_for_thread_handoff  # baseline: pre-existing divergence, unreviewed
+
+# --- mlx_vlm/trainer/datasets.py
+mlx_vlm/trainer/datasets.py::_completion_prefix  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/trainer/datasets.py::_token_length  # baseline: pre-existing divergence, unreviewed
+
+# --- mlx_vlm/trainer/sft_trainer.py
+mlx_vlm/trainer/sft_trainer.py::_collate_grid_thw  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/trainer/sft_trainer.py::_model_type  # baseline: pre-existing divergence, unreviewed
+
+# --- mlx_vlm/turboquant.py
+mlx_vlm/turboquant.py::_contiguous  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/turboquant.py::_z  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/turboquant.py::_zero  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/turboquant.py::_zero_state_row_tail  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/turboquant.py::batch_size  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/turboquant.py::dequantize_for_apc  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/turboquant.py::extract  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/turboquant.py::is_single_row  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/turboquant.py::zero_row_tail  # baseline: pre-existing divergence, unreviewed
+
+# --- mlx_vlm/utils.py
+mlx_vlm/utils.py::_compressed_tensors_group_weights  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/utils.py::_dequantize_compressed_tensors_fp8_weight  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/utils.py::_transform_compressed_tensors_mixed_weights  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/utils.py::pop_forced_token_id  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/utils.py::should_add_special_tokens  # baseline: pre-existing divergence, unreviewed

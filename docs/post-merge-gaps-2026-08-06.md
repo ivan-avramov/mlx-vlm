@@ -1,5 +1,23 @@
 # Post-merge known gaps (2026-08-06)
 
+> **SUPERSEDED — see [`upstream-gaps.md`](upstream-gaps.md).**
+>
+> Kept for its incident history (the `is_mlx_format` / `+1.0` norm-shift
+> production regression in §2 and the tokenizer race in the intro are still the
+> best write-ups of those). Do not treat the gap list below as current:
+>
+> - §1's claim that prefix-cache reuse is "entirely absent from our
+>   `dispatch.py`" is **wrong**. The fork does prefix reuse and has its own
+>   guard; the actual bug was a subclass-matching hole that exposed
+>   `BufferedRotatingKVCache` to ring-buffer corruption. Fixed — see
+>   `upstream-gaps.md`.
+> - §2's `minicpmv4_6` import breakage is fixed.
+> - §1's DeepSeek V4 HISA config fields are restored (wiring still open).
+> - The "18 failures" figure covered only four test files; the full suite was
+>   at 36 failures at that time.
+> - `origin/upstream` (the branch this doc refers to) no longer exists; the
+>   fork now uses a conventional fetch-only `upstream` remote.
+
 Context: `main` was merged with `origin/upstream` (`Blaizzy/mlx-vlm`, synced to
 commit `94edef5`, 28 commits) to fix a regression where `initialize_rope` was
 missing from `mlx_vlm/models/rope_utils.py` (traced to an earlier bad merge,

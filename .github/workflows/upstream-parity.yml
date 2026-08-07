@@ -1,0 +1,48 @@
+name: Upstream parity
+
+# Guards against the failure mode described in docs/upstream-gaps.md: when a
+# merge resolution drops a file or symbol that upstream added, the upstream
+# commit that added it still becomes an ancestor of `main`, so git treats it as
+# "merged then deliberately deleted" and no later merge ever re-offers it. The
+# loss is permanent, self-perpetuating, and invisible to `git log`.
+#
+# Runs on pushes to main as well as PRs, because this fork is usually committed
+# to directly rather than through PRs.
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  parity:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # Full history: the checks diff against upstream, so a shallow clone
+          # has no merge base to compare with.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/Blaizzy/mlx-vlm.git
+          git remote set-url --push upstream no_push
+          git fetch --no-tags upstream main
+
+      - name: Check no upstream file is silently missing
+        run: python dev/check_upstream_parity.py --upstream-ref upstream/main
+
+      - name: Check no upstream symbol is silently missing
+        run: python dev/check_upstream_symbols.py --upstream-ref upstream/main

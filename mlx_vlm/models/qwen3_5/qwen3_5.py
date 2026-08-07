@@ -11,6 +11,27 @@ from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
 
+NORM_WEIGHT_SUFFIXES = (
+    ".input_layernorm.weight",
+    ".post_attention_layernorm.weight",
+    "model.norm.weight",
+    ".q_norm.weight",
+    ".k_norm.weight",
+)
+
+
+def should_shift_norm_weights(weights):
+    has_mtp_weights = any("mtp." in key for key in weights)
+    has_unsanitized_conv1d = any(
+        "conv1d.weight" in key and value.shape[-1] != 1
+        for key, value in weights.items()
+    )
+    return has_mtp_weights or has_unsanitized_conv1d
+
+
+def should_offset_norm_weight(original_key, shift_norm_weights):
+    return shift_norm_weights or not original_key.startswith("language_model.")
+
 
 def sanitize_key(key):
     if key.startswith("model.language_model.visual"):
