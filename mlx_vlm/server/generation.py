@@ -42,7 +42,11 @@ from ..generate import (
 )
 from ..generate.common import generation_stream, wired_limit
 from ..generate.diffusion import diffusion_generation_family, stream_diffusion_generate
-from ..prompt_utils import detect_thinking_format, prompt_is_inside_thinking
+from ..prompt_utils import (
+    cached_special_token_encode,
+    detect_thinking_format,
+    prompt_is_inside_thinking,
+)
 from ..sample_utils import top_p_sampling
 from ..speculative.utils import (
     make_speculative_prompt_cache,
@@ -1582,11 +1586,11 @@ class ResponseGenerator:
         tokenizer = self.tokenizer
         thinking_start_token = args.thinking_start_token or DEFAULT_THINKING_START_TOKEN
         thinking_end_token = args.thinking_end_token or DEFAULT_THINKING_END_TOKEN
-        thinking_start_token_id = tokenizer.encode(
-            thinking_start_token, add_special_tokens=False
+        thinking_start_token_id = cached_special_token_encode(
+            tokenizer, thinking_start_token
         )[-1]
-        thinking_end_token_id = tokenizer.encode(
-            thinking_end_token, add_special_tokens=False
+        thinking_end_token_id = cached_special_token_encode(
+            tokenizer, thinking_end_token
         )[-1]
         return thinking_start_token_id, thinking_end_token_id
 
@@ -1657,7 +1661,7 @@ class ResponseGenerator:
             thinking_start_token = fmt.openers[0]
             thinking_end_token = fmt.closers[0]
             for _closer in fmt.closers:
-                if len(tokenizer.encode(_closer, add_special_tokens=False)) == 1:
+                if len(cached_special_token_encode(tokenizer, _closer)) == 1:
                     thinking_end_token = _closer
                     break
         return ThinkingBudgetCriteria(

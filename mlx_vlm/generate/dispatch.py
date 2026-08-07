@@ -15,6 +15,7 @@ from .. import apc as _apc
 from ..models import cache
 from ..prompt_utils import (
     apply_chat_template,
+    cached_special_token_encode,
     detect_thinking_format,
     prompt_is_inside_thinking,
 )
@@ -1100,7 +1101,7 @@ def stream_generate(
             # token id of the closer string).
             eff_end_token = fmt.closers[0]
             for _closer in fmt.closers:
-                if len(tokenizer.encode(_closer, add_special_tokens=False)) == 1:
+                if len(cached_special_token_encode(tokenizer, _closer)) == 1:
                     eff_end_token = _closer
                     break
         tokenizer.thinking_budget_criteria = ThinkingBudgetCriteria(

@@ -1,5 +1,6 @@
 import inspect
 import json
+import threading
 from dataclasses import dataclass
 from enum import Enum
 from functools import partial
@@ -192,6 +193,41 @@ position of any marker in the rendered prompt. Each entry is a
 distinct literal — there's no overlap between families' user-turn
 delimiters.
 """
+
+
+_TOKEN_ENCODE_CACHE: Dict[Tuple[int, str], List[int]] = {}
+_TOKEN_ENCODE_CACHE_LOCK = threading.Lock()
+
+
+def cached_special_token_encode(tokenizer, text: str) -> List[int]:
+    """Thread-safe, cached ``tokenizer.encode(text, add_special_tokens=False)``.
+
+    HF's fast (Rust-backed) tokenizer mutates internal truncation/padding
+    state on every ``.encode()`` call, which is not safe under concurrent
+    calls from multiple request threads: continuous batching shares ONE
+    tokenizer instance across all in-flight requests, so two requests
+    calling this at the same moment can panic with "Already borrowed"
+    (a Rust RefCell double-borrow) -- and since the tokenizer is shared,
+    that panic can corrupt state for whatever OTHER request happens to be
+    running at the same moment, not just the one that triggered it.
+
+    Callers here only ever pass a small, fixed set of format/default token
+    strings (opener/closer literals from THINKING_FORMATS, or a request's
+    explicit thinking-token override) -- never arbitrary per-request user
+    text -- so the encoded result is deterministic for a given
+    (tokenizer, text) pair and safe to compute once and reuse.
+    """
+    cache_key = (id(tokenizer), text)
+    cached = _TOKEN_ENCODE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    with _TOKEN_ENCODE_CACHE_LOCK:
+        cached = _TOKEN_ENCODE_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+        result = tokenizer.encode(text, add_special_tokens=False)
+        _TOKEN_ENCODE_CACHE[cache_key] = result
+        return result
 
 
 def detect_thinking_format(text: str) -> Optional[ThinkingFormat]:
