@@ -84,6 +84,20 @@ def _kv_seq_axis(shape) -> int:
     return 2
 
 
+def _cache_kind_names(c) -> frozenset:
+    """Every class name in ``type(c)``'s MRO.
+
+    Cache-type dispatch here is by class *name* rather than ``isinstance`` so
+    the fork does not have to import cache classes that only exist in some
+    mlx_lm versions. Matching against the whole MRO instead of
+    ``type(c).__name__`` is what makes that safe for subclasses: our own
+    ``BufferedRotatingKVCache(RotatingKVCache)`` is a rotating ring buffer and
+    must be treated as one everywhere, but an exact-name check silently
+    classifies it as a plain flat cache.
+    """
+    return frozenset(t.__name__ for t in type(c).__mro__)
+
+
 def _trim_cache(c, target_len):
     """Recursively trim a KV cache (or nested container of caches) so its
     sequence dimension is exactly ``target_len``.
@@ -137,13 +151,18 @@ def _trim_cache(c, target_len):
     #     producing a 1-element list that breaks the next call to
     #     `mx.quantized_matmul(queries, *q_keys, ...)` with a "missing
     #     scales argument" TypeError.
-    if type(c).__name__ in (
+    #   Matched against the full MRO: BufferedRotatingKVCache subclasses
+    #   RotatingKVCache, and slicing its ring buffer physically while
+    #   ``.trim()`` above already moved the offset logically leaves the ring
+    #   index desynced from ``offset`` -- silent wrong output, or a broadcast
+    #   crash on the next update.
+    if _cache_kind_names(c) & {
         "TurboQuantKVCache",
         "RotatingKVCache",
         "BatchRotatingKVCache",
         "QuantizedKVCache",
         "BatchQuantizedKVCache",
-    ):
+    }:
         return
 
     k_attr = "keys" if hasattr(c, "keys") else "k" if hasattr(c, "k") else None
@@ -570,20 +589,34 @@ def _rotating_rewind_safe(entries, target_len) -> bool:
     rewind is safe — just trim the offset.
     """
     for c in entries:
-        name = type(c).__name__
-        if name in ("RotatingKVCache", "BatchRotatingKVCache"):
+        if hasattr(c, "caches"):
+            if not _rotating_rewind_safe(c.caches, target_len):
+                return False
+            continue
+        if isinstance(c, (list, tuple)):
+            if not _rotating_rewind_safe(c, target_len):
+                return False
+            continue
+
+        # Buffered / chunked caches evict by advancing start_position, so
+        # anything before it is gone no matter what the ring arithmetic below
+        # says. BufferedRotatingKVCache (what speculative decoding installs)
+        # reports itself trimmable even after evicting, so this has to be
+        # checked explicitly rather than inferred from .is_trimmable().
+        start_position = getattr(c, "start_position", None)
+        if start_position is not None and target_len < int(start_position):
+            return False
+
+        # Subclass-aware on purpose: a BufferedRotatingKVCache built directly
+        # (rather than via .from_cache) keeps start_position at 0 while its ring
+        # wraps, so the check above cannot be the only one that covers it.
+        if _cache_kind_names(c) & {"RotatingKVCache", "BatchRotatingKVCache"}:
             offset = int(c.offset.item() if hasattr(c.offset, "item") else c.offset)
             max_size = getattr(c, "max_size", None)
             if max_size is not None and offset > max_size:
                 # Buffer has wrapped — data before (offset - max_size) is gone
                 if target_len < (offset - max_size):
                     return False
-        elif hasattr(c, "caches"):
-            if not _rotating_rewind_safe(c.caches, target_len):
-                return False
-        elif isinstance(c, (list, tuple)):
-            if not _rotating_rewind_safe(c, target_len):
-                return False
     return True
 
 

@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 import pytest
-from mlx_lm.models.cache import BatchKVCache, KVCache
+from mlx_lm.models.cache import BatchKVCache, KVCache, RotatingKVCache
 
 from mlx_vlm import apc as apc_module
 from mlx_vlm.generate import (
@@ -24,8 +24,10 @@ from mlx_vlm.generate import (
     _prime_cached_prefix_rope_state,
 )
 from mlx_vlm.generate import ar as ar_module
+from mlx_vlm.generate import common as common_module
 from mlx_vlm.generate import dispatch as dispatch_module
 from mlx_vlm.generate import normalize_resize_shape
+from mlx_vlm.models.cache import BufferedRotatingKVCache
 from mlx_vlm.utils import ThinkingBudgetCriteria
 
 generate_module = sys.modules["mlx_vlm.generate"]
@@ -2085,6 +2087,93 @@ def test_cached_prefix_rope_failure_falls_back_to_cold(caplog):
     assert bool(mx.array_equal(language_model._rope_deltas, rope_deltas_before))
     assert bool(mx.array_equal(language_model._position_ids, position_ids_before))
     assert "falling back to cold prefill" in caplog.text
+
+
+class TestPrefixCacheReuseTrim:
+    """Prompt-cache prefix reuse must respect each cache's own retention.
+
+    Fork counterpart of upstream's ``TestPrefixCacheReuseTrim``. Upstream gates
+    reuse with ``_prefix_cache_trim_amount``/``_cache_fully_retained``; this fork
+    uses ``_rotating_rewind_safe`` plus a snapshot ring instead, so the scenarios
+    are the same but the entry points differ.
+
+    Both guards previously dispatched on ``type(c).__name__``, which does not
+    match subclasses. ``BufferedRotatingKVCache`` -- installed by speculative
+    decoding (``speculative/mtp.py``, ``drafters/qwen3_dflash``) -- therefore
+    slipped through as if it were a flat cache: the guard declared an evicted
+    rewind safe, and ``_trim_cache`` then physically sliced the ring buffer while
+    ``.trim()`` had already moved the offset, desyncing the ring index
+    (mlx-vlm issue #1715).
+    """
+
+    @staticmethod
+    def _ring(offset, *, max_size=16, start_position=None, buffer_size=4):
+        c = BufferedRotatingKVCache(max_size=max_size, buffer_size=buffer_size)
+        c.keys = mx.zeros((1, 2, min(offset, max_size), 4))
+        c.values = mx.zeros((1, 2, min(offset, max_size), 4))
+        c.offset = offset
+        if start_position is not None:
+            c.start_position = start_position
+        return c
+
+    def test_wrapped_buffered_rotating_declines_evicted_rewind(self):
+        # from_cache() sets start_position = offset - keep; tokens 0..19 are gone.
+        c = self._ring(36, start_position=20)
+        assert common_module._rotating_rewind_safe([c], 5) is False
+
+    def test_wrapped_buffered_rotating_allows_retained_rewind(self):
+        c = self._ring(36, start_position=20)
+        assert common_module._rotating_rewind_safe([c], 25) is True
+
+    def test_unwrapped_buffered_rotating_is_rewindable(self):
+        # start_position == 0 => nothing evicted, still rollback-able even though
+        # is_trimmable() is unconditionally True for this class.
+        c = self._ring(100, max_size=512, start_position=0)
+        assert common_module._rotating_rewind_safe([c], 40) is True
+
+    def test_directly_built_wrapped_buffered_is_declined(self):
+        # Built directly rather than via from_cache: start_position stays 0 while
+        # the ring wraps, so the ring-wrap arithmetic must also be subclass-aware.
+        c = self._ring(36)
+        assert c.start_position == 0
+        assert common_module._rotating_rewind_safe([c], 5) is False
+
+    def test_nested_and_container_caches_are_walked(self):
+        unsafe = self._ring(36, start_position=20)
+        assert common_module._rotating_rewind_safe([[unsafe]], 5) is False
+        assert (
+            common_module._rotating_rewind_safe(
+                [SimpleNamespace(caches=[unsafe])], 5
+            )
+            is False
+        )
+
+    def test_trim_does_not_physically_slice_buffered_ring(self):
+        c = self._ring(36, start_position=20)
+        before = c.keys.shape
+        common_module._trim_cache(c, 5)
+        assert c.keys.shape == before, "ring buffer must not be sliced"
+
+    def test_trim_matches_parent_class_behaviour(self):
+        parent = RotatingKVCache(max_size=16)
+        parent.keys = mx.zeros((1, 2, 16, 4))
+        parent.values = mx.zeros((1, 2, 16, 4))
+        parent.offset = 36
+        child = self._ring(36, start_position=20)
+        common_module._trim_cache(parent, 5)
+        common_module._trim_cache(child, 5)
+        assert child.keys.shape == parent.keys.shape
+
+    def test_flat_cache_is_still_physically_sliced(self):
+        # Guard against over-broadening the skip-list: flat caches must still be
+        # sliced, or ghost tokens desync RoPE on the next forward pass.
+        c = KVCache()
+        c.keys = mx.zeros((1, 2, 20, 4))
+        c.values = mx.zeros((1, 2, 20, 4))
+        c.offset = 20
+        common_module._trim_cache(c, 8)
+        assert c.keys.shape[2] == 8
+        assert int(c.offset) == 8
 
 
 class TestGemma4LogitsToKeep:
