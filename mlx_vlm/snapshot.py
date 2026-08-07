@@ -187,6 +187,11 @@ class RotatingKVSnapshot:
     idx: int
     max_size: int
     keep: int
+    # Eviction watermark for buffered/chunked rings (BufferedRotatingKVCache).
+    # Restoring keys/values/offset without it leaves the layer claiming to
+    # retain tokens the restored buffer no longer holds. Defaults to 0 so
+    # plain RotatingKVCache layers, which have no such attribute, are unchanged.
+    start_position: int = 0
 
 
 def capture_rotating(layer, layer_index: int) -> RotatingKVSnapshot:
@@ -217,6 +222,7 @@ def capture_rotating(layer, layer_index: int) -> RotatingKVSnapshot:
         idx=int(layer._idx.item() if hasattr(layer._idx, "item") else layer._idx),
         max_size=int(layer.max_size),
         keep=int(getattr(layer, "keep", 0)),
+        start_position=int(getattr(layer, "start_position", 0) or 0),
     )
 
 
@@ -238,3 +244,8 @@ def restore_rotating(layer, snapshot: RotatingKVSnapshot) -> None:
     layer.max_size = snapshot.max_size
     if hasattr(layer, "keep"):
         layer.keep = snapshot.keep
+    # Only buffered/chunked rings carry this; restoring K/V and offset without
+    # it would leave the layer's eviction watermark describing a buffer state
+    # that no longer exists.
+    if hasattr(layer, "start_position"):
+        layer.start_position = snapshot.start_position

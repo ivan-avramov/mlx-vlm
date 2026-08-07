@@ -620,9 +620,21 @@ def _rotating_rewind_safe(entries, target_len) -> bool:
     return True
 
 
+ROTATING_CACHE_KINDS = frozenset({"RotatingKVCache", "BatchRotatingKVCache"})
+
+
 def _is_rotating_kv_layer(c) -> bool:
-    """True if `c` is a RotatingKVCache (sliding-window KV cache)."""
-    return type(c).__name__ in ("RotatingKVCache", "BatchRotatingKVCache")
+    """True if `c` is a rotating (sliding-window) KV cache, subclasses included.
+
+    This is a *routing* predicate, not a label: the post-generation path uses it
+    to decide whether a layer is rewound by snapshot restore (rotating) or by
+    ``_trim_cache`` (flat). Matching on ``type(c).__name__`` sent
+    ``BufferedRotatingKVCache`` down the flat path, where it was neither
+    captured by ``_capture_rotating_layers_for_snapshot`` nor safe to trim --
+    a wrapped ring rewound with no snapshot to restore from is exactly the
+    "memory hole" this machinery exists to prevent.
+    """
+    return bool(_cache_kind_names(c) & ROTATING_CACHE_KINDS)
 
 
 def _anchor_within_loop_range(
@@ -921,17 +933,26 @@ def _rotating_post_gen_trim_safe(entries, target_len) -> bool:
     force full re-prefill.
     """
     for c in entries:
-        name = type(c).__name__
-        if name in ("RotatingKVCache", "BatchRotatingKVCache"):
+        if hasattr(c, "caches"):
+            if not _rotating_post_gen_trim_safe(c.caches, target_len):
+                return False
+            continue
+        if isinstance(c, (list, tuple)):
+            if not _rotating_post_gen_trim_safe(c, target_len):
+                return False
+            continue
+
+        # Buffered/chunked rings evict by advancing start_position; a non-zero
+        # watermark means the ring has already lost early tokens, which is the
+        # same "not strictly safe" condition as a wrapped offset.
+        start_position = getattr(c, "start_position", None)
+        if start_position is not None and int(start_position) > 0:
+            return False
+
+        if _is_rotating_kv_layer(c):
             offset = int(c.offset.item() if hasattr(c.offset, "item") else c.offset)
             max_size = getattr(c, "max_size", None)
             if max_size is not None and offset > max_size:
-                return False
-        elif hasattr(c, "caches"):
-            if not _rotating_post_gen_trim_safe(c.caches, target_len):
-                return False
-        elif isinstance(c, (list, tuple)):
-            if not _rotating_post_gen_trim_safe(c, target_len):
                 return False
     return True
 

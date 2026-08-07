@@ -34,6 +34,7 @@ from mlx_vlm.generate import (
     _should_capture_anchor_pre_prefill,
     _trim_cache,
 )
+from mlx_vlm.models.cache import BufferedRotatingKVCache
 from mlx_vlm.snapshot import DeltaNetSnapshotRing, capture_rotating
 
 
@@ -1984,4 +1985,85 @@ class TestToolContinuationAnchorPath:
             f"tool_response content. The next NEW user turn then hits "
             f"SWA Ring Buffer Corruption Guard → full re-prefill of "
             f"~5900 tokens (~13s in the trace)."
+        )
+
+
+class TestBufferedRotatingIsClassifiedAsRotating:
+    """Cache-kind predicates must match subclasses, not exact class names.
+
+    `BufferedRotatingKVCache(RotatingKVCache)` is what speculative decoding
+    installs. While the predicates matched on `type(c).__name__`, it was
+    classified as a *flat* cache everywhere, which meant the post-generation
+    path gave it neither treatment: `_capture_rotating_layers_for_snapshot`
+    skipped it (so no snapshot existed), and it fell into the `_trim_cache`
+    branch instead. A wrapped ring rewound with nothing to restore from is the
+    exact "memory hole" the snapshot machinery exists to prevent.
+    """
+
+    @staticmethod
+    def _buffered(offset, *, max_size=16, start_position=0, idx=0):
+        c = BufferedRotatingKVCache(max_size=max_size, buffer_size=4)
+        c.keys = mx.zeros((1, 2, min(offset, max_size), 4))
+        c.values = mx.zeros((1, 2, min(offset, max_size), 4))
+        c.offset = offset
+        c._idx = idx
+        c.start_position = start_position
+        return c
+
+    def test_subclass_is_recognised_as_rotating(self):
+        assert _is_rotating_kv_layer(self._buffered(36, start_position=20))
+
+    def test_plain_rotating_still_recognised(self):
+        assert _is_rotating_kv_layer(_rotating(offset=100, max_size=512))
+
+    def test_flat_cache_is_not_rotating(self):
+        # Guard against over-broadening: flat caches must keep taking the
+        # _trim_cache branch, or they never get physically sliced.
+        assert not _is_rotating_kv_layer(KVCache())
+        assert not _is_rotating_kv_layer(_arrays_cache())
+
+    def test_buffered_layer_is_captured_for_snapshot(self):
+        snaps = _capture_rotating_layers_for_snapshot(
+            [self._buffered(36, start_position=20)], capture_rotating
+        )
+        assert len(snaps) == 1, "buffered ring must be snapshotted like its parent"
+        assert snaps[0].start_position == 20
+
+    def test_restore_round_trip_preserves_eviction_watermark(self):
+        # Restoring keys/values/offset while leaving start_position stale would
+        # leave the layer claiming to retain tokens the buffer no longer holds.
+        snaps = _capture_rotating_layers_for_snapshot(
+            [self._buffered(36, start_position=20, idx=9)], capture_rotating
+        )
+        live = self._buffered(99, start_position=83, idx=3)
+        _restore_rotating_layers_from_snapshots([live], snaps)
+        assert int(live.offset) == 36
+        assert int(live._idx) == 9
+        assert int(live.start_position) == 20
+
+    def test_plain_rotating_restore_unaffected_by_start_position(self):
+        # RotatingKVCache has no start_position; the snapshot default must not
+        # invent one on it.
+        layer = _rotating(offset=100, max_size=512)
+        snaps = _capture_rotating_layers_for_snapshot([layer], capture_rotating)
+        assert snaps[0].start_position == 0
+        live = _rotating(offset=400, max_size=512)
+        _restore_rotating_layers_from_snapshots([live], snaps)
+        assert not hasattr(live, "start_position")
+
+    def test_post_gen_trim_guard_rejects_evicted_buffered_ring(self):
+        # _rotating_post_gen_trim_safe's strict contract is "nothing evicted".
+        assert (
+            _rotating_post_gen_trim_safe(
+                [self._buffered(36, start_position=20)], target_len=5
+            )
+            is False
+        )
+
+    def test_post_gen_trim_guard_allows_untouched_buffered_ring(self):
+        assert (
+            _rotating_post_gen_trim_safe(
+                [self._buffered(100, max_size=512, start_position=0)], target_len=40
+            )
+            is True
         )
