@@ -118,6 +118,15 @@ class Model(Qwen3VLModel):
         return inputs_embeds, special_image_mask
 
     def sanitize(self, weights):
+        # Already-converted mlx-native checkpoints (produced by running this
+        # same sanitize once at conversion time) store keys pre-prefixed
+        # with "language_model." -- the norm-weight shift below is NOT
+        # idempotent (it unconditionally adds 1.0), so re-running it on an
+        # already-shifted checkpoint corrupts every norm layer. Mirrors the
+        # same self-guard qwen2's Model.sanitize() uses.
+        if any(key.startswith("language_model.") for key in weights):
+            return weights
+
         # ignore mtp weights
         weights = {key: value for key, value in weights.items() if "mtp." not in key}
 

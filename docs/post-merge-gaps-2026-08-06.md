@@ -13,32 +13,48 @@ A **second, unrelated regression** surfaced immediately after: the task model
 `ValueError: Received 732 parameters not in model`. Root cause: `load_model`
 in `mlx_vlm/utils.py` gated `sanitize_weights(...)` behind `if not
 is_mlx_format:` (detected via the checkpoint's safetensors metadata,
-`format: mlx`), added to preserve MTP-shard (`mtp.*`) tensors on MTP-packaged
-checkpoints. But this skips `sanitize()` for **every** MLX-format checkpoint,
-not just MTP-packaged ones — and for a plain model like this one,
-`get_class_predicate`'s `f"{p}.scales" in weights` key-matching (inside
-`nn.quantize(...)`) depends on `sanitize_weights` having run to align
-checkpoint key names with the model's parameter paths. Without it, nothing
-gets quantized, so the checkpoint's `.scales`/`.biases` tensors have nowhere
-to load into. Confirmed via bisection this predates the merge entirely
-(reproduces at `main`'s pre-merge tip, `6e65e98`, once `rope_utils` is
-patched in isolation) — it was simply masked by the crash above, since the
-task model never got past import to reach model loading. Confirmed safe to
-just always run `sanitize_weights`: `qwen3_5`'s own `sanitize()` already
-drops `mtp.*` as its first line, and `load_model` already has a second,
-independent `mtp.*`-strip safety net right before `model.load_weights(...)`
-— so the original MTP-preservation concern is covered redundantly even with
-`sanitize_weights` unconditional. Fixed by removing the `is_mlx_format` gate
-entirely (and the now-unused `safetensors` import it required).
+`format: mlx`). `get_class_predicate`'s `f"{p}.scales" in weights`
+key-matching (inside `nn.quantize(...)`) depends on `sanitize_weights` having
+run to align checkpoint key names (add the `language_model.` wrapper prefix)
+with the model's parameter paths — without it nothing gets quantized, so the
+checkpoint's `.scales`/`.biases` tensors have nowhere to load. Confirmed via
+bisection this predates the merge entirely (reproduces at `main`'s pre-merge
+tip, `6e65e98`, once `rope_utils` is patched in isolation) — masked by the
+crash above since the task model never got past import to reach model
+loading. First fix attempt: remove the `is_mlx_format` gate entirely so
+`sanitize_weights` always runs. **This was wrong and briefly broke the main
+model in production** (see §2 below for the full story and the actual
+correct fix — the real signal is per-model key-prefix presence, not file
+format, and it's now fixed properly in `qwen2`/`qwen3_5`/`qwen3_5_moe`'s own
+`sanitize()` methods rather than as a global gate in `utils.py`).
 
-After resolving all merge conflicts, fixing what the conflict resolution
+A **third, unrelated regression** surfaced while testing the fixes above:
+garbled output on an unrelated prompt, later reproduced as a genuine
+`RuntimeError: Already borrowed` in production logs. Root cause: HF's fast
+(Rust-backed) tokenizer mutates internal truncation/padding state on every
+`.encode()` call, which isn't safe under concurrent calls from multiple
+request threads — continuous batching shares ONE tokenizer instance across
+all in-flight requests, so two requests calling `.encode()` at the same
+moment can panic with a Rust `RefCell` double-borrow, and because the
+tokenizer is shared, that panic can corrupt state for whatever *other*
+request happens to be running at the same moment. Found four call sites
+doing this per-request on a small, fixed set of format/default token
+strings (`mlx_vlm/generate/dispatch.py:1103`, `mlx_vlm/server/generation.py`'s
+`_thinking_token_ids` and `_make_thinking_budget_criteria`, the latter
+explicitly commented "Mirrors the dispatch.py path") — all deterministic
+per (tokenizer, text) and therefore safe to cache. Fixed by adding
+`cached_special_token_encode` to `prompt_utils.py` (double-checked locking:
+lockless on cache hit) and routing all four call sites through it.
+
+After resolving all merge conflicts and fixing what the conflict resolution
 silently broke (`base.py`'s `kv_sequence_length`, a stale `qwen3_omni_moe`
-import), and the `is_mlx_format` fix above, the four touched test files
+import) plus the three regressions above, the four touched test files
 (`test_generate.py`, `test_models.py`, `test_processors.py`,
-`test_server.py`) run at **657 passed / 20 failed** (the `is_mlx_format` fix
-also incidentally fixed `TestGptOssMixedQuant::test_mixed_quant_checkpoint_loads`,
-which had the identical root cause). None of the remaining 20 are things this
-merge introduced — they're pre-existing gaps the new upstream tests happen to
+`test_server.py`) run at **659 passed / 18 failed** (the `sanitize()` fixes
+incidentally also fixed `TestGptOssMixedQuant::test_mixed_quant_checkpoint_loads`
+and both `TestQwen35NormSanitization` tests, all sharing the same root
+cause). None of the remaining 18 are things this merge introduced — they're
+pre-existing gaps the new upstream tests happen to
 newly exercise, or bugs that predate this session entirely. Below is what's
 failing and why, grouped by root cause, so a follow-up session can pick up
 without re-deriving any of this.
@@ -86,18 +102,59 @@ without re-deriving any of this.
 - None of this exists in our fork. Where conflict markers referenced it (`emitted_at = self._log_decode_progress(...)`, `**log_state`), those calls were dropped rather than partially grafted in (they'd have raised `NameError`/`AttributeError` immediately). The *other* half of these same conflict hunks — `draft_kind`/`draft_rounds`/`draft_n_accepted`/`draft_n` speculative-decode telemetry via `spec_snapshot`/`speculative_stats_since` — **was** ported and is wired up correctly (verified via `test_generation_metrics_record_speculative_stats` etc., all passing).
 - Pure observability/logging feature; nothing depends on it for correctness as far as this session found.
 
-## 2. `qwen3_5` `sanitize()` — needs a product decision, not a quick fix
+## 2. `qwen3_5` / `qwen3_5_moe` `sanitize()` — RESOLVED (was the cause of a production incident)
 
-- `mlx_vlm/tests/test_models.py::TestQwen35NormSanitization::test_qwen3_5_preserves_mlx_norm_weights` (line 8149)
-- `mlx_vlm/tests/test_models.py::TestQwen35NormSanitization::test_qwen3_5_moe_preserves_mlx_norm_weights` (line 8161)
-- Also blocks (via `ImportError: cannot import name 'NORM_WEIGHT_SUFFIXES'`):
-  - `mlx_vlm/tests/test_models.py::TestMiniCPMV4_6::test_minicpmv4_6_language_uses_text_only_rope` (7084)
-  - `mlx_vlm/tests/test_models.py::TestMiniCPMV4_6::test_minicpmv4_6_language_rejects_qwen_vl_grid_rope` (7096)
-  - `mlx_vlm/tests/test_processors.py::TestMiniCPMVProcessor::test_video_marker_expands_to_frame_bounds` (line 879; imports `NORM_WEIGHT_SUFFIXES`/`should_offset_norm_weight`/`should_shift_norm_weights` from `..qwen3_5.qwen3_5` via `mlx_vlm/models/minicpmv4_6/minicpmv4_6.py:8`)
-- What happened: at the merge-base, `mlx_vlm/models/qwen3_5/qwen3_5.py` had `NORM_WEIGHT_SUFFIXES`, `should_shift_norm_weights(weights)`, and `should_offset_norm_weight(original_key, shift_norm_weights)`, used inside `Model.sanitize()` to decide whether MTP-shard/unsanitized-conv1d checkpoints need their norm weights shifted.
-- Our fork's `main` **replaced** that logic with a simpler `weights = {k: v for k, v in weights.items() if "mtp." not in k}` (just dropping MTP weights, no norm-weight shift/offset decision at all). This was alongside a real, deliberate, unrelated change in the same commit region: `get_input_embeddings` now defers `get_rope_index` to only when there's an actual image/video grid, storing `_position_ids`/`_rope_deltas` directly on the language model (comment: "Pre-calculate position_ids for chunked prefill") instead of returning them via `InputEmbeddingsFeatures`.
-- Because both changes landed together and the norm-weight simplification could plausibly be intentional (e.g. if it turned out the shift/offset logic was unnecessary for checkpoints we actually load, or was itself a source of bugs), **do not just restore the three upstream functions verbatim** without checking: (a) whether any checkpoint we actually load needs the shift/offset behavior, and (b) whether the simplification was deliberate or fell out of the same bad-merge pattern that broke `rope_utils.py`. Worth a `git log -p` / blame pass on this specific hunk in isolation, and possibly asking whoever wrote the chunked-prefill position-id change if the norm-weight simplification was intentional.
-- `minicpmv4_6` and the minicpm video-marker processor test are collateral: they import `NORM_WEIGHT_SUFFIXES` etc. from `qwen3_5.qwen3_5` for their own (correct, presumably still-needed) purposes. Fixing the `qwen3_5` question fixes these transitively.
+**Update, later same session:** this was not just a test gap — it caused a real
+production regression and is now fixed. Sequence of events:
+
+1. While fixing the task model's quantization bug (see intro), `is_mlx_format`
+   was removed from `mlx_vlm/utils.py`'s `load_model` so `sanitize_weights`
+   always runs.
+2. This broke the **main model** (`caslca/Ornith-1.0-35B-mlx-uniform-4bit`,
+   `model_type: qwen3_5_moe`) — confirmed via live testing: coherent output
+   before the fix, garbled tokens (`'uteI, senses ownI️: in2.<|im_start|>...'`)
+   after, on a single non-concurrent request (so not the tokenizer race either).
+3. Root cause, found via bisection: `qwen3_5_moe.py`'s own `Model.sanitize()`
+   (and `qwen3_5.py`'s, though `qwen3_5_moe` doesn't inherit it — it has its
+   own copy) does `if value.ndim == 1: value += 1.0` on norm-layer weights
+   unconditionally, with no idempotency guard. This is a one-time HF→MLX
+   convention correction that Ornith's checkpoint **already had applied at
+   conversion time** — confirmed by its keys already being
+   `language_model.`-prefixed (e.g. `language_model.model.layers.31...`).
+   Running `sanitize()` again added the +1.0 offset a *second* time to every
+   norm layer, corrupting the model numerically. `is_mlx_format` (checking
+   safetensors `format: mlx` metadata) had originally existed to prevent
+   exactly this — but it's the wrong signal: the task model's checkpoint
+   (`mlx-community/Qwen2.5-1.5B-Instruct-4bit`) is *also* tagged
+   `format: mlx` (it's an `mlx_lm`-only conversion, no `language_model.`
+   wrapper) yet still needs `sanitize()` to run once to add that prefix.
+4. **The precise, correct signal is prefix presence, not file format** —
+   exactly the self-guard `qwen2`'s own `Model.sanitize()` already uses:
+   `if any(k.startswith("language_model.") for k in weights): return weights`.
+   Added the identical guard to `qwen3_5.qwen3_5.Model.sanitize()` and
+   `qwen3_5_moe.qwen3_5_moe.Model.sanitize()` (the MoE expert-weight fusion
+   in the latter was already safe/idempotent on its own — it guards on
+   presence of the pre-fusion `experts.*` keys, which vanish after the first
+   run).
+5. Verified: Ornith coherent again, task model still fine, and this
+   incidentally fixed `TestQwen35NormSanitization::test_qwen3_5_preserves_mlx_norm_weights`
+   and `test_qwen3_5_moe_preserves_mlx_norm_weights` (both now pass — down
+   from 21→20→**18** failures across this session).
+
+**Still open:** `mlx_vlm/models/minicpmv4_6/minicpmv4_6.py` imports
+`NORM_WEIGHT_SUFFIXES`/`should_offset_norm_weight`/`should_shift_norm_weights`
+from `..qwen3_5.qwen3_5` — symbols that no longer exist there (removed at
+some point, unrelated to this fix; not reintroduced). This still blocks:
+- `mlx_vlm/tests/test_models.py::TestMiniCPMV4_6::test_minicpmv4_6_language_uses_text_only_rope` (7084)
+- `mlx_vlm/tests/test_models.py::TestMiniCPMV4_6::test_minicpmv4_6_language_rejects_qwen_vl_grid_rope` (7096)
+- `mlx_vlm/tests/test_processors.py::TestMiniCPMVProcessor::test_video_marker_expands_to_frame_bounds` (879)
+
+`minicpmv4_6.py`'s own sanitize (line 430) uses `should_offset_norm_weight`
+as a **per-key** gate (not a blanket shift), which is actually closer to the
+right shape than what `qwen3_5`/`qwen3_5_moe` had — worth using as a
+reference if `NORM_WEIGHT_SUFFIXES` et al. get restored/redesigned. Not
+attempted this session since minicpmv4_6 was already non-functional
+(`ImportError`) independent of anything here.
 
 ## 3. Pre-existing bugs, unrelated to this merge (found incidentally while validating)
 
@@ -122,7 +179,8 @@ without re-deriving any of this.
 ## Suggested priority if picking this up
 
 1. **Prefix-cache-reuse trimming** (§1) — real correctness bug upstream fixed (silent corruption / crashes on rotating caches), currently entirely absent from our fork. Worth doing even without a failing test forcing it.
-2. **`qwen3_5` sanitize()** (§2) — blocks 5 tests across 3 files and touches active-campaign model families; needs the git-history/intent check described above before touching.
-3. **DeepSeek V4 HISA** (§1) — smallest, most contained of the quantization/attention feature gaps (kernel already correct, just config + wiring).
-4. Everything else in §1 (AWQ, FP8/NVFP4, lfm2_vl projector, structured logging) — lower urgency, no known correctness impact, port opportunistically.
-5. §3 and §4 — pre-existing/unrelated; fix whenever convenient, no urgency tied to this merge.
+2. **`qwen3_5`/`qwen3_5_moe` sanitize()** (§2) — RESOLVED this session; was a real production incident (silently corrupted the main model's norm weights). If touching either file's `sanitize()` again, preserve the `language_model.`-prefix self-guard.
+3. **DeepSeek V4 HISA** (§1) — smallest, most contained of the remaining quantization/attention feature gaps (kernel already correct, just config + wiring).
+4. `minicpmv4_6`'s broken `NORM_WEIGHT_SUFFIXES` import (§2) — low effort now that the reference implementation (`qwen2`'s and `qwen3_5`'s prefix-guard pattern) is clear; minicpmv4_6's own per-key `should_offset_norm_weight` gate is actually closer to correct than what qwen3_5 had.
+5. Everything else in §1 (AWQ, FP8/NVFP4, lfm2_vl projector, structured logging) — lower urgency, no known correctness impact, port opportunistically.
+6. §3 and §4 — pre-existing/unrelated; fix whenever convenient, no urgency tied to this merge.
