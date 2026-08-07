@@ -8,14 +8,40 @@ a stale pre-consolidation snapshot of upstream and reverted several shared
 files). That regression is fixed and verified: `qwen2`, `qwen3`, `qwen3_5`, and
 `gemma4` all import cleanly again.
 
-After resolving all merge conflicts and fixing what the conflict resolution
+A **second, unrelated regression** surfaced immediately after: the task model
+(`mlx-community/Qwen2.5-1.5B-Instruct-4bit`) still failed to load, now with
+`ValueError: Received 732 parameters not in model`. Root cause: `load_model`
+in `mlx_vlm/utils.py` gated `sanitize_weights(...)` behind `if not
+is_mlx_format:` (detected via the checkpoint's safetensors metadata,
+`format: mlx`), added to preserve MTP-shard (`mtp.*`) tensors on MTP-packaged
+checkpoints. But this skips `sanitize()` for **every** MLX-format checkpoint,
+not just MTP-packaged ones — and for a plain model like this one,
+`get_class_predicate`'s `f"{p}.scales" in weights` key-matching (inside
+`nn.quantize(...)`) depends on `sanitize_weights` having run to align
+checkpoint key names with the model's parameter paths. Without it, nothing
+gets quantized, so the checkpoint's `.scales`/`.biases` tensors have nowhere
+to load into. Confirmed via bisection this predates the merge entirely
+(reproduces at `main`'s pre-merge tip, `6e65e98`, once `rope_utils` is
+patched in isolation) — it was simply masked by the crash above, since the
+task model never got past import to reach model loading. Confirmed safe to
+just always run `sanitize_weights`: `qwen3_5`'s own `sanitize()` already
+drops `mtp.*` as its first line, and `load_model` already has a second,
+independent `mtp.*`-strip safety net right before `model.load_weights(...)`
+— so the original MTP-preservation concern is covered redundantly even with
+`sanitize_weights` unconditional. Fixed by removing the `is_mlx_format` gate
+entirely (and the now-unused `safetensors` import it required).
+
+After resolving all merge conflicts, fixing what the conflict resolution
 silently broke (`base.py`'s `kv_sequence_length`, a stale `qwen3_omni_moe`
-import), the four touched test files (`test_generate.py`, `test_models.py`,
-`test_processors.py`, `test_server.py`) run at **656 passed / 21 failed**.
-None of the 21 are things this merge introduced — they're pre-existing gaps
-the new upstream tests happen to newly exercise, or bugs that predate this
-session entirely. Below is what's failing and why, grouped by root cause, so a
-follow-up session can pick up without re-deriving any of this.
+import), and the `is_mlx_format` fix above, the four touched test files
+(`test_generate.py`, `test_models.py`, `test_processors.py`,
+`test_server.py`) run at **657 passed / 20 failed** (the `is_mlx_format` fix
+also incidentally fixed `TestGptOssMixedQuant::test_mixed_quant_checkpoint_loads`,
+which had the identical root cause). None of the remaining 20 are things this
+merge introduced — they're pre-existing gaps the new upstream tests happen to
+newly exercise, or bugs that predate this session entirely. Below is what's
+failing and why, grouped by root cause, so a follow-up session can pick up
+without re-deriving any of this.
 
 ## 1. Deferred upstream features (exist upstream, not yet ported to this fork)
 
@@ -31,10 +57,6 @@ follow-up session can pick up without re-deriving any of this.
   - `test_strict_load_and_selective_quantize` (9150)
   - `test_rejects_multiple_native_quant_modes` (9192)
 - Not diagnosed at the symbol level this session — likely a whole quantization-format feature (FP8/NVFP4 compressed-tensors support) that hasn't been ported, similar in shape to the AWQ gap.
-
-### gpt_oss mixed-quant checkpoint loading — 1 test
-- `mlx_vlm/tests/test_models.py::TestGptOssMixedQuant::test_mixed_quant_checkpoint_loads` (class at 9226, method at 9282)
-- Failure: `ValueError: Received 71 parameters not in model: ...` — a per-layer key-remapping mismatch when loading a mixed-quant gpt_oss checkpoint (expert layers get keys the current `sanitize`/quantize-predicate path doesn't expect). Related in spirit to the `qwen3_5` sanitize gap below but a different model family.
 
 ### DeepSeek V4 HISA (sparse attention) — 3 of 4 tests
 - `mlx_vlm/tests/test_models.py::TestDeepseekV4HISA` (class at 7967)
@@ -102,5 +124,5 @@ follow-up session can pick up without re-deriving any of this.
 1. **Prefix-cache-reuse trimming** (§1) — real correctness bug upstream fixed (silent corruption / crashes on rotating caches), currently entirely absent from our fork. Worth doing even without a failing test forcing it.
 2. **`qwen3_5` sanitize()** (§2) — blocks 5 tests across 3 files and touches active-campaign model families; needs the git-history/intent check described above before touching.
 3. **DeepSeek V4 HISA** (§1) — smallest, most contained of the quantization/attention feature gaps (kernel already correct, just config + wiring).
-4. Everything else in §1 (AWQ, FP8/NVFP4, gpt_oss mixed-quant, lfm2_vl projector, structured logging) — lower urgency, no known correctness impact, port opportunistically.
+4. Everything else in §1 (AWQ, FP8/NVFP4, lfm2_vl projector, structured logging) — lower urgency, no known correctness impact, port opportunistically.
 5. §3 and §4 — pre-existing/unrelated; fix whenever convenient, no urgency tied to this merge.
