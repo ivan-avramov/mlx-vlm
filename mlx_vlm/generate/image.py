@@ -463,8 +463,7 @@ def generate_image(
         if isinstance(request, ImageGenerationRequest):
             if image_paths is None:
                 raise ValueError(
-                    "image_paths are required when editing from "
-                    "ImageGenerationRequest"
+                    "image_paths are required when editing from ImageGenerationRequest"
                 )
             request = ImageEditRequest(
                 prompt=request.prompt,
@@ -561,6 +560,9 @@ def run_image_generation_cli(args: Any) -> None:
     task = _normalize_image_task(getattr(args, "task", DEFAULT_IMAGE_TASK))
     _validate_image_generation_args(args, task=task)
     seed = args.seed if args.seed is not None else random.randrange(2**32)
+    steps = getattr(args, "steps", None)
+    if steps is None:
+        steps = DEFAULT_IMAGE_STEPS
     prompt = _prompt_to_image_text(args.prompt)
     if not prompt:
         raise ValueError(f"--prompt must not be empty for image {task}")
@@ -586,7 +588,7 @@ def run_image_generation_cli(args: Any) -> None:
             prompt=prompt,
             image_paths=tuple(args.image),
             seed=seed,
-            steps=args.steps,
+            steps=steps,
             width=width,
             height=height,
             guidance=args.guidance,
@@ -613,7 +615,7 @@ def run_image_generation_cli(args: Any) -> None:
         request = ImageGenerationRequest(
             prompt=prompt,
             seed=seed,
-            steps=args.steps,
+            steps=steps,
             width=width,
             height=height,
             guidance=args.guidance,

@@ -1797,6 +1797,68 @@ class TestModels(unittest.TestCase):
                 self.assertIn("language_model.lm_head", config.quantization)
                 self.assertIs(config.quantization, config.quantization_config)
 
+    def test_chandra_ocr2_config_uses_qwen3_5(self):
+        from mlx_vlm.models import qwen3_5
+        from mlx_vlm.utils import get_model_and_args
+
+        chandra_config = {
+            "model_type": "qwen3_5",
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "image_token_id": 151655,
+            "video_token_id": 151656,
+            "vision_start_token_id": 151652,
+            "vision_end_token_id": 151653,
+            "tie_word_embeddings": True,
+            "text_config": {"model_type": "qwen3_5_text"},
+            "vision_config": {"model_type": "qwen3_5", "patch_size": 16},
+        }
+
+        model_class, _ = get_model_and_args(config=dict(chandra_config))
+        self.assertIs(model_class, qwen3_5)
+
+        config = qwen3_5.ModelConfig.from_dict(dict(chandra_config))
+        self.assertEqual(config.image_token_id, 151655)
+        self.assertEqual(config.video_token_id, 151656)
+        self.assertEqual(config.vision_start_token_id, 151652)
+        self.assertEqual(config.vision_end_token_id, 151653)
+        self.assertEqual(config.vision_config.patch_size, 16)
+
+    def test_qwen3_5_decode_uses_rope_deltas_kwarg(self):
+        from mlx_vlm.models import qwen3_5
+
+        text_config = qwen3_5.TextConfig(
+            model_type="qwen3_5",
+            hidden_size=16,
+            intermediate_size=32,
+            linear_num_value_heads=2,
+            linear_num_key_heads=2,
+            linear_key_head_dim=8,
+            linear_value_head_dim=8,
+            linear_conv_kernel_dim=3,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            rms_norm_eps=1e-5,
+            vocab_size=32,
+            num_key_value_heads=2,
+            max_position_embeddings=128,
+            head_dim=8,
+        )
+        config = qwen3_5.ModelConfig(
+            text_config=text_config,
+            vision_config=qwen3_5.VisionConfig(
+                model_type="qwen3_5",
+                depth=1,
+                hidden_size=16,
+                intermediate_size=32,
+                out_hidden_size=16,
+                num_heads=2,
+            ),
+            model_type="qwen3_5",
+        )
+        language_model = qwen3_5.LanguageModel(text_config, config)
+
+        self._assert_mrope_decode_uses_rope_deltas_kwarg(language_model, 16)
+
     def test_qwen3_5_sanitize_key_routes_nested_visual_weights(self):
         from mlx_vlm.models.qwen3_5.qwen3_5 import sanitize_key
 

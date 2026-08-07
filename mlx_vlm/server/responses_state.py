@@ -348,6 +348,7 @@ def _split_thinking(
     text: str,
     thinking_start_token: Optional[str] = None,
     thinking_end_token: Optional[str] = None,
+    starts_in_thinking: bool = False,
 ) -> Tuple[Optional[str], str]:
     """Split thinking tags from content. Returns (reasoning, content).
 
@@ -394,6 +395,10 @@ def _split_thinking(
         if start_marker in text:
             reasoning = _clean_reasoning(text, start_marker)
             return reasoning or None, ""
+
+    if starts_in_thinking:
+        reasoning = _strip_content_markers(text).strip()
+        return reasoning or None, ""
 
     return None, _strip_content_markers(text).strip()
 
