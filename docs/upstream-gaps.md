@@ -511,6 +511,13 @@ merged-then-dropped** — `git log HEAD..upstream/main` is empty and always was.
 invisible: the merge that dropped a feature hunk usually dropped its tests in the
 same resolution.
 
+**Progress as of 2026-08-08 (second pass).** 72 -> **63** commits with missing
+content, 39 -> **36** diverged files, 239 -> **216** `.symbol-exclusions`
+entries. Suite 2380 -> **2403 passed, 5 skipped, 0 failed**. Seven items closed;
+see the table. Two remain deliberately unlanded pending an operator decision
+(**#1** changes auth behaviour on every endpoint, **#6** changes model numerics on
+served paths), and **#17** is sequenced after #6.
+
 Re-run the scanner after every merge:
 
 ```bash
@@ -523,27 +530,57 @@ as false positives. Every hit still needs `git log -S` and a read.
 
 ### Fixed already
 
-`#1492`, `ff2a6daa`, `ecc457b2` (partial), `bc3461b1`, `#1503`, `46ee12dd`,
-`#1554` (MTP `+2.0` norm shift), 4 `MODEL_REMAPPING` entries, DeepSeek V4's
-`swiglu_limit` clamp + `zero_row_tail`, and the mlx-lm vendoring.
+`#1492`, `ff2a6daa`, `bc3461b1`, `#1503`, `46ee12dd`, `#1554` (MTP `+2.0` norm
+shift), 4 `MODEL_REMAPPING` entries, DeepSeek V4's `swiglu_limit` clamp +
+`zero_row_tail`, and the mlx-lm vendoring.
+
+Closed in the 2026-08-08 second pass — items **2, 4, 5, 7, 10, 13** below plus the
+multi-kind preload flags:
+
+| Commit here | Restores | Was |
+|---|---|---|
+| `c8609a0c` | `ecc457b2` (#1374), now complete | MiniMax M3 VL unusable on every batch/server path; `--thinking-mode` unreachable |
+| `b7ae124b` | `c6084344` | `--image-model` / `--tts-model` / `--stt-model` documented in README but rejected by argparse |
+| `f5b74a9a` | `dab4cb45` (#1582) | `--quantized-kv-start` a dead parameter |
+| `609bdf95` | `40757df3` | `/v1/embeddings` 404 with 246 lines of implementation in the tree |
+| `92620167` | `#1447`, `#1453`, `#1432` | TurboQuant batch cache untrimmable — a live `IndexError`/`TypeError` |
+| `510f16e9` | `960b26f9` (#1597), `53052569` | 1-bit backend unreachable; laguna markers duplicated |
+| `a91f9b4d` | — (tooling) | stale `.symbol-exclusions` entries now warned about instead of rotting silently |
+
+Three things worth carrying forward from that pass:
+
+- **Docs landing without their code is the most reliable tell in this repo.**
+  Four of the six restores were findable that way, not from line counts: README
+  documented `--image-model`/`--tts-model`/`--stt-model`, `--embedding-model`, a
+  whole `/v1/embeddings` section, and (see #1) "Bearer token required for
+  inference, model discovery, and management endpoints" — all while the code did
+  none of it. Grep the README against argparse when triaging.
+- **The stale-exclusion warning paid for itself immediately**, surfacing 5 dead
+  entries after the TurboQuant restore and 1 after the laguna restore. It is a
+  warning, not an error, so `upstream-parity.yml` does not start failing on the
+  pre-existing backlog.
+- **One deliberate non-restore.** Upstream's `BatchTurboQuantKVCache` has *two*
+  `zero_row_tail` definitions (upstream:6193 from #1447, upstream:6234 from
+  #1432) in the same class body, so the first is shadowed and unreachable. Ours
+  has the surviving one. Do not "restore" the dead duplicate.
 
 ### Ranked backlog — each item has a demonstrated failure
 
 | # | Item | Owning commit | Demonstrated effect |
 |---|---|---|---|
 | 1 | **Inference routes unauthenticated** | `4993eac1` (#1714) | with `MLX_VLM_SERVER_API_KEY` set, `/v1/models` returns 200 and `/v1/chat/completions` reaches body validation without auth, while `/v1/cache/stats` correctly 401s. Upstream wraps them in `APIRouter(dependencies=[Depends(_require_management_api_key)])`; we register on `app` directly |
-| 2 | **MiniMax M3 VL cannot run on any batch/server path** | `ecc457b2` (#1374) | `ar._make_cache(model, [0,1])` -> `ValueError: MiniMaxM3KVCache does not yet support batching`. 3-line `to_batch` guard at the top of `to_batch_cache` |
+| 2 | ~~MiniMax M3 VL cannot run on any batch/server path~~ **FIXED `c8609a0c`** | `ecc457b2` (#1374) | `ar._make_cache(model, [0,1])` -> `ValueError: MiniMaxM3KVCache does not yet support batching`. 3-line `to_batch` guard at the top of `to_batch_cache` |
 | 3 | **Streaming `/v1/responses` streams raw chain-of-thought as visible output** | `7c233155`, `cfcc36d9` | `openai.py` streaming path is `delta = chunk.text`; zero `response.reasoning*` events. Non-streaming drops the item too: `_response_output_items_from_text` yields `['message']` where upstream yields `['reasoning','message']` |
-| 4 | **`/v1/embeddings` 404s although the implementation ships** | `40757df3` | `server/embeddings.py` + `models/pooling.py` byte-identical to upstream with **zero importers**; the `app.py`/`cli.py` wiring was dropped |
-| 5 | **`--quantized-kv-start` silently ignored on the server** | `dab4cb45` (#1582) | plumbed all the way to `ar.py`'s `self.quantized_kv_start = ...` and **read by nothing**. TurboQuant quantizes from token 0 regardless. A dead-parameter tell |
+| 4 | ~~`/v1/embeddings` 404s although the implementation ships~~ **FIXED `609bdf95`** | `40757df3` | `server/embeddings.py` + `models/pooling.py` byte-identical to upstream with **zero importers**; the `app.py`/`cli.py` wiring was dropped |
+| 5 | ~~`--quantized-kv-start` silently ignored on the server~~ **FIXED `f5b74a9a`** | `dab4cb45` (#1582) | plumbed all the way to `ar.py`'s `self.quantized_kv_start = ...` and **read by nothing**. TurboQuant quantizes from token 0 regardless. A dead-parameter tell |
 | 6 | **mRoPE cluster** | `a8642018`, `b8671991`, `#1527`, `#1741` | must land WITH `generate/ar.py`: our batcher lacks the MRoPE helpers, so `(3,B,L)` `position_ids` is truncated to `(1,B,L)`. Restoring `qwen3_5` alone *creates* a bug. **Live today for qwen2_vl / qwen2_5_vl / qwen3_vl / qwen3_vl_moe** — qwen3_5's staleness is what masks it |
-| 7 | **TurboQuant trim cluster** | `#1447`, `#1453`, `#1432` | `BatchTurboQuantKVCache.is_trimmable()` -> `False`, `trim(2)` -> `0` (upstream: `True`, `2`). Under `--kv-bits` the cache falls into the SSM branch and is indexed `c[0]`/`c[1]` -> `TypeError`; on the non-crashing path every later `gdn_states[j]` index shifts, restoring GatedDeltaNet state from the wrong layer. `zero_row_tail` exists with **no caller anywhere** |
+| 7 | ~~TurboQuant trim cluster~~ **FIXED `92620167`** | `#1447`, `#1453`, `#1432` | `BatchTurboQuantKVCache.is_trimmable()` -> `False`, `trim(2)` -> `0` (upstream: `True`, `2`). Under `--kv-bits` the cache falls into the SSM branch and is indexed `c[0]`/`c[1]` -> `TypeError`; on the non-crashing path every later `gdn_states[j]` index shifts, restoring GatedDeltaNet state from the wrong layer. `zero_row_tail` exists with **no caller anywhere** |
 | 8 | **`tool_choice` ignored on `/v1/chat/completions`** | `2394fcf1` (#1611) | `"tools" in ChatRequest.model_fields` -> False; also lost the `if not tools: tool_module = None` guard, so tool markup is parsed for callers who sent no tools |
 | 9 | **`skip_special_tokens` is an undeclared attribute** | `cfcc36d9`/`29b6c00b` | `anthropic.py:489` writes `gen_args.skip_special_tokens = False`; the field does not exist on `GenerationArguments` and `generation.py` hardcodes `True`. The recorded "Anthropic tool-markup" fix is **inert** |
-| 10 | **1-bit repos cannot load** | `960b26f9` (#1597) | kernel, `__init__` export and 123-line test all landed; only `utils.py`'s 7 lines of `replace_one_bit_modules` wiring dropped |
+| 10 | ~~1-bit repos cannot load~~ **FIXED `510f16e9`** | `960b26f9` (#1597) | kernel, `__init__` export and 123-line test all landed; only `utils.py`'s 7 lines of `replace_one_bit_modules` wiring dropped |
 | 11 | **AWQ quantization absent** | `3c0232ed` (#1666) | 104 lines of `convert.py`, 91% of the hunk |
 | 12 | **Empty-input rejection absent** | `a344713a` (#1491) | empty requests reach model load instead of a 400 |
-| 13 | `should_add_special_tokens` missing | `53052569` | see the shadowed-test note below; gemma3/3n/4/4_unified/laguna get markers added outside the template |
+| 13 | ~~`should_add_special_tokens` missing~~ **FIXED `510f16e9`** | `53052569` | see the shadowed-test note below; gemma3/3n/4/4_unified/laguna get markers added outside the template |
 | 14 | `load_image(PIL.Image)` raises | `84025353` | `ValueError: Unsupported image source type: Image` |
 | 15 | `request_normalization.py` orphaned | `221fe0b3` (#1644) | 242 lines, byte-identical, **zero importers**, and it *raises on first call* (passes `top_n_sigma` to a `GenerationArguments` that lacks it) — a landmine for anyone who "fixes" the import |
 | 16 | Three sampler modes unreachable | `36331ea7`, `#1653`, `#1663` | `sample_utils.make_sampler` accepts `top_n_sigma`/`p_less`/`typical_p`; no request field reaches them |
