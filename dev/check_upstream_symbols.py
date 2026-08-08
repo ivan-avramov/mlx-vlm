@@ -141,6 +141,7 @@ def main() -> int:
     exclusions = load_exclusions()
     missing: list[tuple[str, str]] = []
     excused = 0
+    used: set[tuple[str, str]] = set()
 
     shared = sorted(upstream_files & our_files)
     upstream_sources = read_blobs(ref, shared)
@@ -157,12 +158,30 @@ def main() -> int:
             for path_glob, sym_glob, _reason in exclusions:
                 if fnmatch.fnmatch(path, path_glob) and fnmatch.fnmatch(name, sym_glob):
                     excused += 1
+                    used.add((path_glob, sym_glob))
                     break
             else:
                 missing.append((path, name))
 
     if excused:
         print(f"{excused} known symbol exclusion(s) vs {ref}.")
+
+    # An exclusion that no longer excuses anything means the symbol came back —
+    # usually because a restore landed. Those entries go stale silently
+    # otherwise, and a stale exclusion is a hole in the next audit: it would
+    # excuse the symbol again if it were dropped a second time.
+    stale = [
+        f"{path_glob}::{sym_glob}"
+        for path_glob, sym_glob, _reason in exclusions
+        if (path_glob, sym_glob) not in used
+    ]
+    if stale:
+        print(
+            f"\nwarning: {len(stale)} exclusion(s) in {EXCLUSIONS_FILE.name} no "
+            f"longer excuse a missing symbol and should be pruned:"
+        )
+        for entry in stale:
+            print(f"      - {entry}")
 
     if missing:
         print(

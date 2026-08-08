@@ -139,8 +139,6 @@ mlx_vlm/tests/test_batch_quantized_cache.py::test_shallow_stack_quantizes_all  #
 
 # --- mlx_vlm/tests/test_generate.py
 mlx_vlm/tests/test_generate.py::FallbackArgmaxModel  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_generate.py::TestBatchTurboQuantizedKVStart  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_generate.py::_cache_kinds  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::_fill  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::fused_greedy_decode  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::make_batch  # baseline: pre-existing divergence, unreviewed
@@ -150,8 +148,6 @@ mlx_vlm/tests/test_generate.py::test_batch_generate_optional_input_annotations_m
 mlx_vlm/tests/test_generate.py::test_batch_generator_apc_media_token_ids_handles_text_only_model  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::test_capture_rope_deltas_prefers_prompt_kwargs  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::test_cold_batch_merges_mixed_text_and_mrope_position_ids  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_generate.py::test_default_preserves_immediate_quantization  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_generate.py::test_defers_to_float_below_threshold  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::test_empty_cache_is_reusable  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::test_flat_cache_trims_to_prefix  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::test_full_prefix_needs_no_trim  # baseline: pre-existing divergence, unreviewed
@@ -161,7 +157,6 @@ mlx_vlm/tests/test_generate.py::test_generation_batch_extend_expands_compact_pro
 mlx_vlm/tests/test_generate.py::test_generation_batch_ignores_speculative_argmax_without_fused_decode  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::test_generation_batch_thinking_budget_does_not_sync_next_token  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::test_generation_batch_uses_fused_greedy_decode_without_logprobs  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_generate.py::test_immediate_when_start_zero  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::test_mixed_flat_and_wrapped_rotating_is_not_reusable  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::test_pop_forced_token_id_consumes_pending_token_id  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::test_pop_forced_token_id_emits_forced_token_when_budget_exceeded  # baseline: pre-existing divergence, unreviewed
@@ -172,7 +167,6 @@ mlx_vlm/tests/test_generate.py::test_prompt_processing_batch_slices_native_mrope
 mlx_vlm/tests/test_generate.py::test_prompt_step_keeps_exact_apc_checkpoint_async  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::test_prompt_step_schedules_cache_evaluation_asynchronously  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::test_public_generation_annotations_match_runtime_results  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_generate.py::test_quantizes_at_or_above_threshold  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::test_split_prompt_kwargs_handles_native_mrope_position_ids  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::test_unwrapped_buffered_rotating_trims  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::test_unwrapped_rotating_trims_and_stays_usable  # baseline: pre-existing divergence, unreviewed
@@ -252,7 +246,6 @@ mlx_vlm/tests/test_server.py::generate_one  # baseline: pre-existing divergence,
 mlx_vlm/tests/test_server.py::make_criteria  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::preprocess  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::reject_model  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_server.py::run_lifespan  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_build_gen_args_explicit_thinking_overrides_standard_reasoning  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_build_gen_args_maps_chat_reasoning_effort  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_build_gen_args_maps_none_reasoning_effort_to_disabled  # baseline: pre-existing divergence, unreviewed
@@ -276,7 +269,6 @@ mlx_vlm/tests/test_server.py::test_gpu_embed_drops_none_embedding_fields  # base
 mlx_vlm/tests/test_server.py::test_inference_endpoint_accepts_configured_api_key  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_inference_endpoints_require_configured_api_key  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_info_decode_logging_uses_interval_without_token_details  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_server.py::test_lifespan_preloads_configured_model_kinds  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_load_model_resources_returns_load_failure_as_bad_request  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_log_progress_interval_is_configurable  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_metrics_store_logs_request_lifecycle  # baseline: pre-existing divergence, unreviewed
