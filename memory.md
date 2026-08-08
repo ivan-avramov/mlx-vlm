@@ -469,9 +469,32 @@ On prompts with 10+ independent constraints, Gemma 4 reasoning can enter a runaw
 
 **Change Log Over Upstream**
 
-Refresh authoritative commit list with `git log --pretty=format:"%h|%ad|%s" --date=short upstream/main..HEAD`.
+**How to refresh this table.** `upstream/main..HEAD` is NOT the right range --
+it returns ~837 commits, because it includes the fork's entire history back to
+its original divergence, not just curated work. This table lists the fork's own
+atomic commits since the last upstream merge. Use:
 
-**Upstream base:** `c2058a5` *Fix Kimi VL concurrent Metal crash and mixed-batch text degradation (#1039)*
+```bash
+# commits since the most recent upstream merge
+MERGE=$(git log --merges --first-parent -1 --format=%H --grep='Merge upstream')
+git log --reverse --no-merges --pretty=format:"%h|%ad|%s" --date=short $MERGE..HEAD
+```
+
+For the cumulative fork-vs-upstream diff, use three dots:
+`git diff upstream/main...HEAD`.
+
+**Upstream base (current):** `0c846ef` *Merge pull request #1808 from
+lucasnewman/minimax-h3* — merged 2026-08-07 in `3f148d4`.
+
+**Historical upstream base:** `c2058a5` *Fix Kimi VL concurrent Metal crash and
+mixed-batch text degradation (#1039)* — the base the 2026-05-03 block below was
+written against.
+
+> **Hashes in the 2026-05-03 block below no longer resolve.** They were recorded
+> before the `port(generate)` restructure, which rewrote that history; `git show`
+> on them fails. They are kept as a record of what work was grouped together, not
+> as addressable commits. Everything from the 2026-08-07 block onward uses live
+> hashes.
 
 **Local commits over upstream** (oldest → newest, as of 2026-05-03):
 
@@ -495,6 +518,42 @@ Refresh authoritative commit list with `git log --pretty=format:"%h|%ad|%s" --da
 | `7007616` | 2026-05-01 | test: fill test gaps in prompt_utils, server, turboquant (~110 new tests — registry coverage, image-schema, allocation-hook lifecycle, MAX_KV_SIZE plumbing, `_build_gen_args` plumbing). | #3, #4, #5, #8, #12, #15, #20, #22, #24, #27 |
 | `e48ef69` | 2026-05-02 | feat(server): SSE thinking-state-machine rewrite — `_step_thinking_state` helper, `_partial_tag_start_pos` ends-with-prefix detection. Fixes for token-spanning tags, partial-buffer leak, multi-transition-per-token, double-append regression, per-turn-opener leak while seeded `in_thinking=True`. | #29, #29b, #29c, #29d, #29e |
 | `2d5feec` | 2026-05-02 → 2026-05-03 | feat(generate,snapshot,server): asymmetric-template caching with hybrid-cache rewind. `RotatingKVSnapshot` for SWA layers (post-gen-trim wrap-detection guard); `_compute_anchor_before_latest_user_offset` for OWUI RAG-context wrapping; `_first_kv_offset` for hybrid topology; mid-prefill capture with three side-channels (rotating + arrays + offset marker); pre-prefill capture for OWUI tool-continuation flow; `_trim_cache` skip-list fix for `QuantizedKVCache` / `BatchQuantizedKVCache`; cache-trim-back to end-of-user post-generation. Squashes the four progressive fixes #31a–#31d (originally `e2a567f`, `53ca424`, `5817e82`, `925ff11`) plus the diagnostic-add/revert pair (`bb323f2` + `5ffdbb7`, net-zero). | #28, #30, #31, #31a, #31b, #31c, #31d |
+
+**Local commits over upstream** (2026-08-07, after merging `0c846ef`):
+
+> Context: this block came out of auditing the *previous* merges rather than the
+> new one. The merge itself was 9 upstream commits and 3 conflict hunks; almost
+> everything below is recovering content earlier merges had silently dropped. See
+> `docs/upstream-gaps.md` for the mechanism and the full taxonomy of failure
+> shapes.
+
+| commit | date | purpose |
+|---|---|---|
+| `3f148d4` | 2026-08-07 | Merge `upstream/main` 94edef5..0c846ef (minimax_h3, video generation, fixes). Three conflicts, all resolved as unions: `generate/__init__.py` needed both `common` and `video_generation` in the lazy import lists or the merged body raises `NameError`. |
+| `1029e57` | 2026-08-07 | fix(server): port `prompt_has_open_thinking`. Upstream #1811's call sites auto-merged into `openai.py` but neither the definition nor the import did, so **every chat-completions request 500'd**. 9 of the 10 regressions the merge introduced. |
+| `b9861db` | 2026-08-07 | fix(generate): rotating-cache guards must match subclasses (#1715). `BufferedRotatingKVCache` (installed by speculative decoding) was treated as a flat cache, so `_rotating_rewind_safe` allowed an evicted rewind and `_trim_cache` physically sliced the ring buffer. Adds `_cache_kind_names()` (MRO-wide) + `start_position`. |
+| `3a65fa7` | 2026-08-07 | restore 16 dropped upstream test files; add `dev/check_upstream_parity.py`, `dev/check_upstream_symbols.py`, `.merge-exclusions`, `.symbol-exclusions`, `upstream-parity.yml`. Files kept byte-identical to upstream; skips live in `tests/conftest.py`. |
+| `087c91a3` | 2026-08-07 | fix(cache): subclass-aware dispatch in `_is_rotating_kv_layer` (the snapshot-vs-trim *routing* predicate) and `_rotating_post_gen_trim_safe`; `start_position` plumbed through `RotatingKVSnapshot`. |
+| `7a23706` | 2026-08-07 | docs+apc: record that `_rotating_post_gen_trim_safe` is intentionally superseded by mid-prefill snapshots (do not wire it in); port `should_quantize_kv_layer`. |
+| `dcf67c4` | 2026-08-07 | feat(apc): thread `kv_quant_config` through all five warm-cache builders + the `dispatch.py`/`ar.py` callers, so warm restore rebuilds the layer types live generation would. |
+| `6170659` | 2026-08-07 | feat(apc): `APCBlock` migrated onto `APCNode`; `apc.py` now uses `apc_storage`, which had been present and byte-identical but unused. Also fixes `models/minimax_m3_vl` being **unloadable** (`dynamic_roll` ImportError). |
+| `7678b44` | 2026-08-07 | feat(apc): quantized block harvest. `dequantize_for_apc` grafted onto mlx_lm's `QuantizedKVCache` behind a `hasattr` guard so it self-retires if mlx_lm ships its own, paired with a behavioural contract test. Ports `layer_kv_for_apc`, `snapshot_prompt_cache_row`. |
+| `b3fd098` | 2026-08-07 | feat(apc): `turboquant.py` fully converged (7 methods); wired `layer_kv_for_apc` into `harvest_blocks_from_batch_cache`; ported `commit_prefix_blocks`. |
+| `15771fc` | 2026-08-07 | fix(apc): delegate `_cache_entry_supports_exact_apc`, `_clone_cache_entry_for_apc` (-85 lines) and `_cache_entry_supports_block_apc` to the `apc_adapters` capability layer. Adds a `BatchRotatingKVCache` subclass carrying upstream's right-pad prefill fix, which mlx_lm lacks. |
+| `0f359e5` | 2026-08-07 | feat(apc): semantic keys + self-check. **`apc.py` fully converged with upstream.** `semantic_extra_hash` reduces exactly to `tenant_scoped_hash` with no extras, so existing cache keys are unchanged. |
+| `b16e711` | 2026-08-07 | fix: `/responses` now validates before loading the model (bad `file_id` 400s instead of 500s); thinking-delay falls back to an id-scan when `decode` is unavailable; DeepSeek V4 HISA wired; stale `lfm2_vl` tests replaced with upstream's. |
+| `443f924` | 2026-08-07 | fix(apc): **APC was disabled entirely whenever `--kv-bits` was set** — removed, now that warm restore is quantization-aware. Most user-visible change here, since the served models are quantized. Also delegates `_merge_exact_cache_entries`. |
+| `7ff51d7` | 2026-08-07 | fix(qwen3_5): the production `+1.0` double-shift guard was a blanket `return weights`, which also skipped `mtp.` filtering, expert fusion and key renaming. Narrowed to per-key gating; both incident cases re-verified. |
+| `2de64d6` | 2026-08-07 | feat: FP8/NVFP4 compressed-tensors; flux2 quantized-repo routing (one dropped guard line, `supports_model`, broke every quantized flux2 repo). |
+| `4b15cc5` | 2026-08-07 | fix: dropped registry entries — `mage`/`mageflow`, `minimax_m3_vl`, `kimi_k3`. The last was the entire "kimi_k3 template mismatch" earlier docs guessed at. ULP-bounds a Metal-kernel test that asserted bitwise equality. |
+| `e3593ee` | 2026-08-07 | docs: `upstream-gaps.md` + `CLAUDE.md` brought current. |
+
+Suite across this block: **36 failed / 1805 passed → 16 failed / 2175 passed**, with
+collection up ~2004 → ~2190. All 16 remaining failures are in
+`test_diffusion_gemma.py` (11) and `test_diffusion_models.py` (5); no other file
+has a failing test. Compare failing *test IDs*, not counts.
+
+---
 
 Sections #1–#16 (the pre-port architecture work — StreamingTranslator, MultiCacheManager, prefill-step tuning, RoPE desync fix, ghost-prompt removal, etc.) predate the last-merged upstream tip and are not individually itemized in this commit table; they're reflected in the cumulative diff `git diff upstream/main...HEAD` (three dots — diffs from the merge base).
 
