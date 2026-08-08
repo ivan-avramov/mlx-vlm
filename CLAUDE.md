@@ -62,24 +62,29 @@ uv pip install --python .venv/bin/python -e . pytest pytest-asyncio
 cd mlx_vlm/ && pytest -s ./tests --ignore=tests/test_smoke.py --ignore=tests/test_utils.py
 ```
 
-The suite is **not green**: 16 failed / 2175 passed. Compare against that number
-rather than expecting zero.
-
-All 16 remaining failures are in `test_diffusion_gemma.py` (11) and
-`test_diffusion_models.py` (5) — no other test file has a failing test. They need
-a design decision on reconciling `generate/diffusion.py`, which has diverged from
-upstream in both directions; see `docs/upstream-gaps.md`.
+The suite is **green: 2197 passed, 5 skipped, 0 failed.** Keep it that way.
 
 **Compare failing test IDs, not counts.** A change that fixes one test and breaks
-another shows the same total. Diff the sorted `FAILED ...` lines:
+another shows the same total:
 
 ```bash
-# before and after your change
 pytest -q ./tests --ignore=tests/test_smoke.py --ignore=tests/test_utils.py \
   | grep '^FAILED' | sed 's/ - .*//' | sort > /tmp/after.txt
 comm -13 /tmp/before.txt /tmp/after.txt   # regressions
 comm -23 /tmp/before.txt /tmp/after.txt   # fixed
 ```
+
+**Green does not mean converged with upstream.** Of the last five real bugs found
+here, four had no failing test at all — see `docs/upstream-gaps.md`. When
+investigating a divergence from upstream, two commands settle most questions:
+
+```bash
+git log -S'<symbol>' --all -- <path>   # a "fork-only" symbol is often stale UPSTREAM code
+git show --stat <commit>               # a dropped commit spans several files; restore them together
+```
+
+Restoring one file of a multi-file dropped commit is worse than restoring none —
+the stale files are internally consistent.
 
 `mlx_vlm/tests/conftest.py` skips 2 restored upstream test files, both a
 deliberate permanent divergence (quantized-SDPA masks; this fork dequantizes, so

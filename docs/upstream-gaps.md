@@ -163,77 +163,107 @@ behind the "repetition loops on turn 2" incident.
 
 ## Test-suite state
 
-Full suite, `cd mlx_vlm/ && pytest ./tests --ignore=tests/test_smoke.py
---ignore=tests/test_utils.py`:
+**The suite is green: 2197 passed, 5 skipped, 0 failed.**
 
 | Stage | Result |
 |---|---|
-| Before the merge | 36 failed, 1805 passed, 3 skipped |
-| After the merge | 46 failed, 1833 passed (10 regressions, all from the `prompt_has_open_thinking` break) |
-| After the restore | 76 failed, 1924 passed (44 pre-existing gaps became *visible*) |
-| **Now** | **16 failed, 2175 passed, 5 skipped** |
+| Before the merge | 36 failed, 1805 passed |
+| After the merge | 46 failed, 1833 passed (10 regressions, the `prompt_has_open_thinking` break) |
+| After restoring 16 dropped test files | 76 failed, 1924 passed (44 pre-existing gaps became *visible*) |
+| **Now** | **0 failed, 2197 passed** |
 
-Read the middle rows carefully: the rise to 76 was not a regression. Restoring
-the 16 dropped test files exposed 44 gaps that had been invisible because the
-tests for them were missing. Everything from there down was closing real gaps.
+The rise to 76 was not a regression — restoring the dropped test files exposed
+gaps that had been invisible because the tests for them were missing.
 
-**Every remaining failure is in `test_diffusion_gemma.py` (11) or
-`test_diffusion_models.py` (5). No other test file has a failing test.**
+Skipped files: 2, the deliberate quant-SDPA divergence (down from 6).
 
-Skipped files: 2, both the deliberate quant-SDPA divergence described above
-(down from 6).
+**Compare failing test IDs, not counts**, when validating a change:
+`comm -13`/`comm -23` over the sorted `FAILED ...` lines. A fix-one-break-one swap
+shows an identical total.
 
-Compare failing *test IDs*, not counts, when validating a change here — a
-same-count swap is otherwise invisible. `comm -13`/`comm -23` over the sorted
-`FAILED ...` lines is enough.
+## Green does not mean converged
+
+This is the most important thing on this page.
+
+Of the last five real bugs found in this fork, **four had no failing test**:
+
+| Bug | Impact | Test that caught it |
+|---|---|---|
+| Gemma 4 tool-call normalization dropped (`tool_parsers/gemma4.py`, +0/−8) | `":name{...}"` and `"name{...}"` call shapes silently fail to parse | none |
+| Anthropic endpoint seeded thinking state from `enable_thinking` instead of `prompt_has_open_thinking(...)` | wrong thinking state; also `skip_special_tokens` left on, stripping tool markup | none |
+| `glm4_moe_lite_mtp` / `inkling_mtp` missing from the drafter registry | those drafters cannot be auto-detected | none |
+| 5 models missing from the prompt-format registry | prompts formatted by the fallback path | none |
+| `gemma4`/`gemma4_unified` processors stuck pre-#1492 | `AutoProcessor` rejects the DiffusionGemma processor | yes |
+
+All four silent ones surfaced only by **diffing files that a dropped upstream
+commit had touched**. Neither audit can see them: the files are present and every
+symbol is present.
+
+### The two history commands that actually settle things
+
+Learned the hard way, twice, on the diffusion subsystem:
+
+```bash
+git log -S'<symbol>' --all -- <path>    # who introduced it, and was that upstream?
+git show --stat <commit>                # EVERY file that commit touched
+```
+
+1. **A "fork-only" symbol is not necessarily fork work.** `diffusion.py`'s seven
+   fork-only symbols looked like a two-way divergence needing an architecture
+   decision. `git log -S` showed all seven came from upstream PRs #1347/#1348 and
+   were deliberately removed upstream by #1359 and #1508. The fork was carrying
+   upstream's June implementation. There was no design decision — just staleness.
+2. **A dropped commit usually spans several files, and they are internally
+   consistent while stale.** #1492 changed `gemma4`'s and `gemma4_unified`'s
+   processors together. Restoring only one *broke* two passing tests. Restoring
+   one file of a multi-file dropped commit is worse than restoring none.
+
+### Classify divergence by direction
+
+Cheap triage that finds losses without waiting for a test:
+
+```bash
+git diff --numstat upstream/main -- 'mlx_vlm/**/*.py' |   awk '$1==0 && $2>0 {print "PURE LOSS -"$2"\t"$3}'
+```
+
+`+0/−N` means upstream content absent with nothing of ours added — safe to take
+verbatim. As of this writing there are **0** such files (22 are fork-only, ~63
+diverge both ways and need case-by-case review).
 
 ## The recurring failure mode, in full
-
-Every gap closed in this fork traced to one of these shapes. Worth knowing the
-list, because two of them are invisible to `dev/check_upstream_parity.py` and
-`dev/check_upstream_symbols.py`:
 
 | Shape | Example | Caught by tooling? |
 |---|---|---|
 | Whole file dropped | 16 upstream test files | yes (parity) |
 | Symbol dropped | `dynamic_roll`, `layer_kv_for_apc` | yes (symbols) |
 | Definition dropped, call sites merged | `prompt_has_open_thinking` → every chat request 500'd | yes (symbols) |
-| Call site dropped, definition merged | `_image_model_type_from_component_indexes`, `layer_kv_for_apc` | **no** |
-| Module constant dropped | `_COMPRESSED_TENSORS_DROP_SUFFIXES`, `IMAGE_COMPONENT_INDEX_DOWNLOAD_PATTERNS` | **no** (not a def/class) |
+| Call site dropped, definition merged | `_image_model_type_from_component_indexes`; `anthropic.py`'s thinking seed | **no** |
+| Module constant dropped | `_COMPRESSED_TENSORS_DROP_SUFFIXES` | **no** |
 | Single guard/line dropped | `alias_model_class.supports_model(model)` — broke every quantized flux2 repo | **no** |
-| Registry entry dropped | `"kimi_k3"`, `"mage"`, `minimax_m3_vl` | **no** |
-| Duplicate authority kept instead of delegating | 5 cache-classification ladders in `apc.py`, 117 lines | **no** |
-| Stale *fork* version kept over upstream's rewrite | `lfm2_vl` projector tests asserted the inverse of our own code | **no** |
+| Registry entry dropped | `"kimi_k3"`, `"mage"`, `inkling_mtp`, 5 prompt formats | **no** |
+| Hunk dropped from a present file | gemma4 processors stuck pre-#1492 | **no** |
+| Duplicate authority kept instead of delegating | 5 cache-classification ladders, 117 lines | **no** |
+| Stale *upstream* code retained after upstream replaced it | the whole diffusion subsystem | **no** |
+| Stale *fork* test kept over upstream's rewrite | `lfm2_vl` tests asserted the inverse of our own code | **no** |
 
-The lesson for future merges: the audits catch structural loss (files, symbols).
-They cannot catch a dropped line, a dropped dict entry, or a kept-but-stale test.
-Only running the suite and comparing test IDs finds those.
+Eight of eleven are invisible to the audits. They catch structural loss only.
 
 ## Still open
 
-**The diffusion subsystem — needs a design decision, not a port.**
+**Upstream #1492's video-input support.** `prompt_utils.py` is −66 lines against
+upstream, and those 66 are one coherent feature: `_get_video_token()`, video
+handling in `_flatten_content`, `_template_references_kw`, video-message routing.
+It pairs with `server/schemas.py`'s missing `VideoUrl`,
+`ResponseInputVideoParam`, `ResponseVideoUrlParam`, `ResponseVideoParam`.
 
-16 failures, all in the two diffusion test files, both of which are
-**byte-identical to upstream**, so they test upstream's design.
+The full feature spans `prompt_utils.py`, `schemas.py`, `server/openai.py`,
+`server/generation.py`, `server/app.py`. Three carry heavy fork work, so this is
+an interleaved port, not a `git checkout`. Start from
+`git show --stat 4d468e85` and reconcile each file — per lesson 2 above, do not
+restore them one at a time.
 
-`mlx_vlm/generate/diffusion.py` has diverged in *both* directions: 188 insertions
-and 332 deletions against upstream. Upstream has 9 symbols this fork lacks (the
-model-owned generator path: `_stream_model_diffusion_generate`,
-`_uses_model_diffusion_generator`, `_normalize_decoder_input_ids`,
-`_diffusion_initial_canvas`, …). This fork has 7 upstream lacks
-(`_diffusion_soft_embeddings`, `_diffusion_entropy_probs_chain`,
-`_diffusion_entropy_and_soft_embeddings`, `_diffusion_soft_embedding_weight`,
-`_diffusion_prefill_cache`, `_is_diffusion_config`, `is_masked_diffusion_model`),
-and `is_masked_diffusion_model` is wired into `generate/dispatch.py`.
-
-Taking upstream's file wholesale would delete working fork functionality. The
-open question is whether this fork's soft-embedding/entropy path should sit on
-top of upstream's model-owned generator or is superseded by it. That is an
-architecture call about intent, not a mechanical merge, so it was deliberately
-left alone rather than guessed at.
-
-Also open, low priority: `_rotating_post_gen_trim_safe` remains intentionally
-unwired (see above) — that is correct, not a gap.
+Also open, low priority: `_rotating_post_gen_trim_safe` stays intentionally
+unwired (see above) — correct, not a gap.
 
 ## Not a source of known issues
 
