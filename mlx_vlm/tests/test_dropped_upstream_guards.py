@@ -116,3 +116,94 @@ class TestEmbeddingServingIsWired:
         from mlx_vlm.server.app import _cache_group_for_cache
 
         assert _cache_group_for_cache({"model_kind": "embedding"}) == "embedding"
+
+
+class TestOneBitLoaderWiring:
+    """`960b26f9` — Add 1-bit inference kernel (Python-hosted) (#1597).
+
+    The kernel (`quantization/one_bit.py`) and its tests landed; only `utils.py`'s
+    7 lines of loader wiring were dropped, so stock MLX saw `bits=1` and rejected
+    it — a 494-line backend reachable by nothing. `test_one_bit.py` exercises the
+    kernel directly and so passed throughout.
+    """
+
+    def test_loader_imports_the_one_bit_hooks(self):
+        """`utils` must hold both hooks, and they must be the real ones.
+
+        This is also an autoflake tripwire: `--remove-all-unused-imports` would
+        delete this import outright if the two call sites were ever lost again.
+        """
+        import mlx_vlm.utils as utils
+        from mlx_vlm.quantization import one_bit
+
+        assert utils.replace_one_bit_modules is one_bit.replace_one_bit_modules
+        assert utils._quantization_for_path is one_bit._quantization_for_path
+
+    def test_per_path_quantization_reports_one_bit_layers(self):
+        """The predicate keys off this, so a wrong shape silently re-quantizes."""
+        from mlx_vlm.quantization.one_bit import _quantization_for_path
+
+        quantization = {"bits": 4, "group_size": 64, "model.layers.0.mlp": {"bits": 1}}
+
+        assert _quantization_for_path(quantization, "model.layers.0.mlp")["bits"] == 1
+        assert _quantization_for_path(quantization, "model.layers.1.mlp")["bits"] == 4
+
+
+class TestLagunaTokenizationContract:
+    """`53052569` — fix(laguna): preserve provider tokenization contract.
+
+    Upstream *does* ship a test for this
+    (`test_processors.py::TestLagunaProcessor::test_chat_template_owns_laguna_special_tokens`),
+    but `TestLagunaProcessor` is defined **twice** in that file, so the earlier
+    definition — the one holding this test — is shadowed by the later one and is
+    never collected. That is why a missing `utils.should_add_special_tokens`
+    failed nothing here despite a test for it sitting in the tree. Our
+    `test_processors.py` is byte-identical to upstream, so the shadowing is an
+    upstream bug too; the guard lives here instead of being duplicated there.
+    """
+
+    def test_laguna_chat_template_owns_its_special_tokens(self):
+        from types import SimpleNamespace
+
+        from mlx_vlm.utils import should_add_special_tokens
+
+        processor = SimpleNamespace(chat_template="{{ messages }}")
+
+        assert should_add_special_tokens("laguna", processor) is False
+        assert should_add_special_tokens("llama", processor) is True
+        # A model whose template owns the markers but that has no template must
+        # fall back to adding them.
+        assert should_add_special_tokens("laguna", SimpleNamespace()) is True
+
+    def test_generate_paths_use_the_shared_helper(self):
+        """Both generate paths must go through the helper, not an inline gemma list.
+
+        The inline conditional they replaced listed only the gemma variants, so
+        Laguna fell through to `True` and the provider's markers were duplicated.
+        """
+        from mlx_vlm.generate import ar, dispatch
+        from mlx_vlm.utils import should_add_special_tokens
+
+        assert ar.should_add_special_tokens is should_add_special_tokens
+        assert dispatch.should_add_special_tokens is should_add_special_tokens
+
+    def test_upstreams_own_laguna_test_is_still_shadowed(self):
+        """Tripwire: if upstream ever de-duplicates the class, drop this guard.
+
+        Asserts the shadowing that makes the guard above necessary. When this
+        starts failing, upstream's test is collected and this class is redundant.
+        """
+        import ast
+        from pathlib import Path
+
+        source = Path(__file__).with_name("test_processors.py").read_text()
+        names = [
+            node.name
+            for node in ast.parse(source).body
+            if isinstance(node, ast.ClassDef) and node.name == "TestLagunaProcessor"
+        ]
+        assert len(names) == 2, (
+            "TestLagunaProcessor is no longer duplicated in test_processors.py — "
+            "upstream's own laguna test now collects, so TestLagunaTokenizationContract "
+            "can be removed."
+        )

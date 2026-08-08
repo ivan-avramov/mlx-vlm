@@ -24,6 +24,7 @@ from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
 
 from .models.base import BaseImageProcessor
+from .quantization.one_bit import _quantization_for_path, replace_one_bit_modules
 from .tokenizer_utils import load_tokenizer
 from .trainer.utils import apply_lora_layers
 
@@ -773,6 +774,9 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             else model
         )
 
+        # Stock MLX rejects bits=1; route those layers to our Metal kernel.
+        replace_one_bit_modules(quantized_model, quantization, weights)
+
         def get_class_predicate(p, m):
             # Skip legacy multimodal layers unless the checkpoint has quantized
             # tensors for this exact module.
@@ -781,6 +785,9 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 and skip_vision
                 and not _has_quantized_weights(p, weights)
             ):
+                return False
+            # Skip 1-bit layers already replaced above.
+            if _quantization_for_path(config["quantization"], p).get("bits") == 1:
                 return False
             # Handle custom per layer quantizations. Config keys from the
             # underlying text checkpoint omit the mlx-vlm ``language_model.``
@@ -1105,6 +1112,10 @@ def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImagePro
 def load_processor(
     model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
 ) -> ProcessorMixin:
+
+    config = load_config(model_path, trust_remote_code=True)
+    if config.get("model_type") == "laguna":
+        kwargs.setdefault("fix_mistral_regex", True)
 
     processor = AutoProcessor.from_pretrained(model_path, **kwargs)
     if add_detokenizer:
@@ -2265,3 +2276,17 @@ def sanitize_strict_json(text: str) -> str:
     math_escaped = re.sub(math_block_pattern, _escape_math_block, inner)
 
     return json_repair.repair_json(math_escaped)
+
+
+def should_add_special_tokens(model_type: str, processor) -> bool:
+    """Return whether tokenization should add markers outside the chat template."""
+    template_owns_markers = {
+        "gemma3",
+        "gemma3n",
+        "gemma4",
+        "gemma4_unified",
+        "laguna",
+    }
+    if model_type not in template_owns_markers:
+        return True
+    return getattr(processor, "chat_template", None) is None

@@ -319,4 +319,3 @@ mlx_vlm/turboquant.py::_z  # baseline: pre-existing divergence, unreviewed
 
 # --- mlx_vlm/utils.py
 mlx_vlm/utils.py::pop_forced_token_id  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/utils.py::should_add_special_tokens  # baseline: pre-existing divergence, unreviewed

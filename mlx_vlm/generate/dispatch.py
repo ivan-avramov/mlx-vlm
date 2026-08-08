@@ -21,7 +21,13 @@ from ..prompt_utils import (
 )
 from ..speculative.utils import format_speculative_stats
 from ..tokenizer_utils import make_streaming_detokenizer
-from ..utils import StoppingCriteria, ThinkingBudgetCriteria, load, prepare_inputs
+from ..utils import (
+    StoppingCriteria,
+    ThinkingBudgetCriteria,
+    load,
+    prepare_inputs,
+    should_add_special_tokens,
+)
 from .image import (
     DEFAULT_IMAGE_GUIDANCE,
     DEFAULT_IMAGE_SIZE,
@@ -708,11 +714,7 @@ def stream_generate(
         else []
     )
 
-    add_special_tokens = (
-        getattr(processor, "chat_template", None) is None
-        if model.config.model_type in ["gemma3", "gemma3n", "gemma4", "gemma4_unified"]
-        else True
-    )
+    add_special_tokens = should_add_special_tokens(model.config.model_type, processor)
 
     resize_shape = normalize_resize_shape(kwargs.pop("resize_shape", None))
     image_token_index = getattr(model.config, "image_token_index", None)
