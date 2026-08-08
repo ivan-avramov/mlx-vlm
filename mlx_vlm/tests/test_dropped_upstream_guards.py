@@ -49,3 +49,43 @@ class TestMinimaxM3Support:
         out of the suffix list quantizes/loads it as a text module.
         """
         assert skip_multimodal_module("x.patch_merge_mlp.fc1") is True
+
+
+class TestQuantizedKVStartOnTheBatchPath:
+    """`dab4cb45` — Honor quantized_kv_start on the batch TurboQuant path (#1582).
+
+    Upstream's own tests (`test_generate.py::TestBatchTurboQuantizedKVStart`) cover
+    `_make_cache` in isolation. This guard covers the *plumbing* instead, which is
+    where the fork's bug actually was: `--quantized-kv-start` reached
+    `BatchGenerator.self.quantized_kv_start` and was read by nothing, so
+    TurboQuant quantized from token 0 no matter what the operator configured.
+    """
+
+    def test_prompt_processing_batch_threads_it_into_make_cache(self, monkeypatch):
+        import mlx.core as mx
+
+        seen = {}
+
+        def fake_make_cache(model, left_padding, **kwargs):
+            seen.update(kwargs)
+            return []
+
+        monkeypatch.setattr(ar, "_make_cache", fake_make_cache)
+
+        ar.PromptProcessingBatch(
+            model=nn.Module(),
+            uids=[1, 2],
+            input_ids=[[4, 5], [6, 7, 8]],
+            max_tokens=[1, 1],
+            inputs_embeds=mx.ones((2, 3, 4)),
+            prompt_kwargs={},
+            prefill_step_size=None,
+            kv_bits=3.5,
+            kv_quant_scheme="turboquant",
+            quantized_kv_start=5000,
+        )
+
+        assert seen["quantized_kv_start"] == 5000
+        # `prefill_length` must be the padded prompt length, so the deferral
+        # decision is made against the real prefill size.
+        assert seen["prefill_length"] == 3
