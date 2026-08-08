@@ -89,3 +89,30 @@ class TestQuantizedKVStartOnTheBatchPath:
         # `prefill_length` must be the padded prompt length, so the deferral
         # decision is made against the real prefill size.
         assert seen["prefill_length"] == 3
+
+
+class TestEmbeddingServingIsWired:
+    """`40757df3` — Add native embedding serving infra.
+
+    `server/embeddings.py` and `models/pooling.py` landed byte-identical to
+    upstream and had **zero importers**; only the wiring was dropped, so
+    `/v1/embeddings` 404'd while README documented it. A dropped import is
+    invisible to both audits — parity only sees missing files and the symbol
+    check only sees missing `def`/`class` names.
+    """
+
+    def test_embeddings_route_is_registered(self):
+        from mlx_vlm.server.app import app
+
+        assert "/v1/embeddings" in {route.path for route in app.routes}
+
+    def test_embedding_models_get_their_own_cache_group(self):
+        """Without this branch an embedding model lands in `text_generation`.
+
+        That is the same registry slot as the served language model, so loading
+        an embedding model would evict the LLM (and vice versa) instead of
+        living alongside it.
+        """
+        from mlx_vlm.server.app import _cache_group_for_cache
+
+        assert _cache_group_for_cache({"model_kind": "embedding"}) == "embedding"
