@@ -6802,7 +6802,7 @@ class BatchTurboQuantKVCache(_BaseCache):
 
     @property
     def group_size(self):
-        # Required by mlx_lm's scaled_dot_product_attention dispatch
+        # Required by scaled_dot_product_attention's quantized-cache dispatch
         # but not used for TurboQuant (it has its own attention path)
         return 64
 

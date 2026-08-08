@@ -85,7 +85,7 @@ class DeltaNetSnapshotRing:
             return None
         if self._snapshots and self._snapshots[-1].offset >= offset:
             return None
-        # Local import to keep mlx_lm dependency at the leaves.
+        # Local import to keep the cache dependency at the leaves.
         from mlx_vlm.models.cache import ArraysCache
 
         states: List[Optional[List[mx.array]]] = []
@@ -141,7 +141,7 @@ class DeltaNetSnapshotRing:
 # ---------------------------------------------------------------------------
 # RotatingKVCache snapshots
 #
-# Sliding-window attention layers (mlx_lm's RotatingKVCache) hold their
+# Sliding-window attention layers (RotatingKVCache) hold their
 # K/V state in a ring buffer that's mutated in-place during generation.
 # Once the ring wraps (offset > max_size), `RotatingKVCache.trim(n)`
 # can't undo the writes — it only decrements offset/_idx, leaving the

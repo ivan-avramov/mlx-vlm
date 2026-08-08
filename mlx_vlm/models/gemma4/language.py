@@ -105,7 +105,7 @@ class GeGLU(nn.Module):
 
 
 class Experts(nn.Module):
-    """Sparse MoE using mlx_lm SwitchGLU with gather_mm."""
+    """Sparse MoE using SwitchGLU with gather_mm."""
 
     def __init__(self, config: TextConfig):
         super().__init__()
