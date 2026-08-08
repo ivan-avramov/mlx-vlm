@@ -2,6 +2,7 @@
 
 import mlx.core as mx
 import pytest
+from mlx_lm.models.cache import QuantizedKVCache
 
 from mlx_vlm.models.cache import (
     BatchKVCache,
@@ -303,6 +304,83 @@ class TestBatchGeneratorIntegration:
 
         gen = BatchGenerator(model, proc)
         assert gen.kv_bits is None
+
+
+class TestDequantizeForApcContract:
+    """Behavioural contract for `dequantize_for_apc`, whoever provides it.
+
+    `models/cache.py` grafts this method onto mlx_lm's QuantizedKVCache behind a
+    `hasattr` guard, so the graft retires automatically if mlx_lm ever ships its
+    own. That guard cannot tell a compatible implementation from an incompatible
+    one -- these tests can. They assert the contract APC relies on rather than
+    our specific implementation, so they pass against either provider and fail
+    loudly if a future mlx_lm version changes the semantics.
+
+    If these ever fail after an mlx_lm upgrade, the graft has silently deferred
+    to a different implementation; check its slicing/emptiness behaviour before
+    assuming APC still stores correct K/V.
+    """
+
+    def test_method_is_available_on_quantized_kv_cache(self):
+        assert hasattr(QuantizedKVCache, "dequantize_for_apc")
+
+    def test_empty_cache_returns_none_pair(self):
+        c = QuantizedKVCache(group_size=GROUP_SIZE, bits=BITS)
+        assert c.dequantize_for_apc() == (None, None)
+
+    def test_returns_float_arrays_sliced_to_offset(self):
+        c = QuantizedKVCache(group_size=GROUP_SIZE, bits=BITS)
+        k, v = _rand_kv(1, 8)
+        c.update_and_fetch(k, v)
+        dk, dv = c.dequantize_for_apc()
+        assert dk is not None and dv is not None
+        # Dense float, not the packed (uint32, scales, biases) triple.
+        assert isinstance(dk, mx.array) and isinstance(dv, mx.array)
+        assert dk.dtype != mx.uint32 and dv.dtype != mx.uint32
+        # Sliced to the logical length, not the padded step capacity.
+        assert dk.shape == (1, H, 8, D)
+        assert dv.shape == (1, H, 8, D)
+
+    def test_roundtrip_is_close_to_original(self):
+        c = QuantizedKVCache(group_size=GROUP_SIZE, bits=BITS)
+        k, v = _rand_kv(1, 8)
+        c.update_and_fetch(k, v)
+        dk, dv = c.dequantize_for_apc()
+        # 8-bit uniform quantization: loose tolerance, but must track the input.
+        assert mx.allclose(dk, k, atol=0.1).item()
+        assert mx.allclose(dv, v, atol=0.1).item()
+
+    def test_batch_variant_slices_to_idx(self):
+        c = BatchQuantizedKVCache([0, 0], group_size=GROUP_SIZE, bits=BITS)
+        k, v = _rand_kv(B, 8)
+        c.update_and_fetch(k, v)
+        dk, dv = c.dequantize_for_apc()
+        assert dk.shape == (B, H, 8, D)
+        assert dv.shape == (B, H, 8, D)
+
+    def test_batch_extract_yields_single_row_quantized_cache(self):
+        c = BatchQuantizedKVCache([0, 0], group_size=GROUP_SIZE, bits=BITS)
+        k, v = _rand_kv(B, 8)
+        c.update_and_fetch(k, v)
+        row = c.extract(1)
+        assert isinstance(row, QuantizedKVCache)
+        assert int(row.offset) == 8
+        dk, _ = row.dequantize_for_apc()
+        assert dk.shape == (1, H, 8, D)
+
+    def test_batch_extract_honours_left_padding(self):
+        c = BatchQuantizedKVCache([3, 0], group_size=GROUP_SIZE, bits=BITS)
+        k, v = _rand_kv(B, 8)
+        c.update_and_fetch(k, v)
+        # Row 0 has 3 pad tokens, so only 5 real positions survive extraction.
+        assert int(c.extract(0).offset) == 5
+        assert int(c.extract(1).offset) == 8
+
+    def test_batch_extract_on_empty_cache_returns_empty(self):
+        c = BatchQuantizedKVCache([0, 0], group_size=GROUP_SIZE, bits=BITS)
+        row = c.extract(0)
+        assert isinstance(row, QuantizedKVCache)
+        assert row.keys is None
 
 
 if __name__ == "__main__":

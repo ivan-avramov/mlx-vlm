@@ -19,6 +19,68 @@ from mlx_lm.models.cache import KVCache, RotatingKVCache, _BaseCache
 # hard ImportError on that entire model.
 
 
+def _dequantize_uniform(keys_tuple, values_tuple, length, group_size, bits):
+    """Dequantize uniform-quantized K/V tuples to raw float arrays.
+
+    Shared by QuantizedKVCache and BatchQuantizedKVCache for APC storage.
+    Returns None, None if the cache is empty.
+    """
+    if keys_tuple is None or values_tuple is None or length == 0:
+        return None, None
+    keys = mx.dequantize(
+        keys_tuple[0][..., :length, :],
+        keys_tuple[1][..., :length, :],
+        keys_tuple[2][..., :length, :],
+        group_size=group_size,
+        bits=bits,
+    )
+    values = mx.dequantize(
+        values_tuple[0][..., :length, :],
+        values_tuple[1][..., :length, :],
+        values_tuple[2][..., :length, :],
+        group_size=group_size,
+        bits=bits,
+    )
+    return keys, values
+
+
+def dequantize_for_apc(self):
+    """Return raw float (keys, values) sliced to current offset for APC storage.
+
+    Returns (None, None) if the cache is empty.
+
+    Defined at module level so it can be attached to ``QuantizedKVCache``, which
+    this fork takes from mlx_lm rather than vendoring. Upstream declares this as
+    a method because it vendors that class; we cannot, so it is grafted on below.
+    """
+    if self.keys is None or self.offset == 0:
+        return None, None
+    return _dequantize_uniform(
+        self.keys, self.values, self.offset, self.group_size, self.bits
+    )
+
+
+# Graft `dequantize_for_apc` onto mlx_lm's QuantizedKVCache -- CONDITIONALLY.
+#
+# APC's block harvest asks `hasattr(c, "dequantize_for_apc")`, so a free function
+# alone would never be found. Upstream mlx-vlm defines it as a real method
+# because it vendors QuantizedKVCache; this fork delegates that class to mlx_lm,
+# so the only way to satisfy the same contract is to attach it.
+#
+# The `hasattr` guard makes this self-retiring: the day mlx_lm (or any other
+# provider) ships its own `dequantize_for_apc`, theirs wins and this graft
+# silently stops applying -- no version pin, no conflict, nothing to clean up.
+#
+# The guard cannot tell a *compatible* upstream implementation from an
+# incompatible one, so it is deliberately paired with a behavioural contract test
+# (tests/test_batch_quantized_cache.py::TestDequantizeForApcContract) that runs
+# against whichever implementation is live. If a future mlx_lm version provides
+# one with different semantics, that test fails loudly instead of this graft
+# quietly deferring to it.
+if not hasattr(QuantizedKVCache, "dequantize_for_apc"):
+    QuantizedKVCache.dequantize_for_apc = dequantize_for_apc
+
+
 def should_quantize_kv_layer(layer_idx: int, num_layers: int) -> bool:
     """Whether layer ``layer_idx`` should use a quantized KV cache.
 
@@ -437,6 +499,34 @@ class BatchQuantizedKVCache(_BaseCache):
             tuple(k[..., : self._idx, :] for k in self.keys),
             tuple(v[..., : self._idx, :] for v in self.values),
         )
+
+    def dequantize_for_apc(self):
+        """Return raw float (keys, values) sliced to current _idx for APC storage.
+
+        Returns (None, None) if the cache is empty. Batch caches slice to
+        ``_idx`` rather than ``offset``, which is a per-row array here.
+        """
+        if self.keys is None or self._idx == 0:
+            return None, None
+        return _dequantize_uniform(
+            self.keys, self.values, self._idx, self.group_size, self.bits
+        )
+
+    def extract(self, idx):
+        """Extract one batch row as a single-sequence QuantizedKVCache."""
+        cache = QuantizedKVCache(group_size=self.group_size, bits=self.bits)
+        if self.keys is None or self._idx == 0:
+            return cache
+        padding = int(self.left_padding[idx].item())
+        end = self._idx
+        cache.keys = tuple(
+            mx.contiguous(k[idx : idx + 1, :, padding:end, :]) for k in self.keys
+        )
+        cache.values = tuple(
+            mx.contiguous(v[idx : idx + 1, :, padding:end, :]) for v in self.values
+        )
+        cache.offset = int(cache.keys[0].shape[2])
+        return cache
 
     def filter(self, batch_indices: mx.array):
         """Keep only the sequences at *batch_indices*."""

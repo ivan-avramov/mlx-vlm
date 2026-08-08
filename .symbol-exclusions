@@ -29,7 +29,6 @@ mlx_vlm/apc.py::_adapter_schema_version  # baseline: pre-existing divergence, un
 mlx_vlm/apc.py::_env_truthy  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/apc.py::_hash_payload  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/apc.py::_layer_capability  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/apc.py::_prompt_cache_is_batch_shaped  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/apc.py::_resident_bytes_locked  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/apc.py::_tensor_content_hash  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/apc.py::apc_disk_namespace  # baseline: pre-existing divergence, unreviewed
@@ -38,17 +37,11 @@ mlx_vlm/apc.py::apc_trace  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/apc.py::apc_trace_enabled  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/apc.py::classify_layer_for_apc  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/apc.py::commit_prefix_blocks  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/apc.py::layer_kv_for_apc  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/apc.py::lock_count  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/apc.py::model_key_dependencies  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/apc.py::node_key  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/apc.py::parent_key  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/apc.py::prefix_len  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/apc.py::record_reject  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/apc.py::resident_bytes  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/apc.py::self_check_model_apc  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/apc.py::semantic_extra_hash  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/apc.py::snapshot_prompt_cache_row  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/apc.py::validate_prompt_cache_layout  # baseline: pre-existing divergence, unreviewed
 
 # --- mlx_vlm/convert.py
@@ -113,7 +106,6 @@ mlx_vlm/models/cache.py::_BaseCache  # baseline: pre-existing divergence, unrevi
 mlx_vlm/models/cache.py::__getitem__  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/models/cache.py::__new__  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/models/cache.py::__setitem__  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/models/cache.py::_dequantize_uniform  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/models/cache.py::_temporal_order  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/models/cache.py::_trim  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/models/cache.py::_update_concat  # baseline: pre-existing divergence, unreviewed
@@ -123,7 +115,6 @@ mlx_vlm/models/cache.py::batch_size  # baseline: pre-existing divergence, unrevi
 mlx_vlm/models/cache.py::cat  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/models/cache.py::create_attention_mask  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/models/cache.py::create_causal_mask  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/models/cache.py::dequantize_for_apc  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/models/cache.py::dynamic_roll  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/models/cache.py::expand_quant  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/models/cache.py::from_state  # baseline: pre-existing divergence, unreviewed
