@@ -3286,3 +3286,33 @@ def test_split_deepseek_v4_mtp_writes_sidecar_without_index_mtp_entries(tmp_path
     assert "e_proj.weight" in weights
     assert "e_proj.scales" in weights
     assert "enorm.weight" in weights
+
+
+def test_qwen3_5_mtp_sanitize_is_idempotent_on_mlx_layout_weights():
+    """The `+1.0` norm shift must apply only to HF-layout (`mtp.`-prefixed) keys.
+
+    Regression for upstream #1554, which was silently lost in a merge. Both load
+    paths run sanitize TWICE over the same tensors: `split.py` shifts at
+    conversion time and writes bare keys, then `utils.load_model` calls
+    `sanitize_weights` unconditionally (there is no mlx-format gate any more).
+    Without the `is_hf_layout` guard the second pass shifts again, so every
+    Qwen3.5/3.6 MTP drafter loaded through `load_drafter` carries `+2.0` on every
+    RMSNorm weight. It degrades silently — lower speculative acceptance, no crash
+    — and neither upstream audit can see it: the file is present and every `def`
+    is present, so only a line-level diff finds it.
+    """
+    from mlx_vlm.speculative.drafters.qwen3_5_mtp.qwen3_5_mtp import (
+        Qwen3_5MTPDraftModel,
+    )
+
+    hf_layout = {"mtp.layers.0.input_layernorm.weight": mx.zeros((4,))}
+
+    once = Qwen3_5MTPDraftModel.sanitize(None, hf_layout)
+    key = next(k for k in once if "input_layernorm" in k)
+    assert not key.startswith("mtp."), "prefix should be stripped"
+    assert once[key].tolist() == [1.0] * 4, "HF layout gets the +1.0 shift"
+
+    # Second pass over already-sanitized (bare-key) weights must be a no-op.
+    twice = Qwen3_5MTPDraftModel.sanitize(None, once)
+    key2 = next(k for k in twice if "input_layernorm" in k)
+    assert twice[key2].tolist() == [1.0] * 4, "must not shift a second time"

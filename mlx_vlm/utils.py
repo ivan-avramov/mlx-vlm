@@ -51,6 +51,10 @@ MODEL_REMAPPING = {
     "falcon-perception": "falcon_perception",
     "nemotronh_nano_omni_reasoning_v3": "nemotron_h_nano_omni",
     "cohere2moe": "cohere2_moe",
+    "unlimited-ocr": "unlimited_ocr",
+    "mistral": "llama",
+    "nemotron-nas": "nemotron_nas",
+    "inkling_mm_model": "inkling",
 }
 
 MAX_FILE_SIZE_GB = 5
