@@ -134,11 +134,6 @@ mlx_vlm/tests/test_batch_quantized_cache.py::test_prepare_stores_right_padding  
 mlx_vlm/tests/test_batch_quantized_cache.py::test_shallow_stack_quantizes_all  # baseline: pre-existing divergence, unreviewed
 
 # --- mlx_vlm/tests/test_cli.py
-mlx_vlm/tests/test_cli.py::_assert_thinking_mode_flag  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_cli.py::_find_add_argument  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_cli.py::_literal_values  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_cli.py::test_chat_thinking_mode_flag  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_cli.py::test_generate_thinking_mode_flag  # baseline: pre-existing divergence, unreviewed
 
 # --- mlx_vlm/tests/test_gemma4_tool_parser.py
 
@@ -246,10 +241,6 @@ mlx_vlm/tests/test_models.py::test_unlimited_ocr_input_embeddings  # baseline: p
 # --- mlx_vlm/tests/test_processors.py
 
 # --- mlx_vlm/tests/test_prompt_utils.py
-mlx_vlm/tests/test_prompt_utils.py::EnableThinkingProcessor  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_prompt_utils.py::ThinkingModeProcessor  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_prompt_utils.py::test_apply_chat_template_keeps_enable_thinking_only_for_other_templates  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_prompt_utils.py::test_apply_chat_template_maps_enable_thinking_for_thinking_mode_templates  # baseline: pre-existing divergence, unreviewed
 
 # --- mlx_vlm/tests/test_sample_utils.py
 
