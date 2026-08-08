@@ -62,14 +62,29 @@ uv pip install --python .venv/bin/python -e . pytest pytest-asyncio
 cd mlx_vlm/ && pytest -s ./tests --ignore=tests/test_smoke.py --ignore=tests/test_utils.py
 ```
 
-The suite is **not green** and has not been for a while: 76 failed / 1924 passed
-as of the `0c846ef` merge. Compare against that number rather than expecting
-zero — `docs/upstream-gaps.md` breaks the failures down by cause. Most are
-unported upstream features, surfaced by test files that used to be missing.
+The suite is **not green**: 16 failed / 2175 passed. Compare against that number
+rather than expecting zero.
 
-`mlx_vlm/tests/conftest.py` skips 6 restored upstream test files that import
-symbols this fork never ported, each with a reason. Restored upstream tests are
-kept byte-identical to upstream so future merges apply cleanly to them; put skip
+All 16 remaining failures are in `test_diffusion_gemma.py` (11) and
+`test_diffusion_models.py` (5) — no other test file has a failing test. They need
+a design decision on reconciling `generate/diffusion.py`, which has diverged from
+upstream in both directions; see `docs/upstream-gaps.md`.
+
+**Compare failing test IDs, not counts.** A change that fixes one test and breaks
+another shows the same total. Diff the sorted `FAILED ...` lines:
+
+```bash
+# before and after your change
+pytest -q ./tests --ignore=tests/test_smoke.py --ignore=tests/test_utils.py \
+  | grep '^FAILED' | sed 's/ - .*//' | sort > /tmp/after.txt
+comm -13 /tmp/before.txt /tmp/after.txt   # regressions
+comm -23 /tmp/before.txt /tmp/after.txt   # fixed
+```
+
+`mlx_vlm/tests/conftest.py` skips 2 restored upstream test files, both a
+deliberate permanent divergence (quantized-SDPA masks; this fork dequantizes, so
+the hazard they cover cannot occur). Restored upstream tests are kept
+byte-identical to upstream so future merges apply cleanly to them; put skip
 decisions in `conftest.py`, not in the test files.
 
 ### Run a single test file
