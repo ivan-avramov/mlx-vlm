@@ -2694,10 +2694,11 @@ class TestModels(unittest.TestCase):
         )
         model = lfm2_vl.Model(config)
 
-        self.assertIsNotNone(model.multi_modal_projector.layer_norm)
         self.assertFalse(model.multi_modal_projector.projector_use_layernorm)
+        # LFM2.5-VL checkpoints ship no projector layer_norm weights, so the
+        # module must not exist or strict loading would require them.
         parameters = model.multi_modal_projector.parameters()
-        self.assertIn("layer_norm", parameters)
+        self.assertNotIn("layer_norm", parameters)
 
     def test_lfm2_vl_projector_skips_disabled_layernorm_branch(self):
         from mlx_vlm.models import lfm2_vl
@@ -6149,19 +6150,30 @@ class TestGetInputEmbeddings(unittest.TestCase):
             )
         )
 
-        self.assertIsNotNone(model.multi_modal_projector.layer_norm)
         self.assertFalse(model.multi_modal_projector.projector_use_layernorm)
 
+        # Real LFM2.5-VL checkpoints ship no projector layer_norm weights.
         model.multi_modal_projector.load_weights(
             [
-                ("layer_norm.weight", mx.ones((64,))),
-                ("layer_norm.bias", mx.zeros((64,))),
                 ("linear_1.weight", mx.ones((16, 64))),
                 ("linear_1.bias", mx.zeros((16,))),
                 ("linear_2.weight", mx.ones((16, 16))),
                 ("linear_2.bias", mx.zeros((16,))),
             ]
         )
+
+        # Conversions from when the projector always created the layer_norm
+        # can carry stale weights; sanitize must drop them when disabled.
+        sanitized = model.sanitize(
+            {
+                "model.multi_modal_projector.layer_norm.weight": mx.ones((64,)),
+                "model.multi_modal_projector.layer_norm.bias": mx.zeros((64,)),
+                "model.multi_modal_projector.linear_1.weight": mx.ones((16, 64)),
+            }
+        )
+        self.assertNotIn("multi_modal_projector.layer_norm.weight", sanitized)
+        self.assertNotIn("multi_modal_projector.layer_norm.bias", sanitized)
+        self.assertIn("multi_modal_projector.linear_1.weight", sanitized)
 
     def test_molmo2_input_embeddings(self):
         from mlx_vlm.models import molmo2

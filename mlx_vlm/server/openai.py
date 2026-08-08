@@ -971,6 +971,31 @@ async def responses_input_items_endpoint(response_id: str):
     }
 
 
+def _normalize_response_instruction_messages(
+    chat_messages: List[dict],
+    instructions: Optional[str],
+) -> Optional[str]:
+    instruction_parts = [instructions] if instructions else []
+    conversation = []
+
+    for message in chat_messages:
+        if message.get("role") in ("system", "developer"):
+            content = message.get("content")
+            if content:
+                instruction_parts.append(str(content))
+        else:
+            conversation.append(message)
+
+    normalized_instructions = "\n\n".join(instruction_parts) or None
+    if normalized_instructions:
+        conversation.insert(
+            0,
+            {"role": "system", "content": normalized_instructions},
+        )
+    chat_messages[:] = conversation
+    return normalized_instructions
+
+
 async def responses_endpoint(request: Request):
     """
     OpenAI-compatible endpoint for generating text based on a prompt and optional images.
@@ -1031,28 +1056,31 @@ async def responses_endpoint(request: Request):
     openai_request = OpenAIRequest(**body)
 
     try:
-        # Get model, processor, config - loading if necessary
-        model, processor, config = get_cached_model(
-            openai_request.model, _adapter_path_or_inherit(openai_request)
-        )
-
         kwargs = {}
 
         if openai_request.input is None:
-            print("no input")
+            logger.warning("Responses request is missing input.")
             raise HTTPException(status_code=400, detail="Missing input.")
 
+        # Validate and convert the request BEFORE loading the model. Loading
+        # first meant an invalid request (e.g. an image file_id, rejected in
+        # responses_state._response_image_source) surfaced as a 500 from the
+        # model load instead of a 400 from validation.
         current_input_items = _normalize_response_input(openai_request.input)
         prompt_items = (
             _response_chain_items(openai_request.previous_response_id)
             + current_input_items
         )
         chat_messages, images = _response_items_to_chat(prompt_items)
-        instructions = openai_request.instructions
-        if instructions:
-            chat_messages.insert(0, {"role": "system", "content": instructions})
-        elif chat_messages and chat_messages[0].get("role") in ("system", "developer"):
-            instructions = chat_messages[0].get("content")
+        instructions = _normalize_response_instruction_messages(
+            chat_messages,
+            openai_request.instructions,
+        )
+
+        # Get model, processor, config - loading if necessary
+        model, processor, config = get_cached_model(
+            openai_request.model, _adapter_path_or_inherit(openai_request)
+        )
 
         chat_tools, tool_registry = _response_tool_registry(openai_request.tools)
         tool_parser_type = _infer_tool_parser_from_processor(processor)

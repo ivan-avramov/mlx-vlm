@@ -388,7 +388,9 @@ def get_server_generation_defaults() -> dict:
     except (ValueError, TypeError) as e:
         raise ValueError(f"--generation-defaults is not valid JSON: {e}") from e
     if not isinstance(defaults, dict):
-        raise ValueError("--generation-defaults must be a JSON object (mapping of param -> value)")
+        raise ValueError(
+            "--generation-defaults must be a JSON object (mapping of param -> value)"
+        )
     known = set(GenerationArguments.__dataclass_fields__)
     unknown = sorted(set(defaults) - known)
     if unknown:
@@ -1607,22 +1609,49 @@ class ResponseGenerator:
         # prompt and reuse the registry detector the streaming splitter
         # uses, so the two can't drift (see prompt_utils.ThinkingFormat).
         tokens = input_ids.flatten().tolist()
+        text: Optional[str] = None
         try:
             text = self.tokenizer.decode(tokens)
         except Exception:
-            return False
-        if prompt_is_inside_thinking(text):
-            return True
-        # Preserve the explicit per-request token override path (rare; not
-        # in the registry) — honor a custom opener/closer pair if supplied.
-        start = args.thinking_start_token
-        end = args.thinking_end_token
-        if start:
-            last_start = text.rfind(start)
-            last_end = text.rfind(end) if end else -1
-            if last_start >= 0 and last_end < last_start:
+            text = None
+
+        if text is not None:
+            if prompt_is_inside_thinking(text):
                 return True
-        return False
+            # Preserve the explicit per-request token override path (rare; not
+            # in the registry) — honor a custom opener/closer pair if supplied.
+            start = args.thinking_start_token
+            end = args.thinking_end_token
+            if start:
+                last_start = text.rfind(start)
+                last_end = text.rfind(end) if end else -1
+                if last_start >= 0 and last_end < last_start:
+                    return True
+            return False
+
+        # Decode unavailable or failed. Fall back to upstream's token-id scan
+        # rather than reporting "not thinking": returning False here silently
+        # disables the structured-processor delay and the thinking-budget
+        # criteria, which is a wrong answer rather than a missing one.
+        return self._prompt_has_open_thinking_by_token_ids(args, tokens)
+
+    def _prompt_has_open_thinking_by_token_ids(
+        self, args: GenerationArguments, tokens: List[int]
+    ) -> bool:
+        """Upstream's id-scan detector: last opener id occurs after last closer."""
+        try:
+            start_id, end_id = self._thinking_token_ids(args)
+        except Exception:
+            return False
+        try:
+            last_start = len(tokens) - 1 - tokens[::-1].index(start_id)
+        except ValueError:
+            return False
+        try:
+            last_end = len(tokens) - 1 - tokens[::-1].index(end_id)
+        except ValueError:
+            last_end = -1
+        return last_start > last_end
 
     def _wrap_processors_until_thinking_done(
         self,
