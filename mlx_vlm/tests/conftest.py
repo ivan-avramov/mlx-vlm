@@ -32,17 +32,6 @@ UNPORTED_UPSTREAM_TESTS: dict[str, tuple[str, str]] = {
         "mlx_vlm.apc.APCSelfCheckResult",
         "upstream's APC self-check subsystem, not ported",
     ),
-    "test_apc_quantized.py": (
-        "mlx_vlm.models.cache.should_quantize_kv_layer",
-        "upstream's shared kv-quantization layer policy. Porting the helper "
-        "alone would not test anything: upstream requires _make_cache, stream "
-        "quantize and APC warm restore to all route through it, and this fork "
-        "decides per-layer quantization inline",
-    ),
-    "test_minimax_m3.py": (
-        "mlx_vlm.models.base.align_attention_mask_to_scores",
-        "upstream's mask/score alignment helper, not ported",
-    ),
     # These two are a deliberate, permanent divergence rather than a backlog
     # item -- see docs/upstream-gaps.md. Upstream's quantized attention calls
     # mx.quantized_matmul and reshapes scores to 5D (B, n_kv_heads, n_repeats,

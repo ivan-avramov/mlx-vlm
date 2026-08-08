@@ -8,8 +8,15 @@ from mlx_lm.models.cache import BatchRotatingKVCache  # noqa: F401
 from mlx_lm.models.cache import CacheList  # noqa: F401
 from mlx_lm.models.cache import ChunkedKVCache  # noqa: F401
 from mlx_lm.models.cache import QuantizedKVCache  # noqa: F401
+from mlx_lm.models.cache import dynamic_roll  # noqa: F401
 from mlx_lm.models.cache import BatchKVCache as _MLXLMBatchKVCache
 from mlx_lm.models.cache import KVCache, RotatingKVCache, _BaseCache
+
+# Note on `dynamic_roll` above: it is re-exported from mlx_lm rather than
+# vendored. Upstream keeps its own copy because it vendors the cache classes;
+# mlx_lm's is byte-identical and this fork delegates base classes to mlx_lm.
+# models/minimax_m3_vl/language.py imports it from here, so its absence was a
+# hard ImportError on that entire model.
 
 
 def should_quantize_kv_layer(layer_idx: int, num_layers: int) -> bool:

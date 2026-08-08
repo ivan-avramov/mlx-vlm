@@ -49,12 +49,14 @@ import re
 import threading
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import mlx.core as mx
 import numpy as np
+
+from .apc_storage import APCNode, ComponentId, StateHandle
 
 logger = logging.getLogger("mlx_vlm.apc")
 
@@ -461,8 +463,8 @@ def adjust_prefix_to_text_suffix_boundary(
 
 
 @dataclass
-class APCBlock:
-    """One fixed-size KV block. Holds per-layer K/V slabs once committed."""
+class APCBlock(APCNode):
+    """Pooled logical node for one fixed-size KV block; its pageable K/V lives in the "kv" component handle."""
 
     block_id: int
     block_hash: Optional[int] = None
@@ -470,11 +472,26 @@ class APCBlock:
     token_ids: Tuple[int, ...] = ()
     extra_hash: int = 0
     ref_cnt: int = 0
-    keys: Optional[List[mx.array]] = None
-    values: Optional[List[mx.array]] = None
+    components: Dict[ComponentId, StateHandle] = field(default_factory=dict)
     last_used: float = 0.0
     prev: Optional["APCBlock"] = None
     next: Optional["APCBlock"] = None
+
+    @property
+    def node_key(self) -> Optional[int]:
+        return self.block_hash
+
+    @property
+    def prefix_len(self) -> int:
+        return len(self.token_ids)
+
+    @property
+    def parent_key(self) -> int:
+        return self.parent_hash
+
+    @property
+    def lock_count(self) -> int:
+        return self.ref_cnt
 
 
 @dataclass
@@ -2884,8 +2901,7 @@ class APCManager:
         b.token_ids = ()
         b.parent_hash = SEED_PARENT_HASH
         b.extra_hash = 0
-        b.keys = None
-        b.values = None
+        b.release_components()
         return b
 
     def _acquire_existing(self, b: APCBlock) -> APCBlock:
@@ -3336,8 +3352,7 @@ class APCManager:
                 b.parent_hash = parent
                 b.token_ids = chunk
                 b.extra_hash = extra_hash
-                b.keys = k_slabs
-                b.values = v_slabs
+                b.set_kv(k_slabs, v_slabs)
                 b.ref_cnt = 1
                 self.hash_table[h] = b
                 new_blocks.append(b)
@@ -3387,8 +3402,7 @@ class APCManager:
                 b.token_ids = ()
                 b.parent_hash = SEED_PARENT_HASH
                 b.extra_hash = 0
-                b.keys = None
-                b.values = None
+                b.release_components()
                 b.ref_cnt = 0
                 b.prev = b.next = None
             self.hash_table.clear()
