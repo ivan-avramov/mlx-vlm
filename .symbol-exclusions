@@ -134,7 +134,6 @@ mlx_vlm/models/qwen3_5/language.py::_restore_batch_padding_metadata  # baseline:
 mlx_vlm/models/text_only.py::_resolve_text_model_classes  # baseline: pre-existing divergence, unreviewed
 
 # --- mlx_vlm/prompt_utils.py
-mlx_vlm/prompt_utils.py::_template_references_kw  # baseline: pre-existing divergence, unreviewed
 
 # --- mlx_vlm/sample_utils.py
 mlx_vlm/sample_utils.py::_apply_min_p  # baseline: pre-existing divergence, unreviewed
@@ -290,7 +289,6 @@ mlx_vlm/tests/test_models.py::test_deepseek_v3_language_model  # baseline: pre-e
 mlx_vlm/tests/test_models.py::test_deepseekocr_2_language_model  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_models.py::test_fused_apply_rotary_vjp  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_models.py::test_gemma3_text_language_model  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_gemma4_unified_audio_tokens_keep_vision_overlay  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_models.py::test_glm_moe_dsa_language_model  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_models.py::test_inkling_language_model  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_models.py::test_inkling_towers_and_multimodal  # baseline: pre-existing divergence, unreviewed
@@ -354,7 +352,6 @@ mlx_vlm/tests/test_prompt_utils.py::EnableThinkingProcessor  # baseline: pre-exi
 mlx_vlm/tests/test_prompt_utils.py::ThinkingModeProcessor  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_prompt_utils.py::test_apply_chat_template_keeps_enable_thinking_only_for_other_templates  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_prompt_utils.py::test_apply_chat_template_maps_enable_thinking_for_thinking_mode_templates  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_prompt_utils.py::test_gemma4_unified_formats_video_and_audio_messages  # baseline: pre-existing divergence, unreviewed
 
 # --- mlx_vlm/tests/test_sample_utils.py
 mlx_vlm/tests/test_sample_utils.py::TestPLess  # baseline: pre-existing divergence, unreviewed

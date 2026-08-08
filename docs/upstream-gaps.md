@@ -74,11 +74,52 @@ rather than a backlog item:
 
 | Skipped file | Needs | Why it stays skipped |
 |---|---|---|
-| `test_quant_sdpa_mask.py` | `base.quantized_scaled_dot_product_attention` | upstream's quantized attention reshapes scores to 5D for `mx.quantized_matmul`, which is what makes right-aligning a 4D mask alias `B` with `n_kv_heads` (upstream #1567). This fork dequantizes and runs dense attention (`models/base.py:251`), so 5D scores never exist and the hazard is structurally impossible. Porting the helper would be dead code. |
+| `test_quant_sdpa_mask.py` | `base.quantized_scaled_dot_product_attention` | the symbol genuinely does not exist here: plain quantized caches delegate to `mlx_lm`'s SDPA, and TurboQuant caches use their own `quantized_attention`. The hazard those tests cover is handled elsewhere — see below. |
 | `test_quant_sdpa_mask_adversarial.py` | as above | as above |
 
 Deleting an entry from `UNPORTED_UPSTREAM_TESTS` is the definition of done for
 porting that feature.
+
+### **[correction]** why those two stay skipped — the old reason was wrong
+
+This entry previously read: "this fork dequantizes and runs dense attention
+(`models/base.py:251`), so 5D scores never exist and the hazard is structurally
+impossible." **Both halves are false**, and the error was load-bearing, so it is
+worth spelling out.
+
+`models/base.py` no longer dequantizes — it calls `cache.quantized_attention(...)`
+(chunked over Q and K with online softmax, `mx.eval` between K-tiles, so peak
+memory is ~O(chunk) rather than O(context)). And `TurboQuantKVCache.quantized_attention`
+reshapes queries to `(B, n_kv_heads, n_repeats, L, D)`, so **its scores are 5D —
+exactly the shape family that makes upstream #1567 possible.**
+
+What actually prevents the hazard is `TurboQuantKVCache._apply_attention_mask`
+(`turboquant.py:5419`):
+
+```python
+mask_chunk = mask[..., q_start:q_end, k_start:k_end]
+if mask_chunk.ndim == scores.ndim - 1:
+    mask_chunk = mx.expand_dims(mask_chunk, axis=2)
+```
+
+That inserts the singleton axis *before* the trailing `(L, K)` pair, which is
+upstream's `align_attention_mask_to_scores` by another name. So the conclusion
+("the tests would be dead code here") still holds — but for a completely
+different reason than recorded, and via **three lines that were untested**.
+Nothing in the suite referenced `_apply_attention_mask`, so a refactor could have
+deleted that `expand_dims` and reintroduced #1567 while this page asserted the
+hazard was impossible. `test_apply_attention_mask_aligns_batch_not_heads_on_5d_scores`
+and `..._causal_string_broadcasts_over_5d_scores` in `tests/test_turboquant.py`
+now pin it; the first was verified to fail when the `expand_dims` is removed
+(row 0 silently receives row 1's mask — no exception, just wrong numbers).
+
+**One narrower-than-upstream point, left as-is deliberately.** The guard is a
+single `if ... == scores.ndim - 1`, where upstream loops
+`while mask.ndim < scores.ndim`. A mask two or more ranks short — e.g. a 3D
+`(B, L, K)` — would therefore still right-align and alias `B` with `n_repeats`.
+Masks reaching here are 4D or the `"causal"` string, so this is latent rather
+than live; noted so that whoever makes 3D masks reachable knows to widen the
+guard to a loop first.
 
 ## Fixed in this pass
 
@@ -393,34 +434,25 @@ that half is an interleaved port, not a checkout.
 
 ## Still open
 
-**`ff2a6daa` "Preserve audio in Gemma 4 video prompts"** — dropped across all
-four files it touched, and it is *not* just a prompt-formatting change:
+Both of the dropped-commit items previously listed here are **done** —
+`ff2a6daa` (audio preservation in Gemma 4 video prompts, all four files) and
+`ecc457b2`/#1374 (`_template_references_kw` + the `thinking_mode` block).
+`prompt_utils.py` is now `+280/-2` against upstream, and those two remaining
+`-` lines are the fork's own text-only fallback (`MessageFormatter` returning
+plain messages for unknown `model_type` instead of raising). **No upstream
+content is missing from `prompt_utils.py`.**
 
-- `prompt_utils.py`: the video-routing call site passes only `(prompt, role,
-  **kwargs)`, so `_format_video_message`'s `skip_audio_token` / `num_audios`
-  parameters — which our copy still declares — are dead. The body's
-  `content.extend([MessageBuilder.audio_message()] * num_audios)` is missing, so
-  **audio placeholders are silently dropped from any video+audio prompt.**
-- `models/gemma4/language.py`: upstream deleted the `has_audio_tokens` gate on
-  `use_bidirectional_vision`; we still have it, so mixed audio+visual Gemma 4
-  prompts stay causal where upstream now applies the vision overlay. This is a
-  **model-behaviour** change, which is why it wants its own reviewable commit
-  rather than riding along with the video port.
-- `tests/test_models.py`: our
-  `test_gemma4_unified_audio_tokens_keep_vision_mask_causal` asserts the *old*
-  behaviour; upstream renamed it to `…_keep_vision_overlay` and inverted the
-  assertion. Taking the model change without this test is a guaranteed failure.
-- `tests/test_prompt_utils.py`: `test_gemma4_unified_formats_video_and_audio_messages`
-  is absent.
+What is left is one decision and one verified lead:
 
-Note `2197a68a` (which *added* `has_audio_tokens`) is also upstream's — a case of
-lesson 1: our "fork-only" `has_audio_tokens` is stale *upstream* code that
-upstream later removed.
-
-**`ecc457b2` (#1374) `_template_references_kw`** — the helper and the block that
-sets `template_kwargs["thinking_mode"] = "enabled"` when the template references
-`thinking_mode` and `enable_thinking is True`. Without it, templates gated on
-`thinking_mode` never enter thinking mode even with `enable_thinking=True`.
+1. **The mlx-lm removal divergence** — an architecture decision, written up
+   above under "The both-ways sweep". Nothing should be patched file-by-file
+   until it is made.
+2. **`models/gemma4/gemma4.py`'s `image_position_ids` / `video_position_ids`
+   plumbing** (from `bc3461b1`/#1523) — a verified lesson-2 trap: it must land
+   together with `vision.py`, whose `VisionModel.__call__` still takes only
+   `(pixel_values)` where upstream takes `(pixel_values, pixel_position_ids=None)`.
+   Restoring the caller alone `TypeError`s on every Gemma 4 image request.
+   `vision.py` carries fork work (`+50/-67`), so that half is an interleaved port.
 
 Also open, low priority: `_rotating_post_gen_trim_safe` stays intentionally
 unwired (see above) — correct, not a gap.

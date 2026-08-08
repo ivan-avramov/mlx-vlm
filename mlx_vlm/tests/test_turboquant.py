@@ -776,3 +776,57 @@ class TestMaxKVSizePlumbing:
         # Behavior at first write equivalence is enforced by the
         # `or 0` idiom in _step; we trust that idiom here rather than
         # spinning up a Metal device just to assert it.
+
+
+def test_apply_attention_mask_aligns_batch_not_heads_on_5d_scores():
+    """A 4D batch mask must not alias B with n_kv_heads on 5D grouped scores.
+
+    ``quantized_attention`` reshapes queries to ``(B, n_kv_heads, n_repeats, L,
+    D)``, so its scores are 5D. Right-aligning a 4D ``(B, 1, L, K)`` mask against
+    that would line the mask's leading axis up with ``n_kv_heads`` instead of
+    ``B`` -- upstream #1567. It does not raise when B == n_kv_heads; it silently
+    applies one row's mask to another. ``_apply_attention_mask`` avoids it by
+    inserting the singleton axis *before* the last two, and this pins that.
+    """
+    cache = TurboQuantKVCache(bits=4, max_kv_size=0)
+
+    B, n_kv, n_rep, L, K = 2, 2, 2, 3, 4
+    scores = mx.zeros((B, n_kv, n_rep, L, K))
+
+    # Row 0 attends everywhere; row 1 may not attend to key 0. Distinct per row,
+    # so an aliased mask shows up as a wrong row rather than a shape error.
+    allow = mx.ones((1, 1, L, K), dtype=mx.bool_)
+    block_k0 = mx.concatenate(
+        [
+            mx.zeros((1, 1, L, 1), dtype=mx.bool_),
+            mx.ones((1, 1, L, K - 1), dtype=mx.bool_),
+        ],
+        axis=-1,
+    )
+    mask = mx.concatenate([allow, block_k0], axis=0)  # (B, 1, L, K)
+
+    out = cache._apply_attention_mask(scores, mask, 0, L, 0, K, L, K)
+
+    assert out.shape == scores.shape
+    neg = mx.finfo(scores.dtype).min
+    # Row 0 is unmasked for every (head, repeat).
+    assert bool(mx.all(out[0] != neg).item())
+    # Row 1 has key 0 masked for every (head, repeat), and nothing else.
+    assert bool(mx.all(out[1, :, :, :, 0] == neg).item())
+    assert bool(mx.all(out[1, :, :, :, 1:] != neg).item())
+
+
+def test_apply_attention_mask_causal_string_broadcasts_over_5d_scores():
+    """The ``"causal"`` fast path must also produce a 5D-broadcastable mask."""
+    cache = TurboQuantKVCache(bits=4, max_kv_size=0)
+
+    B, n_kv, n_rep, L, K = 2, 2, 2, 3, 3
+    scores = mx.zeros((B, n_kv, n_rep, L, K))
+
+    out = cache._apply_attention_mask(scores, "causal", 0, L, 0, K, L, K)
+
+    assert out.shape == scores.shape
+    neg = mx.finfo(scores.dtype).min
+    # Strictly-upper triangle is masked, identically for every batch row/head.
+    assert bool(mx.all(out[:, :, :, 0, 1:] == neg).item())
+    assert bool(mx.all(out[:, :, :, 2, :] != neg).item())
