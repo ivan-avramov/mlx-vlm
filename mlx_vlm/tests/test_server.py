@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 import logging
@@ -5302,6 +5303,9 @@ class TestResponseGenerator:
             "MLX_VLM_ENABLE_THINKING",
             "MLX_VLM_PRELOAD_MODEL",
             "MLX_VLM_PRELOAD_ADAPTER",
+            "MLX_VLM_PRELOAD_IMAGE_MODEL",
+            "MLX_VLM_PRELOAD_TTS_MODEL",
+            "MLX_VLM_PRELOAD_STT_MODEL",
             "MLX_VLM_VISION_CACHE_SIZE",
             "MLX_VLM_MAX_TOKENS",
             "MLX_VLM_THINKING_BUDGET",
@@ -5325,6 +5329,12 @@ class TestResponseGenerator:
                 "8080",
                 "--model",
                 "demo",
+                "--image-model",
+                "image-demo",
+                "--tts-model",
+                "tts-demo",
+                "--stt-model",
+                "stt-demo",
                 "--enable-thinking",
                 "--thinking-budget",
                 "128",
@@ -5351,12 +5361,19 @@ class TestResponseGenerator:
             assert os.environ["MLX_VLM_THINKING_START_TOKEN"] == "<|START_THINKING|>"
             assert os.environ["MLX_VLM_THINKING_END_TOKEN"] == "<|END_THINKING|>"
             assert os.environ["MLX_VLM_SERVER_API_KEY"] == "admin-token"
+            assert os.environ["MLX_VLM_PRELOAD_MODEL"] == "demo"
+            assert os.environ["MLX_VLM_PRELOAD_IMAGE_MODEL"] == "image-demo"
+            assert os.environ["MLX_VLM_PRELOAD_TTS_MODEL"] == "tts-demo"
+            assert os.environ["MLX_VLM_PRELOAD_STT_MODEL"] == "stt-demo"
             assert run_calls[0][1]["host"] == "127.0.0.1"
         finally:
             for env_var in (
                 "MLX_VLM_ENABLE_THINKING",
                 "MLX_VLM_PRELOAD_MODEL",
                 "MLX_VLM_PRELOAD_ADAPTER",
+                "MLX_VLM_PRELOAD_IMAGE_MODEL",
+                "MLX_VLM_PRELOAD_TTS_MODEL",
+                "MLX_VLM_PRELOAD_STT_MODEL",
                 "MLX_VLM_VISION_CACHE_SIZE",
                 "MLX_VLM_MAX_TOKENS",
                 "MLX_VLM_THINKING_BUDGET",
@@ -5365,6 +5382,42 @@ class TestResponseGenerator:
                 "MLX_VLM_SERVER_API_KEY",
             ):
                 os.environ.pop(env_var, None)
+
+    def test_lifespan_preloads_configured_model_kinds(self, monkeypatch):
+        preload_env = {
+            "MLX_VLM_PRELOAD_MODEL": "language-demo",
+            "MLX_VLM_PRELOAD_ADAPTER": "adapter-demo",
+            "MLX_VLM_PRELOAD_IMAGE_MODEL": "image-demo",
+            "MLX_VLM_PRELOAD_TTS_MODEL": "tts-demo",
+            "MLX_VLM_PRELOAD_STT_MODEL": "stt-demo",
+        }
+        for key, value in preload_env.items():
+            monkeypatch.setenv(key, value)
+        calls = []
+
+        def fake_get_cached_model(model_path, adapter_path=None, *, model_kind="auto"):
+            calls.append((model_path, adapter_path, model_kind))
+            return SimpleNamespace(), None, SimpleNamespace(model_type=model_kind)
+
+        monkeypatch.setattr(
+            server._app_module, "get_cached_model", fake_get_cached_model
+        )
+        monkeypatch.setattr(server.runtime, "audio_queue", None)
+
+        async def run_lifespan():
+            async with server._app_module.lifespan(server.app):
+                pass
+
+        asyncio.run(run_lifespan())
+
+        assert calls == [
+            ("language-demo", "adapter-demo", "text_generation"),
+            ("image-demo", None, "image_generation"),
+            ("tts-demo", None, "audio_tts"),
+            ("stt-demo", None, "audio_stt"),
+        ]
+        for key in preload_env:
+            assert key not in os.environ
 
     def test_gpu_embed_hashes_pixel_values_without_image_ref(self):
         class Embed:
