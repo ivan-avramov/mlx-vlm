@@ -245,22 +245,100 @@ diverge both ways and need case-by-case review).
 | Duplicate authority kept instead of delegating | 5 cache-classification ladders, 117 lines | **no** |
 | Stale *upstream* code retained after upstream replaced it | the whole diffusion subsystem | **no** |
 | Stale *fork* test kept over upstream's rewrite | `lfm2_vl` tests asserted the inverse of our own code | **no** |
+| Positional payload widened, one consumer left at the old arity | `self.requests` grew to a 7-tuple; `_run_diffusion` still unpacked 5 → `ValueError` on every diffusion request | **no** |
+| Parameters kept, the hunk that uses them dropped | `_format_video_message` still declares `skip_audio_token` / `num_audios`; the body and the call site that pass them are gone, so they are dead | **no** |
 
-Eight of eleven are invisible to the audits. They catch structural loss only.
+Nine of thirteen are invisible to the audits. They catch structural loss only.
+
+The last two share a tell worth internalising: **a signature that nothing
+exercises**. Both a positional payload read at two different arities and a
+parameter no caller supplies are cheap to grep for and neither needs upstream as
+a reference — they are internally inconsistent on their own terms. Upstream's
+move to a dataclass (`QueuedGenerationRequest`) removes the first shape by
+construction, which is a better reason to take it than byte-convergence.
+
+## Closed: upstream #1492's video-input support
+
+Ported. The `−66` lines `prompt_utils.py` carried against upstream turned out to
+be **three** dropped commits, not one — worth recording, because reading the
+line count as a single feature is what made this look smaller than it was:
+
+| Missing piece | Owning upstream commit | Status |
+|---|---|---|
+| `_get_video_token()`, video markers + `("video","input_video","video_url")` in `_flatten_content`, `_messages_to_plain_prompt` wiring | `4d468e85` (#1492) | **restored** |
+| `_format_video_message` audio preservation + its positional call site | `ff2a6daa` | still open, see below |
+| `_template_references_kw` + the `thinking_mode="enabled"` block | `ecc457b2` (#1374) | still open, see below |
+
+`server/schemas.py`'s four TypedDicts (`VideoUrl`, `ResponseInputVideoParam`,
+`ResponseVideoUrlParam`, `ResponseVideoParam`) plus the
+`ResponseInputContentParam` union are restored byte-identical to upstream.
+`server/openai.py` has `_extract_video_reference` and the full request path
+(collection → `apply_chat_template(video=…)` → preflight → all four generate
+call sites). `server/app.py`'s preflight takes `videos`.
+
+**The queue rewrite was the substantive part.** `server/generation.py` carried a
+7-tuple on `self.requests` — `(rqueue, raw_inputs, prompt_tokens, args, images,
+prompt_cache_state, prompt)` — read three different ways: `_item[:5]` in the
+batch loop, `*_extra` in the speculative loop, and **a bare 5-tuple in
+`_run_diffusion`**. That last one meant every diffusion request submitted through
+`generate()` raised `ValueError: too many values to unpack`. Adopting upstream's
+`QueuedGenerationRequest` dataclass (upstream's 6 fields, plus the fork's
+`prompt_cache_state` / `prompt`) fixes it structurally and converges the shape.
+No test covered `_run_diffusion` — another entry for the "green does not mean
+converged" table above. Three tests now do.
+
+`_preprocess_request` is worth keeping even though the fork's `prepare_inputs`
+already accepts `videos`: it preserves the 3-argument `_cpu_preprocess(prompt,
+images, audio)` call shape when `videos is None`, which is what lets existing
+test fakes (and any subclass override) keep working.
+
+**One more dropped hunk, found by ratio-triage rather than by the port.**
+`models/gemma4/__init__.py` was `+1/−5`: it did not re-export
+`Gemma4VideoProcessor`, from `bc3461b1` (#1523). Every other file that commit
+touched had landed — `processing_gemma4.py` and `processing_gemma4_unified.py`
+byte-identical, `gemma4/rope_utils.py` correctly deleted — so only the export was
+missing, while the class itself was present. That matters because
+`diffusion_gemma/processing_diffusion_gemma.py:71` declares
+`video_processor_class = "Gemma4VideoProcessor"` and `AutoProcessor` resolves it
+by name off the model package.
+
+**Neither audit could see it, by construction:** the parity check works on whole
+files (present), and the symbol check only compares `def`/`class` names — an
+`__init__.py` defines none, and the class *is* defined in the file it lives in.
+A re-export is invisible to both. Worth remembering that package `__init__.py`
+files are a structural blind spot for the current tooling; `git diff --numstat
+upstream/main` on them is the only thing that finds this shape.
 
 ## Still open
 
-**Upstream #1492's video-input support.** `prompt_utils.py` is −66 lines against
-upstream, and those 66 are one coherent feature: `_get_video_token()`, video
-handling in `_flatten_content`, `_template_references_kw`, video-message routing.
-It pairs with `server/schemas.py`'s missing `VideoUrl`,
-`ResponseInputVideoParam`, `ResponseVideoUrlParam`, `ResponseVideoParam`.
+**`ff2a6daa` "Preserve audio in Gemma 4 video prompts"** — dropped across all
+four files it touched, and it is *not* just a prompt-formatting change:
 
-The full feature spans `prompt_utils.py`, `schemas.py`, `server/openai.py`,
-`server/generation.py`, `server/app.py`. Three carry heavy fork work, so this is
-an interleaved port, not a `git checkout`. Start from
-`git show --stat 4d468e85` and reconcile each file — per lesson 2 above, do not
-restore them one at a time.
+- `prompt_utils.py`: the video-routing call site passes only `(prompt, role,
+  **kwargs)`, so `_format_video_message`'s `skip_audio_token` / `num_audios`
+  parameters — which our copy still declares — are dead. The body's
+  `content.extend([MessageBuilder.audio_message()] * num_audios)` is missing, so
+  **audio placeholders are silently dropped from any video+audio prompt.**
+- `models/gemma4/language.py`: upstream deleted the `has_audio_tokens` gate on
+  `use_bidirectional_vision`; we still have it, so mixed audio+visual Gemma 4
+  prompts stay causal where upstream now applies the vision overlay. This is a
+  **model-behaviour** change, which is why it wants its own reviewable commit
+  rather than riding along with the video port.
+- `tests/test_models.py`: our
+  `test_gemma4_unified_audio_tokens_keep_vision_mask_causal` asserts the *old*
+  behaviour; upstream renamed it to `…_keep_vision_overlay` and inverted the
+  assertion. Taking the model change without this test is a guaranteed failure.
+- `tests/test_prompt_utils.py`: `test_gemma4_unified_formats_video_and_audio_messages`
+  is absent.
+
+Note `2197a68a` (which *added* `has_audio_tokens`) is also upstream's — a case of
+lesson 1: our "fork-only" `has_audio_tokens` is stale *upstream* code that
+upstream later removed.
+
+**`ecc457b2` (#1374) `_template_references_kw`** — the helper and the block that
+sets `template_kwargs["thinking_mode"] = "enabled"` when the template references
+`thinking_mode` and `enable_thinking is True`. Without it, templates gated on
+`thinking_mode` never enter thinking mode even with `enable_thinking=True`.
 
 Also open, low priority: `_rotating_post_gen_trim_safe` stays intentionally
 unwired (see above) — correct, not a gap.

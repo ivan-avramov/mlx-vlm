@@ -874,6 +874,29 @@ class GenerationContext:
 
 
 @dataclass
+class QueuedGenerationRequest:
+    """Preprocessed generation request waiting for the GPU worker.
+
+    Upstream's fields come first; ``prompt_cache_state`` and ``prompt`` are
+    fork additions carrying the per-chat cached-request path (see
+    ``ResponseGenerator.generate``). Attribute access rather than tuple
+    unpacking is deliberate: the queue previously carried a 7-tuple that the
+    batch loop read as ``_item[:5]``, the speculative loop as ``*_extra``, and
+    the diffusion loop as a bare 5-tuple -- which raised ValueError on every
+    diffusion request.
+    """
+
+    rqueue: Queue
+    raw_inputs: dict
+    prompt_tokens: int
+    args: GenerationArguments
+    images: Optional[List] = None
+    videos: Optional[List] = None
+    prompt_cache_state: Optional["PromptCacheState"] = None
+    prompt: Optional[str] = None
+
+
+@dataclass
 class GenerationMetrics:
     """Runtime metrics collected while consuming generation output."""
 
@@ -1242,6 +1265,7 @@ class ResponseGenerator:
         images: Optional[List] = None,
         audio: Optional[List] = None,
         args: Optional[GenerationArguments] = None,
+        videos: Optional[List] = None,
         prompt_cache_state: Optional["PromptCacheState"] = None,
     ) -> Tuple[GenerationContext, "_TokenIterator"]:
         """Submit a generation request to the GPU thread.
@@ -1278,9 +1302,9 @@ class ResponseGenerator:
             )
         rqueue: Queue = Queue()
 
-        # CPU preprocessing (tokenize, load images) on caller thread.
+        # CPU preprocessing (tokenize, load images/videos) on caller thread.
         # GPU work (vision encoder) deferred to GPU thread.
-        raw_inputs = self._cpu_preprocess(prompt, images, audio)
+        raw_inputs = self._preprocess_request(prompt, images, audio, videos)
         prompt_tokens = _count_prompt_tokens(raw_inputs)
         _apply_generation_budget(args, prompt_tokens)
 
@@ -1289,14 +1313,15 @@ class ResponseGenerator:
         # prefix). Carrying it through the queue lets the daemon dispatch to
         # either path with full context.
         self.requests.put(
-            (
-                rqueue,
-                raw_inputs,
-                prompt_tokens,
-                args,
-                images,
-                prompt_cache_state,
-                prompt,
+            QueuedGenerationRequest(
+                rqueue=rqueue,
+                raw_inputs=raw_inputs,
+                prompt_tokens=prompt_tokens,
+                args=args,
+                images=images,
+                videos=videos,
+                prompt_cache_state=prompt_cache_state,
+                prompt=prompt,
             )
         )
 
@@ -1309,7 +1334,7 @@ class ResponseGenerator:
             rqueue, ctx.uid, self._cancel, get_token_queue_timeout()
         )
 
-    def _cpu_preprocess(self, prompt, images=None, audio=None) -> dict:
+    def _cpu_preprocess(self, prompt, images=None, audio=None, videos=None) -> dict:
         """CPU-only: tokenize text, load/resize images. Thread-safe."""
         add_special_tokens = (
             getattr(self.processor, "chat_template", None) is None
@@ -1322,10 +1347,16 @@ class ResponseGenerator:
             self.processor,
             images=images,
             audio=audio,
+            videos=videos,
             prompts=prompt,
             image_token_index=image_token_index,
             add_special_tokens=add_special_tokens,
         )
+
+    def _preprocess_request(self, prompt, images=None, audio=None, videos=None) -> dict:
+        if videos is None:
+            return self._cpu_preprocess(prompt, images, audio)
+        return self._cpu_preprocess(prompt, images, audio, videos)
 
     def _token_iterator(self, rqueue: Queue, uid: int):
         """Yield StreamingToken items from rqueue until the daemon signals
@@ -1859,14 +1890,14 @@ class ResponseGenerator:
                         batch_gen.close()
                         batch_gen = None
 
-                for _item in new_items:
-                    # Requests carry (rqueue, raw_inputs, prompt_tokens, args,
-                    # images) plus optional (prompt_cache_state, prompt) for
-                    # the cached path. Tolerate the 5-tuple form so callers /
-                    # tests that submit the base shape keep working.
-                    rqueue, raw_inputs, prompt_tokens, args, images = _item[:5]
-                    prompt_cache_state = _item[5] if len(_item) > 5 else None
-                    formatted_prompt = _item[6] if len(_item) > 6 else None
+                for request in new_items:
+                    rqueue = request.rqueue
+                    raw_inputs = request.raw_inputs
+                    prompt_tokens = request.prompt_tokens
+                    args = request.args
+                    images = request.images
+                    prompt_cache_state = request.prompt_cache_state
+                    formatted_prompt = request.prompt
                     # Dispatch cached requests to the dedicated handler. They
                     # run inline on this daemon thread (the one that owns the
                     # model) and skip continuous batching — single-chat
@@ -2011,7 +2042,11 @@ class ResponseGenerator:
                 if should_stop:
                     break
                 cancelled |= self._drain_cancellations()
-                for rqueue, raw_inputs, prompt_tokens, args, _images in new_items:
+                for request in new_items:
+                    rqueue = request.rqueue
+                    raw_inputs = request.raw_inputs
+                    prompt_tokens = request.prompt_tokens
+                    args = request.args
                     uid_counter += 1
                     uid = uid_counter
                     rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
@@ -2230,7 +2265,12 @@ class ResponseGenerator:
                 if hasattr(lm, "_rope_deltas"):
                     lm._rope_deltas = None
 
-                for rqueue, raw_inputs, prompt_tokens, args, images, *_extra in pending:
+                for request in pending:
+                    rqueue = request.rqueue
+                    raw_inputs = request.raw_inputs
+                    prompt_tokens = request.prompt_tokens
+                    args = request.args
+                    images = request.images
                     input_ids, gen_kwargs = self._gpu_embed(raw_inputs, images)
                     uid = id(rqueue)
                     uids.append(uid)
@@ -2373,8 +2413,7 @@ class ResponseGenerator:
                     token_dtype=mx.int32,
                     stop_check=stop_check,
                     greedy_sampling=all(
-                        pending_args.temperature == 0
-                        for _, _, _, pending_args, *_rest in pending
+                        request.args.temperature == 0 for request in pending
                     ),
                     shared_kv_states=shared_kv_states,
                     eos_token_ids=eos_set,
@@ -2462,7 +2501,9 @@ class ResponseGenerator:
                 print(f"Error in speculative generation thread: {e}")
                 traceback.print_exc()
                 error_queues = {id(rqueue): rqueue for rqueue in rqueues.values()}
-                error_queues.update({id(rqueue): rqueue for rqueue, *_ in pending})
+                error_queues.update(
+                    {id(request.rqueue): request.rqueue for request in pending}
+                )
                 _notify_queues(error_queues.values(), e, None)
                 mx.clear_cache()
                 gc.collect()
@@ -2556,13 +2597,14 @@ class ResponseGenerator:
         images: Optional[List] = None,
         audio: Optional[List] = None,
         args: Optional[GenerationArguments] = None,
+        videos: Optional[List] = None,
     ):
         """Validate request size before opening a streaming response."""
         if get_configured_context_limit() is None:
             return
         self.wait_until_ready()
         args = args or GenerationArguments(max_tokens=get_server_max_tokens())
-        raw_inputs = self._cpu_preprocess(prompt, images, audio)
+        raw_inputs = self._preprocess_request(prompt, images, audio, videos)
         # Floor-rejection check only; the real clamp mutates args in submit().
         # log_clamp=False: suppress the clamp WARNING here — it will be logged
         # at submit time when _apply_generation_budget runs on the streaming path.

@@ -134,7 +134,6 @@ mlx_vlm/models/qwen3_5/language.py::_restore_batch_padding_metadata  # baseline:
 mlx_vlm/models/text_only.py::_resolve_text_model_classes  # baseline: pre-existing divergence, unreviewed
 
 # --- mlx_vlm/prompt_utils.py
-mlx_vlm/prompt_utils.py::_get_video_token  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/prompt_utils.py::_template_references_kw  # baseline: pre-existing divergence, unreviewed
 
 # --- mlx_vlm/sample_utils.py
@@ -162,14 +161,12 @@ mlx_vlm/sample_utils.py::repetition_penalty_processor  # baseline: pre-existing 
 mlx_vlm/sample_utils.py::sampler  # baseline: pre-existing divergence, unreviewed
 
 # --- mlx_vlm/server/generation.py
-mlx_vlm/server/generation.py::QueuedGenerationRequest  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/server/generation.py::_DiffusionBlockEmitter  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/server/generation.py::_check_configured_context_budget  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/server/generation.py::_log_decode_progress  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/server/generation.py::_log_prefill_completed  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/server/generation.py::_log_prefill_progress  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/server/generation.py::_log_prefill_started  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/server/generation.py::_preprocess_request  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/server/generation.py::_request_log_id  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/server/generation.py::_sample_top_p_one  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/server/generation.py::diffusion_kwargs  # baseline: pre-existing divergence, unreviewed
@@ -180,7 +177,6 @@ mlx_vlm/server/generation.py::on_result  # baseline: pre-existing divergence, un
 # --- mlx_vlm/server/openai.py
 mlx_vlm/server/openai.py::_content_has_effective_input  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/server/openai.py::_ensure_effective_input  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/server/openai.py::_extract_video_reference  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/server/openai.py::_has_non_empty_text  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/server/openai.py::_message_has_effective_input  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/server/openai.py::_normalize_response_instruction_messages  # baseline: pre-existing divergence, unreviewed
@@ -192,11 +188,7 @@ mlx_vlm/server/openai.py::_with_tool_choice_instruction  # baseline: pre-existin
 mlx_vlm/server/responses_state.py::_reasoning_output_items  # baseline: pre-existing divergence, unreviewed
 
 # --- mlx_vlm/server/schemas.py
-mlx_vlm/server/schemas.py::ResponseInputVideoParam  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/server/schemas.py::ResponseVideoParam  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/server/schemas.py::ResponseVideoUrlParam  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/server/schemas.py::StreamingTimings  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/server/schemas.py::VideoUrl  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/server/schemas.py::sync_reasoning_aliases  # baseline: pre-existing divergence, unreviewed
 
 # --- mlx_vlm/speculative/drafters/qwen3_dflash/dflash.py
@@ -408,7 +400,6 @@ mlx_vlm/tests/test_server.py::test_build_gen_args_maps_chat_reasoning_effort  # 
 mlx_vlm/tests/test_server.py::test_build_gen_args_maps_none_reasoning_effort_to_disabled  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_build_gen_args_maps_responses_reasoning_configuration  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_build_gen_args_preserves_diffusion_options  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_server.py::test_chat_completions_endpoint_forwards_video_content  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_chat_completions_endpoint_preserves_assistant_reasoning_content  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_chat_completions_endpoint_rejects_empty_effective_input  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_chat_completions_forced_tool_choice_filters_tools  # baseline: pre-existing divergence, unreviewed

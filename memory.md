@@ -547,11 +547,19 @@ written against.
 | `2de64d6` | 2026-08-07 | feat: FP8/NVFP4 compressed-tensors; flux2 quantized-repo routing (one dropped guard line, `supports_model`, broke every quantized flux2 repo). |
 | `4b15cc5` | 2026-08-07 | fix: dropped registry entries — `mage`/`mageflow`, `minimax_m3_vl`, `kimi_k3`. The last was the entire "kimi_k3 template mismatch" earlier docs guessed at. ULP-bounds a Metal-kernel test that asserted bitwise equality. |
 | `e3593ee` | 2026-08-07 | docs: `upstream-gaps.md` + `CLAUDE.md` brought current. |
+| `9b51518` | 2026-08-07 | docs(memory): repair the change-log section and add this 2026-08-07 block. |
+| `f068dd0` | 2026-08-07 | feat: converge the diffusion + gemma4 processors on upstream; **suite green**. Source of lesson 2 in `upstream-gaps.md`: #1492 changed `gemma4`'s and `gemma4_unified`'s processors together, and restoring only one *broke two passing tests*. |
+| `42503dc` | 2026-08-07 | fix: restore the pure-loss (`+0/−N`) files + 5 dropped prompt-format registrations. Takes the pure-loss count to **0**. |
+| `8d40fe3` | 2026-08-07 | docs: record the green state and the two history commands (`git log -S`, `git show --stat`) that settle divergence questions. |
 
-Suite across this block: **36 failed / 1805 passed → 16 failed / 2175 passed**, with
-collection up ~2004 → ~2190. All 16 remaining failures are in
-`test_diffusion_gemma.py` (11) and `test_diffusion_models.py` (5); no other file
-has a failing test. Compare failing *test IDs*, not counts.
+Suite across this block: **36 failed / 1805 passed → 0 failed / 2197 passed**, with
+collection up ~2004 → ~2202. Compare failing *test IDs*, not counts.
+
+**Local commits over upstream** (2026-08-07, continued — video-input port):
+
+| commit | date | purpose |
+|---|---|---|
+| _(this commit)_ | 2026-08-07 | feat(server): port upstream #1492's **video-input support**, the last named gap in `upstream-gaps.md`. Interleaved across 5 fork-heavy files rather than checked out: `prompt_utils.py` (`_get_video_token`, video markers in `_flatten_content`), `server/schemas.py` (4 TypedDicts + union), `server/openai.py` (`_extract_video_reference` + request-path wiring), `server/generation.py`, `server/app.py`. Replaces the request queue's 7-tuple with upstream's `QueuedGenerationRequest` dataclass — which **also fixes a live bug**: `_run_diffusion` unpacked a bare 5-tuple, so every diffusion request through `generate()` raised `ValueError`. No test covered that loop. Also restores `models/gemma4/__init__.py`'s `Gemma4VideoProcessor` re-export (dropped from `bc3461b1`/#1523) — a re-export is invisible to *both* audits, so package `__init__.py` files are a known tooling blind spot. |
 
 ---
 

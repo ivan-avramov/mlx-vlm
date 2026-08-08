@@ -531,12 +531,11 @@ def test_server_serves_ar_requests_after_drafter_mismatch(monkeypatch):
 
     rqueue = Queue()
     gen.requests.put(
-        (
-            rqueue,
-            {"token": 1},
-            1,
-            server.GenerationArguments(max_tokens=1),
-            None,
+        server_generation.QueuedGenerationRequest(
+            rqueue=rqueue,
+            raw_inputs={"token": 1},
+            prompt_tokens=1,
+            args=server.GenerationArguments(max_tokens=1),
         )
     )
     worker = Thread(target=gen._run, daemon=True)
@@ -570,12 +569,11 @@ def test_speculative_thread_exception_reaches_client_queue(monkeypatch):
 
     rqueue = Queue()
     pending = [
-        (
-            rqueue,
-            {"input_ids": mx.array([[1]], dtype=mx.int32)},
-            1,
-            server.GenerationArguments(max_tokens=2),
-            None,
+        server_generation.QueuedGenerationRequest(
+            rqueue=rqueue,
+            raw_inputs={"input_ids": mx.array([[1]], dtype=mx.int32)},
+            prompt_tokens=1,
+            args=server.GenerationArguments(max_tokens=2),
         )
     ]
     calls = {"count": 0}
@@ -616,19 +614,17 @@ def test_speculative_thread_exception_skips_broken_queues(monkeypatch):
 
     good_queue = Queue()
     pending = [
-        (
-            BrokenQueue(),
-            {"input_ids": mx.array([[1]], dtype=mx.int32)},
-            1,
-            server.GenerationArguments(max_tokens=2),
-            None,
+        server_generation.QueuedGenerationRequest(
+            rqueue=BrokenQueue(),
+            raw_inputs={"input_ids": mx.array([[1]], dtype=mx.int32)},
+            prompt_tokens=1,
+            args=server.GenerationArguments(max_tokens=2),
         ),
-        (
-            good_queue,
-            {"input_ids": mx.array([[1]], dtype=mx.int32)},
-            1,
-            server.GenerationArguments(max_tokens=2),
-            None,
+        server_generation.QueuedGenerationRequest(
+            rqueue=good_queue,
+            raw_inputs={"input_ids": mx.array([[1]], dtype=mx.int32)},
+            prompt_tokens=1,
+            args=server.GenerationArguments(max_tokens=2),
         ),
     ]
     calls = {"count": 0}
@@ -668,12 +664,11 @@ def test_speculative_thread_exception_clears_runtime_cache(monkeypatch):
         if collect_calls["count"] > 1:
             return [], True
         return [
-            (
-                rqueue,
-                {"input_ids": mx.array([[1]], dtype=mx.int32)},
-                1,
-                server.GenerationArguments(max_tokens=2),
-                None,
+            server_generation.QueuedGenerationRequest(
+                rqueue=rqueue,
+                raw_inputs={"input_ids": mx.array([[1]], dtype=mx.int32)},
+                prompt_tokens=1,
+                args=server.GenerationArguments(max_tokens=2),
             )
         ], False
 
@@ -1196,12 +1191,11 @@ def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
     args = server.GenerationArguments(max_tokens=2, temperature=0)
     for spec in request_specs:
         gen.requests.put(
-            (
-                Queue(),
-                {"input_ids": spec["input_ids"]},
-                int(spec["input_ids"].shape[1]),
-                args,
-                None,
+            server_generation.QueuedGenerationRequest(
+                rqueue=Queue(),
+                raw_inputs={"input_ids": spec["input_ids"]},
+                prompt_tokens=int(spec["input_ids"].shape[1]),
+                args=args,
             )
         )
 
@@ -2535,6 +2529,53 @@ def test_chat_completions_endpoint_flattens_text_content_parts(client):
     ]
 
 
+def test_chat_completions_endpoint_forwards_video_content(client):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="gemma4")
+    result = GenerationResult(
+        text="done",
+        prompt_tokens=8,
+        generation_tokens=4,
+        total_tokens=12,
+        prompt_tps=10.0,
+        generation_tps=5.0,
+        peak_memory=0.1,
+    )
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result) as mock_generate,
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "video_url", "video_url": {"url": "clip.mp4"}},
+                            {"type": "text", "text": "Describe this video."},
+                        ],
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    assert mock_template.call_args.kwargs["video"] == ["clip.mp4"]
+    assert mock_template.call_args.args[2] == [
+        {"role": "user", "content": "Describe this video."}
+    ]
+    assert mock_generate.call_args.kwargs["video"] == ["clip.mp4"]
+
+
 # ---------------------------------------------------------------------------
 # Legacy OpenAI text-completions endpoint (/v1/completions)
 # ---------------------------------------------------------------------------
@@ -3704,6 +3745,103 @@ class TestResponseGenerator:
         gen._cpu_preprocess = lambda prompt, images, audio: {"input_ids": [1, 2, 3]}
         return gen
 
+    def test_generate_forwards_videos_to_preprocess_and_queue(self):
+        """videos must reach prepare_inputs AND ride the queue to the GPU thread.
+
+        Upstream #1492's server half: without the queue field the vision
+        embeddings for a video request are silently built from images only.
+        """
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.wait_until_ready = lambda: None
+        gen.draft_model = None
+        gen._cancel = lambda uid: None
+        seen = {}
+        queued = []
+
+        def fake_cpu_preprocess(prompt, images=None, audio=None, videos=None):
+            seen["videos"] = videos
+            return {"input_ids": mx.array([[1, 2, 3]], dtype=mx.int32)}
+
+        # generate() blocks on rqueue.get() for the GPU thread's context, so
+        # the fake queue has to answer inline.
+        class Requests:
+            def put(self, item):
+                queued.append(item)
+                item.rqueue.put(SimpleNamespace(uid="req-1"))
+
+        gen._cpu_preprocess = fake_cpu_preprocess
+        gen.requests = Requests()
+
+        gen.generate(
+            "describe the clip",
+            videos=["clip.mp4"],
+            args=server.GenerationArguments(max_tokens=4),
+        )
+
+        assert seen["videos"] == ["clip.mp4"]
+        assert isinstance(queued[0], server_generation.QueuedGenerationRequest)
+        assert queued[0].videos == ["clip.mp4"]
+
+    def test_generate_omits_videos_arg_when_none(self):
+        """A videos=None request must still call the 3-arg _cpu_preprocess.
+
+        ``_preprocess_request`` exists purely to keep that call shape, so
+        overrides/fakes that predate the videos parameter keep working.
+        """
+        gen = self._bare_generator()  # _cpu_preprocess takes exactly 3 args
+        gen._cancel = lambda uid: None
+        queued = []
+
+        class Requests:
+            def put(self, item):
+                queued.append(item)
+                item.rqueue.put(SimpleNamespace(uid="req-1"))
+
+        gen.requests = Requests()
+
+        gen.generate("hello", args=server.GenerationArguments(max_tokens=4))
+
+        assert queued[0].videos is None
+
+    def test_diffusion_daemon_consumes_full_request_object(self):
+        """Regression: the diffusion loop unpacked a bare 5-tuple.
+
+        ``generate()`` has always queued more fields than that (the fork adds
+        prompt_cache_state + prompt), so every diffusion request raised
+        ValueError before the queue became a QueuedGenerationRequest.
+        """
+        gen = _unstarted_response_generator()
+        rqueue: Queue = Queue()
+        request = server_generation.QueuedGenerationRequest(
+            rqueue=rqueue,
+            raw_inputs={"input_ids": mx.array([[1, 2]], dtype=mx.int32)},
+            prompt_tokens=2,
+            args=server.GenerationArguments(max_tokens=1),
+            prompt_cache_state=SimpleNamespace(),
+            prompt="hello",
+        )
+
+        collected = {"count": 0}
+
+        def collect_pending_requests(**_kwargs):
+            collected["count"] += 1
+            if collected["count"] == 1:
+                return [request], False
+            return [], True
+
+        handled = []
+        gen._collect_pending_requests = collect_pending_requests
+        gen._generate_diffusion = lambda uid, rq, raw, args, cancelled: handled.append(
+            (uid, raw, args)
+        )
+
+        gen._run_diffusion("block")
+
+        assert len(handled) == 1
+        assert handled[0][2].max_tokens == 1
+        assert isinstance(rqueue.get_nowait(), server.GenerationContext)
+        assert rqueue.get_nowait() is None
+
     def test_generate_rejects_requests_over_configured_context_limit(self, monkeypatch):
         gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
         gen.wait_until_ready = lambda: None
@@ -3773,7 +3911,7 @@ class TestResponseGenerator:
 
         class Requests:
             def put(self, item):
-                rqueue = item[0]
+                rqueue = item.rqueue
                 rqueue.put(SimpleNamespace(uid="req-1"))
 
         gen.requests = Requests()
@@ -3838,7 +3976,7 @@ class TestResponseGenerator:
 
         class Requests:
             def put(self, item):
-                rqueue: Queue = item[0]
+                rqueue: Queue = item.rqueue
                 rqueue.put(SimpleNamespace(uid="req-1"))
 
                 def deliver():
@@ -4223,12 +4361,11 @@ class TestResponseGenerator:
             rqueue = Queue()
             request_queues.append(rqueue)
             gen.requests.put(
-                (
-                    rqueue,
-                    {"request_id": request_id},
-                    1,
-                    server.GenerationArguments(max_tokens=2),
-                    None,
+                server_generation.QueuedGenerationRequest(
+                    rqueue=rqueue,
+                    raw_inputs={"request_id": request_id},
+                    prompt_tokens=1,
+                    args=server.GenerationArguments(max_tokens=2),
                 )
             )
 
@@ -4380,12 +4517,11 @@ class TestResponseGenerator:
             rqueue = Queue()
             request_queues.append(rqueue)
             gen.requests.put(
-                (
-                    rqueue,
-                    {"request_id": request_id},
-                    1,
-                    server.GenerationArguments(max_tokens=1, temperature=0),
-                    None,
+                server_generation.QueuedGenerationRequest(
+                    rqueue=rqueue,
+                    raw_inputs={"request_id": request_id},
+                    prompt_tokens=1,
+                    args=server.GenerationArguments(max_tokens=1, temperature=0),
                 )
             )
 
@@ -4565,12 +4701,13 @@ class TestResponseGenerator:
         def run_request(request_id, temperature):
             rqueue = Queue()
             gen.requests.put(
-                (
-                    rqueue,
-                    {"request_id": request_id},
-                    1,
-                    server.GenerationArguments(max_tokens=1, temperature=temperature),
-                    None,
+                server_generation.QueuedGenerationRequest(
+                    rqueue=rqueue,
+                    raw_inputs={"request_id": request_id},
+                    prompt_tokens=1,
+                    args=server.GenerationArguments(
+                        max_tokens=1, temperature=temperature
+                    ),
                 )
             )
             ctx = rqueue.get(timeout=1)
