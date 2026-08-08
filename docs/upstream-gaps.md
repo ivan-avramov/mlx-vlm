@@ -309,6 +309,88 @@ A re-export is invisible to both. Worth remembering that package `__init__.py`
 files are a structural blind spot for the current tooling; `git diff --numstat
 upstream/main` on them is the only thing that finds this shape.
 
+## The both-ways sweep: one divergence explains most of it
+
+Triaging the ~63 both-ways-diverged files by loss ratio
+(`−N/+M`, largest first) surfaces this at the top:
+
+| ratio | file | verdict |
+|---|---|---|
+| 396:1 | `tests/test_processors.py` | mostly cosmetic + grouping |
+| 258:1 | `tests/test_sample_utils.py` | expected — the fork rewrote `sample_utils` |
+| 250:1 | `tests/test_trainer.py` | expected |
+| 185:1 | `models/qwen3_5/gated_delta.py` | **mlx-lm removal** (below) |
+| 86:1 | `trainer/datasets.py` | cosmetic (`numpy` import) |
+| 9.4:1 | `models/base.py` | **deliberate** — the quant-SDPA divergence + mlx-lm |
+| 4:1 | `speculative/drafters/qwen3_dflash/dflash.py` | **mlx-lm removal** |
+| 4:1 | `models/text_only.py` | **mlx-lm removal** |
+| 3.2:1 | `models/gemma4/gemma4.py` | real gap, see below |
+
+**The ratio heuristic works, but nearly every top hit is the same one thing.**
+Upstream has completed an mlx-lm *removal* series (#1593, #1594, #1616, plus
+`893f659a` and `4dac60c6`): it vendored the text architectures, activations,
+RoPE helpers and cache classes into `mlx_vlm/` and stopped importing `mlx_lm`
+in library code.
+
+    # upstream/main
+    $ grep -rl 'from mlx_lm\|import mlx_lm' --include='*.py' mlx_vlm | wc -l
+    0
+    # here
+    31        (19 outside mlx_vlm/tests)
+
+`models/cache.py` alone: **0** mlx_lm references upstream, **25** here.
+
+Both remotes still *declare* `mlx-lm>=0.31.3` in `requirements.txt`, so this is
+about imports in library code, not the dependency itself.
+
+**This is an architecture decision, not a dropped hunk, and it should not be
+resolved file-by-file.** Two coherent positions:
+
+- **Follow upstream.** Removes the largest single source of future merge
+  conflict. But the fork's APC work is built *on* mlx-lm internals — e.g.
+  `models/cache.py` grafts `dequantize_for_apc` onto mlx_lm's
+  `QuantizedKVCache`, and `BatchRotatingKVCache` subclasses mlx_lm's to carry a
+  right-pad prefill fix mlx_lm lacks. Vendoring means owning all of that.
+- **Stay on mlx-lm and declare it permanent.** Then these ~10 files should be
+  recorded here as intentional divergence (like the quant-SDPA entry) so future
+  sweeps stop re-triaging them, and `.symbol-exclusions` reasons should say
+  "mlx-lm delegation" rather than "pre-existing divergence, unreviewed".
+
+Either way the *next* action is a decision, not a patch. Until it is made,
+treat every "we import `mlx_lm`, upstream defines it locally" hunk as explained
+rather than as a gap.
+
+**One genuine gap the sweep did find**, independent of the above:
+`models/gemma4/gemma4.py` (`+12/−38`) is missing two hunks from `bc3461b1`
+(#1523) — the same commit whose `__init__.py` export this branch just restored:
+
+1. `image_position_ids` / `video_position_ids` plumbing through
+   `get_input_embeddings` and `encode_image`, with `_encode_image` /
+   `_encode_video` split out of `_encode_vision`.
+2. Conv-weight layout *detection* in `sanitize()`. Upstream transposes only when
+   the incoming shape does not already match the expected MLX layout
+   (`expected_in` derived from `audio_config.subsampling_conv_channels`); we
+   transpose unconditionally. Upstream's commit message for this is "Handle
+   Gemma4 audio weights in MLX layout", i.e. **already-converted checkpoints get
+   double-transposed here.**
+
+Item 2 is a correctness bug with no failing test, and it is independent — it can
+be fixed on its own.
+
+**Item 1 is a textbook lesson-2 trap, and worth checking before you touch it.**
+`gemma4.py` and `vision.py` are consistently stale *together*:
+
+```
+ours:      def __call__(self, pixel_values) -> mx.array:                          # vision.py
+upstream:  def __call__(self, pixel_values, pixel_position_ids=None) -> mx.array:
+```
+
+So restoring `gemma4.py`'s `_encode_image` / `_encode_video` split alone makes it
+call `self.vision_tower(pixels, position_ids)` against a one-argument
+`VisionModel.__call__` — an immediate `TypeError` on every Gemma 4 image request.
+The pair must land together, and `vision.py` carries fork work (`+50/−67`), so
+that half is an interleaved port, not a checkout.
+
 ## Still open
 
 **`ff2a6daa` "Preserve audio in Gemma 4 video prompts"** — dropped across all
