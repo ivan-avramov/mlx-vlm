@@ -72,7 +72,6 @@ mlx_vlm/generate/dispatch.py::wired_limit  # baseline: pre-existing divergence, 
 # --- mlx_vlm/models/qwen3_5/gated_delta.py
 
 # --- mlx_vlm/models/qwen3_5/language.py
-mlx_vlm/models/qwen3_5/language.py::_is_ssm_cache  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/models/qwen3_5/language.py::_restore_batch_padding_metadata  # baseline: pre-existing divergence, unreviewed
 
 # --- mlx_vlm/models/text_only.py
@@ -290,13 +289,10 @@ mlx_vlm/tests/test_speculative.py::Model  # baseline: pre-existing divergence, u
 mlx_vlm/tests/test_speculative.py::_qwen3_5_batch_cache  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_speculative.py::_qwen3_5_hybrid_batch_model  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_speculative.py::speculative_logits_from_hidden  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_speculative.py::test_deepseek_v4_rollback_speculative_cache_handles_turboquant_batch_tail_zero  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_speculative.py::test_gemma4_rollback_speculative_cache_handles_turboquant_batch_tail_zero  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_speculative.py::test_kind_none_autodetects_mtp_for_glm4_moe_lite_mtp  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_speculative.py::test_qwen3_5_all_rows_fully_padded_prefill  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_speculative.py::test_qwen3_5_fully_padded_prefill_row_survives_chunks  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_speculative.py::test_qwen3_5_partially_padded_rows_match_unbatched  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_speculative.py::test_qwen3_5_rollback_speculative_cache_handles_turboquant_batch_kv  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_speculative.py::test_qwen_fused_greedy_decode_support_matches_lm_head  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_speculative.py::test_qwen_fused_greedy_decode_uses_quantized_argmax  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_speculative.py::test_split_glm4_moe_lite_mtp_flattens_nextn_layer  # baseline: pre-existing divergence, unreviewed
@@ -306,7 +302,6 @@ mlx_vlm/tests/test_speculative.py::test_split_glm4_moe_lite_mtp_flattens_nextn_l
 # --- mlx_vlm/tests/test_trainer.py
 
 # --- mlx_vlm/tests/test_turboquant.py
-mlx_vlm/tests/test_turboquant.py::test_batch_turboquant_cache_supports_uniform_right_trim  # baseline: pre-existing divergence, unreviewed
 
 # --- mlx_vlm/tests/test_utils.py
 mlx_vlm/tests/test_utils.py::Processor  # baseline: pre-existing divergence, unreviewed
