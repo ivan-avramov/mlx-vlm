@@ -106,8 +106,6 @@ mlx_vlm/models/cache.py::prefix_cache_snapshot  # baseline: pre-existing diverge
 mlx_vlm/models/deepseek_v4/language.py::_hisa_select  # baseline: pre-existing divergence, unreviewed
 
 # --- mlx_vlm/models/gemma4/gemma4.py
-mlx_vlm/models/gemma4/gemma4.py::_encode_image  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/models/gemma4/gemma4.py::_encode_video  # baseline: pre-existing divergence, unreviewed
 
 # --- mlx_vlm/models/gemma4/processing_gemma4.py
 mlx_vlm/models/gemma4/processing_gemma4.py::_convert_video_to_patches  # baseline: pre-existing divergence, unreviewed
@@ -115,7 +113,6 @@ mlx_vlm/models/gemma4/processing_gemma4.py::_pad_video_patches  # baseline: pre-
 mlx_vlm/models/gemma4/processing_gemma4.py::check_argument_for_proper_class  # baseline: pre-existing divergence, unreviewed
 
 # --- mlx_vlm/models/gemma4/vision.py
-mlx_vlm/models/gemma4/vision.py::embed_patches  # baseline: pre-existing divergence, unreviewed
 
 # --- mlx_vlm/models/qwen3_5/gated_delta.py
 mlx_vlm/models/qwen3_5/gated_delta.py::_gated_delta_step_ops  # baseline: pre-existing divergence, unreviewed
