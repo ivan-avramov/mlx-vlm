@@ -352,107 +352,181 @@ upstream/main` on them is the only thing that finds this shape.
 
 ## The both-ways sweep: one divergence explains most of it
 
-Triaging the ~63 both-ways-diverged files by loss ratio
-(`−N/+M`, largest first) surfaces this at the top:
+Triaging the ~63 both-ways-diverged files by loss ratio (`-N/+M`, largest first)
+puts the same root cause at the top over and over:
 
 | ratio | file | verdict |
 |---|---|---|
-| 396:1 | `tests/test_processors.py` | mostly cosmetic + grouping |
+| 396:1 | `tests/test_processors.py` | mostly cosmetic + test grouping |
 | 258:1 | `tests/test_sample_utils.py` | expected — the fork rewrote `sample_utils` |
 | 250:1 | `tests/test_trainer.py` | expected |
-| 185:1 | `models/qwen3_5/gated_delta.py` | **mlx-lm removal** (below) |
+| 185:1 | `models/qwen3_5/gated_delta.py` | **mlx-lm delegation** (below) |
 | 86:1 | `trainer/datasets.py` | cosmetic (`numpy` import) |
-| 9.4:1 | `models/base.py` | **deliberate** — the quant-SDPA divergence + mlx-lm |
-| 4:1 | `speculative/drafters/qwen3_dflash/dflash.py` | **mlx-lm removal** |
-| 4:1 | `models/text_only.py` | **mlx-lm removal** |
-| 3.2:1 | `models/gemma4/gemma4.py` | real gap, see below |
+| 9.4:1 | `models/base.py` | **mlx-lm delegation** + the quant-SDPA divergence |
+| 4:1 | `speculative/drafters/qwen3_dflash/dflash.py` | **mlx-lm delegation** |
+| 4:1 | `models/text_only.py` | **mlx-lm delegation** |
 
-**The ratio heuristic works, but nearly every top hit is the same one thing.**
-Upstream has completed an mlx-lm *removal* series (#1593, #1594, #1616, plus
-`893f659a` and `4dac60c6`): it vendored the text architectures, activations,
-RoPE helpers and cache classes into `mlx_vlm/` and stopped importing `mlx_lm`
-in library code.
+**Almost every top hit is one thing: upstream vendored its infrastructure and we
+still import it from `mlx_lm`.** Upstream did this across #1593, #1594, #1616,
+`893f659a` and `4dac60c6`, and its motivation is stated in the code — the header
+of upstream's `models/qwen3_5/gated_delta.py` reads: *"Vendored from
+mlx_lm.models.gated_delta (mlx-lm 0.31.3) to drop the module-level mlx_lm import
+so qwen3_5 loads without mlx-lm (and under transformers>=5.13)."*
 
-    # upstream/main
-    $ grep -rl 'from mlx_lm\|import mlx_lm' --include='*.py' mlx_vlm | wc -l
-    0
-    # here
-    31        (19 outside mlx_vlm/tests)
+### **[correction]** upstream is not mlx-lm-free, and the numbers here were wrong
 
-`models/cache.py` alone: **0** mlx_lm references upstream, **25** here.
+An earlier version of this section claimed upstream imports `mlx_lm` in **0**
+library files against 31 here. That came from a buggy shell loop. Measured
+properly, against a clean `git archive upstream/main`:
 
-Both remotes still *declare* `mlx-lm>=0.31.3` in `requirements.txt`, so this is
-about imports in library code, not the dependency itself.
+| | files importing `mlx_lm` (library code, excl. tests) |
+|---|---|
+| upstream/main | **2** — and only **1** is a real import |
+| here | **19** |
 
-**This is an architecture decision, not a dropped hunk, and it should not be
-resolved file-by-file.** Two coherent positions:
+Upstream's two are worth knowing precisely, because together they *are* the target
+state:
 
-- **Follow upstream.** Removes the largest single source of future merge
-  conflict. But the fork's APC work is built *on* mlx-lm internals — e.g.
-  `models/cache.py` grafts `dequantize_for_apc` onto mlx_lm's
-  `QuantizedKVCache`, and `BatchRotatingKVCache` subclasses mlx_lm's to carry a
-  right-pad prefill fix mlx_lm lacks. Vendoring means owning all of that.
-- **Stay on mlx-lm and declare it permanent.** Then these ~10 files should be
-  recorded here as intentional divergence (like the quant-SDPA entry) so future
-  sweeps stop re-triaging them, and `.symbol-exclusions` reasons should say
-  "mlx-lm delegation" rather than "pre-existing divergence, unreviewed".
+- `models/qwen3_5/gated_delta.py` — the `mlx_lm` string is only the provenance
+  comment quoted above. Genuinely vendored, no import.
+- `models/text_only.py` — a **lazy, optional** `from mlx_lm.utils import
+  _get_classes` inside a function, wrapped in `try/except ImportError` that
+  re-raises with "Loading text-only model_type '…' relies on mlx-lm's model
+  registry (no native mlx-vlm implementation). Install it with `pip install
+  mlx-lm`." That is a deliberate, contained escape hatch for text-only
+  architectures mlx-vlm has no native implementation of — not a dependency.
 
-Either way the *next* action is a decision, not a patch. Until it is made,
-treat every "we import `mlx_lm`, upstream defines it locally" hunk as explained
-rather than as a gap.
+So "eliminate mlx-lm" is achievable, and upstream shows exactly what the residue
+looks like: one lazy optional fallback with a good error message.
 
-**One genuine gap the sweep did find**, independent of the above:
-`models/gemma4/gemma4.py` (`+12/−38`) is missing two hunks from `bc3461b1`
-(#1523) — the same commit whose `__init__.py` export this branch just restored:
+### Is there a path? Yes — and it is mostly deleting our own workarounds
 
-1. `image_position_ids` / `video_position_ids` plumbing through
-   `get_input_embeddings` and `encode_image`, with `_encode_image` /
-   `_encode_video` split out of `_encode_vision`.
-2. Conv-weight layout *detection* in `sanitize()`. Upstream transposes only when
-   the incoming shape does not already match the expected MLX layout
-   (`expected_in` derived from `audio_config.subsampling_conv_channels`); we
-   transpose unconditionally. Upstream's commit message for this is "Handle
-   Gemma4 audio weights in MLX layout", i.e. **already-converted checkpoints get
-   double-transposed here.**
+The question worth asking is not "can we vendor" but "do our customisations
+survive vendoring." **They do — because upstream already has them.** Of the 35
+symbols this fork imports from `mlx_lm` in library code, **33 have a real
+top-level definition in upstream's tree** (the other two are `_get_classes`, i.e.
+the fallback above, and a module-alias artifact). More to the point, the specific
+things this fork bolts onto `mlx_lm` are *native methods* in upstream's
+`models/cache.py`:
 
-Item 2 is a correctness bug with no failing test, and it is independent — it can
-be fixed on its own.
+| our workaround | why it exists | upstream |
+|---|---|---|
+| `dequantize_for_apc` as a module-level function grafted on via `if not hasattr(QuantizedKVCache, ...)`, plus a behavioural contract test to catch a future incompatible `mlx_lm` implementation | can't add a method to a class we don't own | plain method, `_dequantize_uniform` helper included |
+| `should_quantize_kv_layer` | same | defined natively |
+| `BatchRotatingKVCache` subclass carrying the right-pad prefill fix | can't patch a dependency's hot path | fix is in upstream's vendored copy |
 
-**Item 1 is a textbook lesson-2 trap, and worth checking before you touch it.**
-`gemma4.py` and `vision.py` are consistently stale *together*:
+Our own code already says this. `models/cache.py`: *"Defined at module level so it
+can be attached to `QuantizedKVCache`, which this fork takes from mlx_lm rather
+than vendoring. **Upstream declares this as a method because it vendors that
+class; we cannot, so it is grafted on below.**"* And the subclass docstring:
+*"**Upstream mlx-vlm carries this fix in its vendored copy**; mlx_lm does not."*
+
+So the graft scaffolding — module-level function, `hasattr` self-retiring guard,
+contract test, subclass-instead-of-patch — is **entirely a consequence of not
+vendoring**, not a design we would choose. Vendoring deletes it.
+
+**It also closes a real hole.** The subclass docstring admits: *"Caveat: only
+instances built through this module get the fix. Caches constructed inside mlx_lm
+itself still use its class."* Any cache `mlx_lm` builds internally silently lacks
+the right-pad prefill fix. Vendoring makes that unrepresentable.
+
+### Scope, honestly
+
+This is **not** a `git checkout` like `gemma4/vision.py` was. `models/cache.py` is
+the fork's most heavily customised infrastructure file (`+506/-1499`), and the
+split is clean enough to plan:
+
+- **10 symbols to take from upstream** — exactly the ones we re-export from
+  `mlx_lm` today: `KVCache`, `RotatingKVCache`, `QuantizedKVCache`,
+  `ChunkedKVCache`, `ArraysCache`, `CacheList`, `_BaseCache`,
+  `create_attention_mask`, `create_causal_mask`, `dynamic_roll`.
+- **7 to keep** — genuine fork work: `PreallocKVCache`,
+  `PreallocQuantizedKVCache`, `SlidingWindowCache`, `StaticKVCache`,
+  `_arrays_cache_batch_size`, `_batch_size`, `_is_single_row`.
+- **1 to delete** — `dequantize_for_apc`, which becomes a method.
+
+Then ~18 files need mechanical import rewrites (`mlx_lm.models.X` ->
+`..models.X`), each already having a native upstream home per the mapping above.
+`turboquant.py`, `apc.py`, `snapshot.py` and `generate/common.py` are the ones to
+watch, since they touch cache internals.
+
+**The transformers argument is latent, not live.** Upstream now requires
+`transformers>=5.14.0`; we require `>=5.5.0`; installed here is 5.14.1 with
+mlx-lm 0.31.3, which declares only `transformers>=5.0.0`. So mlx-lm is not
+currently holding us back — the risk is that it lags a future transformers, which
+is what upstream insulated itself from. Do not use this as the reason to act; use
+the graft-deletion and the `BatchRotatingKVCache` hole.
+
+### The gemma4 gap the sweep found — resolved, with two of my own errors
+
+The sweep flagged `models/gemma4/gemma4.py` (`+12/-38`). Chasing it turned up a
+**second dropped commit and a live crash**, and both of the characterisations
+recorded here earlier were wrong. Kept as a worked example, because the mistakes
+are the instructive part.
+
+**What it actually was.** `#1503` ("Support Gemma 4 variable soft-token budgets")
+landed *half*: `processing_gemma4.py` got the `max_soft_tokens` / `patch_size` /
+`pooling_kernel_size` forwarding, but `vision.py` did not, so the tower still
+padded to a fixed `self.max_patches` and pooled to `self.default_output_length`.
+Half-landed commits are worse than fully-dropped ones — the two halves disagree at
+runtime:
 
 ```
-ours:      def __call__(self, pixel_values) -> mx.array:                          # vision.py
-upstream:  def __call__(self, pixel_values, pixel_position_ids=None) -> mx.array:
+budget=16  processor says 16 soft tokens
+ValueError: [broadcast_shapes] Shapes (1,64,32) and (1,16,32) cannot be broadcast
 ```
 
-So restoring `gemma4.py`'s `_encode_image` / `_encode_video` split alone makes it
-call `self.vision_tower(pixels, position_ids)` against a one-argument
-`VisionModel.__call__` — an immediate `TypeError` on every Gemma 4 image request.
-The pair must land together, and `vision.py` carries fork work (`+50/−67`), so
-that half is an interleaved port, not a checkout.
+Stock defaults happen to agree (processor `max_soft_tokens=280` ==
+`VisionConfig.default_output_length=280`), so exposure is a caller passing
+`max_soft_tokens`, or a repo whose `preprocessor_config.json` disagrees with its
+`config.json`.
+
+**Error 1: "`vision.py` carries fork work (`+50/-67`), so that half is an
+interleaved port, not a checkout."** False. `git log` shows no fork-only commit
+ever touched `vision.py`; the `+50` was stale pre-`#1503` upstream code, including
+a dead `all_same_size = True` / `else:` branch. `#1052`'s NaN-gradient fix was
+shared context, not ours. Both `vision.py` and `gemma4.py` were taken from
+upstream byte-for-byte.
+
+**Error 2: "the position_ids plumbing is inert on its own."** Also false, in the
+useful direction: restoring `mm_token_type_ids` / `token_type_ids` to
+`Model.__call__`'s LM kwargs filter matters beyond video. Without it `_make_masks`
+always saw `None`, so the bidirectional vision overlay never engaged on the
+`Model.__call__` path. The server path was unaffected because
+`server/generation.py` passes `mm_token_type_ids` directly — a **CLI-only silent
+difference**, invisible to every test.
+
+**Both errors have the same cause:** reasoning from the `+N/-M` line count instead
+of running `git log -S` on the symbols. That is exactly what the two history
+commands above exist to prevent, and the ratio table is a triage heuristic, not
+evidence. Use it to pick what to look at, never to conclude.
+
+The coupling was real, though — just the other way round. With `gemma4.py`
+restored and `vision.py` stale, the tests fail `TypeError: VisionModel.__call__()
+takes 2 positional arguments but 3 were given`. Landing the pair together is
+still the rule.
 
 ## Still open
 
-Both of the dropped-commit items previously listed here are **done** —
-`ff2a6daa` (audio preservation in Gemma 4 video prompts, all four files) and
-`ecc457b2`/#1374 (`_template_references_kw` + the `thinking_mode` block).
-`prompt_utils.py` is now `+280/-2` against upstream, and those two remaining
-`-` lines are the fork's own text-only fallback (`MessageFormatter` returning
-plain messages for unknown `model_type` instead of raising). **No upstream
-content is missing from `prompt_utils.py`.**
+Every named dropped-commit item this page has carried is now **done**:
+`4d468e85`/#1492 (video input), `ff2a6daa` (audio in Gemma 4 video prompts),
+`ecc457b2`/#1374 (`_template_references_kw` + `thinking_mode`), `bc3461b1`/#1523
+(`Gemma4VideoProcessor` export, audio conv layout detection, position-ids
+plumbing) and `3b6fe89b`/#1503 (variable soft-token budgets).
 
-What is left is one decision and one verified lead:
+`prompt_utils.py` is `+280/-2` against upstream and both `-` lines are the fork's
+own text-only fallback; `models/gemma4/{vision,gemma4,__init__}.py` are
+byte-identical to upstream. **No upstream content is missing from any of them.**
 
-1. **The mlx-lm removal divergence** — an architecture decision, written up
-   above under "The both-ways sweep". Nothing should be patched file-by-file
-   until it is made.
-2. **`models/gemma4/gemma4.py`'s `image_position_ids` / `video_position_ids`
-   plumbing** (from `bc3461b1`/#1523) — a verified lesson-2 trap: it must land
-   together with `vision.py`, whose `VisionModel.__call__` still takes only
-   `(pixel_values)` where upstream takes `(pixel_values, pixel_position_ids=None)`.
-   Restoring the caller alone `TypeError`s on every Gemma 4 image request.
-   `vision.py` carries fork work (`+50/-67`), so that half is an interleaved port.
+What is left is exactly one item, and it is a decision rather than a patch:
+
+**The mlx-lm delegation.** Written up above — feasibility is established (33/35
+symbols have native upstream definitions; our APC grafts exist *only* because we
+do not vendor, and upstream already defines them as methods), the scope is broken
+down file-by-file, and the one real hole it closes is
+`BatchRotatingKVCache`'s "only instances built through this module get the fix."
+Nothing in the ~10 affected files should be patched individually until the call is
+made — that way lies re-triaging the same divergence once per file.
 
 Also open, low priority: `_rotating_post_gen_trim_safe` stays intentionally
 unwired (see above) — correct, not a gap.
