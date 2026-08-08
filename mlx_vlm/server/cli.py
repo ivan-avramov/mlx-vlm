@@ -278,7 +278,7 @@ def main():
         type=int,
         default=None,
         help="Pre-allocate every KV cache to this fixed token floor on first fill "
-             "(no mid-generation realloc). Must be <= --max-kv-size.",
+        "(no mid-generation realloc). Must be <= --max-kv-size.",
     )
     parser.add_argument(
         "--quantized-kv-start",

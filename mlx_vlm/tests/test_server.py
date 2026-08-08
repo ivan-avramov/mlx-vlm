@@ -239,9 +239,7 @@ def test_positioned_target_sampler_min_p_filters_tail():
 def test_positioned_target_sampler_defaults_unchanged():
     # top_k=0 / min_p=0 / top_p=1 must reproduce the plain keyed categorical
     # draw -> no behavior change for existing callers.
-    logits = mx.array(
-        [[0.0, 1.0, 2.0, 3.0], [3.0, 2.0, 1.0, 0.0]], dtype=mx.float32
-    )
+    logits = mx.array([[0.0, 1.0, 2.0, 3.0], [3.0, 2.0, 1.0, 0.0]], dtype=mx.float32)
     logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
     base = server_generation._PositionedTargetSampler(
         temperature=0.7, top_p=1.0, seed=42
@@ -2596,9 +2594,9 @@ def _completion_fake_generator(tokens, prompt_tokens=8, captured=None):
                 captured["images"] = images
                 captured["audio"] = audio
                 captured["args"] = args
-            return server.GenerationContext(
-                uid=1, prompt_tokens=prompt_tokens
-            ), iter(list(tokens))
+            return server.GenerationContext(uid=1, prompt_tokens=prompt_tokens), iter(
+                list(tokens)
+            )
 
     return FakeResponseGenerator()
 
@@ -2802,9 +2800,7 @@ def test_completions_streaming_echo_first_chunk(client, monkeypatch):
     processor = SimpleNamespace()
     config = SimpleNamespace(model_type="qwen2_vl")
     tokens = [
-        server.StreamingToken(
-            text="gen", token=1, logprobs=0.0, finish_reason="stop"
-        )
+        server.StreamingToken(text="gen", token=1, logprobs=0.0, finish_reason="stop")
     ]
     monkeypatch.setattr(
         server.runtime, "response_generator", _completion_fake_generator(tokens)
@@ -2841,9 +2837,7 @@ def test_completions_streaming_stop_sequence_truncates(client, monkeypatch):
         server.StreamingToken(
             text="DEFstop", token=2, logprobs=0.0, finish_reason=None
         ),
-        server.StreamingToken(
-            text="zzz", token=3, logprobs=0.0, finish_reason="stop"
-        ),
+        server.StreamingToken(text="zzz", token=3, logprobs=0.0, finish_reason="stop"),
     ]
     monkeypatch.setattr(
         server.runtime, "response_generator", _completion_fake_generator(tokens)
@@ -5053,28 +5047,41 @@ class TestResponseGenerator:
     def test_generation_defaults_applied_when_request_omits(self, monkeypatch):
         """Registry generation_defaults fill every sampling field the request omits — the
         VS Code/Zed fix (those clients send no sampling)."""
-        monkeypatch.setenv("MLX_VLM_GENERATION_DEFAULTS", json.dumps({
-            "temperature": 0.3, "top_p": 0.95, "top_k": 20,
-            "min_p": 0.05, "presence_penalty": 0.0, "enable_thinking": True,
-        }))
+        monkeypatch.setenv(
+            "MLX_VLM_GENERATION_DEFAULTS",
+            json.dumps(
+                {
+                    "temperature": 0.3,
+                    "top_p": 0.95,
+                    "top_k": 20,
+                    "min_p": 0.05,
+                    "presence_penalty": 0.0,
+                    "enable_thinking": True,
+                }
+            ),
+        )
         req = server.ChatRequest(
-            model="demo", messages=[server.ChatMessage(role="user", content="hi")],
+            model="demo",
+            messages=[server.ChatMessage(role="user", content="hi")],
         )
 
         args = server._build_gen_args(req)
 
-        assert args.temperature == 0.3      # base default 0.0 -> yaml
-        assert args.top_p == 0.95           # base default 1.0 -> yaml
-        assert args.top_k == 20             # base default 0 -> yaml
-        assert args.min_p == 0.05           # had NO middle layer before -> yaml
+        assert args.temperature == 0.3  # base default 0.0 -> yaml
+        assert args.top_p == 0.95  # base default 1.0 -> yaml
+        assert args.top_k == 20  # base default 0 -> yaml
+        assert args.min_p == 0.05  # had NO middle layer before -> yaml
         assert args.presence_penalty == 0.0  # base None -> yaml
         assert args.enable_thinking is True
 
     def test_request_sampling_overrides_generation_defaults(self, monkeypatch):
         """Explicit request sampling always beats the registry default (request wins)."""
-        monkeypatch.setenv("MLX_VLM_GENERATION_DEFAULTS", json.dumps({"temperature": 0.3}))
+        monkeypatch.setenv(
+            "MLX_VLM_GENERATION_DEFAULTS", json.dumps({"temperature": 0.3})
+        )
         req = server.ChatRequest(
-            model="demo", messages=[server.ChatMessage(role="user", content="hi")],
+            model="demo",
+            messages=[server.ChatMessage(role="user", content="hi")],
             temperature=0.9,
         )
 
@@ -5087,22 +5094,29 @@ class TestResponseGenerator:
         request > yaml > checkpoint > hardcoded. Without this, the distill's baked temp 1.0
         would still win for a no-sampling client."""
         monkeypatch.setitem(
-            server.runtime.model_cache, "config",
+            server.runtime.model_cache,
+            "config",
             SimpleNamespace(temperature=1.0, top_p=0.95, top_k=64),
         )
-        monkeypatch.setenv("MLX_VLM_GENERATION_DEFAULTS", json.dumps({"temperature": 0.3}))
+        monkeypatch.setenv(
+            "MLX_VLM_GENERATION_DEFAULTS", json.dumps({"temperature": 0.3})
+        )
         req = server.ChatRequest(
-            model="demo", messages=[server.ChatMessage(role="user", content="hi")],
+            model="demo",
+            messages=[server.ChatMessage(role="user", content="hi")],
         )
 
         args = server._build_gen_args(req)
 
-        assert args.temperature == 0.3   # yaml wins over the checkpoint's 1.0
+        assert args.temperature == 0.3  # yaml wins over the checkpoint's 1.0
 
     def test_generation_defaults_max_tokens_alias_not_clobbered(self, monkeypatch):
         """A request that sets the max_output_tokens alias suppresses the max_tokens
-        default (the two are aliases; the overlay must not override the aliased request value)."""
-        monkeypatch.setenv("MLX_VLM_GENERATION_DEFAULTS", json.dumps({"max_tokens": 102400}))
+        default (the two are aliases; the overlay must not override the aliased request value).
+        """
+        monkeypatch.setenv(
+            "MLX_VLM_GENERATION_DEFAULTS", json.dumps({"max_tokens": 102400})
+        )
         req = server.OpenAIRequest(model="demo", input="hi", max_output_tokens=555)
 
         args = server._build_gen_args(req)
@@ -5111,7 +5125,9 @@ class TestResponseGenerator:
 
     def test_get_server_generation_defaults_rejects_unknown_key(self, monkeypatch):
         """An unknown/typo'd key fails loud and fast, not a silent no-op."""
-        monkeypatch.setenv("MLX_VLM_GENERATION_DEFAULTS", json.dumps({"temperatur": 0.3}))
+        monkeypatch.setenv(
+            "MLX_VLM_GENERATION_DEFAULTS", json.dumps({"temperatur": 0.3})
+        )
         with pytest.raises(ValueError, match="temperatur"):
             server_generation.get_server_generation_defaults()
 
@@ -6245,9 +6261,9 @@ class TestStepThinkingState:
             assert dr is None, f"unexpected reasoning emit on plain token: {dr!r}"
             if dc is not None:
                 emitted.append(dc)
-        assert "".join(emitted) == "".join(tokens), (
-            f"emitted content {''.join(emitted)!r} != input {''.join(tokens)!r}"
-        )
+        assert "".join(emitted) == "".join(
+            tokens
+        ), f"emitted content {''.join(emitted)!r} != input {''.join(tokens)!r}"
 
     def test_helper_appends_token_internally_with_buffered_partial(self, gemma_fmt):
         # Same byte-for-byte invariant when partial buffering is in
@@ -6262,9 +6278,9 @@ class TestStepThinkingState:
         )
         assert dr1 is None and dr2 is None
         emitted = (dc1 or "") + (dc2 or "")
-        assert emitted == "before < after", (
-            f"got {emitted!r}, expected 'before < after'"
-        )
+        assert (
+            emitted == "before < after"
+        ), f"got {emitted!r}, expected 'before < after'"
 
     def test_seeded_in_thinking_elides_per_turn_opener(self, gemma_fmt):
         # Production bug (Gemma 4 26B 8-bit, OWUI first-turn):
@@ -6988,9 +7004,9 @@ class TestCachedPathHeartbeatWatchdog:
         # after the None — that would be a leak past the finally.
         assert items[-1] is None
         none_index = items.index(None)
-        assert none_index == len(items) - 1, (
-            f"None terminator must be last; got {[type(i).__name__ for i in items]}"
-        )
+        assert (
+            none_index == len(items) - 1
+        ), f"None terminator must be last; got {[type(i).__name__ for i in items]}"
 
     def test_exception_in_stream_generate_still_stops_watchdog(self, monkeypatch):
         # If stream_generate raises, the except block puts the exception

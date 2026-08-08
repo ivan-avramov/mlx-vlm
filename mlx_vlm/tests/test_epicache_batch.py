@@ -15,8 +15,10 @@ memory-prohibitive anyway).
 Run directly (no pytest):
   PYTHONPATH=. <venv>/bin/python mlx_vlm/tests/test_epicache_batch.py
 """
+
 import mlx.core as mx
 from mlx_lm.models.cache import KVCache
+
 from mlx_vlm.generate import ar
 from mlx_vlm.models import cache
 from mlx_vlm.models.epicache import EpiCacheKVCache
@@ -30,14 +32,22 @@ class _EpiModel:
         self._b, self._s, self._r, self._bs = budget, sink, recent, block_size
 
     def make_cache(self):
-        return [EpiCacheKVCache(KVCache(), budget=self._b, block_size=self._bs,
-                                sink=self._s, recent=self._r)]
+        return [
+            EpiCacheKVCache(
+                KVCache(),
+                budget=self._b,
+                block_size=self._bs,
+                sink=self._s,
+                recent=self._r,
+            )
+        ]
 
 
 def test_batch_cache_wraps_epicache_for_b1():
     # B=1: to_batch_cache must wrap a batch-aware inner in EpiCacheKVCache (not raise).
-    caches = ar._make_cache(_EpiModel(budget=20, sink=4, recent=8, block_size=512),
-                            left_padding=[0])
+    caches = ar._make_cache(
+        _EpiModel(budget=20, sink=4, recent=8, block_size=512), left_padding=[0]
+    )
     assert len(caches) == 1
     epi = caches[0]
     assert isinstance(epi, EpiCacheKVCache), type(epi)
@@ -47,7 +57,9 @@ def test_batch_cache_wraps_epicache_for_b1():
     assert (epi.budget, epi.sink, epi.recent, epi.block_size) == (20, 4, 8, 512)
     # and the wrapped cache is usable on the batched path (B=1 update_and_fetch)
     B, H, L, D = 1, 2, 5, 4
-    keys = mx.broadcast_to(mx.arange(L).reshape(1, 1, L, 1).astype(mx.float32), (B, H, L, D))
+    keys = mx.broadcast_to(
+        mx.arange(L).reshape(1, 1, L, 1).astype(mx.float32), (B, H, L, D)
+    )
     rk, rv = epi.update_and_fetch(keys, keys + 0.5)
     assert rk.shape[2] == L and rv.shape[2] == L, (rk.shape, rv.shape)
     # BatchKVCache offset is a per-sequence array; B=1 with left_padding 0 => [L]

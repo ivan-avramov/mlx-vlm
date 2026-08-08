@@ -258,11 +258,7 @@ def _target_verify_qlinear_header(bits: int, group_size: int) -> str:
       }
       return scale * accum + sum * bias;
     }
-""".replace(
-        "__BITS__", str(bits)
-    ).replace(
-        "__GS__", str(group_size)
-    )
+""".replace("__BITS__", str(bits)).replace("__GS__", str(group_size))
 
 
 _TARGET_VERIFY_QMV_SOURCE = r"""
@@ -1603,7 +1599,9 @@ class Qwen3_5Attention(nn.Module):
                 # EpiCache: RoPE the query/new-keys at the TRUE absolute index (rope_offset),
                 # not the shrunk physical offset, so post-eviction kept keys + query share a
                 # RoPE frame; mask/kv-length still use the physical offset. No-op for plain caches.
-                position_ids, _kv_delta = _qwen35_scalar_positions(cache, cache_offset, L)
+                position_ids, _kv_delta = _qwen35_scalar_positions(
+                    cache, cache_offset, L
+                )
                 kv_seq_len += _kv_delta
         else:
             kv_seq_len += cache.offset + 1 if cache is not None else 0

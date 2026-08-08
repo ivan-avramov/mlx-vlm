@@ -425,6 +425,51 @@ sets `template_kwargs["thinking_mode"] = "enabled"` when the template references
 Also open, low priority: `_rotating_post_gen_trim_safe` stays intentionally
 unwired (see above) — correct, not a gap.
 
+## Formatting is convergent here, not divergent — settled
+
+This was deferred for a while on the reasoning that "several of the unformatted
+files are files upstream also has, so reformatting them diverges from upstream's
+bytes and creates future merge conflicts." **That is false, and it is worth
+recording why so it is not deferred on the same reasoning again.**
+
+    $ git diff upstream/main -- .pre-commit-config.yaml     # -> empty; same pins
+    $ git archive upstream/main | tar -x -C /tmp/up && cd /tmp/up
+    $ black --check $(find . -name '*.py')
+    All done! 1148 files would be left unchanged.
+
+Upstream's entire tree is already clean under the *same* pinned
+black 26.3.1 / isort 5.13.2 / autoflake 2.2.1 this repo declares. So an
+unformatted file here is not "ours, differently styled" — it has **drifted away
+from upstream's formatting**, and reformatting it moves it *toward* upstream.
+
+Measured over the 12 shared files that were unformatted:
+
+| | lines differing from `upstream/main` |
+|---|---|
+| before | 5690 |
+| after | 5685 (**−5**) |
+
+and `speculative/mtp.py`, `tests/test_cohere_tool_parser.py` and
+`tests/test_smoke.py` became **byte-identical to upstream** (they had differed
+only by a magic trailing comma that newer black adds). The files that went
+slightly *up* (`server/app.py` +6, `tests/test_server.py` +16) did so only by
+reformatting fork-added code, which upstream does not have either way.
+
+Two notes for whoever runs this next:
+
+- **autoflake is the hook with teeth.** black and isort only move whitespace;
+  autoflake deletes imports. It removed `top_p_sampling` from
+  `server/generation.py` and `DEFAULT_DIFFUSION_CONFIDENCE_THRESHOLD` from
+  `generate/dispatch.py` — both verified unreferenced in the importing module and
+  not re-exports. `models/base.py` and `models/cache.py` are excluded from
+  autoflake in `.pre-commit-config.yaml` precisely because they *are* re-export
+  surfaces; keep that exclusion, and check any new removal by hand.
+- `black` warns "Python 3.12 cannot parse code formatted for Python 3.14" and
+  skips its AST safety check. It still exits 0, so this does not fail
+  `pre-commit`, and formatting is derived from file content rather than the
+  running interpreter — but CI runs Python 3.10, so that path is verified only
+  by CI actually going green, not from here.
+
 ## Not a source of known issues
 
 `docs/report_issues.md` is four lines of upstream boilerplate pointing at

@@ -261,8 +261,14 @@ def _build_gen_args(
     logger.info(
         "resolved sampling: temperature=%s top_p=%s top_k=%s min_p=%s presence_penalty=%s "
         "max_tokens=%s thinking_budget=%s enable_thinking=%s",
-        args.temperature, args.top_p, args.top_k, args.min_p, args.presence_penalty,
-        args.max_tokens, args.thinking_budget, args.enable_thinking,
+        args.temperature,
+        args.top_p,
+        args.top_k,
+        args.min_p,
+        args.presence_penalty,
+        args.max_tokens,
+        args.thinking_budget,
+        args.enable_thinking,
     )
     return args
 

@@ -10,10 +10,10 @@ from mlx_vlm.prompt_utils import (
     MessageFormatter,
     apply_chat_template,
     detect_thinking_format,
-    prompt_is_inside_thinking,
     extract_text_from_content,
     get_cache_alignment_kwargs,
     get_chat_template,
+    prompt_is_inside_thinking,
 )
 
 
@@ -804,9 +804,7 @@ class TestThinkingFormatRegistry:
         assert prompt_is_inside_thinking("a <|think|> b </think> answer") is False
         assert prompt_is_inside_thinking("<think> r </think> done") is False
         # Gemma per-turn block closed by its channel closer.
-        assert (
-            prompt_is_inside_thinking("<|channel>thought x <channel|> out") is False
-        )
+        assert prompt_is_inside_thinking("<|channel>thought x <channel|> out") is False
         # No thinking markers at all.
         assert prompt_is_inside_thinking("plain prompt, no markers") is False
 

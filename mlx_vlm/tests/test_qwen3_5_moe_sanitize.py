@@ -37,9 +37,15 @@ def test_sanitize_stacks_unfused_experts():
     w = {}
     for e in range(E):
         # gate/up: [intermediate, hidden]; down: [hidden, intermediate] (nn.Linear weight = [out, in])
-        w[f"model.language_model.layers.0.mlp.experts.{e}.gate_proj.weight"] = mx.full((I, H), float(e))
-        w[f"model.language_model.layers.0.mlp.experts.{e}.up_proj.weight"] = mx.ones((I, H))
-        w[f"model.language_model.layers.0.mlp.experts.{e}.down_proj.weight"] = mx.ones((H, I))
+        w[f"model.language_model.layers.0.mlp.experts.{e}.gate_proj.weight"] = mx.full(
+            (I, H), float(e)
+        )
+        w[f"model.language_model.layers.0.mlp.experts.{e}.up_proj.weight"] = mx.ones(
+            (I, H)
+        )
+        w[f"model.language_model.layers.0.mlp.experts.{e}.down_proj.weight"] = mx.ones(
+            (H, I)
+        )
 
     out = Model.sanitize(_fake_self(L, E), dict(w))
 
@@ -57,7 +63,9 @@ def test_sanitize_fused_experts_still_supported():
     # Regression: the original Qwen3.6-VL fused layout must keep working.
     E, H, I = 4, 8, 6
     w = {
-        "model.language_model.layers.0.mlp.experts.gate_up_proj": mx.zeros((E, 2 * I, H)),
+        "model.language_model.layers.0.mlp.experts.gate_up_proj": mx.zeros(
+            (E, 2 * I, H)
+        ),
         "model.language_model.layers.0.mlp.experts.down_proj": mx.zeros((E, H, I)),
     }
     out = Model.sanitize(_fake_self(1, E), dict(w))

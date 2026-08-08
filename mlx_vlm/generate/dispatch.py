@@ -564,7 +564,6 @@ from .common import (
     wired_limit,
 )
 from .diffusion import (
-    DEFAULT_DIFFUSION_CONFIDENCE_THRESHOLD,
     DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH,
     DiffusionOutputHandler,
     diffusion_kwargs_from_args,

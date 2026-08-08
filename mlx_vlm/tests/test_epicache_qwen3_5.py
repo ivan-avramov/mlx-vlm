@@ -11,10 +11,12 @@ Run (parent fork venv, full deps):
     ./.venv/bin/python \
     mlx_vlm/tests/test_epicache_qwen3_5.py
 """
+
 import os
 import types
 
 from mlx_lm.models.cache import KVCache
+
 from mlx_vlm.models.cache import ArraysCache
 from mlx_vlm.models.epicache import EpiCacheKVCache
 from mlx_vlm.models.qwen3_5.language import LanguageModel
@@ -41,7 +43,10 @@ def test_make_cache_off_is_behaviour_preserving():
     caches = LanguageModel.make_cache(_fake_self())
     for i, c in enumerate(caches):
         if _is_full_attn(i):
-            assert isinstance(c, KVCache) and not isinstance(c, EpiCacheKVCache), (i, type(c))
+            assert isinstance(c, KVCache) and not isinstance(c, EpiCacheKVCache), (
+                i,
+                type(c),
+            )
         else:
             assert isinstance(c, ArraysCache), (i, type(c))
 
@@ -87,9 +92,9 @@ def test_scalar_positions_plain_cache_uses_offset():
 
     cache = types.SimpleNamespace(offset=10)  # plain cache, no rope_offset attribute
     pos, kv_delta = _qwen35_scalar_positions(cache, 10, 4)
-    assert tuple(pos.shape) == (3, 1, 4), pos.shape       # tiled for MRoPE's 3 sections
+    assert tuple(pos.shape) == (3, 1, 4), pos.shape  # tiled for MRoPE's 3 sections
     assert pos[0, 0].tolist() == [10, 11, 12, 13], pos[0, 0].tolist()
-    assert kv_delta == 11, kv_delta                        # cache_offset + 1
+    assert kv_delta == 11, kv_delta  # cache_offset + 1
 
 
 def test_scalar_positions_epicache_uses_rope_offset_for_rope_physical_for_mask():
@@ -100,8 +105,10 @@ def test_scalar_positions_epicache_uses_rope_offset_for_rope_physical_for_mask()
 
     cache = types.SimpleNamespace(offset=20, rope_offset=50)
     pos, kv_delta = _qwen35_scalar_positions(cache, 20, 3)
-    assert pos[0, 0].tolist() == [50, 51, 52], pos[0, 0].tolist()   # RoPE at TRUE position
-    assert kv_delta == 21, kv_delta                                  # mask uses PHYSICAL offset
+    assert pos[0, 0].tolist() == [50, 51, 52], pos[
+        0, 0
+    ].tolist()  # RoPE at TRUE position
+    assert kv_delta == 21, kv_delta  # mask uses PHYSICAL offset
 
 
 if __name__ == "__main__":

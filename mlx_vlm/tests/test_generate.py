@@ -26,9 +26,7 @@ from mlx_vlm.generate import (
 from mlx_vlm.generate import ar as ar_module
 from mlx_vlm.generate import common as common_module
 from mlx_vlm.generate import dispatch as dispatch_module
-from mlx_vlm.generate import (
-    normalize_resize_shape,
-)
+from mlx_vlm.generate import normalize_resize_shape
 from mlx_vlm.models.cache import BufferedRotatingKVCache
 from mlx_vlm.utils import ThinkingBudgetCriteria
 

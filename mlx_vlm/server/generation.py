@@ -47,7 +47,6 @@ from ..prompt_utils import (
     detect_thinking_format,
     prompt_is_inside_thinking,
 )
-from ..sample_utils import top_p_sampling
 from ..speculative.utils import (
     make_speculative_prompt_cache,
     run_speculative_server_rounds,

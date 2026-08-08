@@ -4,15 +4,16 @@ Prod = MSE coarse + a 1-bit QJL residual sketch on keys -> higher-fidelity
 reconstruction at ~equal storage. Wired via kv_quant_mode="prod" (Prod key,
 MSE value). The headline test is the reconstruction-quality uplift over MSE.
 """
+
 import math
-import numpy as np
+
 import mlx.core as mx
-import pytest
+import numpy as np
 
 from mlx_vlm.turboquant import (
     TurboQuantKVCache,
-    _TurboQuantProdCodec,
     _TurboQuantMSECodec,
+    _TurboQuantProdCodec,
 )
 
 
@@ -52,7 +53,9 @@ def _attn_out_err_vs_true(bits, mode, seed, T=4096, D=256):
     rng = np.random.default_rng(seed)
     kk = rng.standard_normal((T, D)).astype(np.float32)
     idx = rng.choice(T, size=8, replace=False)
-    qq = np.stack([kk[i] + 0.5 * rng.standard_normal(D).astype(np.float32) for i in idx])
+    qq = np.stack(
+        [kk[i] + 0.5 * rng.standard_normal(D).astype(np.float32) for i in idx]
+    )
     k = mx.array(kk[None, None])
     q = mx.array(qq[None, None])
     scale = 1.0 / math.sqrt(D)
@@ -71,7 +74,9 @@ def test_prod_beats_mse_on_attention_output_at_3bit():
     mse = float(np.mean([_attn_out_err_vs_true(3, "mse", s) for s in (0, 1, 2)]))
     prod = float(np.mean([_attn_out_err_vs_true(3, "prod", s) for s in (0, 1, 2)]))
     print(f"\n3-bit attention out-MAE vs true: MSE={mse:.5f}  Prod={prod:.5f}")
-    assert prod < mse, "Prod (unbiased QJL) should preserve attention output better than MSE at 3-bit"
+    assert (
+        prod < mse
+    ), "Prod (unbiased QJL) should preserve attention output better than MSE at 3-bit"
 
 
 def test_prod_l2_reconstruction_is_worse_by_design():
@@ -82,8 +87,12 @@ def test_prod_l2_reconstruction_is_worse_by_design():
     cp = TurboQuantKVCache(bits=3, seed=0, kv_quant_mode="prod")
     ksm, _ = cm.update_and_fetch(k, k)
     ksp, _ = cp.update_and_fetch(k, k)
-    em = mx.mean((k - cm.key_codec.dequantize(cm._unwrap(ksm)).astype(mx.float32)) ** 2).item()
-    ep = mx.mean((k - cp.key_codec.dequantize(cp._unwrap(ksp)).astype(mx.float32)) ** 2).item()
+    em = mx.mean(
+        (k - cm.key_codec.dequantize(cm._unwrap(ksm)).astype(mx.float32)) ** 2
+    ).item()
+    ep = mx.mean(
+        (k - cp.key_codec.dequantize(cp._unwrap(ksp)).astype(mx.float32)) ** 2
+    ).item()
     assert ep > em  # Prod trades L2 fidelity for unbiased dot products
 
 
@@ -103,8 +112,15 @@ def test_prod_dispatch_prefill_and_decode_run():
     vd = mx.repeat(vd, r, axis=1)
 
     for L, seed in [(32, 5), (1, 6)]:
-        q = mx.array(np.random.default_rng(seed).standard_normal((B, n_kv * r, L, D)).astype(np.float32) * 0.1)
-        ref = mx.fast.scaled_dot_product_attention(q, kd, vd, scale=scale, mask="causal")
+        q = mx.array(
+            np.random.default_rng(seed)
+            .standard_normal((B, n_kv * r, L, D))
+            .astype(np.float32)
+            * 0.1
+        )
+        ref = mx.fast.scaled_dot_product_attention(
+            q, kd, vd, scale=scale, mask="causal"
+        )
         out = scaled_dot_product_attention(q, ks, vs, c, scale=scale, mask="causal")
         assert out.shape == ref.shape, f"L={L} shape {out.shape} != {ref.shape}"
         d = mx.max(mx.abs(out - ref)).item()
@@ -117,6 +133,7 @@ def test_kv_quant_mode_from_env():
     # fallback when no explicit kv_quant_mode is passed. Confirms the threading
     # endpoint (YAML -> mlx-serve -> --kv-quant-mode -> env -> cache).
     import os
+
     prev = os.environ.get("TQ_KV_QUANT_MODE")
     os.environ["TQ_KV_QUANT_MODE"] = "prod"
     try:
