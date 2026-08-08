@@ -36,7 +36,6 @@ mlx_vlm/apc.py::apc_lookup_plan  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/apc.py::apc_trace  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/apc.py::apc_trace_enabled  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/apc.py::classify_layer_for_apc  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/apc.py::commit_prefix_blocks  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/apc.py::model_key_dependencies  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/apc.py::record_reject  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/apc.py::resident_bytes  # baseline: pre-existing divergence, unreviewed
@@ -111,14 +110,12 @@ mlx_vlm/models/cache.py::_trim  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/models/cache.py::_update_concat  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/models/cache.py::_update_in_place  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/models/cache.py::advance  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/models/cache.py::batch_size  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/models/cache.py::cat  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/models/cache.py::create_attention_mask  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/models/cache.py::create_causal_mask  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/models/cache.py::dynamic_roll  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/models/cache.py::expand_quant  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/models/cache.py::from_state  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/models/cache.py::is_single_row  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/models/cache.py::maybe_trim_front  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/models/cache.py::pad  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/models/cache.py::prefix_cache_merge  # baseline: pre-existing divergence, unreviewed
@@ -519,15 +516,7 @@ mlx_vlm/trainer/sft_trainer.py::_collate_grid_thw  # baseline: pre-existing dive
 mlx_vlm/trainer/sft_trainer.py::_model_type  # baseline: pre-existing divergence, unreviewed
 
 # --- mlx_vlm/turboquant.py
-mlx_vlm/turboquant.py::_contiguous  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/turboquant.py::_z  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/turboquant.py::_zero  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/turboquant.py::_zero_state_row_tail  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/turboquant.py::batch_size  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/turboquant.py::dequantize_for_apc  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/turboquant.py::extract  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/turboquant.py::is_single_row  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/turboquant.py::zero_row_tail  # baseline: pre-existing divergence, unreviewed
 
 # --- mlx_vlm/utils.py
 mlx_vlm/utils.py::_compressed_tensors_group_weights  # baseline: pre-existing divergence, unreviewed

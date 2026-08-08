@@ -2,7 +2,7 @@
 
 import mlx.core as mx
 import pytest
-from mlx_lm.models.cache import QuantizedKVCache
+from mlx_lm.models.cache import ArraysCache, BatchRotatingKVCache, QuantizedKVCache
 
 from mlx_vlm.models.cache import (
     BatchKVCache,
@@ -381,6 +381,57 @@ class TestDequantizeForApcContract:
         row = c.extract(0)
         assert isinstance(row, QuantizedKVCache)
         assert row.keys is None
+
+
+class TestBatchSizeContract:
+    """Contract for `batch_size` / `is_single_row`, whoever provides them.
+
+    Same self-retiring graft arrangement as TestDequantizeForApcContract:
+    BatchRotatingKVCache and ArraysCache come from mlx_lm, so models/cache.py
+    attaches these behind `hasattr` guards. These tests assert the behaviour APC
+    row-normalization relies on, so they hold for either provider and fail if a
+    future mlx_lm ships incompatible semantics.
+    """
+
+    def _filled(self, cache, batch):
+        k, v = _rand_kv(batch, 8)
+        cache.update_and_fetch(k, v)
+        return cache
+
+    def test_dense_batch_caches_report_row_count(self):
+        for cache in (
+            self._filled(BatchKVCache(left_padding=[0] * B), B),
+            self._filled(BatchRotatingKVCache(max_size=512, left_padding=[0] * B), B),
+        ):
+            assert cache.batch_size == B
+            assert cache.is_single_row() is False
+
+    def test_quantized_batch_cache_reports_row_count(self):
+        # keys are a (packed, scales, biases) triple here, so batch_size must
+        # index into keys[0] rather than keys.
+        c = self._filled(
+            BatchQuantizedKVCache([0] * B, group_size=GROUP_SIZE, bits=BITS), B
+        )
+        assert c.batch_size == B
+        assert c.is_single_row() is False
+
+    def test_single_row_is_detected(self):
+        c = self._filled(BatchKVCache(left_padding=[0]), 1)
+        assert c.batch_size == 1
+        assert c.is_single_row() is True
+
+    def test_empty_cache_falls_back_to_left_padding(self):
+        # No keys yet: row count must still come from left_padding.
+        assert BatchKVCache(left_padding=[0, 0, 0]).batch_size == 3
+        assert (
+            BatchQuantizedKVCache([0, 0], group_size=GROUP_SIZE, bits=BITS).batch_size
+            == 2
+        )
+
+    def test_arrays_cache_reports_batch_size(self):
+        a = ArraysCache(4)
+        assert a.batch_size == 1
+        assert a.is_single_row() is True
 
 
 if __name__ == "__main__":

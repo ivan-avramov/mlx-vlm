@@ -81,6 +81,47 @@ if not hasattr(QuantizedKVCache, "dequantize_for_apc"):
     QuantizedKVCache.dequantize_for_apc = dequantize_for_apc
 
 
+def _batch_size(self):
+    """Number of rows in a batch-shaped cache."""
+    keys = getattr(self, "keys", None)
+    if keys is not None:
+        # Quantized layouts store keys as a (packed, scales, biases) triple.
+        return int((keys[0] if isinstance(keys, tuple) else keys).shape[0])
+    return int(self.left_padding.shape[0])
+
+
+def _arrays_cache_batch_size(self):
+    """`batch_size` for ArraysCache, which holds a list of state arrays."""
+    for c in self.cache:
+        if c is not None:
+            return c.shape[0]
+    if getattr(self, "left_padding", None) is not None:
+        return self.left_padding.size
+    if getattr(self, "lengths", None) is not None:
+        return self.lengths.size
+    return 1
+
+
+def _is_single_row(self):
+    return self.batch_size == 1
+
+
+# Same conditional-graft contract as `dequantize_for_apc` above: APC's row
+# normalization asks for `batch_size` / `is_single_row`, upstream declares them on
+# its vendored cache classes, and these two come from mlx_lm. Each guard is
+# independent so a provider that ships only one of them still wins for that one.
+# TestBatchSizeContract covers whichever implementation ends up live.
+for _cls, _bs in (
+    (BatchRotatingKVCache, _batch_size),
+    (ArraysCache, _arrays_cache_batch_size),
+):
+    if not hasattr(_cls, "batch_size"):
+        _cls.batch_size = property(_bs)
+    if not hasattr(_cls, "is_single_row"):
+        _cls.is_single_row = _is_single_row
+del _cls, _bs
+
+
 def should_quantize_kv_layer(layer_idx: int, num_layers: int) -> bool:
     """Whether layer ``layer_idx`` should use a quantized KV cache.
 
@@ -413,6 +454,15 @@ class BatchKVCache(_MLXLMBatchKVCache):
             return self.keys[..., :new_end, :], self.values[..., :new_end, :]
         return super().update_and_fetch(keys, values)
 
+    @property
+    def batch_size(self):
+        if self.keys is not None:
+            return int(self.keys.shape[0])
+        return int(self.left_padding.shape[0])
+
+    def is_single_row(self):
+        return self.batch_size == 1
+
 
 class BatchQuantizedKVCache(_BaseCache):
     """Batch-aware quantized KV cache for continuous batching.
@@ -499,6 +549,15 @@ class BatchQuantizedKVCache(_BaseCache):
             tuple(k[..., : self._idx, :] for k in self.keys),
             tuple(v[..., : self._idx, :] for v in self.values),
         )
+
+    @property
+    def batch_size(self):
+        if self.keys is not None:
+            return int(self.keys[0].shape[0])
+        return int(self.left_padding.shape[0])
+
+    def is_single_row(self):
+        return self.batch_size == 1
 
     def dequantize_for_apc(self):
         """Return raw float (keys, values) sliced to current _idx for APC storage.

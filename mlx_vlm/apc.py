@@ -4025,37 +4025,29 @@ def extract_prompt_cache_from_batch(
 def harvest_blocks_from_batch_cache(
     apc_manager: "APCManager",
     batch_caches: List[Any],
-    batch_idx: int,
     full_token_ids: Sequence[int],
     *,
+    batch_idx: Optional[int] = None,
     extra_hash: int = 0,
     skip_first_n_tokens: int = 0,
 ) -> List[APCBlock]:
-    """Slice one row out of a batched KV cache and store its full blocks.
+    """Harvest full blocks from a prompt cache and store them.
 
-    Used at the end of prompt prefill in continuous-batching mode to add
-    the new prefix to APC.
+    With ``batch_idx`` set, slices one row out of a batched KV cache
+    (continuous-batching prefill). With ``batch_idx`` unset, harvests a
+    single-request cache. Either way, adds the new prefix to APC.
     """
     layer_keys: List[mx.array] = []
     layer_values: List[mx.array] = []
     for c in batch_caches:
-        keys = getattr(c, "keys", None)
-        values = getattr(c, "values", None)
-        idx = getattr(c, "_idx", None)
-        left_padding = getattr(c, "left_padding", None)
-        if keys is None or values is None or idx is None:
+        k, v = layer_kv_for_apc(c, batch_idx=batch_idx)
+        if k is None or v is None:
             return []
-        # Pull this batch row, dropping any left-padding for this seq.
-        if left_padding is not None:
-            try:
-                lp = int(left_padding[batch_idx].item())
-            except Exception:
-                lp = 0
-        else:
-            lp = 0
-        # shape after slicing: [1, H, idx-lp, D]
-        layer_keys.append(keys[batch_idx : batch_idx + 1, :, lp:idx, :])
-        layer_values.append(values[batch_idx : batch_idx + 1, :, lp:idx, :])
+        if batch_idx is not None and int(k.shape[0]) != 1:
+            k = k[batch_idx : batch_idx + 1]
+            v = v[batch_idx : batch_idx + 1]
+        layer_keys.append(k)
+        layer_values.append(v)
     return apc_manager.store_kv_blocks(
         full_token_ids,
         layer_keys,
@@ -4063,6 +4055,29 @@ def harvest_blocks_from_batch_cache(
         extra_hash=extra_hash,
         skip_first_n_tokens=skip_first_n_tokens,
     )
+
+
+def commit_prefix_blocks(
+    apc_manager: "APCManager",
+    prompt_cache: List[Any],
+    full_token_ids: Sequence[int],
+    *,
+    batch_idx: Optional[int] = None,
+    extra_hash: int = 0,
+    skip_first_n_tokens: int = 0,
+    blocks_in_use: Sequence[APCBlock] = (),
+) -> List[APCBlock]:
+    """Harvest one (row of a) prompt cache into hashed blocks, store them, then release the in-use prefix blocks together with the new ones. Shared block-mode commit for both generate paths."""
+    new_blocks = harvest_blocks_from_batch_cache(
+        apc_manager,
+        prompt_cache,
+        full_token_ids,
+        batch_idx=batch_idx,
+        extra_hash=extra_hash,
+        skip_first_n_tokens=skip_first_n_tokens,
+    )
+    apc_manager.release(list(blocks_in_use) + new_blocks)
+    return new_blocks
 
 
 def model_apc_mode(language_model: Any) -> Optional[str]:

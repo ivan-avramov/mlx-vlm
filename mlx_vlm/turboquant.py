@@ -4309,6 +4309,21 @@ def _filter_state(state, batch_indices: mx.array):
     return _map_state(state, lambda a, ndim: a[batch_indices])
 
 
+def _zero_state_row_tail(state, batch_index: int, start: int, end: int):
+    """Zero a single batch row over the token range [start, end)."""
+    if state is None or start >= end:
+        return state
+
+    def _zero(a, ndim):
+        if ndim == 3:
+            a[batch_index, :, start:end] = 0
+        else:
+            a[batch_index, :, start:end, :] = 0
+        return a
+
+    return _map_state(state, _zero)
+
+
 def _pad_state_tokens(state, left: int, right: int):
     """Pad along the token dimension (index 2)."""
     if left == 0 and right == 0:
@@ -5549,8 +5564,12 @@ class TurboQuantKVCache(_BaseCache):
         (``TQ_PREFILL_IMPL``): the decomposed mx.matmul path (default) or the
         hand-written fused flash kernel."""
         if self._prefill_impl == "fused":
-            return self._mse_prefill_fused(queries, keys_state, values_state, scale, mask)
-        return self._mse_prefill_decomposed(queries, keys_state, values_state, scale, mask)
+            return self._mse_prefill_fused(
+                queries, keys_state, values_state, scale, mask
+            )
+        return self._mse_prefill_decomposed(
+            queries, keys_state, values_state, scale, mask
+        )
 
     def _mse_prefill_decomposed(self, queries, keys_state, values_state, scale, mask):
         """Decomposed prefill: dequant K/V to (model-space) unit vectors and run
@@ -5572,7 +5591,9 @@ class TurboQuantKVCache(_BaseCache):
         q_s = (queries * scale).reshape(B, n_kv, r, L, D).astype(mx.float16)
 
         k_unit = self.key_codec._dequantize_unit(keys_state.indices).astype(mx.float16)
-        v_unit = self.value_codec._dequantize_unit(values_state.indices).astype(mx.float16)  # [B,n_kv,T,D]
+        v_unit = self.value_codec._dequantize_unit(values_state.indices).astype(
+            mx.float16
+        )  # [B,n_kv,T,D]
         k_norm = keys_state.norms.astype(mx.float32)  # [B,n_kv,T]
         v_norm = values_state.norms.astype(mx.float32)
 
@@ -5605,7 +5626,9 @@ class TurboQuantKVCache(_BaseCache):
     def _mse_prefill_fused(self, queries, keys_state, values_state, scale, mask):
         """Hand-written fused flash kernel (Task 3B). Implemented after the
         decomposed path so the two can be benchmarked head-to-head (spec §10)."""
-        raise NotImplementedError("fused MSE prefill kernel not yet implemented (Task 3B)")
+        raise NotImplementedError(
+            "fused MSE prefill kernel not yet implemented (Task 3B)"
+        )
 
     def prefill_attention(
         self,
@@ -6484,6 +6507,21 @@ class TurboQuantKVCache(_BaseCache):
         self._cached_state_offset = -1
         return n
 
+    def dequantize_for_apc(self):
+        """Return raw float (keys, values) for APC storage.
+
+        Returns (None, None) if the cache is empty.
+        """
+        if self.keys is None or self.offset == 0:
+            return None, None
+        return self.dequantize()
+
+    def zero_row_tail(self, batch_index: int, start: int, end: int):
+        self.keys = _zero_state_row_tail(self.keys, batch_index, start, end)
+        self.values = _zero_state_row_tail(self.values, batch_index, start, end)
+        self._cached_state = None
+        self._cached_state_offset = -1
+
     def make_mask(self, *args, **kwargs):
         return create_attention_mask(*args, offset=self.offset, **kwargs)
 
@@ -6712,6 +6750,49 @@ class BatchTurboQuantKVCache(_BaseCache):
 
     def empty(self):
         return self.keys is None
+
+    def zero_row_tail(self, batch_index: int, start: int, end: int):
+        self.keys = _zero_state_row_tail(self.keys, batch_index, start, end)
+        self.values = _zero_state_row_tail(self.values, batch_index, start, end)
+
+    def dequantize_for_apc(self):
+        """Return raw float (keys, values) for APC storage.
+
+        Returns (None, None) if the cache is empty.
+        """
+        if self.keys is None or self._idx == 0:
+            return None, None
+        return self.dequantize()
+
+    def extract(self, idx):
+        """Extract one batch row as a single-sequence TurboQuantKVCache."""
+        cache = TurboQuantKVCache(bits=self.bits, seed=self.seed)
+        if self.keys is None or self._idx == 0:
+            return cache
+        cache.key_codec = self.key_codec
+        cache.value_codec = self.value_codec
+        padding = max(0, int(self.left_padding[idx].item()))
+        end = self._idx
+        if padding >= end:
+            return cache
+        bi = mx.array([idx])
+        keys = _filter_state(_slice_state_range(self.keys, padding, end), bi)
+        values = _filter_state(_slice_state_range(self.values, padding, end), bi)
+
+        def _contiguous(a, ndim):
+            return mx.contiguous(a)
+
+        cache.keys = _map_state(keys, _contiguous)
+        cache.values = _map_state(values, _contiguous)
+        cache.offset = _state_length(cache.keys)
+        return cache
+
+    @property
+    def batch_size(self):
+        return int(self.left_padding.shape[0])
+
+    def is_single_row(self):
+        return self.batch_size == 1
 
     def make_mask(self, N: int, return_array: bool = False, **kwargs):
         return create_causal_mask(
