@@ -137,7 +137,6 @@ mlx_vlm/models/cache.py::pad  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/models/cache.py::prefix_cache_merge  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/models/cache.py::prefix_cache_restore  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/models/cache.py::prefix_cache_snapshot  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/models/cache.py::should_quantize_kv_layer  # baseline: pre-existing divergence, unreviewed
 
 # --- mlx_vlm/models/deepseek_v4/language.py
 mlx_vlm/models/deepseek_v4/language.py::_hisa_select  # baseline: pre-existing divergence, unreviewed

@@ -131,12 +131,28 @@ name-based style so optional `mlx_lm` classes need not be imported) plus honouri
 `TestPrefixCacheReuseTrim` (8 tests, the fork counterpart of upstream's dropped
 class) covers it; 5 of the 8 fail without the fix.
 
-**Known remaining gap:** `_is_rotating_kv_layer` — used by snapshot
-capture/restore, *not* by the reuse guard any more — still matches exact names,
-so buffered layers are skipped by `_capture_rotating_layers_for_snapshot`.
-Fixing that also needs `start_position` plumbed through `RotatingKVSnapshot` and
-`restore_rotating`, which is a separate change and was deliberately not rushed
-in alongside a correctness fix.
+Follow-up, now done (commit `087c91a3`): `_is_rotating_kv_layer` had the same
+exact-name hole, and it is the *routing* predicate — the post-generation path
+uses it to choose snapshot-restore vs. `_trim_cache`. A buffered layer got
+neither (the same predicate gates `_capture_rotating_layers_for_snapshot`, so no
+snapshot existed) and then fell into the trim branch. Fixed, together with
+`start_position` plumbed through `RotatingKVSnapshot` / `capture_rotating` /
+`restore_rotating`, since restoring K/V and offset while leaving the eviction
+watermark stale would leave the layer claiming tokens the buffer no longer holds.
+
+**`_rotating_post_gen_trim_safe` is intentionally dead — do not wire it in.**
+Commit `087c91a3`'s message called it "a guard not wired into the path it was
+written to protect"; that was wrong. `memory.md:274` records it being
+*deliberately* unhooked when the mid-prefill snapshot landed, and `memory.md:315`
+explains why the snapshot is strictly better: rather than refusing to trim a
+wrapped ring (correct, but forfeits all prefix reuse), it captures rotating state
+exactly at the anchor offset during chunked prefill so post-gen restores instead
+of trimming. Wiring the strict guard would reject the asymmetric anchoring path
+almost always — at the anchor the ring is normally already wrapped (Gemma 4's
+`max_size` is 1024) — turning the cache-reuse win back into full re-prefill. Its
+subclass hole was still fixed, and its docstring now says all of this so the
+trap is not re-sprung; its tests are kept as documentation of the SWA invariant
+behind the "repetition loops on turn 2" incident.
 
 ## Test-suite state
 

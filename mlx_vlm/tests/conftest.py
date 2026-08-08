@@ -39,18 +39,29 @@ UNPORTED_UPSTREAM_TESTS: dict[str, tuple[str, str]] = {
         "quantize and APC warm restore to all route through it, and this fork "
         "decides per-layer quantization inline",
     ),
-    "test_quant_sdpa_mask.py": (
-        "mlx_vlm.models.cache.dynamic_roll",
-        "upstream's vendored rotating-cache roll helper; this fork delegates "
-        "the base cache classes to mlx_lm",
-    ),
-    "test_quant_sdpa_mask_adversarial.py": (
-        "mlx_vlm.models.cache.dynamic_roll",
-        "same as test_quant_sdpa_mask.py",
-    ),
     "test_minimax_m3.py": (
         "mlx_vlm.models.base.align_attention_mask_to_scores",
         "upstream's mask/score alignment helper, not ported",
+    ),
+    # These two are a deliberate, permanent divergence rather than a backlog
+    # item -- see docs/upstream-gaps.md. Upstream's quantized attention calls
+    # mx.quantized_matmul and reshapes scores to 5D (B, n_kv_heads, n_repeats,
+    # L, K), which is what makes right-aligning a 4D (B, 1, L, K) mask alias B
+    # with n_kv_heads (upstream #1567) and require
+    # align_attention_mask_to_scores. This fork instead dequantizes via
+    # cache.dequantize() and runs dense scaled_dot_product_attention
+    # (models/base.py:251), so scores are never 5D and the hazard these tests
+    # cover is structurally impossible here. Porting the helper would be dead
+    # code; porting the whole quantized-matmul path would be a
+    # performance-motivated rewrite of our attention, not a bug fix.
+    "test_quant_sdpa_mask.py": (
+        "mlx_vlm.models.base.quantized_scaled_dot_product_attention",
+        "fork dequantizes instead of using quantized_matmul, so the 5D "
+        "GQA mask-aliasing bug these tests cover cannot occur -- divergence",
+    ),
+    "test_quant_sdpa_mask_adversarial.py": (
+        "mlx_vlm.models.base.quantized_scaled_dot_product_attention",
+        "same as test_quant_sdpa_mask.py -- divergence, not a backlog item",
     ),
 }
 

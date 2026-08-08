@@ -928,9 +928,30 @@ def _rotating_post_gen_trim_safe(entries, target_len) -> bool:
     but the strict invariant was violated.
 
     The strictly-safe condition is: the ring never wrapped at all
-    (``offset <= max_size``). Otherwise, callers should persist the full
-    end-of-asst state and let the next request's existing rewind guard
-    force full re-prefill.
+    (``offset <= max_size``).
+
+    SUPERSEDED -- do not wire this into the post-generation path.
+    ------------------------------------------------------------
+    This helper has no production caller by design, and adding one would be a
+    pessimization, not a fix. It predates the mid-prefill snapshot primitive,
+    which solves the same problem strictly better:
+
+      * The old plan was "if the ring wrapped, refuse to trim, persist the full
+        end-of-asst state, and let the next request's rewind guard force a full
+        re-prefill." Correct, but it gives up all prefix reuse.
+      * The snapshot path instead captures rotating-layer state EXACTLY at the
+        anchor offset *during* chunked prefill, so post-gen never has to trim a
+        rotating layer at all -- it restores one. ``dispatch.py``'s asymmetric
+        branch does that and trims only non-rotating layers; the symmetric
+        branch does not trim.
+
+    Wiring this in would reject the asymmetric anchoring path almost always: at
+    the anchor offset the ring is typically already wrapped (Gemma 4's
+    ``max_size`` is 1024, so any non-trivial conversation wraps well before the
+    anchor), which is exactly the case the snapshot machinery was built to make
+    reusable. The tests below are kept because they document the real SWA
+    invariant -- the "repetition loops on turn 2" incident above -- not because
+    the function is on a live path.
     """
     for c in entries:
         if hasattr(c, "caches"):

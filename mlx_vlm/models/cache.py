@@ -4,12 +4,29 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_map
 from mlx_lm.models.cache import ArraysCache  # noqa: F401
-from mlx_lm.models.cache import BatchKVCache as _MLXLMBatchKVCache
 from mlx_lm.models.cache import BatchRotatingKVCache  # noqa: F401
 from mlx_lm.models.cache import CacheList  # noqa: F401
 from mlx_lm.models.cache import ChunkedKVCache  # noqa: F401
 from mlx_lm.models.cache import QuantizedKVCache  # noqa: F401
+from mlx_lm.models.cache import BatchKVCache as _MLXLMBatchKVCache
 from mlx_lm.models.cache import KVCache, RotatingKVCache, _BaseCache
+
+
+def should_quantize_kv_layer(layer_idx: int, num_layers: int) -> bool:
+    """Whether layer ``layer_idx`` should use a quantized KV cache.
+
+    Ported from upstream. This is a *shared policy*, not a local helper: live
+    batch generation (``_make_cache``), stream quantize, and APC warm restore
+    must all agree, or continuous-batching ``extend`` can try to join
+    differently-typed peers.
+
+    For deep stacks (``num_layers > 2``) the last full-attention layer stays
+    unquantized -- it is sensitive to quantization (see gemma-4-class models).
+    Shallow stacks (``num_layers <= 2``) quantize every layer when kv-bits is on.
+    """
+    if num_layers <= 2:
+        return True
+    return layer_idx < num_layers - 1
 
 
 class BufferedRotatingKVCache(RotatingKVCache):
@@ -263,15 +280,20 @@ class PreallocQuantizedKVCache(QuantizedKVCache):
             for i in range(len(self.keys)):
                 self.keys[i][..., prev : self.offset, :] = qk[i]
                 self.values[i][..., prev : self.offset, :] = qv[i]
-            return tree_map(lambda x: x[..., : self.offset, :], (self.keys, self.values))
+            return tree_map(
+                lambda x: x[..., : self.offset, :], (self.keys, self.values)
+            )
         return super().update_and_fetch(keys, values)
 
     @classmethod
     def from_quantized(cls, src, prealloc_tokens):
         """Copy a (possibly non-empty) QuantizedKVCache's triple into a pre-allocated
         buffer. Copies quantized arrays directly (no re-quantization)."""
-        c = cls(group_size=src.group_size, bits=src.bits,
-                prealloc_tokens=int(prealloc_tokens or 0))
+        c = cls(
+            group_size=src.group_size,
+            bits=src.bits,
+            prealloc_tokens=int(prealloc_tokens or 0),
+        )
         c.offset = src.offset
         if src.keys is not None:
             n = src.offset
