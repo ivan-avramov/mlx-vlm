@@ -154,97 +154,12 @@ def _clone_cache_entry_for_apc(
     min_capacity_tokens: Optional[int],
     eval_targets: List[mx.array],
 ) -> Optional[Any]:
-    """Deep-copy one prompt-cache entry, preserving its concrete cache kind."""
-    from mlx_lm.models import cache as lm_cache
+    """Deep-copy one prompt-cache entry via the registered cache adapter."""
+    from .apc_adapters import clone_cache_entry
 
-    if isinstance(c, lm_cache.KVCache):
-        out = type(c)()
-        off = int(getattr(c, "offset", 0) or 0)
-        if c.keys is not None and c.values is not None and off > 0:
-            keys = _copy_mlx_array(c.keys[..., :off, :])
-            values = _copy_mlx_array(c.values[..., :off, :])
-            step = int(getattr(c, "step", getattr(type(c), "step", 256)) or 0)
-            keys, values = _pad_kv_for_capacity(
-                keys,
-                values,
-                offset=off,
-                min_capacity_tokens=min_capacity_tokens,
-                step=step,
-            )
-            out.keys = keys
-            out.values = values
-            out.offset = off
-            eval_targets.extend([keys, values])
-        return out
-
-    if isinstance(c, lm_cache.RotatingKVCache):
-        out = type(c)(
-            max_size=int(getattr(c, "max_size")),
-            keep=int(getattr(c, "keep", 0)),
-        )
-        out.offset = int(getattr(c, "offset", 0) or 0)
-        out._idx = int(getattr(c, "_idx", 0) or 0)
-        if c.keys is not None and c.values is not None:
-            out.keys = _copy_mlx_array(c.keys)
-            out.values = _copy_mlx_array(c.values)
-            eval_targets.extend([out.keys, out.values])
-        return out
-
-    if isinstance(c, lm_cache.ChunkedKVCache):
-        out = type(c)(chunk_size=int(getattr(c, "chunk_size")))
-        out.offset = int(getattr(c, "offset", 0) or 0)
-        out.start_position = int(getattr(c, "start_position", 0) or 0)
-        if c.keys is not None and c.values is not None:
-            out.keys = _copy_mlx_array(c.keys)
-            out.values = _copy_mlx_array(c.values)
-            eval_targets.extend([out.keys, out.values])
-        return out
-
-    if isinstance(c, lm_cache.ArraysCache):
-        out = lm_cache.ArraysCache(len(c.cache))
-        out.cache = []
-        for state in c.cache:
-            if state is None:
-                out.cache.append(None)
-                continue
-            copied = _copy_mlx_array(state)
-            out.cache.append(copied)
-            eval_targets.append(copied)
-        if c.left_padding is not None:
-            out.left_padding = _copy_mlx_array(c.left_padding)
-            eval_targets.append(out.left_padding)
-        if c.lengths is not None:
-            out.lengths = _copy_mlx_array(c.lengths)
-            eval_targets.append(out.lengths)
-        return out
-
-    if isinstance(c, lm_cache.CacheList):
-        copied = [
-            _clone_cache_entry_for_apc(
-                sub_c,
-                min_capacity_tokens=min_capacity_tokens,
-                eval_targets=eval_targets,
-            )
-            for sub_c in c.caches
-        ]
-        if any(sub_c is None for sub_c in copied):
-            return None
-        return lm_cache.CacheList(*copied)
-
-    if isinstance(c, tuple):
-        copied = [
-            _clone_cache_entry_for_apc(
-                sub_c,
-                min_capacity_tokens=min_capacity_tokens,
-                eval_targets=eval_targets,
-            )
-            for sub_c in c
-        ]
-        if any(sub_c is None for sub_c in copied):
-            return None
-        return tuple(copied)
-
-    return None
+    return clone_cache_entry(
+        c, min_capacity_tokens=min_capacity_tokens, eval_targets=eval_targets
+    )
 
 
 def _clone_prompt_cache_for_apc(
@@ -389,29 +304,15 @@ def _clone_layer_major_kv_cache_for_apc(
 
 
 def _cache_entry_supports_exact_apc(c: Any) -> bool:
-    from mlx_lm.models import cache as lm_cache
+    from .apc_adapters import apc_exact_eligible
 
-    if isinstance(
-        c,
-        (
-            lm_cache.KVCache,
-            lm_cache.RotatingKVCache,
-            lm_cache.ChunkedKVCache,
-            lm_cache.ArraysCache,
-        ),
-    ):
-        return True
-    if isinstance(c, lm_cache.CacheList):
-        return all(_cache_entry_supports_exact_apc(sub_c) for sub_c in c.caches)
-    if isinstance(c, tuple):
-        return all(_cache_entry_supports_exact_apc(sub_c) for sub_c in c)
-    return False
+    return apc_exact_eligible(c)
 
 
 def _cache_entry_supports_block_apc(c: Any) -> bool:
-    from mlx_lm.models import cache as lm_cache
+    from .apc_adapters import apc_block_eligible
 
-    return isinstance(c, lm_cache.KVCache)
+    return apc_block_eligible(c)
 
 
 def _sequence_hash(token_ids: Sequence[int], extra_hash: int, block_size: int) -> int:
@@ -558,6 +459,29 @@ def adjust_prefix_to_text_suffix_boundary(
     return prefix_len
 
 
+def _env_truthy(name: str, default: str = "") -> bool:
+    """Return True when env var is a common truthy string (1/true/yes)."""
+    return os.environ.get(name, default).lower() in ("1", "true", "yes")
+
+
+def apc_trace_enabled() -> bool:
+    """Optional request-path tracing (``APC_TRACE=1``), sibling of ``APC_DISK_TRACE``."""
+    return _env_truthy("APC_TRACE")
+
+
+def apc_trace(event: str, **fields: Any) -> None:
+    """Emit a single greppable ``APC_TRACE`` log line when tracing is enabled.
+
+    Kept separate from stats counters: stats are always-on aggregates; trace is
+    opt-in detail for debugging store/lookup/reject/self-check paths.
+    """
+    if not apc_trace_enabled():
+        return
+    parts = " ".join(f"{key}={value}" for key, value in fields.items())
+    msg = f"APC_TRACE {event}" + (f" {parts}" if parts else "")
+    logger.info(msg)
+
+
 @dataclass
 class APCBlock(APCNode):
     """Pooled logical node for one fixed-size KV block; its pageable K/V lives in the "kv" component handle."""
@@ -657,6 +581,15 @@ class APCStats:
     disk_writes: int = 0
     exact_hits: int = 0
     exact_stores: int = 0
+    rejects: int = 0
+    rejects_by_reason: Dict[str, int] = field(default_factory=dict)
+    last_reject: Optional[Dict[str, Any]] = None
+
+    def record_reject(self, reason: str, **details: Any) -> None:
+        self.rejects += 1
+        self.rejects_by_reason[reason] = self.rejects_by_reason.get(reason, 0) + 1
+        self.last_reject = {"reason": reason, **details}
+        apc_trace("reject", reason=reason, **details)
 
     def snapshot(self, num_blocks: int, block_size: int) -> dict:
         denom = self.matched_tokens + self.served_tokens
@@ -676,6 +609,11 @@ class APCStats:
             "disk_writes": self.disk_writes,
             "exact_hits": self.exact_hits,
             "exact_stores": self.exact_stores,
+            "rejects": self.rejects,
+            "rejects_by_reason": dict(self.rejects_by_reason),
+            "last_reject": (
+                dict(self.last_reject) if self.last_reject is not None else None
+            ),
         }
 
 
@@ -3169,6 +3107,19 @@ class APCManager:
         token_tuple = tuple(int(t) for t in token_ids)
         copied = _clone_prompt_cache_for_apc(prompt_cache)
         if copied is None:
+            types = [type(c).__name__ for c in prompt_cache]
+            logger.warning(
+                "APC exact-cache store rejected: unclonable prompt cache types %s "
+                "(token_len=%d). Exact-mode APC will not reuse this prefix.",
+                types,
+                len(token_tuple),
+            )
+            with self.lock:
+                self.stats.record_reject(
+                    "unclonable",
+                    types=types,
+                    token_len=len(token_tuple),
+                )
             return False
         key = _sequence_hash(token_tuple, extra_hash, self.block_size)
         stored = False
@@ -3466,10 +3417,18 @@ class APCManager:
             self.stats.pool_used = sum(1 for x in self.pool if x.block_hash is not None)
             return new_blocks
 
+    def _resident_bytes_locked(self) -> int:
+        return sum(b.resident_bytes() for b in self.pool)
+
+    def resident_bytes(self) -> int:
+        with self.lock:
+            return self._resident_bytes_locked()
+
     def stats_snapshot(self) -> dict:
         with self.lock:
             self.stats.pool_used = sum(1 for x in self.pool if x.block_hash is not None)
             snap = self.stats.snapshot(self.num_blocks, self.block_size)
+            snap["resident_bytes"] = self._resident_bytes_locked()
             if self.disk is not None:
                 snap["disk_bytes"] = self.disk.disk_bytes
                 snap["disk_max_bytes"] = self.disk.max_bytes

@@ -26,19 +26,13 @@
 mlx_vlm/apc.py::APCSelfCheckResult  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/apc.py::LayerSupport  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/apc.py::_adapter_schema_version  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/apc.py::_env_truthy  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/apc.py::_hash_payload  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/apc.py::_layer_capability  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/apc.py::_resident_bytes_locked  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/apc.py::_tensor_content_hash  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/apc.py::apc_disk_namespace  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/apc.py::apc_lookup_plan  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/apc.py::apc_trace  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/apc.py::apc_trace_enabled  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/apc.py::classify_layer_for_apc  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/apc.py::model_key_dependencies  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/apc.py::record_reject  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/apc.py::resident_bytes  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/apc.py::self_check_model_apc  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/apc.py::semantic_extra_hash  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/apc.py::validate_prompt_cache_layout  # baseline: pre-existing divergence, unreviewed
@@ -95,7 +89,6 @@ mlx_vlm/models/base.py::quantized_scaled_dot_product_attention  # baseline: pre-
 
 # --- mlx_vlm/models/cache.py
 mlx_vlm/models/cache.py::ArraysCache  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/models/cache.py::BatchRotatingKVCache  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/models/cache.py::CacheList  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/models/cache.py::ChunkedKVCache  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/models/cache.py::KVCache  # baseline: pre-existing divergence, unreviewed

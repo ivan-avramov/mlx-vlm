@@ -4,12 +4,12 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_map
 from mlx_lm.models.cache import ArraysCache  # noqa: F401
-from mlx_lm.models.cache import BatchRotatingKVCache  # noqa: F401
 from mlx_lm.models.cache import CacheList  # noqa: F401
 from mlx_lm.models.cache import ChunkedKVCache  # noqa: F401
 from mlx_lm.models.cache import QuantizedKVCache  # noqa: F401
 from mlx_lm.models.cache import dynamic_roll  # noqa: F401
 from mlx_lm.models.cache import BatchKVCache as _MLXLMBatchKVCache
+from mlx_lm.models.cache import BatchRotatingKVCache as _MLXLMBatchRotatingKVCache
 from mlx_lm.models.cache import KVCache, RotatingKVCache, _BaseCache
 
 # Note on `dynamic_roll` above: it is re-exported from mlx_lm rather than
@@ -111,15 +111,47 @@ def _is_single_row(self):
 # its vendored cache classes, and these two come from mlx_lm. Each guard is
 # independent so a provider that ships only one of them still wins for that one.
 # TestBatchSizeContract covers whichever implementation ends up live.
-for _cls, _bs in (
-    (BatchRotatingKVCache, _batch_size),
-    (ArraysCache, _arrays_cache_batch_size),
-):
-    if not hasattr(_cls, "batch_size"):
-        _cls.batch_size = property(_bs)
-    if not hasattr(_cls, "is_single_row"):
-        _cls.is_single_row = _is_single_row
-del _cls, _bs
+# Grafted onto mlx_lm's base class, not our BatchRotatingKVCache subclass below,
+# so both it and the subclass inherit a single implementation.
+#
+# `is_single_row` is granted ONLY where upstream declares it. ArraysCache
+# deliberately gets `batch_size` alone: it already has `extract`, and
+# apc_adapters.clone_cache_entry treats "has extract AND is_single_row" as
+# batch-shaped, then recurses on `extract(0)`. Since extracting an ArraysCache
+# yields another ArraysCache, granting it `is_single_row` makes that recursion
+# infinite (RecursionError in exact-mode store).
+if not hasattr(_MLXLMBatchRotatingKVCache, "batch_size"):
+    _MLXLMBatchRotatingKVCache.batch_size = property(_batch_size)
+if not hasattr(_MLXLMBatchRotatingKVCache, "is_single_row"):
+    _MLXLMBatchRotatingKVCache.is_single_row = _is_single_row
+if not hasattr(ArraysCache, "batch_size"):
+    ArraysCache.batch_size = property(_arrays_cache_batch_size)
+
+
+class BatchRotatingKVCache(_MLXLMBatchRotatingKVCache):
+    """mlx_lm's BatchRotatingKVCache with upstream's right-pad prefill fix.
+
+    mlx_lm routes every S==1 update to `_update_in_place`, which hard-raises
+    "finalize() should be called before deocoding" whenever right-padding
+    bookkeeping is active. But the *last prefill step* can legitimately be S==1
+    while `_lengths` is still set by `prepare()`, and that update has to go
+    through the concat path so pad tokens stay tracked until `finalize()` rolls
+    them out. Upstream mlx-vlm carries this fix in its vendored copy; mlx_lm does
+    not, so this fork subclasses rather than mutating a dependency's hot path.
+
+    Subclassing (not grafting) because this overrides existing behaviour instead
+    of adding a missing method -- there is no `hasattr` to make it self-retiring.
+    Delete this class once mlx_lm routes S==1 correctly; `isinstance` checks
+    against mlx_lm's class keep working either way.
+
+    Caveat: only instances built through this module get the fix. Caches
+    constructed inside mlx_lm itself still use its class.
+    """
+
+    def update_and_fetch(self, keys, values):
+        if keys.shape[2] == 1 and self._lengths is None:
+            return self._update_in_place(keys, values)
+        return self._update_concat(keys, values)
 
 
 def should_quantize_kv_layer(layer_idx: int, num_layers: int) -> bool:

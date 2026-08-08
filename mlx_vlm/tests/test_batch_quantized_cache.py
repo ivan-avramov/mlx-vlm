@@ -431,7 +431,14 @@ class TestBatchSizeContract:
     def test_arrays_cache_reports_batch_size(self):
         a = ArraysCache(4)
         assert a.batch_size == 1
-        assert a.is_single_row() is True
+
+    def test_arrays_cache_must_not_gain_is_single_row(self):
+        # ArraysCache already has `extract`, and clone_cache_entry treats
+        # "extract + is_single_row" as batch-shaped and recurses on extract(0).
+        # Extracting an ArraysCache yields another ArraysCache, so granting it
+        # is_single_row makes that recursion infinite. Upstream declares
+        # batch_size on ArraysCache but deliberately not is_single_row.
+        assert not hasattr(ArraysCache(4), "is_single_row")
 
 
 if __name__ == "__main__":
