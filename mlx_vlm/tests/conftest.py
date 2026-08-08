@@ -23,15 +23,6 @@ import pathlib
 
 # path -> (missing symbol, what porting it actually requires)
 UNPORTED_UPSTREAM_TESTS: dict[str, tuple[str, str]] = {
-    "test_apc_semantic_key.py": (
-        "mlx_vlm.apc._hash_payload",
-        "upstream's semantic-key hashing; this fork hashes via _hash_tokens/"
-        "_hash_use_sha256 instead, so the key derivation differs by design",
-    ),
-    "test_apc_observability.py": (
-        "mlx_vlm.apc.APCSelfCheckResult",
-        "upstream's APC self-check subsystem, not ported",
-    ),
     # These two are a deliberate, permanent divergence rather than a backlog
     # item -- see docs/upstream-gaps.md. Upstream's quantized attention calls
     # mx.quantized_matmul and reshapes scores to 5D (B, n_kv_heads, n_repeats,
