@@ -6,6 +6,7 @@ and Qwen3.5 DFlash cache rollback coverage in one place.
 
 import importlib
 import json
+import math
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 from unittest.mock import patch
@@ -598,7 +599,25 @@ def test_qwen_target_verify_quantized_linear_matches_singleton_batch_path():
     out = qwen_language._target_verify_quantized_linear(linear, x)
     mx.eval(ref, out)
 
-    assert bool(mx.array_equal(ref, out).item())
+    # This is a hand-written Metal kernel standing in for nn.QuantizedLinear, so
+    # it cannot be held to bitwise equality across mlx versions: it accumulates
+    # in a different order than mlx's own quantized matmul, which shows up as
+    # last-bit differences (on mlx 0.32.0: 17/48 elements exact, the rest within
+    # one bfloat16 ULP). Asserting array_equal here was really asserting that two
+    # independent reduction orders happen to coincide.
+    #
+    # Bound the error at one ULP instead, so a genuine kernel regression (wrong
+    # indexing, wrong dequant, wrong group handling) still fails loudly. The
+    # property speculative verification actually depends on -- that argmax agrees
+    # with the reference path -- is covered by
+    # test_qwen_target_verify_quantized_argmax_matches_singleton_path.
+    diff = mx.abs(ref.astype(mx.float32) - out.astype(mx.float32))
+    # bfloat16 keeps 7 explicit mantissa bits, so for a value in [2**e, 2**(e+1))
+    # one ULP is 2**(e-7); for the observed scale (~1.5) that is 2**-7.
+    scale = float(mx.abs(ref.astype(mx.float32)).max())
+    exponent = math.floor(math.log2(scale)) if scale > 0 else 0
+    one_ulp = 2.0 ** (exponent - 7)
+    assert float(diff.max()) <= one_ulp
 
 
 def test_qwen3_5_decode_quantized_linears_fused_matches_separate():
