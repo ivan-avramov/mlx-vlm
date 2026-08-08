@@ -7,7 +7,8 @@ from typing import NamedTuple, Optional
 
 import mlx.core as mx
 import numpy as np
-from mlx_lm.models.cache import _BaseCache, create_attention_mask, create_causal_mask
+
+from mlx_vlm.models.cache import _BaseCache, create_attention_mask, create_causal_mask
 
 _ALLOCATION_HOOKS = []
 

@@ -7,8 +7,8 @@ drop_after, and graceful no-ops on disabled rings or pure-attention models.
 
 import mlx.core as mx
 import pytest
-from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache
 
+from mlx_vlm.models.cache import ArraysCache, KVCache, RotatingKVCache
 from mlx_vlm.snapshot import (
     DEFAULT_RING_SIZE,
     DeltaNetSnapshot,

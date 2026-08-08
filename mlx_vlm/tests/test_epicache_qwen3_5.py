@@ -15,9 +15,7 @@ Run (parent fork venv, full deps):
 import os
 import types
 
-from mlx_lm.models.cache import KVCache
-
-from mlx_vlm.models.cache import ArraysCache
+from mlx_vlm.models.cache import ArraysCache, KVCache
 from mlx_vlm.models.epicache import EpiCacheKVCache
 from mlx_vlm.models.qwen3_5.language import LanguageModel
 

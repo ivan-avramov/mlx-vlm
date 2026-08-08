@@ -12,7 +12,6 @@ regressions before they reach inference.
 
 import mlx.core as mx
 import pytest
-from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache
 
 from mlx_vlm.generate import (
     PromptCacheState,
@@ -34,7 +33,12 @@ from mlx_vlm.generate import (
     _should_capture_anchor_pre_prefill,
     _trim_cache,
 )
-from mlx_vlm.models.cache import BufferedRotatingKVCache
+from mlx_vlm.models.cache import (
+    ArraysCache,
+    BufferedRotatingKVCache,
+    KVCache,
+    RotatingKVCache,
+)
 from mlx_vlm.snapshot import DeltaNetSnapshotRing, capture_rotating
 
 

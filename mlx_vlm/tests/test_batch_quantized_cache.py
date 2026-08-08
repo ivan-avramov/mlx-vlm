@@ -2,11 +2,13 @@
 
 import mlx.core as mx
 import pytest
-from mlx_lm.models.cache import ArraysCache, BatchRotatingKVCache, QuantizedKVCache
 
 from mlx_vlm.models.cache import (
+    ArraysCache,
     BatchKVCache,
     BatchQuantizedKVCache,
+    BatchRotatingKVCache,
+    QuantizedKVCache,
     StaticPrefixKVCache,
 )
 
@@ -309,14 +311,15 @@ class TestBatchGeneratorIntegration:
 class TestDequantizeForApcContract:
     """Behavioural contract for `dequantize_for_apc`, whoever provides it.
 
-    `models/cache.py` grafts this method onto mlx_lm's QuantizedKVCache behind a
-    `hasattr` guard, so the graft retires automatically if mlx_lm ever ships its
+    `models/cache.py` used to graft this method onto mlx_lm's QuantizedKVCache
+    behind a `hasattr` guard. Since the mlx-lm vendoring it is a plain method on
+    our own vendored class, so these assertions are now a straightforward
     own. That guard cannot tell a compatible implementation from an incompatible
     one -- these tests can. They assert the contract APC relies on rather than
     our specific implementation, so they pass against either provider and fail
-    loudly if a future mlx_lm version changes the semantics.
+    behavioural contract rather than a defence against a dependency.
 
-    If these ever fail after an mlx_lm upgrade, the graft has silently deferred
+    Kept because the semantics matter to APC's block harvest; formerly this also
     to a different implementation; check its slicing/emptiness behaviour before
     assuming APC still stores correct K/V.
     """
@@ -387,10 +390,10 @@ class TestBatchSizeContract:
     """Contract for `batch_size` / `is_single_row`, whoever provides them.
 
     Same self-retiring graft arrangement as TestDequantizeForApcContract:
-    BatchRotatingKVCache and ArraysCache come from mlx_lm, so models/cache.py
+    BatchRotatingKVCache and ArraysCache are vendored now, so models/cache.py
     attaches these behind `hasattr` guards. These tests assert the behaviour APC
     row-normalization relies on, so they hold for either provider and fail if a
-    future mlx_lm ships incompatible semantics.
+    declares these directly -- no graft, no version guard.
     """
 
     def _filled(self, cache, batch):

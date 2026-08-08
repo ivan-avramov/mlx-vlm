@@ -197,7 +197,7 @@ def convert(
         raise ValueError("Choose either quantize or dequantize, not both.")
 
     if quantize:
-        from mlx_lm.utils import quantize_model
+        from .quant_utils import quantize_model
 
         _preserve_existing_deepseek_v4_quantization(
             config, model, q_group_size, q_bits, q_mode
@@ -215,7 +215,7 @@ def convert(
         )
 
     if dequantize:
-        from mlx_lm.utils import dequantize_model
+        from .quant_utils import dequantize_model
 
         print("[INFO] Dequantizing")
         model = dequantize_model(model)

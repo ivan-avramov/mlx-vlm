@@ -86,7 +86,7 @@ class DeltaNetSnapshotRing:
         if self._snapshots and self._snapshots[-1].offset >= offset:
             return None
         # Local import to keep mlx_lm dependency at the leaves.
-        from mlx_lm.models.cache import ArraysCache
+        from mlx_vlm.models.cache import ArraysCache
 
         states: List[Optional[List[mx.array]]] = []
         any_arrays = False

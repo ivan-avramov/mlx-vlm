@@ -51,8 +51,8 @@ python dev/check_upstream_parity.py
 python dev/check_upstream_symbols.py
 ```
 
-`.symbol-exclusions` currently holds a **401-entry baseline**, down from 446 as gaps
-were closed. It was captured against
+`.symbol-exclusions` currently holds a **300-entry baseline**, down from 446 as gaps
+were closed (the mlx-lm vendoring alone retired 88). It was captured against
 `upstream/main`. That number is a snapshot of existing divergence, not a defect
 count: it mixes never-ported upstream features, modules this fork deliberately
 rewrote (`sample_utils`, `apc`, `cache`, `server/generation`), and genuine
@@ -67,59 +67,48 @@ That is deliberate: unmodified files let future `git merge upstream/main` apply
 upstream's own edits to them cleanly, and let the parity check prove they have
 not gone missing again.
 
-Four of the six that originally could not even be collected have since been
-fixed and are running. **Two remain skipped**, in one reviewable place in
-`mlx_vlm/tests/conftest.py`, and they are a deliberate permanent divergence
-rather than a backlog item:
+All six that originally could not even be collected now run. **Nothing is
+skipped**, and `UNPORTED_UPSTREAM_TESTS` in `mlx_vlm/tests/conftest.py` is empty.
 
-| Skipped file | Needs | Why it stays skipped |
-|---|---|---|
-| `test_quant_sdpa_mask.py` | `base.quantized_scaled_dot_product_attention` | the symbol genuinely does not exist here: plain quantized caches delegate to `mlx_lm`'s SDPA, and TurboQuant caches use their own `quantized_attention`. The hazard those tests cover is handled elsewhere — see below. |
-| `test_quant_sdpa_mask_adversarial.py` | as above | as above |
+Keep the mechanism even while empty: removing an entry is the definition of done
+for porting an upstream feature, and it announces what it skips at collection
+time (`pytest_report_collectionfinish`) rather than hiding it.
 
-Deleting an entry from `UNPORTED_UPSTREAM_TESTS` is the definition of done for
-porting that feature.
+### **[correction]** the two quant-SDPA files were never a permanent divergence
 
-### **[correction]** why those two stay skipped — the old reason was wrong
+They were skipped for two releases on this reasoning, recorded here and in
+`conftest.py`:
 
-This entry previously read: "this fork dequantizes and runs dense attention
-(`models/base.py:251`), so 5D scores never exist and the hazard is structurally
-impossible." **Both halves are false**, and the error was load-bearing, so it is
-worth spelling out.
+> upstream's quantized attention reshapes scores to 5D for `mx.quantized_matmul`,
+> which is what makes right-aligning a 4D mask alias `B` with `n_kv_heads`
+> (upstream #1567). This fork dequantizes and runs dense attention
+> (`models/base.py:251`), so 5D scores never exist and the hazard is
+> structurally impossible. Porting the helper would be dead code.
 
-`models/base.py` no longer dequantizes — it calls `cache.quantized_attention(...)`
-(chunked over Q and K with online softmax, `mx.eval` between K-tiles, so peak
-memory is ~O(chunk) rather than O(context)). And `TurboQuantKVCache.quantized_attention`
-reshapes queries to `(B, n_kv_heads, n_repeats, L, D)`, so **its scores are 5D —
-exactly the shape family that makes upstream #1567 possible.**
+**Every clause of that is false**, and it is a good case study in how a
+divergence rationale rots:
 
-What actually prevents the hazard is `TurboQuantKVCache._apply_attention_mask`
-(`turboquant.py:5419`):
+1. `models/base.py` had stopped dequantizing — it calls
+   `cache.quantized_attention(...)`, a chunked online-softmax path.
+2. `TurboQuantKVCache.quantized_attention` *does* build 5D
+   `(B, n_kv_heads, n_repeats, L, D)` scores, so the hazard's precondition was
+   present all along.
+3. What actually prevented #1567 was three untested lines in
+   `TurboQuantKVCache._apply_attention_mask` that insert the singleton axis
+   before the trailing `(L, K)` pair — upstream's
+   `align_attention_mask_to_scores` under another name. Those are now pinned by
+   `test_apply_attention_mask_aligns_batch_not_heads_on_5d_scores`, verified to
+   fail when the `expand_dims` is removed.
+4. "Porting the helper would be dead code" was backwards. Adopting upstream's
+   `models/base.py` during the mlx-lm vendoring brought both
+   `quantized_scaled_dot_product_attention` and
+   `align_attention_mask_to_scores` in as a matter of course, and **130
+   previously-skipped tests now pass**.
 
-```python
-mask_chunk = mask[..., q_start:q_end, k_start:k_end]
-if mask_chunk.ndim == scores.ndim - 1:
-    mask_chunk = mx.expand_dims(mask_chunk, axis=2)
-```
-
-That inserts the singleton axis *before* the trailing `(L, K)` pair, which is
-upstream's `align_attention_mask_to_scores` by another name. So the conclusion
-("the tests would be dead code here") still holds — but for a completely
-different reason than recorded, and via **three lines that were untested**.
-Nothing in the suite referenced `_apply_attention_mask`, so a refactor could have
-deleted that `expand_dims` and reintroduced #1567 while this page asserted the
-hazard was impossible. `test_apply_attention_mask_aligns_batch_not_heads_on_5d_scores`
-and `..._causal_string_broadcasts_over_5d_scores` in `tests/test_turboquant.py`
-now pin it; the first was verified to fail when the `expand_dims` is removed
-(row 0 silently receives row 1's mask — no exception, just wrong numbers).
-
-**One narrower-than-upstream point, left as-is deliberately.** The guard is a
-single `if ... == scores.ndim - 1`, where upstream loops
-`while mask.ndim < scores.ndim`. A mask two or more ranks short — e.g. a 3D
-`(B, L, K)` — would therefore still right-align and alias `B` with `n_repeats`.
-Masks reaching here are 4D or the `"causal"` string, so this is latent rather
-than live; noted so that whoever makes 3D masks reachable knows to widen the
-guard to a loop first.
+The lesson generalises: a "permanent divergence" is a claim about code that keeps
+changing underneath it. This one survived because nothing re-checked it — the
+skip made the tests invisible, and the audits only see missing *symbols*, which
+was exactly what the entry excused.
 
 ## Fixed in this pass
 
@@ -216,7 +205,8 @@ behind the "repetition loops on turn 2" incident.
 The rise to 76 was not a regression — restoring the dropped test files exposed
 gaps that had been invisible because the tests for them were missing.
 
-Skipped files: 2, the deliberate quant-SDPA divergence (down from 6).
+Skipped files: **0** (down from 6). The last two ran once the mlx-lm vendoring
+brought upstream's quant-SDPA helpers with it — see below.
 
 **Compare failing test IDs, not counts**, when validating a change:
 `comm -13`/`comm -23` over the sorted `FAILED ...` lines. A fix-one-break-one swap
@@ -399,63 +389,69 @@ state:
 So "eliminate mlx-lm" is achievable, and upstream shows exactly what the residue
 looks like: one lazy optional fallback with a good error message.
 
-### Is there a path? Yes — and it is mostly deleting our own workarounds
+### Done — the vendoring, and what it turned up
 
-The question worth asking is not "can we vendor" but "do our customisations
-survive vendoring." **They do — because upstream already has them.** Of the 35
-symbols this fork imports from `mlx_lm` in library code, **33 have a real
-top-level definition in upstream's tree** (the other two are `_get_classes`, i.e.
-the fallback above, and a module-alias artifact). More to the point, the specific
-things this fork bolts onto `mlx_lm` are *native methods* in upstream's
-`models/cache.py`:
+**Library files importing `mlx_lm`: 19 -> 2.** That is now exactly upstream's
+count, in exactly upstream's two files: `models/text_only.py`'s lazy optional
+`_get_classes` fallback, and a provenance comment (not an import) in
+`models/qwen3_5/gated_delta.py`.
 
-| our workaround | why it exists | upstream |
+| file | before | after |
 |---|---|---|
-| `dequantize_for_apc` as a module-level function grafted on via `if not hasattr(QuantizedKVCache, ...)`, plus a behavioural contract test to catch a future incompatible `mlx_lm` implementation | can't add a method to a class we don't own | plain method, `_dequantize_uniform` helper included |
-| `should_quantize_kv_layer` | same | defined natively |
-| `BatchRotatingKVCache` subclass carrying the right-pad prefill fix | can't patch a dependency's hot path | fix is in upstream's vendored copy |
+| `sample_utils.py` | fork rewrite, 1 symbol | **byte-identical to upstream** (18 symbols) |
+| `models/text_only.py` | `+4/-16` | **byte-identical** |
+| `models/qwen3_5/gated_delta.py` | `+2/-371` | **byte-identical** |
+| `speculative/drafters/qwen3_dflash/dflash.py` | `+4/-16` | **byte-identical** |
+| `models/base.py` | `+11/-103` | `+6/-4` |
+| `models/cache.py` | `+506/-1499` | `+297/-4` |
 
-Our own code already says this. `models/cache.py`: *"Defined at module level so it
-can be attached to `QuantizedKVCache`, which this fork takes from mlx_lm rather
-than vendoring. **Upstream declares this as a method because it vendors that
-class; we cannot, so it is grafted on below.**"* And the subclass docstring:
-*"**Upstream mlx-vlm carries this fix in its vendored copy**; mlx_lm does not."*
+`.symbol-exclusions` shed **88** entries (401 -> 300).
 
-So the graft scaffolding — module-level function, `hasattr` self-retiring guard,
-contract test, subclass-instead-of-patch — is **entirely a consequence of not
-vendoring**, not a design we would choose. Vendoring deletes it.
+**The grafts really were pure workaround.** Upstream's vendored classes match
+every one of them, down to a detail that looked like fork cleverness:
+`QuantizedKVCache.dequantize_for_apc`, `BatchRotatingKVCache.batch_size` *and*
+`is_single_row`, and `ArraysCache.batch_size` **without** `is_single_row` — the
+asymmetry `models/cache.py` explained at length as necessary to stop
+`apc_adapters.clone_cache_entry` recursing forever. That is upstream's own
+design. Deleted: the module-level function, three `hasattr` guards, and the
+`BatchRotatingKVCache` subclass whose docstring conceded *"only instances built
+through this module get the fix."* That hole is now closed by construction.
 
-**It also closes a real hole.** The subclass docstring admits: *"Caveat: only
-instances built through this module get the fix. Caches constructed inside mlx_lm
-itself still use its class."* Any cache `mlx_lm` builds internally silently lacks
-the right-pad prefill fix. Vendoring makes that unrepresentable.
+**Two bugs fell out that the analysis had not predicted:**
 
-### Scope, honestly
+1. **The quant-SDPA "permanent divergence" dissolved** — 130 skipped tests now
+   run. See the `[correction]` above.
+2. **`BatchQuantizedKVCache` was missing `prepare()` / `finalize()`**, upstream's
+   right-pad lifecycle. The `qwen3_5_mtp` call site is `hasattr`-guarded, so
+   quantized batch caches **silently skipped the right-padding rollup** instead
+   of raising. Vendoring supplies the methods.
 
-This is **not** a `git checkout` like `gemma4/vision.py` was. `models/cache.py` is
-the fork's most heavily customised infrastructure file (`+506/-1499`), and the
-split is clean enough to plan:
+### What stayed fork work, and how it is marked
 
-- **10 symbols to take from upstream** — exactly the ones we re-export from
-  `mlx_lm` today: `KVCache`, `RotatingKVCache`, `QuantizedKVCache`,
-  `ChunkedKVCache`, `ArraysCache`, `CacheList`, `_BaseCache`,
-  `create_attention_mask`, `create_causal_mask`, `dynamic_roll`.
-- **7 to keep** — genuine fork work: `PreallocKVCache`,
-  `PreallocQuantizedKVCache`, `SlidingWindowCache`, `StaticKVCache`,
-  `_arrays_cache_batch_size`, `_batch_size`, `_is_single_row`.
-- **1 to delete** — `dequantize_for_apc`, which becomes a method.
+`models/cache.py` keeps a boundary comment; everything above it is vendored and
+should stay byte-identical apart from two hunks marked `# Fork:`.
 
-Then ~18 files need mechanical import rewrites (`mlx_lm.models.X` ->
-`..models.X`), each already having a native upstream home per the mapping above.
-`turboquant.py`, `apc.py`, `snapshot.py` and `generate/common.py` are the ones to
-watch, since they touch cache internals.
+- **`prealloc_tokens`** on `BatchKVCache` and `BatchQuantizedKVCache` — a
+  first-fill allocation floor so later appends write in place. Merged *into* the
+  vendored classes rather than subclassed, deliberately: subclassing is what
+  produced the "only our instances get it" hazard, and the whole point of owning
+  the code is that we no longer have to.
+- **`PreallocKVCache`, `PreallocQuantizedKVCache`, `SlidingWindowCache`,
+  `StaticKVCache`** — fork-only classes, below the boundary comment.
+- **`models/base.py`'s `cache.quantized_attention` call** — chunked over Q and K
+  with online softmax and `mx.eval` between K-tiles, so peak memory is ~O(chunk)
+  rather than O(context). Upstream dequantizes the whole state and runs dense
+  SDPA. This is a genuine fork optimisation and the only reason `base.py` is not
+  byte-identical.
 
-**The transformers argument is latent, not live.** Upstream now requires
-`transformers>=5.14.0`; we require `>=5.5.0`; installed here is 5.14.1 with
-mlx-lm 0.31.3, which declares only `transformers>=5.0.0`. So mlx-lm is not
-currently holding us back — the risk is that it lags a future transformers, which
-is what upstream insulated itself from. Do not use this as the reason to act; use
-the graft-deletion and the `BatchRotatingKVCache` hole.
+### One behavioural change worth knowing
+
+Quantized **non-TurboQuant** caches previously reached `mlx_lm`'s
+`scaled_dot_product_attention` (via `cache=cache`); they now take upstream's
+`quantized_scaled_dot_product_attention`. Both are `mx.quantized_matmul`-based,
+and upstream's carries the #1567 mask-alignment fix — but it is a real numerics
+change on a path the served quantized models use. It is now covered by the 130
+tests above, which is more coverage than the old path ever had here.
 
 ### The gemma4 gap the sweep found — resolved, with two of my own errors
 
@@ -508,28 +504,33 @@ still the rule.
 
 ## Still open
 
-Every named dropped-commit item this page has carried is now **done**:
-`4d468e85`/#1492 (video input), `ff2a6daa` (audio in Gemma 4 video prompts),
-`ecc457b2`/#1374 (`_template_references_kw` + `thinking_mode`), `bc3461b1`/#1523
-(`Gemma4VideoProcessor` export, audio conv layout detection, position-ids
-plumbing) and `3b6fe89b`/#1503 (variable soft-token budgets).
+**Nothing named on this page is outstanding.** Every dropped-commit item is
+restored (`#1492`, `ff2a6daa`, `ecc457b2`, `bc3461b1`, `#1503`), the mlx-lm
+delegation is vendored, the skip list is empty, and there are **0** pure-loss
+files against `upstream/main`.
 
-`prompt_utils.py` is `+280/-2` against upstream and both `-` lines are the fork's
-own text-only fallback; `models/gemma4/{vision,gemma4,__init__}.py` are
-byte-identical to upstream. **No upstream content is missing from any of them.**
+Where the fork still differs from upstream, it now differs *on purpose*, and each
+reason is written down above:
 
-What is left is exactly one item, and it is a decision rather than a patch:
+| divergence | why |
+|---|---|
+| `models/cache.py` `+297/-4` | 4 fork cache classes + `prealloc_tokens`, below/marked by a boundary comment |
+| `models/base.py` `+6/-4` | `cache.quantized_attention` — O(chunk) peak memory |
+| `prompt_utils.py` `+280/-2` | thinking/cache-alignment registries + the text-only `MessageFormatter` fallback |
+| `sample_utils`, `apc`, `turboquant`, `server/generation` | subsystems this fork rewrote; see `.symbol-exclusions` reasons |
+| `_rotating_post_gen_trim_safe` unwired | superseded by the mid-prefill snapshot (see above) |
 
-**The mlx-lm delegation.** Written up above — feasibility is established (33/35
-symbols have native upstream definitions; our APC grafts exist *only* because we
-do not vendor, and upstream already defines them as methods), the scope is broken
-down file-by-file, and the one real hole it closes is
-`BatchRotatingKVCache`'s "only instances built through this module get the fix."
-Nothing in the ~10 affected files should be patched individually until the call is
-made — that way lies re-triaging the same divergence once per file.
+The remaining `.symbol-exclusions` entries are the honest backlog. Most still say
+"baseline: pre-existing divergence, unreviewed" — that phrase means *nobody has
+looked*, not *this is fine*. Re-triaging them file-by-file with `git log -S` is
+the next useful sweep, and the ratio table above is how to pick the order.
 
-Also open, low priority: `_rotating_post_gen_trim_safe` stays intentionally
-unwired (see above) — correct, not a gap.
+**Two habits this page has now paid for twice.** Run `git log -S'<symbol>'` before
+concluding anything about a divergence — a `+N/-M` line count is triage, never
+evidence. And re-read any entry that claims a divergence is *permanent*: both
+such claims on this page (quant-SDPA, and the mlx-lm framing) turned out to be
+wrong, and both survived because the thing that made them wrong was invisible to
+the audits.
 
 ## Formatting is convergent here, not divergent — settled
 

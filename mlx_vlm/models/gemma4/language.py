@@ -4,14 +4,13 @@ from typing import Any, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn import RMSNorm
-from mlx_lm.models.base import create_causal_mask
 
 from ..base import (
     LanguageModelOutput,
     create_attention_mask,
     scaled_dot_product_attention,
 )
-from ..cache import KVCache, RotatingKVCache
+from ..cache import KVCache, RotatingKVCache, create_causal_mask
 from ..rope_utils import initialize_rope
 from .config import TextConfig
 
@@ -110,7 +109,7 @@ class Experts(nn.Module):
 
     def __init__(self, config: TextConfig):
         super().__init__()
-        from mlx_lm.models.switch_layers import SwitchGLU
+        from ..switch_layers import SwitchGLU
 
         self.switch_glu = SwitchGLU(
             input_dims=config.hidden_size,

@@ -3,13 +3,13 @@ from unittest.mock import patch
 
 import mlx.core as mx
 import pytest
-from mlx_lm.models import cache as lmcache
 
 from mlx_vlm.apc import _resolve_turn_capacity
 from mlx_vlm.generate import generate_step
 from mlx_vlm.generate.ar import _make_cache
 from mlx_vlm.generate.common import maybe_preallocate_kv_cache
 from mlx_vlm.models import cache as kvc
+from mlx_vlm.models import cache as lmcache
 from mlx_vlm.models.cache import (
     BatchKVCache,
     BatchQuantizedKVCache,
@@ -63,7 +63,7 @@ def test_prealloc_kvcache_state_and_trim_inherited():
 
 
 def test_prealloc_kvcache_from_kvcache_copies_nonempty():
-    from mlx_lm.models.cache import KVCache
+    from mlx_vlm.models.cache import KVCache
 
     src = KVCache()
     src.update_and_fetch(*_fake(512))  # a mid-prefill plain cache
@@ -294,7 +294,7 @@ def test_validate_kv_prealloc_allows_equal_and_none():
 
 
 def test_prealloc_kvcache_to_quantized_slices_to_offset():
-    from mlx_lm.models.cache import QuantizedKVCache
+    from mlx_vlm.models.cache import QuantizedKVCache
 
     c = PreallocKVCache(prealloc_tokens=262144)
     c.update_and_fetch(*_fake(512))

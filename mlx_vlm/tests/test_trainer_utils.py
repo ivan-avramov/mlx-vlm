@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import mlx.nn as nn
-from mlx_lm.tuner.lora import LoRALinear
+from mlx_vlm.trainer.lora_layers import LoRALinear
 
 from mlx_vlm.trainer.utils import (
     apply_lora_layers,
@@ -78,7 +78,7 @@ class TestTrainerUtils(unittest.TestCase):
         result = find_all_linear_names(model)
         self.assertEqual(set(result), {"layer1", "layer2"})
 
-    @patch("mlx_lm.utils.load_adapters")
+    @patch("mlx_vlm.trainer.adapter_utils.load_adapters")
     def test_apply_lora_layers_dispatches_text_model_adapters(self, mock_load_adapters):
         inner_model = MagicMock()
         loaded_inner_model = MagicMock()

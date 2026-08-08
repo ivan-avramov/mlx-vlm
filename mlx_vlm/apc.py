@@ -285,7 +285,7 @@ def _clone_layer_major_kv_cache_for_apc(
     prefix_len: int,
 ) -> Optional[List[Any]]:
     """Deep-copy layer-major K/V tensors into compact ``KVCache`` entries."""
-    from mlx_lm.models.cache import KVCache
+    from mlx_vlm.models.cache import KVCache
 
     if prefix_len <= 0 or len(layer_keys) != len(layer_values):
         return None
@@ -1799,7 +1799,7 @@ class DiskBlockStore:
         min_capacity_tokens: Optional[int],
         eval_targets: List[mx.array],
     ) -> Optional[Any]:
-        from mlx_lm.models import cache as lm_cache
+        from .models import cache as lm_cache
 
         kind = metadata.get(f"{prefix}_kind")
         if kind == "kv":
@@ -2957,7 +2957,7 @@ class DiskBlockStore:
         arrays: dict[str, mx.array],
         metadata: dict[str, str],
     ) -> bool:
-        from mlx_lm.models import cache as lm_cache
+        from .models import cache as lm_cache
 
         if isinstance(c, lm_cache.KVCache):
             off = int(getattr(c, "offset", 0) or 0)
@@ -4206,7 +4206,7 @@ def _merge_arrays_cache_entries(
     entries: Sequence[Any],
     prefix_lens: Sequence[int],
 ) -> Any:
-    from mlx_lm.models import cache as lm_cache
+    from .models import cache as lm_cache
 
     size = len(entries[0].cache)
     out = lm_cache.ArraysCache(size)

@@ -17,10 +17,10 @@ Run directly (no pytest):
 """
 
 import mlx.core as mx
-from mlx_lm.models.cache import KVCache
 
 from mlx_vlm.generate import ar
 from mlx_vlm.models import cache
+from mlx_vlm.models.cache import KVCache
 from mlx_vlm.models.epicache import EpiCacheKVCache
 
 

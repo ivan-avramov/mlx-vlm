@@ -841,7 +841,7 @@ def _capture_arrays_layers_for_snapshot(cache_list):
     (Qwen 3.5/3.6 GatedDeltaNet, Mamba) where recurrent (``ArraysCache``)
     state needs to be preserved at the before-latest-user boundary.
     """
-    from mlx_lm.models.cache import ArraysCache
+    from mlx_vlm.models.cache import ArraysCache
 
     snapshots = []
     any_arrays = False
@@ -863,7 +863,7 @@ def _restore_arrays_layers_from_snapshots(cache_list, snapshots) -> None:
     """
     if not snapshots:
         return
-    from mlx_lm.models.cache import ArraysCache
+    from mlx_vlm.models.cache import ArraysCache
 
     for c, s in zip(cache_list, snapshots):
         if s is not None and isinstance(c, ArraysCache):
@@ -1007,7 +1007,7 @@ def _restore_deltanet_state(entries, snapshot_states) -> None:
     snapshot list aligns positionally with ``entries`` — None entries
     correspond to trimmable (KV) layers and are skipped here.
     """
-    from mlx_lm.models.cache import ArraysCache
+    from mlx_vlm.models.cache import ArraysCache
 
     for c, s in zip(entries, snapshot_states):
         if s is not None and isinstance(c, ArraysCache):

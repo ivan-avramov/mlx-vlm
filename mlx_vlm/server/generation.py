@@ -14,12 +14,6 @@ from typing import Callable, Generator, List, Optional, Tuple
 
 import mlx.core as mx
 from fastapi import HTTPException
-from mlx_lm.sample_utils import (
-    apply_min_p,
-    apply_top_k,
-    apply_top_p,
-    make_logits_processors,
-)
 
 from .. import apc as _apc
 from ..generate import (
@@ -47,6 +41,7 @@ from ..prompt_utils import (
     detect_thinking_format,
     prompt_is_inside_thinking,
 )
+from ..sample_utils import apply_min_p, apply_top_k, apply_top_p, make_logits_processors
 from ..speculative.utils import (
     make_speculative_prompt_cache,
     run_speculative_server_rounds,
@@ -2221,7 +2216,7 @@ class ResponseGenerator:
         Finished sequences are filtered out automatically by the round-loop's
         ``stop_check`` callback.
         """
-        from mlx_lm.sample_utils import make_sampler as _make_sampler
+        from ..sample_utils import make_sampler as _make_sampler
 
         generation_stream = mx.default_stream(mx.default_device())
 
