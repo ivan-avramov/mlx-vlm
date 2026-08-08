@@ -558,6 +558,7 @@ class MessageFormatter:
             "qwen3_omni_moe",
             "gemma4",
             "gemma4_unified",
+            "diffusion_gemma",
             "minicpmv4_6",
             "minimax_m3_vl",
         ] and kwargs.get("video"):
