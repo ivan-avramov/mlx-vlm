@@ -4232,42 +4232,10 @@ def _merge_exact_cache_entries(
     entries: Sequence[Any],
     prefix_lens: Sequence[int],
 ) -> Any:
-    from mlx_lm.models import cache as lm_cache
+    """Merge single-row exact snapshots via the registered cache adapter."""
+    from .apc_adapters import merge_cache_entries
 
-    if not entries:
-        return None
-    first = entries[0]
-    if all(isinstance(c, lm_cache.KVCache) for c in entries):
-        return lm_cache.BatchKVCache.merge(entries)
-    if all(isinstance(c, lm_cache.ChunkedKVCache) for c in entries):
-        return lm_cache.BatchKVCache.merge(entries)
-    if all(isinstance(c, lm_cache.RotatingKVCache) for c in entries):
-        return lm_cache.BatchRotatingKVCache.merge(entries)
-    if all(isinstance(c, lm_cache.ArraysCache) for c in entries):
-        return _merge_arrays_cache_entries(entries, prefix_lens)
-    if all(isinstance(c, lm_cache.CacheList) for c in entries):
-        merged = [
-            _merge_exact_cache_entries(
-                [entry.caches[i] for entry in entries],
-                prefix_lens,
-            )
-            for i in range(len(first.caches))
-        ]
-        if any(c is None for c in merged):
-            return None
-        return lm_cache.CacheList(*merged)
-    if all(isinstance(c, tuple) for c in entries):
-        merged = [
-            _merge_exact_cache_entries(
-                [entry[i] for entry in entries],
-                prefix_lens,
-            )
-            for i in range(len(first))
-        ]
-        if any(c is None for c in merged):
-            return None
-        return lm_cache.CacheList(*merged)
-    return None
+    return merge_cache_entries(entries, prefix_lens)
 
 
 def _empty_quant_batch_cache(left_padding: List[int], kv_quant_config: dict) -> Any:

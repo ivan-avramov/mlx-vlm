@@ -922,7 +922,7 @@ def _make_cache(
         n = len(model_cache)
         # Skip quantizing the last layer — it's sensitive to quantization
         return [
-            to_batch_cache(c, quantize=(i < n - 1 if n > 2 else True))
+            to_batch_cache(c, quantize=cache.should_quantize_kv_layer(i, n))
             for i, c in enumerate(model_cache)
         ]
     else:
@@ -931,7 +931,7 @@ def _make_cache(
             return [
                 (
                     _make_quant_cache(left_padding)
-                    if i < n - 1 or n <= 2
+                    if cache.should_quantize_kv_layer(i, n)
                     else cache.BatchKVCache(
                         left_padding, prealloc_tokens=kv_prealloc_tokens
                     )
@@ -2293,11 +2293,11 @@ class BatchGenerator:
             top_logprobs_k = 0
             self.compute_logprobs = False
             self.top_logprobs_k = 0
-        # APC: opt-out for KV-quantized caches. Plain KV models use block APC;
-        # mixed/custom cache models use exact prompt-cache snapshots.
+        # Plain KV models use block APC; mixed/custom cache models use exact
+        # prompt-cache snapshots. KV-quantized caches are supported too: the warm
+        # builders take kv_quant_config and rebuild the same layer types live
+        # generation would, so a restored prefix can join quantized peers.
         self.apc_mode = None
-        if apc_manager is not None and kv_bits is not None:
-            apc_manager = None
         if apc_manager is not None:
             self.apc_mode = _apc.model_apc_mode(model)
             if self.apc_mode is None:
