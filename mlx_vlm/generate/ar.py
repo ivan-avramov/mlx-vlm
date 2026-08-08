@@ -296,7 +296,9 @@ def generate_step(
         kv_prealloc_tokens=kv_prealloc_tokens,
     )
     preallocate_cache_fn = functools.partial(
-        _generate_module_override("maybe_preallocate_kv_cache", maybe_preallocate_kv_cache),
+        _generate_module_override(
+            "maybe_preallocate_kv_cache", maybe_preallocate_kv_cache
+        ),
         kv_prealloc_tokens=kv_prealloc_tokens,
     )
 
@@ -348,7 +350,9 @@ def generate_step(
             max_kv_size=max_kv_size,
         )
         if kv_bits is None:
-            preallocate_cache_fn(prompt_cache)  # fp16 model: pre-alloc empty caches before prefill
+            preallocate_cache_fn(
+                prompt_cache
+            )  # fp16 model: pre-alloc empty caches before prefill
 
     # Speculative decoding setup
     last_outputs = None
@@ -904,8 +908,11 @@ def _make_cache(
             # eviction hook there), so evict never fires and rope_offset == inner.offset.
             inner_batched = to_batch_cache(c.inner, quantize=quantize)
             return EpiCacheKVCache(
-                inner_batched, budget=c.budget, block_size=c.block_size,
-                sink=c.sink, recent=c.recent,
+                inner_batched,
+                budget=c.budget,
+                block_size=c.block_size,
+                sink=c.sink,
+                recent=c.recent,
             )
         else:
             raise ValueError(f"{type(c)} does not yet support batching")
@@ -2565,6 +2572,18 @@ class BatchGenerator:
             merged_kwargs[k] = mx.concatenate(vs, axis=0)
 
         apc_mode = getattr(self, "apc_mode", "block")
+        # Warm-restored layers must match the types live `_make_cache` builds,
+        # or continuous-batching `extend` can try to join differently-typed
+        # peers (e.g. a cold quantized row joining an exact float one).
+        _quant_cfg = (
+            {
+                "bits": self.kv_bits,
+                "group_size": self.kv_group_size,
+                "scheme": self.kv_quant_scheme,
+            }
+            if self.kv_bits is not None
+            else None
+        )
         if apc_mode == "exact":
             row_caches = [
                 p["warm_cache"] if p is not None else self.model.make_cache()
@@ -2573,6 +2592,7 @@ class BatchGenerator:
             warm_cache, _ = _apc.make_warm_batch_exact_cache_multi(
                 row_caches,
                 prefix_lens,
+                kv_quant_config=_quant_cfg,
             )
             if warm_cache is None:
                 return None
@@ -2584,7 +2604,7 @@ class BatchGenerator:
                 else len(self.model.layers)
             )
             warm_cache, _ = _apc.make_warm_batch_kv_cache_multi(
-                picks, num_layers=num_layers
+                picks, num_layers=num_layers, kv_quant_config=_quant_cfg
             )
 
         apc_meta = [

@@ -1112,9 +1112,25 @@ def stream_generate(
                     input_ids = input_ids[:, prefix_len:]
                     pixel_values = None
                     kwargs.pop("cached_image_features", None)
+                    # Warm-restored layers must come back the same *type* live
+                    # generation would have built, or continuous-batching
+                    # `extend` can try to join differently-typed peers. Without
+                    # this the warm cache was always float KVCache even with
+                    # kv-bits on.
+                    _kv_bits = kwargs.get("kv_bits")
+                    _quant_cfg = (
+                        {
+                            "bits": _kv_bits,
+                            "group_size": kwargs.get("kv_group_size", 64),
+                            "scheme": kwargs.get("kv_quant_scheme"),
+                        }
+                        if _kv_bits is not None
+                        else None
+                    )
                     kwargs["prompt_cache"] = _apc.make_warm_kv_cache(
                         matched_blocks,
                         min_capacity_tokens=prefix_len + input_ids.shape[1] + 1,
+                        kv_quant_config=_quant_cfg,
                     )
                 else:
                     apc_manager.release(matched_blocks)

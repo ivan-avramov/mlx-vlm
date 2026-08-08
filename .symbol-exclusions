@@ -26,11 +26,7 @@
 mlx_vlm/apc.py::APCSelfCheckResult  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/apc.py::LayerSupport  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/apc.py::_adapter_schema_version  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/apc.py::_align_exact_batch_caches_to_kv_policy  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/apc.py::_empty_quant_batch_cache  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/apc.py::_env_truthy  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/apc.py::_fill_batch_layer_cache  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/apc.py::_fill_stream_layer_cache  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/apc.py::_hash_payload  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/apc.py::_layer_capability  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/apc.py::_prompt_cache_is_batch_shaped  # baseline: pre-existing divergence, unreviewed
