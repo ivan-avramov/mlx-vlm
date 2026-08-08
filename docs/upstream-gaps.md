@@ -502,35 +502,88 @@ restored and `vision.py` stale, the tests fail `TypeError: VisionModel.__call__(
 takes 2 positional arguments but 3 were given`. Landing the pair together is
 still the rule.
 
-## Still open
+## Still open — the systematic audit's backlog
 
-**Nothing named on this page is outstanding.** Every dropped-commit item is
-restored (`#1492`, `ff2a6daa`, `ecc457b2`, `bc3461b1`, `#1503`), the mlx-lm
-delegation is vendored, the skip list is empty, and there are **0** pure-loss
-files against `upstream/main`.
+A three-way audit plus `dev/find_dropped_hunks.py` replaced the previous
+file-ratio triage. Result: **72 upstream commits, ~2749 lines, all
+merged-then-dropped** — `git log HEAD..upstream/main` is empty and always was.
+**56% of the missing content is tests**, which is why so much of this stayed
+invisible: the merge that dropped a feature hunk usually dropped its tests in the
+same resolution.
 
-Where the fork still differs from upstream, it now differs *on purpose*, and each
-reason is written down above:
+Re-run the scanner after every merge:
 
-| divergence | why |
-|---|---|
-| `models/cache.py` `+297/-4` | 4 fork cache classes + `prealloc_tokens`, below/marked by a boundary comment |
-| `models/base.py` `+6/-4` | `cache.quantized_attention` — O(chunk) peak memory |
-| `prompt_utils.py` `+280/-2` | thinking/cache-alignment registries + the text-only `MessageFormatter` fallback |
-| `sample_utils`, `apc`, `turboquant`, `server/generation` | subsystems this fork rewrote; see `.symbol-exclusions` reasons |
-| `_rotating_post_gen_trim_safe` unwired | superseded by the mid-prefill snapshot (see above) |
+```bash
+python dev/find_dropped_hunks.py            # ranked, with owning commits
+```
 
-The remaining `.symbol-exclusions` entries are the honest backlog. Most still say
-"baseline: pre-existing divergence, unreviewed" — that phrase means *nobody has
-looked*, not *this is fine*. Re-triaging them file-by-file with `git log -S` is
-the next useful sweep, and the ratio table above is how to pick the order.
+It is a lead generator, not an oracle — a commit whose content upstream later
+replaced also surfaces, and heavy fork rewrites (`server/generation.py`) show up
+as false positives. Every hit still needs `git log -S` and a read.
 
-**Two habits this page has now paid for twice.** Run `git log -S'<symbol>'` before
-concluding anything about a divergence — a `+N/-M` line count is triage, never
-evidence. And re-read any entry that claims a divergence is *permanent*: both
-such claims on this page (quant-SDPA, and the mlx-lm framing) turned out to be
-wrong, and both survived because the thing that made them wrong was invisible to
-the audits.
+### Fixed already
+
+`#1492`, `ff2a6daa`, `ecc457b2` (partial), `bc3461b1`, `#1503`, `46ee12dd`,
+`#1554` (MTP `+2.0` norm shift), 4 `MODEL_REMAPPING` entries, DeepSeek V4's
+`swiglu_limit` clamp + `zero_row_tail`, and the mlx-lm vendoring.
+
+### Ranked backlog — each item has a demonstrated failure
+
+| # | Item | Owning commit | Demonstrated effect |
+|---|---|---|---|
+| 1 | **Inference routes unauthenticated** | `4993eac1` (#1714) | with `MLX_VLM_SERVER_API_KEY` set, `/v1/models` returns 200 and `/v1/chat/completions` reaches body validation without auth, while `/v1/cache/stats` correctly 401s. Upstream wraps them in `APIRouter(dependencies=[Depends(_require_management_api_key)])`; we register on `app` directly |
+| 2 | **MiniMax M3 VL cannot run on any batch/server path** | `ecc457b2` (#1374) | `ar._make_cache(model, [0,1])` -> `ValueError: MiniMaxM3KVCache does not yet support batching`. 3-line `to_batch` guard at the top of `to_batch_cache` |
+| 3 | **Streaming `/v1/responses` streams raw chain-of-thought as visible output** | `7c233155`, `cfcc36d9` | `openai.py` streaming path is `delta = chunk.text`; zero `response.reasoning*` events. Non-streaming drops the item too: `_response_output_items_from_text` yields `['message']` where upstream yields `['reasoning','message']` |
+| 4 | **`/v1/embeddings` 404s although the implementation ships** | `40757df3` | `server/embeddings.py` + `models/pooling.py` byte-identical to upstream with **zero importers**; the `app.py`/`cli.py` wiring was dropped |
+| 5 | **`--quantized-kv-start` silently ignored on the server** | `dab4cb45` (#1582) | plumbed all the way to `ar.py`'s `self.quantized_kv_start = ...` and **read by nothing**. TurboQuant quantizes from token 0 regardless. A dead-parameter tell |
+| 6 | **mRoPE cluster** | `a8642018`, `b8671991`, `#1527`, `#1741` | must land WITH `generate/ar.py`: our batcher lacks the MRoPE helpers, so `(3,B,L)` `position_ids` is truncated to `(1,B,L)`. Restoring `qwen3_5` alone *creates* a bug. **Live today for qwen2_vl / qwen2_5_vl / qwen3_vl / qwen3_vl_moe** — qwen3_5's staleness is what masks it |
+| 7 | **TurboQuant trim cluster** | `#1447`, `#1453`, `#1432` | `BatchTurboQuantKVCache.is_trimmable()` -> `False`, `trim(2)` -> `0` (upstream: `True`, `2`). Under `--kv-bits` the cache falls into the SSM branch and is indexed `c[0]`/`c[1]` -> `TypeError`; on the non-crashing path every later `gdn_states[j]` index shifts, restoring GatedDeltaNet state from the wrong layer. `zero_row_tail` exists with **no caller anywhere** |
+| 8 | **`tool_choice` ignored on `/v1/chat/completions`** | `2394fcf1` (#1611) | `"tools" in ChatRequest.model_fields` -> False; also lost the `if not tools: tool_module = None` guard, so tool markup is parsed for callers who sent no tools |
+| 9 | **`skip_special_tokens` is an undeclared attribute** | `cfcc36d9`/`29b6c00b` | `anthropic.py:489` writes `gen_args.skip_special_tokens = False`; the field does not exist on `GenerationArguments` and `generation.py` hardcodes `True`. The recorded "Anthropic tool-markup" fix is **inert** |
+| 10 | **1-bit repos cannot load** | `960b26f9` (#1597) | kernel, `__init__` export and 123-line test all landed; only `utils.py`'s 7 lines of `replace_one_bit_modules` wiring dropped |
+| 11 | **AWQ quantization absent** | `3c0232ed` (#1666) | 104 lines of `convert.py`, 91% of the hunk |
+| 12 | **Empty-input rejection absent** | `a344713a` (#1491) | empty requests reach model load instead of a 400 |
+| 13 | `should_add_special_tokens` missing | `53052569` | see the shadowed-test note below; gemma3/3n/4/4_unified/laguna get markers added outside the template |
+| 14 | `load_image(PIL.Image)` raises | `84025353` | `ValueError: Unsupported image source type: Image` |
+| 15 | `request_normalization.py` orphaned | `221fe0b3` (#1644) | 242 lines, byte-identical, **zero importers**, and it *raises on first call* (passes `top_n_sigma` to a `GenerationArguments` that lacks it) — a landmine for anyone who "fixes" the import |
+| 16 | Three sampler modes unreachable | `36331ea7`, `#1653`, `#1663` | `sample_utils.make_sampler` accepts `top_n_sigma`/`p_less`/`typical_p`; no request field reaches them |
+| 17 | **`test_models.py` wholesale take** | 24 commits | proven strict subset (AST: 52 methods only upstream, **0** only ours); +46 tests, retires all 57 `test_models.py` exclusions. 3 fail until item 6 lands |
+
+Plus: generation-logging subsystem (`cfcc36d9`), concurrent thinking-budget race
+(`ff295e36`), `reasoning_content` alias (`6a8cdff6`), multi-kind preload flags
+(`c6084344`), `/v1/responses/input_tokens` counting a different prompt than
+`/v1/responses` builds (`eda1ec4f`, half-landed).
+
+### A test that cannot fail — worth internalising
+
+`should_add_special_tokens` is absent from `utils.py`, and
+`tests/test_processors.py` imports it. That should be a hard `ImportError`, yet
+the suite is green. Reason: **`TestLagunaProcessor` is defined twice** in that
+file, so Python's later definition shadows the earlier one and
+`test_chat_template_owns_laguna_special_tokens` is **never collected**. Our copy
+is byte-identical to upstream, so this is an upstream test bug as well, and worth
+reporting there.
+
+Two habits follow. A green suite proves only that *collected* tests pass — check
+collection counts, not just results (`pytest --collect-only`). And
+`tests/test_utils.py` is excluded from the suite entirely
+(`--ignore=tests/test_utils.py`, 5 pre-existing failures), so any guard placed
+there never runs; put fork regression tests in a file that is actually collected.
+
+### The methodological rule this page has now paid for six times
+
+Never conclude anything about a divergence from a `+N/-M` line count. Run
+`git log -S'<symbol>' --all -- <path>`, check `git merge-base --is-ancestor`
+against **both** HEAD and `upstream/main`, and `git show --stat` the owning commit
+to get its whole file set. Line counts are for choosing what to look at. Wrong
+calls made from them in this repo so far: `vision.py` "needs an interleaved port"
+(it was a clean checkout), position-ids plumbing "inert" (it silently disabled a
+mask overlay), `trainer/datasets.py` "cosmetic numpy import" (a dropped feature),
+`swiglu_limit` "upstream is broken" (wrong constructor), `gemma4_assistant/masks.py`
+"import-style only, zero risk" (its absolute import is load-bearing — broke two
+tests), and the qwen3_5 `sanitize()` guardrail in CLAUDE.md (protecting a
+divergence that no longer exists, which deterred inspection of the exact file
+where the `+2.0` MTP bug was hiding).
 
 ## Formatting is convergent here, not divergent — settled
 
