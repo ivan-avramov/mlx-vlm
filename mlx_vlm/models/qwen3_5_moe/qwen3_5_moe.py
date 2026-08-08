@@ -2,7 +2,12 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..qwen3_5 import Model as Qwen3_5Model
-from ..qwen3_5.qwen3_5 import sanitize_key
+from ..qwen3_5.qwen3_5 import (
+    NORM_WEIGHT_SUFFIXES,
+    sanitize_key,
+    should_offset_norm_weight,
+    should_shift_norm_weights,
+)
 from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
@@ -18,17 +23,19 @@ class Model(Qwen3_5Model):
         self.language_model = LanguageModel(config.text_config, config)
 
     def sanitize(self, weights):
-        # Already-converted mlx-native checkpoints (produced by running this
-        # same sanitize once at conversion time) store keys pre-prefixed
-        # with "language_model." -- the norm-weight shift below is NOT
-        # idempotent (it unconditionally adds 1.0), so re-running it on an
-        # already-shifted checkpoint corrupts every norm layer. Mirrors the
-        # same self-guard qwen2's Model.sanitize() uses.
-        if any(key.startswith("language_model.") for key in weights):
-            return weights
-
-        # ignore mtp weights
+        # The MTP draft shard is separate from the base model. Its presence must
+        # not select the base model's RMSNorm loading convention, so drop it
+        # before deciding whether to shift.
         weights = {key: value for key, value in weights.items() if "mtp." not in key}
+
+        # The norm-weight shift is NOT idempotent (it unconditionally adds 1.0),
+        # so an already-converted mlx-native checkpoint must not be shifted
+        # again -- that corrupted every norm layer in production. This used to be
+        # a blanket `return weights` when any key was "language_model."-prefixed,
+        # which also skipped mtp filtering, lm_head popping, expert fusion and
+        # key renaming for those checkpoints. Gate per key instead: identical
+        # protection, and the rest of sanitize still runs.
+        shift_norm_weights = should_shift_norm_weights(weights)
 
         if self.config.text_config.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
@@ -59,22 +66,17 @@ class Model(Qwen3_5Model):
                     )
             # else: dense (non-MoE) layer — no expert weights to fuse.
 
-        norm_keys = (
-            ".input_layernorm.weight",
-            ".post_attention_layernorm.weight",
-            "model.norm.weight",
-            ".q_norm.weight",
-            ".k_norm.weight",
-        )
-
         sanitized_weights = {}
         for key, value in weights.items():
+            original_key = key
             key = sanitize_key(key)
 
             if "conv1d.weight" in key and value.shape[-1] != 1:
                 value = value.moveaxis(2, 1)
-            if any(key.endswith(sfx) for sfx in norm_keys):
-                if value.ndim == 1:
+            if any(key.endswith(sfx) for sfx in NORM_WEIGHT_SUFFIXES):
+                if value.ndim == 1 and should_offset_norm_weight(
+                    original_key, shift_norm_weights
+                ):
                     value += 1.0
 
             sanitized_weights[key] = value
