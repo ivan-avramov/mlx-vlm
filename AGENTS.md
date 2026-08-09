@@ -16,6 +16,22 @@ top of upstream. Two remotes: `origin` (`ivan-avramov/mlx-vlm`) and `upstream`
 ~90 merge commits; a rebase would replay all of them and flatten the merge
 topology to reach the same tree a merge reaches in a handful of hunks.
 
+**Merge weekly. Never let upstream accumulate.** This is a rule, not a
+preference. Every gap catalogued in `docs/upstream-gaps.md` — 72 commits' worth of
+silently dropped content — came out of resolving large accumulations, because:
+
+- A 90-commit merge produces a resolution nobody can review hunk by hunk, and an
+  unreviewable resolution is where content gets dropped without a conflict.
+- The four audits below only work **if they run**. They are cheap after a
+  five-commit merge and psychologically skippable after a ninety-commit one.
+- A dropped hunk is unrecoverable by any later merge (see the failure mode
+  below), so the cost of a bad resolution is permanent, while the cost of merging
+  often is a few minutes a week.
+
+If upstream has moved and it has been a week, merge — even if the diff looks
+boring, and even mid-task. `git log HEAD..upstream/main` being empty is the
+steady state to maintain, not a coincidence to notice later.
+
 ```bash
 git fetch upstream
 git merge upstream/main
