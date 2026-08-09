@@ -1,5 +1,6 @@
 """Normalize compatible API requests into server generation arguments."""
 
+import logging  # Fork: for the resolved-sampling log in _build_gen_args
 from typing import Optional, Tuple, Union
 
 from ..generate import (
@@ -8,15 +9,20 @@ from ..generate import (
     DEFAULT_TOP_P,
 )
 from ..structured import build_json_schema_logits_processor
-from .generation import (
+from .generation import (  # Fork: the registry generation_defaults overlay in _build_gen_args.
     GenerationArguments,
     get_server_enable_thinking,
+    get_server_generation_defaults,
     get_server_max_tokens,
     get_server_thinking_budget,
     get_server_thinking_end_token,
     get_server_thinking_start_token,
 )
 from .runtime import runtime
+
+# Fork: `mlx_vlm.server`, not this module's dotted name, so the resolved-sampling
+# line below stays on the logger operators already configure for the server.
+logger = logging.getLogger("mlx_vlm.server")
 
 _DISABLED_REASONING_EFFORTS = {"none", "off", "disabled", "false", "0"}
 
@@ -146,6 +152,14 @@ def _build_gen_args(
     logit_bias = getattr(request, "logit_bias", None)
     if logit_bias is not None and isinstance(logit_bias, dict):
         logit_bias = {int(k): v for k, v in logit_bias.items()}
+    # Fork: accept Ollama-style `repeat_penalty` as an alias for
+    # `repetition_penalty`. OpenWebUI's Advanced Params slider uses the Ollama name
+    # on every endpoint, so without this alias the UI knob is silently dropped on
+    # OpenAI targets. Extra fields are allowed by FlexibleBaseModel, so the alias
+    # arrives as an attribute when set. Upstream reads `repetition_penalty` only.
+    repetition_penalty = getattr(request, "repetition_penalty", None) or getattr(
+        request, "repeat_penalty", None
+    )
     standard_reasoning, reasoning_effort, has_standard_reasoning = (
         _standard_reasoning_control(request)
     )
@@ -181,7 +195,7 @@ def _build_gen_args(
         typical_p=getattr(request, "typical_p", 1.0),
         seed=getattr(request, "seed", None),
         logprobs=bool(getattr(request, "logprobs", False)),
-        repetition_penalty=getattr(request, "repetition_penalty", None),
+        repetition_penalty=repetition_penalty,
         repetition_context_size=_request_field_or_default(
             request,
             "repetition_context_size",
@@ -237,6 +251,36 @@ def _build_gen_args(
         ),
         tenant_id=tenant_id,
     )
+    # Fork: registry-side generation defaults (the opaque `generation_defaults`
+    # block, forwarded by mlx-serve as --generation-defaults). Overlay each entry as
+    # a default ONLY when the request omits it -> precedence
+    # request > yaml > checkpoint > hardcoded. Detectable only for Pydantic requests
+    # (model_fields_set); non-Pydantic callers (tests/SimpleNamespace) are left at
+    # the base build. max_tokens/max_output_tokens are aliases, so a request setting
+    # either counts as explicit. Upstream has no equivalent.
+    defaults = get_server_generation_defaults()
+    fields_set = getattr(request, "model_fields_set", None)
+    if defaults and fields_set is not None:
+        for key, value in defaults.items():
+            explicit = key in fields_set or (
+                key == "max_tokens" and "max_output_tokens" in fields_set
+            )
+            if not explicit:
+                setattr(args, key, value)
     if processor is not None:
         args.logits_processors = structured_logits_processor_builder(request, processor)
+    # Fork: log the RESOLVED sampling so runtime pass-through is observable (which
+    # registry generation_defaults / request overrides actually took effect).
+    logger.info(
+        "resolved sampling: temperature=%s top_p=%s top_k=%s min_p=%s presence_penalty=%s "
+        "max_tokens=%s thinking_budget=%s enable_thinking=%s",
+        args.temperature,
+        args.top_p,
+        args.top_k,
+        args.min_p,
+        args.presence_penalty,
+        args.max_tokens,
+        args.thinking_budget,
+        args.enable_thinking,
+    )
     return args

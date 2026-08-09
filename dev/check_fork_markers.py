@@ -94,18 +94,29 @@ def load_allowlist() -> list[tuple[str, str]]:
 
 
 def top_level_spans(source: str) -> list[tuple[int, int]]:
-    """(start, end) 1-indexed line spans of module-level defs and classes."""
+    """(start, end) 1-indexed line spans of every module-level statement.
+
+    Not just defs and classes: a multi-line statement is an enclosing construct
+    too, and for some of them a marker *cannot* live inside the hunk. Adding one
+    name to a parenthesized `from x import (...)` block is the case that forced
+    this -- isort hoists any standalone comment in the block up to the `import (`
+    header line, so a comment can never sit adjacent to the added name. Treating
+    the whole statement as the span is the same granularity trade-off already made
+    for functions, applied consistently.
+
+    Single-line statements yield a 1-line span, so they still require the marker on
+    the line itself (`import logging  # Fork: ...`).
+    """
     try:
         tree = ast.parse(source)
     except SyntaxError:
         return []
     spans = []
     for node in tree.body:
+        start = node.lineno
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            start = min(
-                [node.lineno] + [d.lineno for d in node.decorator_list]  # decorators
-            )
-            spans.append((start, node.end_lineno or node.lineno))
+            start = min([start] + [d.lineno for d in node.decorator_list])
+        spans.append((start, node.end_lineno or node.lineno))
     return spans
 
 

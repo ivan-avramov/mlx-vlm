@@ -33,7 +33,11 @@
 # made both files byte-identical to upstream with the test still passing. Marking
 # masks.py `# Fork:` would have frozen that mistake permanently.
 #
-# Current standing (2026-08-09): 25 files / 334 sites, down from 32 / 349.
+# Current standing (2026-08-09): 25 files / 312 sites, down from 32 / 349. Every
+# diverged file NOT listed here is marked, including
+# server/request_normalization.py — the gen-args union added fork hunks to a file
+# that had been byte-identical to upstream, and this check caught them before the
+# commit landed, which is the workflow working as intended.
 
 # --- Heavy fork rewrites. AGENTS.md names these as the false-positive-prone
 # --- files; site-by-site provenance is the bulk of the remaining work.

@@ -645,7 +645,7 @@ Three more from the second half of the pass, all new:
 | 12 | ~~Empty-input rejection absent~~ **FIXED `4d91b912`** | `a344713a` (#1491) | empty requests reach model load instead of a 400 |
 | 13 | ~~`should_add_special_tokens` missing~~ **FIXED `510f16e9`** | `53052569` | see the shadowed-test note below; gemma3/3n/4/4_unified/laguna get markers added outside the template |
 | 14 | ~~`load_image(PIL.Image)` raises~~ **FIXED `4d91b912`** | `84025353` | `ValueError: Unsupported image source type: Image` |
-| 15 | `request_normalization.py` orphaned — **reclassified, see below** | `221fe0b3` (#1644) | no longer raises (`GenerationArguments` has the fields as of `7ebb5690`), but wiring it is a **union, not a restore**: our `app.py:_build_gen_args` carries fork logic the module lacks |
+| 15 | ~~`request_normalization.py` orphaned~~ **FIXED as a union** | `221fe0b3` (#1644) | module had zero importers; `app.py` now delegates to it, exactly as upstream's `app.py` does. Landed as a **union**: the three fork behaviours in `app.py:_build_gen_args` (Ollama `repeat_penalty` alias, registry `generation_defaults` overlay, resolved-sampling log) moved into the module rather than being dropped, and the four byte-identical helper duplicates were deleted (retiring 3 `.deletion-exclusions` entries). Newly live: `reasoning`/`reasoning_effort` now drive thinking mode, and the 13 diffusion pass-throughs reach `GenerationArguments`. Guarded in `tests/test_dropped_upstream_guards.py::TestGenArgsUnion`, each fork hunk verified to fail its own guard when removed |
 | 16 | ~~Three sampler modes unreachable~~ **FIXED `7ebb5690`** | `36331ea7`, `#1653`, `#1663` | reachable end to end now: schema -> `_build_gen_args` -> `to_generate_kwargs` -> `make_sampler` |
 | 17 | ~~`test_models.py` wholesale take~~ **FIXED `d684708e`** | 24 commits | proven strict subset (AST: 52 methods only upstream, **0** only ours); +46 tests, retires all 57 `test_models.py` exclusions. 3 fail until item 6 lands |
 
@@ -727,7 +727,12 @@ Three design decisions, each of which was forced by something that went wrong:
 - **Raw `-U0` hunk counts are meaningless for a rewritten file.** `apc.py` reports
   **361** of them inside just **4** default-context regions, because diff finds
   many small common substrings in a rewrite. The report counts *sites* instead.
-  Tree-wide that is **334 sites**, not the ~658 hunks previously estimated.
+  Tree-wide that is **312 sites**, not the ~658 hunks previously estimated.
+- **A site is any top-level statement, not just a `def`/`class`.** Adding one name
+  to a parenthesized `from x import (...)` block forced this: isort hoists any
+  standalone comment in such a block up to the `import (` header, so a marker
+  *cannot* be placed adjacent to the added name. Multi-line statements therefore
+  count as enclosing spans; single-line ones still need the marker on the line.
 - **The allowlist is consulted after coverage is computed, not before.** Checking
   it first looks equivalent and is not: an entry naming an already-marked file
   would be silently accepted as if it were doing work, so the stale-entry warning
@@ -748,13 +753,31 @@ recorded as fact. See "the deliberate divergence that wasn't" below.
 Standing at introduction: **7 of 32 files** under the convention (3 converged to
 byte-identical, 4 marked), **25 files / 334 sites** allowlisted with reasons.
 
-### The remaining cluster is a union, not a restore — read this before starting
+### The union cluster — item 15 landed 2026-08-09; 9 and `cfcc36d9` remain
 
-What is left of this table is mostly **one interlocking cluster**, and it does not
-have the shape the earlier entries had. Items **9**, **15**, and the generation-
-logging (`cfcc36d9`) and diffusion-unification (`29b6c00b` / #1508) commits all
-converge on the same gen-args path in `server/app.py` and `server/generation.py` —
-the file AGENTS.md names as the false-positive-prone fork rewrite.
+**Status.** The `_build_gen_args` union is **done** (item 15). `app.py` now
+delegates to `request_normalization`, in the same shape upstream's `app.py` uses,
+with all three fork behaviours carried into the module and the four byte-identical
+helper duplicates deleted. That made `reasoning` / `reasoning_effort` and the 13
+diffusion pass-throughs live for the first time. Still open in this cluster:
+
+- **item 9** — `skip_special_tokens`. The field exists and `anthropic.py:489`
+  writes `False` to it, but `generation.py` still passes a literal
+  `skip_special_tokens=True` at both decode sites, so the write remains inert.
+  Unblocked by the union but not fixed by it.
+- **`cfcc36d9`** (#1634, generation logging) — a 9-file, 716-line dropped commit,
+  surfaced independently by the 2026-08-09 merge when `server/__init__.py`
+  conflicted over importing `get_log_progress_interval`, which exists nowhere in
+  this tree. Seven `.symbol-exclusions` entries marked "unreviewed" are its
+  content. Restore whole or not at all.
+
+The rest of this section is the pre-landing analysis, kept because the reasoning is
+the reusable part.
+
+Items **9**, **15**, and the generation-logging (`cfcc36d9`) and
+diffusion-unification (`29b6c00b` / #1508) commits all converge on the same
+gen-args path in `server/app.py` and `server/generation.py` — the file AGENTS.md
+names as the false-positive-prone fork rewrite.
 
 `GenerationArguments` itself is done: `7ebb5690` took upstream's class after
 proving it a strict superset (39 fields vs 20, **0 fields only ours**, shared
@@ -773,19 +796,33 @@ changes.
 | the `resolved sampling: ...` info log | all 13 diffusion pass-throughs |
 
 So the obvious reading of item 15 — "wire the module, delete `app.py`'s
-duplicates" — **would silently drop three pieces of fork behaviour**. It needs a
-hand-merged union of the two functions, then the delegation.
+duplicates" — **would silently drop three pieces of fork behaviour**. It needed a
+hand-merged union of the two functions, then the delegation, which is what landed.
 
-The good news: the other four helpers (`_as_plain_dict`,
-`_request_field_or_default`, `_model_config_field_or_default`,
-`_extract_response_format_schema`) were confirmed **byte-identical** between the
-two files, so they can be deleted in favour of the module the moment
-`_build_gen_args` is merged. Those three duplicate definitions are what
-`.deletion-exclusions` currently excuses.
+The other four helpers (`_as_plain_dict`, `_request_field_or_default`,
+`_model_config_field_or_default`, `_extract_response_format_schema`) were confirmed
+**byte-identical** between the two files by AST comparison — and, usefully, the same
+comparison showed `_build_structured_logits_processors` was **not** identical, so it
+became a delegating wrapper rather than a deletion. The four are gone now; their
+three `.deletion-exclusions` entries retired with them.
 
-Also note item 15's original description is now stale: the module no longer
-"raises on first call", because the `top_n_sigma` it passes exists as of
-`7ebb5690`. That was the entire reason it was marked a landmine.
+Two things worth keeping from doing it:
+
+- **Upstream had already solved the structure.** Its `app.py` carries exactly the
+  thin delegating wrappers this needed, *including* the `_server_package_attr`
+  indirection for the logits factory that looked like fork work. Reading upstream's
+  target shape before hand-merging turned a rewrite into a convergence. Check for
+  that before designing a resolution.
+- **Removing the moved code made ten of `app.py`'s imports unused**, and autoflake
+  wanted them gone. Each had to be checked for reachability through
+  `mlx_vlm.server.<name>` (the package mirrors `app.py`'s namespace) and for
+  monkeypatching in tests before removing. They were safe, and dropping them moved
+  `app.py`'s import list toward upstream's — but this is exactly the hook AGENTS.md
+  warns has teeth.
+
+Also note item 15's original description was stale by the time it was fixed: the
+module no longer "raises on first call", because the `top_n_sigma` it passes exists
+as of `7ebb5690`. That was the entire reason it was marked a landmine.
 
 ### The deliberate divergence that wasn't — `gemma4_assistant/masks.py`
 

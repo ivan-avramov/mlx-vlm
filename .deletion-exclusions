@@ -36,14 +36,22 @@ mlx_vlm/apc.py::_merge_arrays_cache_entries  # stale half of dropped 8422ece8 "i
 mlx_vlm/generate/ar.py::_greedy_argmax_step  # stale half of dropped 7fbc7bc9 "Optimize 1-bit decode and fused greedy routing" (#1598); upstream replaced it with _fused_greedy_step, which we also lack
 
 # --- mlx_vlm/server/app.py
-# All three are DUPLICATED: they exist here in app.py AND in
-# server/request_normalization.py, which is the file upstream moved them to and
-# which we carry with zero importers. Upstream defines them only in
-# request_normalization.py. This is the clearest instance of the pattern above,
-# and it explains why that module is orphaned rather than merely unused.
-mlx_vlm/server/app.py::_as_plain_dict  # stale half of dropped 221fe0b3 (#1644); upstream's copy lives in server/request_normalization.py
-mlx_vlm/server/app.py::_model_config_field_or_default  # stale half of dropped 221fe0b3 (#1644); upstream's copy lives in server/request_normalization.py
-mlx_vlm/server/app.py::_request_field_or_default  # stale half of dropped 221fe0b3 (#1644); upstream's copy lives in server/request_normalization.py
+# RESOLVED 2026-08-09. Three entries lived here for _as_plain_dict,
+# _request_field_or_default and _model_config_field_or_default: all three were
+# defined twice in this tree, in app.py and in server/request_normalization.py,
+# which is where upstream's 221fe0b3 (#1644) moved them and which we carried with
+# zero importers. Deleted from app.py in favour of the module, which app.py now
+# actually imports; `_as_plain_dict` survives as a one-line alias because the
+# anthropic deps object passes it by reference, exactly as upstream does.
+#
+# The wiring was a UNION, not a restore, and that is the part worth remembering:
+# app.py's _build_gen_args had grown three fork behaviours the module never had
+# (the Ollama `repeat_penalty` alias, the registry generation_defaults overlay, the
+# resolved-sampling log). "Delete app.py's duplicates and use the module" — the
+# obvious reading of this file's old entries — would have dropped all three
+# silently, with a green suite. They are now guarded in
+# tests/test_dropped_upstream_guards.py::TestGenArgsUnion, each verified to fail
+# when its hunk is removed.
 
 # --- mlx_vlm/server/generation.py
 mlx_vlm/server/generation.py::_generate_masked_diffusion  # stale half of dropped 29b6c00b "Unify diffusion generation path" (#1508); 191 lines still missing

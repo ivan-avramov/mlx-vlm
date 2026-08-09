@@ -369,3 +369,181 @@ class TestLagunaTokenizationContract:
             "upstream's own laguna test now collects, so TestLagunaTokenizationContract "
             "can be removed."
         )
+
+
+class TestGenArgsUnion:
+    """`221fe0b3` (#1644) — `server/request_normalization.py`, wired 2026-08-09.
+
+    Upstream moved the gen-args helpers into that module; the resolution dropped
+    the move and kept `app.py`'s copies, so the module shipped with zero
+    importers. Wiring it was a **union, not a restore**: `app.py`'s copy of
+    `_build_gen_args` had grown three fork behaviours the module never had, and the
+    obvious reading ("delete app.py's duplicates") would have silently dropped all
+    three. The suite could not have caught that — upstream has no test for the fork
+    half, by definition, which is what these guards are for.
+
+    The first two fork behaviours do have coverage in `test_server.py`
+    (`test_repeat_penalty_alias_recognized`, `test_generation_defaults_*`); those
+    tests exercise them through `server._build_gen_args` and so keep passing
+    wherever the implementation lives. The guards here instead pin the *union*
+    itself: that the delegation is real, and that the upstream half now works.
+    """
+
+    def _chat_request(self, **kwargs):
+        from mlx_vlm import server
+
+        return server.ChatRequest(
+            model="demo",
+            messages=[server.ChatMessage(role="user", content="hi")],
+            **kwargs,
+        )
+
+    def test_app_delegates_to_the_request_normalization_module(self):
+        """The module must be reached, not merely present.
+
+        It sat in the tree with zero importers for long enough to be catalogued as
+        an orphan; a regression would look exactly like that again.
+        """
+        import ast
+        import importlib
+        import inspect
+
+        # NOT `from mlx_vlm.server import app`: server/__init__.py mirrors app.py's
+        # names into the package, and app.py defines `app` as the FastAPI instance,
+        # so that spelling hands back the ASGI object. Same shadowing trap as
+        # `import mlx_vlm.convert` returning the re-exported function.
+        app = importlib.import_module("mlx_vlm.server.app")
+
+        source = inspect.getsource(app._build_gen_args)
+        calls = [
+            node
+            for node in ast.walk(ast.parse(source.lstrip()))
+            if isinstance(node, ast.Call)
+        ]
+        targets = {ast.unparse(c.func) for c in calls}
+        assert "_request_normalization._build_gen_args" in targets, (
+            "app._build_gen_args no longer delegates to request_normalization; the "
+            "module is orphaned again"
+        )
+
+    def test_repeat_penalty_alias_survives_the_union(self):
+        """Fork behaviour 1: Ollama's `repeat_penalty` spelling.
+
+        OpenWebUI's Advanced Params slider sends the Ollama name on every endpoint.
+        Upstream's copy reads `repetition_penalty` only, so taking it wholesale
+        would drop the knob silently — no error, just an ignored slider.
+        """
+        from mlx_vlm import server
+
+        args = server._build_gen_args(self._chat_request(repeat_penalty=1.15))
+        assert args.repetition_penalty == 1.15
+
+        # An explicit `repetition_penalty` still wins over the alias.
+        both = server._build_gen_args(
+            self._chat_request(repetition_penalty=1.20, repeat_penalty=1.05)
+        )
+        assert both.repetition_penalty == 1.20
+
+    def test_generation_defaults_apply_only_to_omitted_fields(self, monkeypatch):
+        """Fork behaviour 2: registry `generation_defaults`, and its precedence.
+
+        Precedence is request > yaml > checkpoint > hardcoded. The subtle half is
+        the alias rule: `max_tokens` and `max_output_tokens` are the same knob, so a
+        request setting *either* counts as explicit and the yaml value must not
+        overwrite it. Note this rule governs the **overlay only** — the base build
+        reads `max_tokens` first and `ChatRequest.max_tokens` has a non-None
+        default_factory, so the alias never feeds the base value on this request
+        type. What the rule prevents is the registry clobbering a caller who
+        expressed the limit under the other name.
+        """
+        import json
+
+        from mlx_vlm import server
+
+        monkeypatch.setenv(
+            "MLX_VLM_GENERATION_DEFAULTS",
+            json.dumps({"temperature": 0.3, "max_tokens": 111}),
+        )
+
+        omitted = server._build_gen_args(self._chat_request())
+        assert omitted.temperature == 0.3
+        assert omitted.max_tokens == 111
+
+        explicit = server._build_gen_args(self._chat_request(max_tokens=7))
+        assert explicit.max_tokens == 7, "explicit max_tokens must beat the default"
+
+        aliased = server._build_gen_args(self._chat_request(max_output_tokens=9))
+        assert aliased.max_tokens != 111, (
+            "max_output_tokens is an alias for max_tokens, so setting it counts as "
+            "explicit and the registry default must not be overlaid"
+        )
+
+    def test_resolved_sampling_is_logged(self, caplog):
+        """Fork behaviour 3: the resolved-sampling line.
+
+        It is the only way to observe which registry default or request override
+        actually took effect, and it must stay on the `mlx_vlm.server` logger that
+        operators configure — moving the code into `request_normalization` would
+        otherwise have silently moved it to that module's own logger name.
+        """
+        import logging
+
+        from mlx_vlm import server
+
+        with caplog.at_level(logging.INFO, logger="mlx_vlm.server"):
+            server._build_gen_args(self._chat_request(temperature=0.42))
+
+        lines = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "mlx_vlm.server" and "resolved sampling" in r.getMessage()
+        ]
+        assert (
+            lines
+        ), "the resolved-sampling line is gone from the mlx_vlm.server logger"
+        assert "temperature=0.42" in lines[-1]
+
+    def test_reasoning_effort_none_disables_thinking(self):
+        """Upstream half, previously inert: OpenAI-standard reasoning controls.
+
+        `reasoning_effort` arrived on the request (the schemas are `extra='allow'`)
+        and nothing read it, so a client asking for `"none"` got whatever the server
+        default happened to be — the same shape of bug as #1714, an API accepting a
+        parameter and doing nothing with it.
+        """
+        from mlx_vlm import server
+
+        off = server._build_gen_args(self._chat_request(reasoning_effort="none"))
+        assert off.enable_thinking is False
+
+        on = server._build_gen_args(self._chat_request(reasoning_effort="high"))
+        assert on.enable_thinking is True
+
+    def test_explicit_enable_thinking_beats_reasoning_effort(self):
+        """Precedence: the explicit fork/vendor field wins over the standard one.
+
+        Without this, adding the standard controls would have changed behaviour for
+        callers who already send `enable_thinking`.
+        """
+        from mlx_vlm import server
+
+        args = server._build_gen_args(
+            self._chat_request(enable_thinking=True, reasoning_effort="none")
+        )
+        assert args.enable_thinking is True
+
+    def test_diffusion_passthroughs_reach_the_args(self):
+        """Upstream half: the 13 diffusion knobs `29b6c00b` (#1508) added.
+
+        `GenerationArguments` grew the fields in `7ebb5690`; nothing populated them
+        until the module was wired, so every diffusion request silently ran at the
+        engine defaults.
+        """
+        from mlx_vlm import server
+
+        args = server._build_gen_args(
+            self._chat_request(max_denoising_steps=5, block_length=16, threshold=0.7)
+        )
+        assert args.max_denoising_steps == 5
+        assert args.block_length == 16
+        assert args.threshold == 0.7
