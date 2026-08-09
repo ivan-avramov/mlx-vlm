@@ -13,7 +13,7 @@ from collections import OrderedDict
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import mlx.core as mx
 from fastapi import HTTPException, Request
@@ -112,6 +112,67 @@ _count_thinking_tag_tokens = None
 _make_logprob_content = None
 _AUDIO_REFERENCE_PREFIXES = ("http://", "https://", "file://", "/", "./", "../")
 _AUDIO_REFERENCE_SUFFIXES = (".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".webm")
+_MISSING_INPUT_DETAIL = (
+    "Request must include at least one non-empty message content or media input."
+)
+
+
+def _has_non_empty_text(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _content_has_effective_input(content: Any) -> bool:
+    if _has_non_empty_text(content):
+        return True
+    if content is None:
+        return False
+    if isinstance(content, list):
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            item_type = item.get("type")
+            if item_type in ("text", "input_text", "output_text"):
+                if _has_non_empty_text(item.get("text")) or _has_non_empty_text(
+                    item.get("content")
+                ):
+                    return True
+            elif item_type in ("image_url", "input_image"):
+                image = item.get("image_url") or item.get("file_id")
+                if isinstance(image, dict):
+                    image = image.get("url")
+                if image:
+                    return True
+            elif item_type == "input_audio":
+                input_audio = item.get("input_audio")
+                if isinstance(input_audio, dict) and input_audio.get("data"):
+                    return True
+            elif _content_has_effective_input(item.get("content")):
+                return True
+        return False
+    if isinstance(content, dict):
+        return _content_has_effective_input([content])
+    return bool(str(content).strip())
+
+
+def _message_has_effective_input(message: Any) -> bool:
+    if hasattr(message, "model_dump"):
+        message = message.model_dump(exclude_none=True)
+    if not isinstance(message, dict):
+        return False
+    return (
+        _content_has_effective_input(message.get("content"))
+        or bool(message.get("tool_calls"))
+        or _has_non_empty_text(message.get("reasoning_content"))
+        or _has_non_empty_text(message.get("reasoning"))
+    )
+
+
+def _ensure_effective_input(messages, *, images=None, audio=None):
+    if any(image for image in (images or [])) or any(item for item in (audio or [])):
+        return
+    if any(_message_has_effective_input(message) for message in messages or []):
+        return
+    raise HTTPException(status_code=400, detail=_MISSING_INPUT_DETAIL)
 
 
 def _runtime_cache_get(key, default=None, *, kind=None):
@@ -891,10 +952,6 @@ async def responses_input_tokens_endpoint(request: Request):
     body = await request.json()
     openai_request = OpenAIRequest(**body)
     try:
-        model, processor, config = get_cached_model(
-            openai_request.model, _adapter_path_or_inherit(openai_request)
-        )
-        del model
         current_input_items = _normalize_response_input(openai_request.input)
         prompt_items = (
             _response_chain_items(openai_request.previous_response_id)
@@ -905,6 +962,12 @@ async def responses_input_tokens_endpoint(request: Request):
             chat_messages.insert(
                 0, {"role": "system", "content": openai_request.instructions}
             )
+        _ensure_effective_input(chat_messages, images=images)
+
+        model, processor, config = get_cached_model(
+            openai_request.model, _adapter_path_or_inherit(openai_request)
+        )
+        del model
         chat_tools, _ = _response_tool_registry(openai_request.tools)
         gen_args = _build_gen_args(
             openai_request, processor, tenant_id=_read_tenant_id(request)
@@ -1089,6 +1152,7 @@ async def responses_endpoint(request: Request):
             chat_messages,
             openai_request.instructions,
         )
+        _ensure_effective_input(chat_messages, images=images)
 
         # Get model, processor, config - loading if necessary
         model, processor, config = get_cached_model(
@@ -1641,8 +1705,6 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             if "adapter_path" in request.model_fields_set
             else _INHERIT_ADAPTER
         )
-        model, processor, config = get_cached_model(request.model, adapter_path)
-
         kwargs = {}
 
         if request.resize_shape is not None:
@@ -1719,6 +1781,10 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                 msg["reasoning"] = message.reasoning
 
             processed_messages.append(msg)
+
+        _ensure_effective_input(processed_messages, images=images, audio=audio)
+
+        model, processor, config = get_cached_model(request.model, adapter_path)
 
         # Detect tool parser from chat template
         tools = getattr(request, "tools", None)

@@ -88,10 +88,6 @@ mlx_vlm/server/generation.py::get_log_progress_interval  # baseline: pre-existin
 mlx_vlm/server/generation.py::on_result  # baseline: pre-existing divergence, unreviewed
 
 # --- mlx_vlm/server/openai.py
-mlx_vlm/server/openai.py::_content_has_effective_input  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/server/openai.py::_ensure_effective_input  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/server/openai.py::_has_non_empty_text  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/server/openai.py::_message_has_effective_input  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/server/openai.py::_prepare_chat_tool_choice  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/server/openai.py::_tool_function_name  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/server/openai.py::_with_tool_choice_instruction  # baseline: pre-existing divergence, unreviewed
@@ -147,8 +143,6 @@ mlx_vlm/tests/test_generate.py::test_generation_batch_ignores_speculative_argmax
 mlx_vlm/tests/test_generate.py::test_generation_batch_thinking_budget_does_not_sync_next_token  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::test_generation_batch_uses_fused_greedy_decode_without_logprobs  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::test_mixed_flat_and_wrapped_rotating_is_not_reusable  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_generate.py::test_prompt_step_keeps_exact_apc_checkpoint_async  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_generate.py::test_prompt_step_schedules_cache_evaluation_asynchronously  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::test_public_generation_annotations_match_runtime_results  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::test_unwrapped_buffered_rotating_trims  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::test_unwrapped_rotating_trims_and_stays_usable  # baseline: pre-existing divergence, unreviewed
@@ -176,7 +170,6 @@ mlx_vlm/tests/test_server.py::test_build_gen_args_maps_none_reasoning_effort_to_
 mlx_vlm/tests/test_server.py::test_build_gen_args_maps_responses_reasoning_configuration  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_build_gen_args_preserves_diffusion_options  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_chat_completions_endpoint_preserves_assistant_reasoning_content  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_server.py::test_chat_completions_endpoint_rejects_empty_effective_input  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_chat_completions_forced_tool_choice_filters_tools  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_chat_completions_rejects_invalid_tool_choice  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_chat_completions_required_tool_choice_adds_instruction  # baseline: pre-existing divergence, unreviewed
@@ -197,7 +190,6 @@ mlx_vlm/tests/test_server.py::test_prompt_must_end_with_open_thinking_marker_to_
 mlx_vlm/tests/test_server.py::test_prompt_open_marker_is_authoritative_when_flag_is_disabled  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_reasoning_content_field  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_response_generator_diffusion_forwards_generation_options  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_server.py::test_responses_endpoint_rejects_empty_effective_input  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_responses_endpoint_returns_reasoning_items  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_responses_streaming_emits_function_call_arguments_done  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_responses_streaming_emits_reasoning_events  # baseline: pre-existing divergence, unreviewed
@@ -229,7 +221,6 @@ mlx_vlm/tests/test_speculative.py::test_split_glm4_moe_lite_mtp_flattens_nextn_l
 mlx_vlm/tests/test_utils.py::Processor  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_utils.py::consume_attention_mask  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_utils.py::test_get_model_and_args_remaps_mistral_to_llama  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_utils.py::test_pil_image_input  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_utils.py::test_prepare_inputs_preserves_mlx_attention_mask_for_thread_handoff  # baseline: pre-existing divergence, unreviewed
 
 # --- mlx_vlm/trainer/datasets.py
