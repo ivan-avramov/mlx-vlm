@@ -64,7 +64,6 @@ mlx_vlm/generate/dispatch.py::_prefix_cache_trim_amount  # deliberate divergence
 # --- mlx_vlm/sample_utils.py
 
 # --- mlx_vlm/server/generation.py
-mlx_vlm/server/generation.py::_DiffusionBlockEmitter  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/server/generation.py::_check_configured_context_budget  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/server/generation.py::_log_decode_progress  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/server/generation.py::_log_prefill_completed  # baseline: pre-existing divergence, unreviewed
@@ -72,9 +71,7 @@ mlx_vlm/server/generation.py::_log_prefill_progress  # baseline: pre-existing di
 mlx_vlm/server/generation.py::_log_prefill_started  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/server/generation.py::_request_log_id  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/server/generation.py::_sample_top_p_one  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/server/generation.py::feed  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/server/generation.py::get_log_progress_interval  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/server/generation.py::on_result  # baseline: pre-existing divergence, unreviewed
 
 # --- mlx_vlm/server/openai.py
 
@@ -128,13 +125,11 @@ mlx_vlm/tests/test_generate.py::test_wrapped_rotating_is_not_reusable  # baselin
 
 # --- mlx_vlm/tests/test_server.py
 mlx_vlm/tests/test_server.py::fake_apply_chat_template  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_server.py::fake_stream_diffusion_generate_from_kwargs  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::reject_model  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_build_gen_args_explicit_thinking_overrides_standard_reasoning  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_build_gen_args_maps_chat_reasoning_effort  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_build_gen_args_maps_none_reasoning_effort_to_disabled  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_build_gen_args_maps_responses_reasoning_configuration  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_server.py::test_build_gen_args_preserves_diffusion_options  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_chat_completions_response_uses_reasoning_content  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_chat_completions_streaming_keeps_plain_output_as_content_when_thinking_enabled  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_chat_completions_streaming_uses_prompt_opened_thinking_without_flag  # baseline: pre-existing divergence, unreviewed
@@ -147,7 +142,6 @@ mlx_vlm/tests/test_server.py::test_log_progress_interval_is_configurable  # base
 mlx_vlm/tests/test_server.py::test_metrics_store_logs_request_lifecycle  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_prompt_must_end_with_open_thinking_marker_to_start_in_thinking  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_prompt_open_marker_is_authoritative_when_flag_is_disabled  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_server.py::test_response_generator_diffusion_forwards_generation_options  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_responses_streaming_uses_prompt_opened_thinking_without_flag  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_stream_endpoints_do_not_clear_mlx_cache_on_close  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_unsupported_model_request_does_not_crash_server  # baseline: pre-existing divergence, unreviewed

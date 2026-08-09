@@ -79,9 +79,45 @@
 # when its hunk is removed.
 
 # --- mlx_vlm/server/generation.py
-mlx_vlm/server/generation.py::_generate_masked_diffusion  # stale half of dropped 29b6c00b "Unify diffusion generation path" (#1508); 191 lines still missing
-mlx_vlm/server/generation.py::flush  # ditto 29b6c00b (#1508) — nested helper of the pre-unification diffusion path
-mlx_vlm/server/generation.py::on_block  # ditto 29b6c00b (#1508) — nested helper of the pre-unification diffusion path
+# RESOLVED 2026-08-10: 29b6c00b (#1508) restored, and _generate_masked_diffusion plus
+# its nested flush/on_block DELETED as stale. The conclusive test from AGENTS.md:
+# our copy differed from upstream's last pre-deletion copy in exactly two spots, both
+# the `args.skip_special_tokens` -> `True` regression that f044f36a (#1359) had left
+# behind — so the fork never authored this function. STALE, not FORK.
+#
+# The commit had landed in six of its eleven files, which is what hid it:
+# generate/diffusion.py is byte-identical to upstream, so the unified engine and
+# stream_diffusion_generate_from_kwargs were present and even called from
+# generate/dispatch.py. Only the SERVER call site was dropped, and
+# check_dead_helpers.py is blind to that because the helper does have a caller.
+# The app.py half had also landed — relocated into server/request_normalization.py by
+# 221fe0b3 (#1644) and restored with the gen-args union, which is why the 13 request
+# knobs reached GenerationArguments correctly and looked fine in isolation.
+#
+# What made it a live bug rather than dead code: the fork kept `_run_diffusion(family)`
+# selecting `_generate_diffusion` only when `family == "block"`, but
+# `diffusion_generation_family` is upstream's backward-compatible shim and returns only
+# "diffusion" or None. So the unified path was UNREACHABLE and every diffusion request
+# fell through to the stale one, which read no request knobs at all. Consequences, none
+# with a failing test:
+#   * All 13 diffusion request options (block_length, max_denoising_steps, threshold,
+#     diffusion_sampler, ...) were silently ignored at serving time; the stale path took
+#     its sampler tuning from `config.default_diffusion_*` only.
+#   * `skip_special_tokens` and `top_k` were ignored — f044f36a's dropped generation.py
+#     half, live on the only reachable path.
+#   * Structured response_format raised ValueError instead of being forwarded.
+#   * Streaming chunks never carried `generation_tps`; StreamingToken has the field, so
+#     diffusion responses just always reported a null decode rate.
+# The fork's own test called `_run_diffusion("block")` with the literal, so it exercised
+# a branch production never took and the suite stayed green. Guarded now in
+# tests/test_dropped_upstream_guards.py::TestDiffusionUnification, all five validated
+# to fail against the pre-fix source.
+#
+# The schemas.py half is worth its own note: `VLMRequest` is a `FlexibleBaseModel`
+# (`extra="allow"`), so the 13 undeclared knobs still reached GenerationArguments and
+# upstream's own test passes either way. What was lost is type/enum validation and
+# OpenAPI visibility — `diffusion_sampler="nonsense"` and `block_length="abc"` were
+# forwarded into the generation path instead of returning 422.
 
 # --- mlx_vlm/tests
 # RESOLVED 2026-08-09: test_chat_completions_endpoint_preserves_assistant_reasoning

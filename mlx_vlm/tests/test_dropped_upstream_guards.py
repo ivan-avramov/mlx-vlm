@@ -652,3 +652,160 @@ class TestSamplerModesReachTheSampler:
         generator = ResponseGenerator.__new__(ResponseGenerator)
         args = GenerationArguments(max_tokens=8, temperature=0.0)
         assert ResponseGenerator._make_sampler(generator, args) is None
+
+
+class TestDiffusionUnification:
+    """`29b6c00b` — unify diffusion generation path (#1508).
+
+    The commit landed in six of its eleven files, which is what made it invisible:
+    `generate/diffusion.py` is byte-identical to upstream, so
+    `stream_diffusion_generate_from_kwargs` and the whole unified engine were
+    present and even called from `generate/dispatch.py`. Only the *server* call
+    site was dropped, and `check_dead_helpers.py` cannot see that because the
+    helper does have a caller.
+
+    What made it a live bug rather than dead code: the fork kept
+    `_run_diffusion(family)` routing to `_generate_diffusion` when
+    `family == "block"`, but `diffusion_generation_family` — upstream's
+    backward-compatible shim — only ever returns `"diffusion"` or `None`. So the
+    unified path was unreachable and *every* diffusion request fell through to the
+    stale `_generate_masked_diffusion`, which read no request knobs at all. The
+    fork's own test called `_run_diffusion("block")` with the literal, so it
+    exercised a branch production never took and the suite stayed green.
+    """
+
+    def test_diffusion_lane_does_not_branch_on_a_family_the_router_cannot_return(self):
+        """The regression that hid this: routing on a literal the router can't produce.
+
+        `_run_diffusion` must not gate its generator choice on a family string.
+        The two halves are checked together, because each looks fine alone: the
+        shim legitimately returns only "diffusion", and a `family == "block"`
+        branch is only wrong *given* that shim.
+        """
+        import ast
+        import inspect
+
+        from mlx_vlm.generate.diffusion import diffusion_generation_family
+        from mlx_vlm.server.generation import ResponseGenerator
+
+        producible = {
+            node.value
+            for node in ast.walk(
+                ast.parse(inspect.getsource(diffusion_generation_family).lstrip())
+            )
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        }
+        assert "block" not in producible
+
+        lane = inspect.getsource(ResponseGenerator._run_diffusion)
+        compared = {
+            constant.value
+            for node in ast.walk(ast.parse(lane.lstrip()))
+            if isinstance(node, ast.Compare)
+            for constant in node.comparators
+            if isinstance(constant, ast.Constant)
+        }
+        unreachable = compared - producible
+        assert not unreachable, (
+            f"_run_diffusion branches on {sorted(unreachable)}, which "
+            "diffusion_generation_family never returns — that branch is dead"
+        )
+        assert "self._generate_diffusion(" in lane
+
+    def test_served_diffusion_path_reads_the_request_knobs(self):
+        """`_generate_diffusion` is the only diffusion path, and it honours the request.
+
+        The stale path read only max_tokens/temperature/top_p/seed and took its
+        sampler tuning from `config.default_diffusion_*` attributes, so all
+        thirteen request-level diffusion options were silently ignored, along with
+        `skip_special_tokens` and `top_k`.
+        """
+        import ast
+        import inspect
+
+        from mlx_vlm.server.generation import ResponseGenerator
+
+        assert not hasattr(ResponseGenerator, "_generate_masked_diffusion")
+
+        source = inspect.getsource(ResponseGenerator._generate_diffusion)
+        read = {
+            node.attr
+            for node in ast.walk(ast.parse(source.lstrip()))
+            if isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "args"
+        }
+        for field in ("diffusion_kwargs", "skip_special_tokens", "top_k"):
+            assert field in read, f"served diffusion path ignores args.{field}"
+
+    def test_structured_output_is_not_rejected_for_diffusion(self):
+        """The stale path raised ValueError; the unified engine takes the processors."""
+        import inspect
+
+        from mlx_vlm.server.generation import ResponseGenerator
+
+        source = inspect.getsource(ResponseGenerator._generate_diffusion)
+        assert "Structured response_format is not supported" not in source
+        assert '"logits_processors"' in source
+
+    def test_diffusion_request_options_are_declared_and_validated(self):
+        """The schemas.py half — hidden by `extra="allow"`.
+
+        `FlexibleBaseModel` accepts unknown fields, so the knobs still *reached*
+        `GenerationArguments` while undeclared and upstream's own test passes
+        either way. What was lost is type/enum validation and OpenAPI visibility:
+        `diffusion_sampler="nonsense"` and `block_length="abc"` were forwarded
+        straight into the generation path instead of returning 422.
+        """
+        import pytest
+
+        from mlx_vlm.server.schemas import VLMRequest
+
+        properties = VLMRequest.model_json_schema()["properties"]
+        for field in (
+            "max_denoising_steps",
+            "block_length",
+            "num_to_transfer",
+            "max_transfer_per_step",
+            "editing_threshold",
+            "max_post_steps",
+            "stability_steps",
+            "diffusion_full_canvas",
+            "diffusion_min_canvas_length",
+            "diffusion_max_canvas_length",
+            "diffusion_sampler",
+            "threshold",
+            "min_threshold",
+        ):
+            assert field in properties, f"{field} is undocumented and unvalidated"
+
+        messages = [{"role": "user", "content": "hi"}]
+        with pytest.raises(ValueError):
+            VLMRequest(model="m", messages=messages, diffusion_sampler="nonsense")
+        with pytest.raises(ValueError):
+            VLMRequest(model="m", messages=messages, block_length="abc")
+
+    def test_block_emitter_reports_generation_tps(self):
+        """The fork's inline block-chunk loop omitted `generation_tps` entirely.
+
+        `StreamingToken` has the field, so nothing failed — diffusion streaming
+        responses just always reported a null decode rate.
+        """
+        from types import SimpleNamespace
+
+        from mlx_vlm.server.generation import _DiffusionBlockEmitter
+
+        result = SimpleNamespace(
+            is_draft=False,
+            text="hello",
+            token=5,
+            diffusion_block_complete=True,
+            finish_reason=None,
+            generation_tokens=1,
+            peak_memory=1.0,
+            prompt_tps=10.0,
+            generation_tps=4.0,
+        )
+        (chunk,) = list(_DiffusionBlockEmitter().feed(result))
+        assert chunk.generation_tps == 4.0
+        assert chunk.text == "hello"
