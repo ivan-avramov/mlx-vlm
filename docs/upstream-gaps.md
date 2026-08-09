@@ -60,7 +60,7 @@ python dev/check_upstream_deletions.py    # ~70s
 python dev/find_dropped_hunks.py          # slow; ranked report
 ```
 
-`.symbol-exclusions` currently holds **117 entries**, down from 446 (the mlx-lm
+`.symbol-exclusions` currently holds **111 entries**, down from 446 (the mlx-lm
 vendoring retired 88, the `test_models.py` take another 57). That number is a
 snapshot of existing divergence, not a defect count: it mixes never-ported upstream
 features, modules this fork deliberately rewrote (`sample_utils`, `apc`, `cache`,
@@ -519,9 +519,9 @@ merged-then-dropped** — `git log HEAD..upstream/main` is empty and always was.
 invisible: the merge that dropped a feature hunk usually dropped its tests in the
 same resolution.
 
-**Progress as of 2026-08-09 (second pass).** 72 -> **35** commits with missing
-content, 39 -> **34** diverged files, 239 -> **117** `.symbol-exclusions`
-entries (zero of them stale). Suite 2380 -> **2504 passed, 5 skipped, 0 failed**.
+**Progress as of 2026-08-09 (second pass).** 72 -> **34** commits with missing
+content, 39 -> **34** diverged files, 239 -> **111** `.symbol-exclusions`
+entries (zero of them stale). Suite 2380 -> **2510 passed, 5 skipped, 0 failed**.
 **Everything that needed an operator decision landed** — #1 (auth), #6 (mRoPE)
 and #17 (`test_models.py`) after confirmation, plus #1454's `video_generate`
 removal. Also closed: #1611 `tool_choice`, #1491 empty-input rejection,
@@ -620,26 +620,65 @@ Three more from the second half of the pass, all new:
 |---|---|---|---|
 | 1 | ~~Inference routes unauthenticated~~ **FIXED `8839c2ff`** | `4993eac1` (#1714) | with `MLX_VLM_SERVER_API_KEY` set, `/v1/models` returns 200 and `/v1/chat/completions` reaches body validation without auth, while `/v1/cache/stats` correctly 401s. Upstream wraps them in `APIRouter(dependencies=[Depends(_require_management_api_key)])`; we register on `app` directly |
 | 2 | ~~MiniMax M3 VL cannot run on any batch/server path~~ **FIXED `c8609a0c`** | `ecc457b2` (#1374) | `ar._make_cache(model, [0,1])` -> `ValueError: MiniMaxM3KVCache does not yet support batching`. 3-line `to_batch` guard at the top of `to_batch_cache` |
-| 3 | **Streaming `/v1/responses` streams raw chain-of-thought as visible output** — now the top open item | `7c233155`, `cfcc36d9` | `openai.py` streaming path is `delta = chunk.text`; zero `response.reasoning*` events. Non-streaming drops the item too: `_response_output_items_from_text` yields `['message']` where upstream yields `['reasoning','message']` |
+| 3 | ~~Streaming `/v1/responses` streams raw chain-of-thought as visible output~~ **FIXED `b6ed5d8d`** (`7c233155` half; `cfcc36d9` logging still open) | `7c233155`, `cfcc36d9` | `openai.py` streaming path is `delta = chunk.text`; zero `response.reasoning*` events. Non-streaming drops the item too: `_response_output_items_from_text` yields `['message']` where upstream yields `['reasoning','message']` |
 | 4 | ~~`/v1/embeddings` 404s although the implementation ships~~ **FIXED `609bdf95`** | `40757df3` | `server/embeddings.py` + `models/pooling.py` byte-identical to upstream with **zero importers**; the `app.py`/`cli.py` wiring was dropped |
 | 5 | ~~`--quantized-kv-start` silently ignored on the server~~ **FIXED `f5b74a9a`** | `dab4cb45` (#1582) | plumbed all the way to `ar.py`'s `self.quantized_kv_start = ...` and **read by nothing**. TurboQuant quantizes from token 0 regardless. A dead-parameter tell |
 | 6 | ~~mRoPE cluster~~ **FIXED `540a3189`** | `a8642018`, `b8671991`, `#1527`, `#1741` | must land WITH `generate/ar.py`: our batcher lacks the MRoPE helpers, so `(3,B,L)` `position_ids` is truncated to `(1,B,L)`. Restoring `qwen3_5` alone *creates* a bug. **Live today for qwen2_vl / qwen2_5_vl / qwen3_vl / qwen3_vl_moe** — qwen3_5's staleness is what masks it |
 | 7 | ~~TurboQuant trim cluster~~ **FIXED `92620167`** | `#1447`, `#1453`, `#1432` | `BatchTurboQuantKVCache.is_trimmable()` -> `False`, `trim(2)` -> `0` (upstream: `True`, `2`). Under `--kv-bits` the cache falls into the SSM branch and is indexed `c[0]`/`c[1]` -> `TypeError`; on the non-crashing path every later `gdn_states[j]` index shifts, restoring GatedDeltaNet state from the wrong layer. `zero_row_tail` exists with **no caller anywhere** |
 | 8 | ~~`tool_choice` ignored on `/v1/chat/completions`~~ **FIXED `0bb0b07f`** | `2394fcf1` (#1611) | `"tools" in ChatRequest.model_fields` -> False; also lost the `if not tools: tool_module = None` guard, so tool markup is parsed for callers who sent no tools |
-| 9 | **`skip_special_tokens` is an undeclared attribute** | `cfcc36d9`/`29b6c00b` | `anthropic.py:489` writes `gen_args.skip_special_tokens = False`; the field does not exist on `GenerationArguments` and `generation.py` hardcodes `True`. The recorded "Anthropic tool-markup" fix is **inert** |
+| 9 | **`skip_special_tokens` is an undeclared attribute** — field now exists (`7ebb5690`), writes still unwired | `cfcc36d9`/`29b6c00b` | `anthropic.py:489` writes `gen_args.skip_special_tokens = False`; the field does not exist on `GenerationArguments` and `generation.py` hardcodes `True`. The recorded "Anthropic tool-markup" fix is **inert** |
 | 10 | ~~1-bit repos cannot load~~ **FIXED `510f16e9`** | `960b26f9` (#1597) | kernel, `__init__` export and 123-line test all landed; only `utils.py`'s 7 lines of `replace_one_bit_modules` wiring dropped |
 | 11 | ~~AWQ quantization absent~~ **FIXED `1d6e8c9b`** | `3c0232ed` (#1666) | 104 lines of `convert.py`, 91% of the hunk |
 | 12 | ~~Empty-input rejection absent~~ **FIXED `4d91b912`** | `a344713a` (#1491) | empty requests reach model load instead of a 400 |
 | 13 | ~~`should_add_special_tokens` missing~~ **FIXED `510f16e9`** | `53052569` | see the shadowed-test note below; gemma3/3n/4/4_unified/laguna get markers added outside the template |
 | 14 | ~~`load_image(PIL.Image)` raises~~ **FIXED `4d91b912`** | `84025353` | `ValueError: Unsupported image source type: Image` |
-| 15 | `request_normalization.py` orphaned | `221fe0b3` (#1644) | 242 lines, byte-identical, **zero importers**, and it *raises on first call* (passes `top_n_sigma` to a `GenerationArguments` that lacks it) — a landmine for anyone who "fixes" the import |
-| 16 | Three sampler modes unreachable | `36331ea7`, `#1653`, `#1663` | `sample_utils.make_sampler` accepts `top_n_sigma`/`p_less`/`typical_p`; no request field reaches them |
+| 15 | `request_normalization.py` orphaned — **reclassified, see below** | `221fe0b3` (#1644) | no longer raises (`GenerationArguments` has the fields as of `7ebb5690`), but wiring it is a **union, not a restore**: our `app.py:_build_gen_args` carries fork logic the module lacks |
+| 16 | ~~Three sampler modes unreachable~~ **FIXED `7ebb5690`** | `36331ea7`, `#1653`, `#1663` | reachable end to end now: schema -> `_build_gen_args` -> `to_generate_kwargs` -> `make_sampler` |
 | 17 | ~~`test_models.py` wholesale take~~ **FIXED `d684708e`** | 24 commits | proven strict subset (AST: 52 methods only upstream, **0** only ours); +46 tests, retires all 57 `test_models.py` exclusions. 3 fail until item 6 lands |
 
 Plus: generation-logging subsystem (`cfcc36d9`), concurrent thinking-budget race
 (`ff295e36`), `reasoning_content` alias (`6a8cdff6`), multi-kind preload flags
 (`c6084344`), `/v1/responses/input_tokens` counting a different prompt than
 `/v1/responses` builds (`eda1ec4f`, half-landed).
+
+### The remaining cluster is a union, not a restore — read this before starting
+
+What is left of this table is mostly **one interlocking cluster**, and it does not
+have the shape the earlier entries had. Items **9**, **15**, and the generation-
+logging (`cfcc36d9`) and diffusion-unification (`29b6c00b` / #1508) commits all
+converge on the same gen-args path in `server/app.py` and `server/generation.py` —
+the file AGENTS.md names as the false-positive-prone fork rewrite.
+
+`GenerationArguments` itself is done: `7ebb5690` took upstream's class after
+proving it a strict superset (39 fields vs 20, **0 fields only ours**, shared
+methods differing only by our removals). So the *fields* for
+`reasoning`, `reasoning_effort`, `skip_special_tokens` and the 13 diffusion
+knobs now exist. What is not done is populating them, and that is where the shape
+changes.
+
+`app.py:_build_gen_args` and `request_normalization._build_gen_args` have
+**diverged in both directions**:
+
+| only in `app.py` (fork) | only in `request_normalization.py` (upstream) |
+|---|---|
+| `repeat_penalty` alias fallback for `repetition_penalty` | `_standard_reasoning_control` → three-way `enable_thinking` resolution |
+| `get_server_generation_defaults()` applied to fields absent from `model_fields_set` | the three sampler pass-throughs (now also in ours) |
+| the `resolved sampling: ...` info log | all 13 diffusion pass-throughs |
+
+So the obvious reading of item 15 — "wire the module, delete `app.py`'s
+duplicates" — **would silently drop three pieces of fork behaviour**. It needs a
+hand-merged union of the two functions, then the delegation.
+
+The good news: the other four helpers (`_as_plain_dict`,
+`_request_field_or_default`, `_model_config_field_or_default`,
+`_extract_response_format_schema`) were confirmed **byte-identical** between the
+two files, so they can be deleted in favour of the module the moment
+`_build_gen_args` is merged. Those three duplicate definitions are what
+`.deletion-exclusions` currently excuses.
+
+Also note item 15's original description is now stale: the module no longer
+"raises on first call", because the `top_n_sigma` it passes exists as of
+`7ebb5690`. That was the entire reason it was marked a landmine.
 
 ### A test that cannot fail — worth internalising
 
