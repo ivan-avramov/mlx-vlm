@@ -856,6 +856,70 @@ def test_management_endpoints_require_configured_api_key(
     assert valid.status_code == 200
 
 
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("post", "/messages"),
+        ("post", "/messages/count_tokens"),
+        ("post", "/responses/input_tokens"),
+        ("get", "/responses/missing"),
+        ("delete", "/responses/missing"),
+        ("post", "/responses/missing/cancel"),
+        ("get", "/responses/missing/input_items"),
+        ("post", "/responses"),
+        ("post", "/chat/completions"),
+        ("post", "/images/generations"),
+        ("post", "/images/edits"),
+        ("post", "/audio/speech"),
+        ("post", "/audio/transcriptions"),
+        ("post", "/audio/translations"),
+        ("get", "/models"),
+        ("post", "/v1/messages"),
+        ("post", "/v1/messages/count_tokens"),
+        ("post", "/v1/responses/input_tokens"),
+        ("get", "/v1/responses/missing"),
+        ("delete", "/v1/responses/missing"),
+        ("post", "/v1/responses/missing/cancel"),
+        ("get", "/v1/responses/missing/input_items"),
+        ("post", "/v1/responses"),
+        ("post", "/v1/chat/completions"),
+        ("post", "/v1/images/generations"),
+        ("post", "/v1/images/edits"),
+        ("post", "/v1/audio/speech"),
+        ("post", "/v1/audio/transcriptions"),
+        ("post", "/v1/audio/translations"),
+        ("get", "/v1/models"),
+    ],
+)
+def test_inference_endpoints_require_configured_api_key(
+    client, monkeypatch, method, path
+):
+    monkeypatch.setenv("MLX_VLM_SERVER_API_KEY", "secret-token")
+
+    missing = getattr(client, method)(path)
+    invalid = getattr(client, method)(
+        path,
+        headers={"Authorization": "Bearer wrong-token"},
+    )
+
+    assert missing.status_code == 401
+    assert invalid.status_code == 401
+    assert missing.headers["WWW-Authenticate"] == "Bearer"
+    assert invalid.headers["WWW-Authenticate"] == "Bearer"
+
+
+def test_inference_endpoint_accepts_configured_api_key(client, monkeypatch):
+    monkeypatch.setenv("MLX_VLM_SERVER_API_KEY", "secret-token")
+
+    response = client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": "Bearer secret-token"},
+        json={},
+    )
+
+    assert response.status_code == 422
+
+
 def _fake_image_result(*, seed: int, output_path=None) -> ImageGenerationResult:
     image = Image.new("RGB", (16, 16), (seed % 255, 8, 16))
     data = ImageGenerationResult(
@@ -2942,10 +3006,40 @@ def test_completions_generate_fallback_path(client, monkeypatch):
     assert body["usage"]["completion_tokens"] == 3
 
 
+def _registered_paths():
+    """Every route path the app serves, including routers it includes.
+
+    FastAPI >= 0.141 no longer flattens `include_router()` into `app.routes` — it
+    inserts one lazy `_IncludedRouter` node whose `path` is `None` and resolves
+    matches at request time. So scanning `app.routes` alone silently misses every
+    inference route once they live on `inference_router` (#1714). Union in the
+    router we own rather than reaching into the private node.
+    """
+    paths = {r.path for r in server.app.routes if getattr(r, "path", None)}
+    paths |= {
+        r.path
+        for r in server._app_module.inference_router.routes
+        if getattr(r, "path", None)
+    }
+    return paths
+
+
 def test_completions_both_routes_registered():
-    paths = {r.path for r in server.app.routes if hasattr(r, "path")}
+    paths = _registered_paths()
     assert "/completions" in paths
     assert "/v1/completions" in paths
+
+
+def test_inference_routes_are_served_not_just_registered(client):
+    """Companion to the above: registration on a router is not reachability.
+
+    Guards the failure mode where `include_router()` is forgotten — the paths
+    would still be on `inference_router` and the test above would still pass,
+    while every request 404'd.
+    """
+    for path in ("/completions", "/v1/completions", "/v1/chat/completions"):
+        assert client.post(path, json={}).status_code != 404
+    assert client.get("/v1/models").status_code != 404
 
 
 def test_chat_completions_endpoint_preserves_assistant_reasoning(client):

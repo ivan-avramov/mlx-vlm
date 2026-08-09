@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from typing import List, Optional, Tuple, Union
 
 import mlx.core as mx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from huggingface_hub import scan_cache_dir
 from huggingface_hub.errors import CacheNotFound, RepositoryNotFoundError
@@ -569,6 +569,9 @@ app = FastAPI(
     version=__version__,
     lifespan=lifespan,
 )
+inference_router = APIRouter(
+    dependencies=[Depends(_require_management_api_key)],
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -961,14 +964,18 @@ _protocol_deps = SimpleNamespace(
     make_logprob_content=_make_logprob_content,
     build_metrics_envelope=_build_metrics_envelope,
 )
-register_anthropic_routes(app, _protocol_deps)
-register_openai_routes(app, _protocol_deps)
-register_audio_routes(app, _protocol_deps)
-register_embeddings_routes(app, _protocol_deps)
+register_anthropic_routes(inference_router, _protocol_deps)
+register_openai_routes(inference_router, _protocol_deps)
+register_audio_routes(inference_router, _protocol_deps)
+register_embeddings_routes(inference_router, _protocol_deps)
 
 
-@app.get("/models", response_model=ModelsResponse)
-@app.get("/v1/models", response_model=ModelsResponse, include_in_schema=False)
+@inference_router.get("/models", response_model=ModelsResponse)
+@inference_router.get(
+    "/v1/models",
+    response_model=ModelsResponse,
+    include_in_schema=False,
+)
 def models_endpoint():
     """
     Return list of locally downloaded MLX models.
@@ -1018,6 +1025,9 @@ def models_endpoint():
     response = {"object": "list", "data": models}
 
     return response
+
+
+app.include_router(inference_router)
 
 
 # MLX_VLM API endpoints

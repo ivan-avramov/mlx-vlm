@@ -265,8 +265,6 @@ mlx_vlm/tests/test_server.py::test_debug_decode_logging_adds_token_details  # ba
 mlx_vlm/tests/test_server.py::test_decode_logging_uses_one_rate_field  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_generate_serializes_budget_criteria_with_tokenizer_preprocessing  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_gpu_embed_drops_none_embedding_fields  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_server.py::test_inference_endpoint_accepts_configured_api_key  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_server.py::test_inference_endpoints_require_configured_api_key  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_info_decode_logging_uses_interval_without_token_details  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_load_model_resources_returns_load_failure_as_bad_request  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_log_progress_interval_is_configurable  # baseline: pre-existing divergence, unreviewed

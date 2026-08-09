@@ -101,10 +101,24 @@ class TestEmbeddingServingIsWired:
     check only sees missing `def`/`class` names.
     """
 
-    def test_embeddings_route_is_registered(self):
+    def test_embeddings_route_is_served(self):
+        """Behavioural on purpose: reachability, not registration.
+
+        An earlier version of this guard scanned `app.routes`, which broke the
+        moment #1714 moved the protocol surfaces onto `inference_router` —
+        FastAPI >= 0.141 does not flatten `include_router()` into `app.routes`.
+        Asserting the request does not 404 is version-proof and is the thing
+        that actually regressed (the route 404'd for real).
+        """
+        from fastapi.testclient import TestClient
+
         from mlx_vlm.server.app import app
 
-        assert "/v1/embeddings" in {route.path for route in app.routes}
+        response = TestClient(app).post("/v1/embeddings", json={"input": "hello"})
+
+        assert response.status_code != 404
+        # No embedding model configured -> 400, which proves the handler ran.
+        assert response.status_code == 400
 
     def test_embedding_models_get_their_own_cache_group(self):
         """Without this branch an embedding model lands in `text_generation`.
