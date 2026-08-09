@@ -64,7 +64,7 @@ python dev/check_dead_helpers.py          # ~10s; dropped call sites
 python dev/find_dropped_hunks.py          # slow; ranked report
 ```
 
-`.symbol-exclusions` currently holds **82 entries**, down from 446 (the mlx-lm
+`.symbol-exclusions` currently holds **57 entries**, down from 446 (the mlx-lm
 vendoring retired 88, the `test_models.py` take another 57). That number is a
 snapshot of existing divergence, not a defect count: it mixes never-ported upstream
 features, modules this fork deliberately rewrote (`sample_utils`, `apc`, `cache`,
@@ -561,12 +561,17 @@ upstream's own `dispatch.py` duplicates; `.deletion-exclusions` 11 -> 8. **Fifth
 check added:** `dev/check_fork_markers.py`, the fork-content oracle — see below.
 
 **Progress as of 2026-08-09 (fourth pass, same day).** `find_dropped_hunks.py`
-**34 -> 17** commits; diverged files 31 -> 28. Suite **2608 passed / 5 skipped / 0
-failed**, and `tests/test_utils.py` is collected again (its 5 "pre-existing failures"
+**34 -> 12** commits, four of which are now closed-by-review rather than open work;
+diverged files 31 -> 28. Suite **2623 passed / 5 skipped / 0 failed**, and `tests/test_utils.py` is collected again (its 5 "pre-existing failures"
 were stale test code — the only remaining `--ignore` is `test_smoke.py`). Exclusions:
-`.symbol-exclusions` 107 -> **82**, `.deletion-exclusions` 11 -> **4**,
-`.fork-marker-allowlist` 32 -> **21 files**. **Sixth check added:**
-`dev/check_dead_helpers.py`.
+`.symbol-exclusions` 107 -> **57**, `.deletion-exclusions` 11 -> **4**,
+`.fork-marker-allowlist` 32 -> **19 files**, and the new `.dead-helper-exclusions` is
+**empty**. **Sixth check added:** `dev/check_dead_helpers.py`.
+
+Four test files were union-merged with upstream by the same method — `test_utils.py`,
+`test_trainer_utils.py`, `test_batch_quantized_cache.py`, `test_speculative.py` — which
+is what retired most of those exclusions. The method, and the order of its steps, is
+written up under "Per-file convergence".
 
 Restored this pass, all with `git log -S` provenance first: `8e2638b7` (#1558),
 `c1821e93` (#1329), `26220e71`, `9afc59ce`, `57dc1fb5` (#1450), `e3906673` (#1433,
