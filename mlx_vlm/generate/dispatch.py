@@ -621,6 +621,7 @@ from .diffusion import (
     is_diffusion_model,
     stream_diffusion_generate_from_kwargs,
 )
+from .types import GenerateKwargs, ProcessorLike, Unpack
 
 
 def _prime_cached_prefix_rope_state(
@@ -668,13 +669,13 @@ from .ar import generate_step
 
 def stream_generate(
     model: nn.Module,
-    processor: PreTrainedTokenizer,
+    processor: ProcessorLike | PreTrainedTokenizer,
     prompt: str,
-    image: Union[str, List[str]] = None,
-    audio: Union[str, List[str]] = None,
-    video: Union[str, List[str]] = None,
-    **kwargs,
-) -> Union[str, Generator[str, None, None]]:
+    image: Union[str, List[str], None] = None,
+    audio: Union[str, List[str], None] = None,
+    video: Union[str, List[str], None] = None,
+    **kwargs: Unpack[GenerateKwargs],
+) -> Generator[GenerationResult, None, None]:
     """
     A generator producing text based on the given prompt from the model.
 
@@ -1234,30 +1235,18 @@ def stream_generate(
         # layer offsets from ``all_ids``.
         if apc_manager is not None and apc_mode == "block":
             try:
-                # Snapshot keys/values up to the live offset for each layer.
-                layer_keys: List[mx.array] = []
-                layer_values: List[mx.array] = []
-                ok = True
-                for c in tracked_cache:
-                    k = getattr(c, "keys", None)
-                    v = getattr(c, "values", None)
-                    off = getattr(c, "offset", None)
-                    if k is None or v is None or off is None:
-                        ok = False
-                        break
-                    layer_keys.append(k[..., :off, :])
-                    layer_values.append(v[..., :off, :])
-                if ok and layer_keys:
-                    new_blocks = apc_manager.store_kv_blocks(
-                        all_ids,
-                        layer_keys,
-                        layer_values,
-                        extra_hash=apc_extra_hash,
-                        skip_first_n_tokens=reused_prefix_len,
-                    )
-                    apc_manager.release(apc_blocks_in_use + new_blocks)
-                else:
-                    apc_manager.release(apc_blocks_in_use)
+                if all_ids is None:
+                    all_ids = full_input_ids_list + [
+                        t.item() if hasattr(t, "item") else t for t in generated_tokens
+                    ]
+                _apc.commit_prefix_blocks(
+                    apc_manager,
+                    tracked_cache,
+                    all_ids,
+                    extra_hash=apc_extra_hash,
+                    skip_first_n_tokens=reused_prefix_len,
+                    blocks_in_use=apc_blocks_in_use,
+                )
             except Exception as e:
                 logger.warning("APC store failed: %s", e)
                 apc_manager.release(apc_blocks_in_use)
@@ -1329,13 +1318,13 @@ def stream_generate(
 
 def generate(
     model: nn.Module,
-    processor: PreTrainedTokenizer,
+    processor: ProcessorLike | PreTrainedTokenizer,
     prompt: str,
-    image: Union[str, List[str]] = None,
-    audio: Union[str, List[str]] = None,
-    video: Union[str, List[str]] = None,
+    image: Union[str, List[str], None] = None,
+    audio: Union[str, List[str], None] = None,
+    video: Union[str, List[str], None] = None,
     verbose: bool = False,
-    **kwargs,
+    **kwargs: Unpack[GenerateKwargs],
 ) -> GenerationResult:
     """
     Generate text from the model.

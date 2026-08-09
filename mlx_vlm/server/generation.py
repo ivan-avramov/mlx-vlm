@@ -797,7 +797,7 @@ def load_model_resources(model_path: str, adapter_path: Optional[str]):
     except Exception as e:
         print(f"Error loading model {model_path}: {e}")
         traceback.print_exc()  # Print detailed traceback for debugging
-        raise HTTPException(status_code=500, detail=f"Failed to load model: {e}")
+        raise HTTPException(status_code=400, detail=f"Failed to load model: {e}")
 
 
 # =============================================================================

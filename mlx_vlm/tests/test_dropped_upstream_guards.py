@@ -809,3 +809,169 @@ class TestDiffusionUnification:
         (chunk,) = list(_DiffusionBlockEmitter().feed(result))
         assert chunk.generation_tps == 4.0
         assert chunk.text == "hello"
+
+
+class TestApcCallSitesFromTheAdapterRefactor:
+    """`8422ece8` — APC as a pluggable, capability-driven cache adapter (#1638).
+
+    The commit's `server/app.py` and `generate/dispatch.py` halves were restored on
+    2026-08-09 and it was recorded as closed. It was not: the same helpers have a
+    *second* call site each, and `check_dead_helpers.py` is per-symbol rather than
+    per-call-site, so one library caller satisfies it and the second dropped site is
+    invisible. That is the surviving sub-case of "helper landed, call site dropped".
+    """
+
+    @staticmethod
+    def _batch_generator():
+        from mlx_vlm.generate.ar import BatchGenerator
+
+        gen = BatchGenerator.__new__(BatchGenerator)
+        gen.apc_manager = object()
+        gen.model = None
+        gen.processor = None
+        # __del__ -> close() reads this; without it the GC raises during teardown.
+        gen._wire_stack = None
+        return gen
+
+    def test_batch_apc_key_covers_audio_video_embeddings_and_masks(self):
+        """The continuous-batching APC key ignored every non-image medium.
+
+        `_apc_extra_hash` returned `tenant_scoped_hash(tenant, image_hash)`, so two
+        requests differing *only* in audio, video, inputs_embeds or attention_mask
+        hashed identically and shared a prefix cache — reusing KV computed for
+        different media. The single-sequence `dispatch.py` path was fixed in the same
+        commit's restore; this one was missed.
+        """
+        import mlx.core as mx
+
+        from mlx_vlm.generate.ar import BatchGenerator
+
+        gen = self._batch_generator()
+        base = {"pixel_values": None, "_apc_tenant": None}
+        hashes = {
+            "none": BatchGenerator._apc_extra_hash(gen, base),
+            "audio_a": BatchGenerator._apc_extra_hash(
+                gen, dict(base, input_features=mx.zeros((1, 8, 4)))
+            ),
+            "audio_b": BatchGenerator._apc_extra_hash(
+                gen, dict(base, input_features=mx.ones((1, 8, 4)))
+            ),
+            "video": BatchGenerator._apc_extra_hash(
+                gen, dict(base, pixel_values_videos=mx.zeros((1, 2, 3, 4, 4)))
+            ),
+            "embeds": BatchGenerator._apc_extra_hash(
+                gen, dict(base, inputs_embeds=mx.zeros((1, 5, 8)))
+            ),
+            "masks": BatchGenerator._apc_extra_hash(
+                gen, dict(base, attention_mask=mx.ones((1, 6), dtype=mx.int32))
+            ),
+        }
+        assert len(set(hashes.values())) == len(
+            hashes
+        ), f"APC keys collide across media: {hashes}"
+        # Contract of semantic_extra_hash: reduces to tenant_scoped_hash with no media.
+        assert hashes["none"] == 0
+
+    def test_batch_prefix_lookup_uses_the_shared_plan_helper(self):
+        """`_apc_pick_for` kept an ~85-line inline copy of `apc_lookup_plan`.
+
+        Not a behaviour bug — verified equivalent across 512 scenarios including
+        `release()` side-effect order — but two copies of the disk>exact>block
+        precedence ladder drift, and only one of them gets upstream's fixes.
+        """
+        import inspect
+
+        from mlx_vlm.generate.ar import BatchGenerator
+
+        source = inspect.getsource(BatchGenerator._apc_pick_for)
+        assert "apc_lookup_plan" in source
+        assert (
+            "lookup_prefix_disk_cache" not in source
+        ), "the precedence ladder is inlined again instead of delegating"
+
+    def test_single_sequence_block_commit_handles_quantized_caches(self):
+        """dispatch.py hand-rolled the harvest instead of calling commit_prefix_blocks.
+
+        Its inline snapshot did `c.keys[..., :offset, :]`, which raises TypeError on a
+        quantized cache because those store keys as a tuple — swallowed by the
+        surrounding `except Exception` into an "APC store failed" warning. So block-mode
+        APC harvesting silently stored nothing whenever `--kv-bits` was in use.
+        `layer_kv_for_apc` is the helper that exists precisely for this, and its
+        docstring says so.
+        """
+        import inspect
+
+        import mlx.core as mx
+
+        from mlx_vlm import apc as _apc
+        from mlx_vlm.generate import dispatch
+
+        assert "commit_prefix_blocks" in inspect.getsource(dispatch)
+
+        class _QuantishCache:
+            def __init__(self):
+                self.offset = 3
+                self._k = mx.zeros((1, 2, 4, 4))
+                self._v = mx.ones((1, 2, 4, 4))
+                self.keys = (self._k, self._k, self._k)
+                self.values = (self._v, self._v, self._v)
+
+            def dequantize_for_apc(self):
+                return self._k[..., : self.offset, :], self._v[..., : self.offset, :]
+
+        cache = _QuantishCache()
+        # The old inline approach is what must not come back.
+        try:
+            cache.keys[..., : cache.offset, :]
+            raise AssertionError("expected tuple slicing to fail")
+        except TypeError:
+            pass
+        keys, values = _apc.layer_kv_for_apc(cache, batch_idx=None)
+        assert keys is not None and values is not None
+        assert keys.shape[-2] == 3
+
+
+class TestStoppingCriteriaDoesNotAliasCallerLists:
+    """`0ae7f5e0` + `63965655` — copy eos_token_ids to prevent caller-list aliasing."""
+
+    @staticmethod
+    def _criteria(eos_token_ids):
+        from types import SimpleNamespace
+
+        from mlx_vlm.utils import StoppingCriteria
+
+        tokenizer = SimpleNamespace(encode=lambda *a, **k: [0], eos_token_ids=[1])
+        return StoppingCriteria(eos_token_ids, tokenizer=tokenizer)
+
+    def test_init_copies_the_list(self):
+        caller = [1, 2, 3]
+        criteria = self._criteria(caller)
+        criteria.add_eos_token_ids(999)
+        assert caller == [1, 2, 3], "StoppingCriteria mutated the caller's list"
+        assert criteria.eos_token_ids == [1, 2, 3, 999]
+
+    def test_reset_copies_the_list(self):
+        caller = [7, 8]
+        criteria = self._criteria([1])
+        criteria.reset(caller)
+        criteria.add_eos_token_ids(555)
+        assert caller == [7, 8], "reset() aliased the caller's list"
+        assert criteria.eos_token_ids == [7, 8, 555]
+
+
+class TestModelLoadFailureIsABadRequest:
+    """`bd6cb123` — return model loading failures as bad requests (#1717)."""
+
+    def test_failed_model_load_raises_400_not_500(self):
+        """A bad `--model` / request model path is a client error, not a server fault.
+
+        A 500 tells a client to retry and pages an operator; a 400 says the request
+        named a model that cannot be loaded.
+        """
+        import inspect
+
+        from mlx_vlm.server import generation as server_generation
+
+        source = inspect.getsource(server_generation)
+        assert 'status_code=400, detail=f"Failed to load model' in source
+        assert 'status_code=500, detail=f"Failed to load model' not in source
