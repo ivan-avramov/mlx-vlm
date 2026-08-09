@@ -46,6 +46,7 @@ from .common import (
     maybe_quantize_kv_cache,
     wired_limit,
 )
+from .types import GenerateKwargs, ProcessorLike, Unpack
 
 logger = logging.getLogger(f"{os.environ.get('MLX_VLM_LOG_NAME', 'mlx_vlm')}.generate")
 
@@ -54,6 +55,7 @@ DEFAULT_TEMPERATURE = 0.0
 DEFAULT_TOP_P = 1.0
 DEFAULT_TOP_K = 0
 DEFAULT_MIN_P = 0.0
+DEFAULT_TOP_N_SIGMA = 0.0
 DEFAULT_REPETITION_CONTEXT_SIZE = 20
 DEFAULT_PREFILL_STEP_SIZE = 2048
 DEFAULT_COMPLETION_BATCH_SIZE = 32
@@ -199,6 +201,9 @@ def generate_step(
     top_p: float = DEFAULT_TOP_P,
     min_p: float = DEFAULT_MIN_P,
     top_k: int = DEFAULT_TOP_K,
+    top_n_sigma: float = DEFAULT_TOP_N_SIGMA,
+    p_less: bool = False,
+    typical_p: float = 1.0,
     logit_bias: Optional[Dict[int, float]] = None,
     prompt_cache: Optional[List[Any]] = None,
     max_kv_size: Optional[int] = None,
@@ -317,6 +322,9 @@ def generate_step(
             and temperature > 0
             and min_p == DEFAULT_MIN_P
             and top_k == DEFAULT_TOP_K
+            and top_n_sigma == DEFAULT_TOP_N_SIGMA
+            and not p_less
+            and typical_p == 1.0
         ):
             sampler = _PositionedTargetSampler(
                 temperature=temperature,
@@ -329,6 +337,9 @@ def generate_step(
                 top_p=top_p,
                 min_p=min_p,
                 top_k=top_k,
+                top_n_sigma=top_n_sigma,
+                p_less=p_less,
+                typical_p=typical_p,
             )
 
     processors = _generate_module_override(
@@ -1164,6 +1175,15 @@ class GenerationBatch:
     def cache_states(self):
         return [c.state for c in self.prompt_cache if hasattr(c, "state")]
 
+    def _ensure_logits_processor_slots(self, *, force: bool = False):
+        if not (force or (self.logits_processors and any(self.logits_processors))):
+            return
+        if len(self.logits_processors) < len(self.uids):
+            missing = len(self.uids) - len(self.logits_processors)
+            self.logits_processors.extend([None] * missing)
+        elif len(self.logits_processors) > len(self.uids):
+            self.logits_processors = self.logits_processors[: len(self.uids)]
+
     def _ensure_token_context(self, *, force: bool = False):
         if not (force or (self.logits_processors and any(self.logits_processors))):
             if not self.logits_processors:
@@ -1175,30 +1195,29 @@ class GenerationBatch:
         elif len(self.token_context) > len(self.uids):
             self.token_context = self.token_context[: len(self.uids)]
 
-    def _greedy_argmax_step(self, inputs: mx.array, fwd_kwargs: dict):
-        if (
-            not self.greedy_sampling
-            or self.compute_logprobs
-            or self.top_logprobs_k > 0
-            or (self.logits_processors and any(self.logits_processors))
-        ):
+    def _fused_greedy_step(self, inputs: mx.array, fwd_kwargs: dict):
+        if not self.greedy_sampling or self.compute_logprobs or self.top_logprobs_k > 0:
             return None
 
-        argmax_from_hidden = getattr(
-            self._language_model, "speculative_argmax_from_hidden", None
-        )
-        if not callable(argmax_from_hidden):
+        fused_greedy_decode = getattr(self._language_model, "fused_greedy_decode", None)
+        if not callable(fused_greedy_decode):
             return None
 
-        output = self._language_model(
+        decode_kwargs = dict(fwd_kwargs)
+        if self.logits_processors and any(self.logits_processors):
+            supports_processors = getattr(
+                self._language_model, "supports_fused_greedy_logits_processors", None
+            )
+            if not callable(supports_processors) or not supports_processors(
+                self.logits_processors
+            ):
+                return None
+            decode_kwargs["logits_processors"] = self.logits_processors
+        sampled = fused_greedy_decode(
             inputs[:, None],
             cache=self.prompt_cache,
-            return_hidden=True,
-            skip_logits=True,
-            **fwd_kwargs,
+            **decode_kwargs,
         )
-        hidden = output.hidden_states[-1]
-        sampled = argmax_from_hidden(hidden)
         if sampled is None:
             return None
         if sampled.ndim == 2 and sampled.shape[1] == 1:
@@ -1215,7 +1234,7 @@ class GenerationBatch:
         if self._rope_deltas is not None:
             fwd_kwargs["rope_deltas"] = self._rope_deltas
 
-        sampled = self._greedy_argmax_step(inputs, fwd_kwargs)
+        sampled = self._fused_greedy_step(inputs, fwd_kwargs)
         if sampled is not None:
             self._next_tokens = sampled
             self._next_lps = None
@@ -1345,8 +1364,15 @@ class GenerationBatch:
         self_has_processors = self.logits_processors and any(self.logits_processors)
         other_has_processors = other.logits_processors and any(other.logits_processors)
         if self_has_processors or other_has_processors:
+            self._ensure_logits_processor_slots(force=bool(other_has_processors))
+            other._ensure_logits_processor_slots(force=bool(self_has_processors))
             self._ensure_token_context(force=bool(other_has_processors))
             other._ensure_token_context(force=bool(self_has_processors))
+        else:
+            self.token_context = []
+            other.token_context = []
+            self.logits_processors = []
+            other.logits_processors = []
 
         self.uids.extend(other.uids)
         self.prompt_cache = _extend_cache(self.prompt_cache, other.prompt_cache)
@@ -1355,6 +1381,7 @@ class GenerationBatch:
         self.token_context.extend(other.token_context)
         self.logits_processors.extend(other.logits_processors)
         self.thinking_budget_criteria.extend(other.thinking_budget_criteria)
+        self._ensure_logits_processor_slots()
         self._ensure_token_context()
 
         if self._current_tokens is None:
@@ -2456,7 +2483,10 @@ class BatchGenerator:
         return _apc.tenant_scoped_hash(tenant, img)
 
     def _apc_media_token_ids(self) -> set[int]:
-        return _apc.multimodal_token_ids_from_config(self.model.config)
+        config = getattr(self.model, "config", None)
+        if config is None:
+            return set()
+        return _apc.multimodal_token_ids_from_config(config)
 
     def _apc_safe_prefix_lookup_min(self, ids_list: List[int]) -> int:
         safe_min = _apc.media_safe_prefix_min(ids_list, self._apc_media_token_ids())
@@ -3105,17 +3135,17 @@ class BatchGenerator:
 
 
 def batch_generate(
-    model,
-    processor,
-    images: Union[str, List[str]] = None,
-    audios: Union[str, List[str]] = None,
-    prompts: List[str] = None,
+    model: nn.Module,
+    processor: ProcessorLike,
+    images: Union[str, List[str], None] = None,
+    audios: Union[str, List[str], None] = None,
+    prompts: Optional[List[str]] = None,
     max_tokens: Union[int, List[int]] = 128,
     verbose: bool = False,
     group_by_shape: bool = True,
     track_image_sizes: bool = True,
-    **kwargs,
-):
+    **kwargs: Unpack[GenerateKwargs],
+) -> BatchResponse:
     """
     Generate responses for the given batch of prompts with variable-sized images.
 

@@ -281,8 +281,11 @@ def _position_keys(seed: int, row_ids: List[int], positions: List[int]) -> mx.ar
 class _PositionedTargetSampler:
     """Server sampler with stateless target draws for ragged verification.
 
-    Applies top_p / min_p / top_k filtering (mlx_lm logit masks, same chain
-    order as mlx_lm.make_sampler) on the full [B, vocab] batch, then draws per
+    Fork: upstream's copy applies top_p only. This one applies top_p / min_p /
+    top_k filtering (same chain order as `sample_utils.make_sampler`), which is why
+    `_make_sampler` passes those through here rather than dropping them.
+
+    Applies the filters on the full [B, vocab] batch, then draws per
     row with a position-keyed RNG so draws are reproducible by
     (seed, row_id, position) and invariant to how rows are grouped into batches.
     """
@@ -1654,6 +1657,41 @@ class ResponseGenerator:
     def _make_sampler(self, args: GenerationArguments) -> Optional[Callable]:
         if args.temperature == 0:
             return None
+        # top-nσ, p-less and typical-p cannot be expressed by the position-keyed
+        # sampler, so they have to go through make_sampler. Without these three
+        # branches the mode is silently dropped: `to_generate_kwargs()` emits it,
+        # `generate_step` swallows it into **kwargs, and nothing reads it
+        # (36331ea7 / 67ca1f05 / b739dfa4).
+        #
+        # Fork: upstream's branches pass only temp + top_p + the mode, which
+        # silently drops top_k/min_p when one of these is set. This fork's
+        # _PositionedTargetSampler supports top_k/min_p everywhere else, so
+        # dropping them only here would be inconsistent with the rest of the fork;
+        # make_sampler applies the same filter chain, so they are passed through.
+        if args.top_n_sigma > 0:
+            return make_sampler(
+                temp=args.temperature,
+                top_p=args.top_p,
+                min_p=args.min_p,
+                top_k=args.top_k,
+                top_n_sigma=args.top_n_sigma,
+            )
+        if args.p_less:
+            return make_sampler(
+                temp=args.temperature,
+                top_p=args.top_p,
+                min_p=args.min_p,
+                top_k=args.top_k,
+                p_less=True,
+            )
+        if args.typical_p < 1.0:
+            return make_sampler(
+                temp=args.temperature,
+                top_p=args.top_p,
+                min_p=args.min_p,
+                top_k=args.top_k,
+                typical_p=args.typical_p,
+            )
         return _PositionedTargetSampler(
             temperature=args.temperature,
             top_p=args.top_p,

@@ -60,3 +60,10 @@ jobs:
       # outside .fork-marker-allowlist, which is a shrinking rollout schedule.
       - name: Check every fork change in a shared file is marked
         run: python dev/check_fork_markers.py --upstream-ref upstream/main
+
+      # "Helper landed, call site dropped" — the one shape all four checks above
+      # are blind to by construction: the file is present, the def is present,
+      # nothing was deleted, and the missing hunk is in a different file. Four real
+      # instances were found by hand in one session before this existed.
+      - name: Check no upstream-called helper is unreachable here
+        run: python dev/check_dead_helpers.py --upstream-ref upstream/main

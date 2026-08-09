@@ -29,6 +29,12 @@ class GenerateKwargs(TypedDict, total=False):
     top_p: float
     min_p: float
     top_k: int
+    # Fork: declared here because GenerationArguments.to_generate_kwargs() emits
+    # all three; upstream's GenerateKwargs omits them, so they were invisible to
+    # type checkers while silently landing in generate_step's **kwargs.
+    top_n_sigma: float
+    p_less: bool
+    typical_p: float
     logit_bias: dict[int, float] | None
     prompt_cache: list[Any] | None
     max_kv_size: int | None

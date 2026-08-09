@@ -32,7 +32,7 @@ missing** while all 21 genuinely-new upstream files arrived normally.
 
 ## Tooling that now guards this
 
-**Five** checks. Four are wired into `.github/workflows/upstream-parity.yml`
+**Six** checks. Five are wired into `.github/workflows/upstream-parity.yml`
 (which runs on pushes to `main` too, not just PRs, since this fork is usually
 committed to directly); `find_dropped_hunks.py` stays manual because it is a
 ranked report rather than a pass/fail gate.
@@ -43,9 +43,10 @@ ranked report rather than a pass/fail gate.
 | `dev/check_upstream_symbols.py` | `def`/`class` names missing from our copy of a shared file | `.symbol-exclusions` |
 | `dev/check_upstream_deletions.py` | the **reverse**: files/symbols upstream deleted that we kept | `.deletion-exclusions` |
 | `dev/check_fork_markers.py` | fork changes to a shared file that carry no `# Fork:` marker | `.fork-marker-allowlist` |
+| `dev/check_dead_helpers.py` | helpers upstream calls from library code that we reach only from tests | `.dead-helper-exclusions` |
 | `dev/find_dropped_hunks.py` | dropped *hunks*, ranked by owning commit (Python **and** docs/config) | — |
 
-All four gating checks require a `# reason` on every exclusion and fail if one is
+All five gating checks require a `# reason` on every exclusion and fail if one is
 missing, and all read the git **index**, so they can gate a commit rather than only
 report on one. `check_upstream_symbols.py` and `check_fork_markers.py` additionally
 warn when an entry no longer excuses anything — a stale exclusion is a hole in the
@@ -59,6 +60,7 @@ python dev/check_upstream_parity.py
 python dev/check_upstream_symbols.py
 python dev/check_upstream_deletions.py    # ~70s
 python dev/check_fork_markers.py          # ~35s; --summary ranks the rollout
+python dev/check_dead_helpers.py          # ~10s; dropped call sites
 python dev/find_dropped_hunks.py          # slow; ranked report
 ```
 

@@ -4,9 +4,11 @@ A fork-only file, deliberately. These guards cover behaviour that upstream ships
 but never wrote a test for, so restoring an upstream test file is not an option —
 and a merge that drops a feature hunk usually drops its tests in the same
 resolution, which is why most of the real bugs found in this fork had no failing
-test. `tests/test_utils.py` is excluded from the suite
-(`--ignore=tests/test_utils.py`, 5 pre-existing failures), so a guard placed
-there would never run; see `tests/test_model_registry.py` for the same reasoning.
+test. Keep guards here rather than scattering them: `tests/test_utils.py` was
+excluded from the suite for a long time (`--ignore`, 5 pre-existing failures), so a
+guard placed there would never have run. That file is collected again as of
+2026-08-09, but the habit stands — see `tests/test_model_registry.py` for the same
+reasoning about registries.
 
 Each guard names the upstream commit whose content it protects.
 """
@@ -547,3 +549,106 @@ class TestGenArgsUnion:
         assert args.max_denoising_steps == 5
         assert args.block_length == 16
         assert args.threshold == 0.7
+
+
+class TestSamplerModesReachTheSampler:
+    """`36331ea7` (top-nσ), `67ca1f05` (#1653 p-less), `b739dfa4` (#1663 typical-p).
+
+    All three landed their `sample_utils.make_sampler` half and their schema half,
+    so `docs/upstream-gaps.md` recorded them as "reachable end to end". They were
+    not. The dropped halves were the two places that *choose* a sampler, and the
+    failure was silent in both:
+
+    * `generate_step` had no `top_n_sigma` / `p_less` / `typical_p` parameters at
+      all. It has `**kwargs`, so `to_generate_kwargs()` handed them over and they
+      were swallowed — the dead-parameter tell, with no error anywhere.
+    * `ResponseGenerator._make_sampler` returned a `_PositionedTargetSampler`
+      whenever `temperature > 0`. That class cannot express any of the three, so
+      every server request with one set sampled as if it were unset.
+
+    These guards pin the *selection* logic, which is what was missing, rather than
+    the sampler maths, which was always present.
+    """
+
+    def _args(self, **kwargs):
+        from mlx_vlm.server.generation import GenerationArguments
+
+        return GenerationArguments(max_tokens=8, temperature=0.7, **kwargs)
+
+    def _sampler_for(self, **kwargs):
+        from mlx_vlm.server.generation import ResponseGenerator
+
+        # ResponseGenerator.__init__ starts a worker thread; _make_sampler is pure,
+        # so bind it to a bare instance rather than standing a server up.
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        return ResponseGenerator._make_sampler(generator, self._args(**kwargs))
+
+    def test_generate_step_declares_the_three_sampler_params(self):
+        """A `**kwargs` sink is why this needs asserting explicitly.
+
+        Without a declared parameter the value cannot influence sampler choice, and
+        nothing raises to tell you.
+        """
+        import inspect
+
+        from mlx_vlm.generate import ar
+
+        params = inspect.signature(ar.generate_step).parameters
+        for name in ("top_n_sigma", "p_less", "typical_p"):
+            assert name in params, f"generate_step swallows {name} into **kwargs"
+
+    def test_positioned_sampler_guard_rejects_each_mode(self):
+        """The seeded fast path must not claim a request it cannot honour.
+
+        `_PositionedTargetSampler` takes temperature/top_p/seed only, so if the
+        guard does not test these three, setting one is silently ignored.
+        """
+        import inspect
+
+        from mlx_vlm.generate import ar
+
+        source = inspect.getsource(ar.generate_step)
+        guard = source.split("if sampler is None:", 1)[1].split("else:", 1)[0]
+        assert "top_n_sigma == DEFAULT_TOP_N_SIGMA" in guard
+        assert "not p_less" in guard
+        assert "typical_p == 1.0" in guard
+
+    def test_server_sampler_honours_top_n_sigma(self):
+        from mlx_vlm.generate.ar import _PositionedTargetSampler as ArPositioned
+        from mlx_vlm.server.generation import _PositionedTargetSampler
+
+        sampler = self._sampler_for(top_n_sigma=1.5)
+        assert not isinstance(sampler, (_PositionedTargetSampler, ArPositioned)), (
+            "top_n_sigma must route through make_sampler; the position-keyed "
+            "sampler cannot express it"
+        )
+
+    def test_server_sampler_honours_p_less(self):
+        from mlx_vlm.server.generation import _PositionedTargetSampler
+
+        sampler = self._sampler_for(p_less=True)
+        assert not isinstance(sampler, _PositionedTargetSampler)
+
+    def test_server_sampler_honours_typical_p(self):
+        from mlx_vlm.server.generation import _PositionedTargetSampler
+
+        sampler = self._sampler_for(typical_p=0.9)
+        assert not isinstance(sampler, _PositionedTargetSampler)
+
+    def test_server_sampler_keeps_the_seeded_path_when_no_mode_is_set(self):
+        """The fast path must still be chosen by default.
+
+        Losing it would make every seeded request non-reproducible across batch
+        groupings, which is the whole point of the position-keyed sampler.
+        """
+        from mlx_vlm.server.generation import _PositionedTargetSampler
+
+        sampler = self._sampler_for(seed=7)
+        assert isinstance(sampler, _PositionedTargetSampler)
+
+    def test_greedy_still_returns_none(self):
+        from mlx_vlm.server.generation import GenerationArguments, ResponseGenerator
+
+        generator = ResponseGenerator.__new__(ResponseGenerator)
+        args = GenerationArguments(max_tokens=8, temperature=0.0)
+        assert ResponseGenerator._make_sampler(generator, args) is None

@@ -1,0 +1,44 @@
+# Baseline for dev/check_dead_helpers.py — the dropped-call-site audit.
+#
+# Format: `path_glob::symbol_glob  # reason`. Every entry MUST carry a reason; the
+# script refuses to run otherwise.
+#
+# What this audit catches: a helper upstream calls from library code that, here, is
+# referenced only from tests — or from nothing. That is the signature of **helper
+# landed, call site dropped**, the one failure shape all five other checks are blind
+# to by construction (the file is present, the `def` is present, nothing was
+# deleted, and the missing hunk is in a different, usually already-allowlisted file).
+#
+# Two kinds of entry belong here, and they are NOT the same thing:
+#
+#   REVIEWED — established that the helper is intentionally unreachable in this
+#     fork (superseded by fork work, or upstream's caller is code we deliberately
+#     do not have). Say what you established.
+#
+#   CONFIRMED-DROPPED — established that it IS a real dropped call site, with the
+#     restore tracked and pending. This is a **debt marker, not approval.** It keeps
+#     the check gating for everything else instead of being switched off wholesale.
+#     Every entry of this kind must name the owning commit.
+#
+# The stale-entry warning is what stops CONFIRMED-DROPPED entries from rotting: the
+# moment a call site is restored, its entry stops excusing anything and the check
+# says so.
+#
+# Validated to fire before being trusted: reverting `server/app.py`'s restored
+# `apc_disk_namespace` call site makes it report 4 hits and exit 1; restoring it
+# drops back to 3. Runs in ~10s.
+
+# --- mlx_vlm/apc.py
+# All three are CONFIRMED-DROPPED, all from 8422ece8 "implement apc as a pluggable,
+# capability driven cache adapter" (#1638) — the same commit whose `server/app.py`
+# half was restored during the 2026-08-09 merge and whose `apc.py` half
+# `.deletion-exclusions` still records. What remains is its `generate/dispatch.py`
+# refactor: upstream replaced the inline APC lookup block with
+# `_apc.apc_lookup_plan(...)` returning a plan dict, and our dispatch.py still has
+# the pre-refactor inline version. `find_dropped_hunks.py` reports 32 lines for
+# dispatch.py; 17 more it attributes to `generate/ar.py` are coincidental
+# line-content matches (`model=model,`, `processor=processor,`, `},`) and NOT part of
+# the commit's file set — checked against `git show --stat 8422ece8`.
+mlx_vlm/apc.py::apc_lookup_plan  # CONFIRMED-DROPPED: 8422ece8 (#1638) dispatch.py refactor not applied; dispatch.py still has the inline lookup. Tracked.
+mlx_vlm/apc.py::semantic_extra_hash  # CONFIRMED-DROPPED: ditto 8422ece8 (#1638). Called only from tests/test_apc_semantic_key.py, which is why 0f359e5's "apc.py fully converged" claim held while the caller was missing.
+mlx_vlm/apc.py::snapshot_prompt_cache_row  # CONFIRMED-DROPPED: ditto 8422ece8 (#1638); upstream calls it from generate/ar.py. Found by this check, not by hand — it was not in any prior gap list.

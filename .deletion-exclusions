@@ -33,7 +33,14 @@
 mlx_vlm/apc.py::_merge_arrays_cache_entries  # stale half of dropped 8422ece8 "implement apc as a pluggable, capability driven cache adapter" (#1620); 49 lines still missing per find_dropped_hunks.py
 
 # --- mlx_vlm/generate/ar.py
-mlx_vlm/generate/ar.py::_greedy_argmax_step  # stale half of dropped 7fbc7bc9 "Optimize 1-bit decode and fused greedy routing" (#1598); upstream replaced it with _fused_greedy_step, which we also lack
+# RESOLVED 2026-08-09: 7fbc7bc9 (#1598) restored. _greedy_argmax_step ->
+# _fused_greedy_step, now calling the model's fused_greedy_decode. The commit was
+# HALF-landed: models/qwen3_5/language.py already had fused_greedy_decode,
+# supports_fused_greedy_logits_processors and _can_target_verify_quantized_head,
+# so the model exposed the fast quantized-argmax path and NOTHING CALLED IT --
+# the optimization was inert. Taking upstream's current _fused_greedy_step also
+# lands 6d5603b3 (#1628)'s second half, which b616f889 skipped for want of this
+# very method, and ea2edd68 (#1583)'s _ensure_logits_processor_slots.
 
 # --- mlx_vlm/server/app.py
 # RESOLVED 2026-08-09. Three entries lived here for _as_plain_dict,
@@ -59,7 +66,6 @@ mlx_vlm/server/generation.py::flush  # ditto 29b6c00b (#1508) — nested helper 
 mlx_vlm/server/generation.py::on_block  # ditto 29b6c00b (#1508) — nested helper of the pre-unification diffusion path
 
 # --- mlx_vlm/tests
-mlx_vlm/tests/test_generate.py::test_generation_batch_uses_greedy_hidden_argmax_without_logprobs  # tests _greedy_argmax_step above; retire with 7fbc7bc9 (#1598)
 # RESOLVED 2026-08-09: test_chat_completions_endpoint_preserves_assistant_reasoning
 # was excused here as "the stale half of dropped 24f6f590 (#1370)". The attribution
 # was wrong: the rename to ..._reasoning_content belongs to 6a8cdff6 (#1411, the

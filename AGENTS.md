@@ -22,7 +22,7 @@ silently dropped content — came out of resolving large accumulations, because:
 
 - A 90-commit merge produces a resolution nobody can review hunk by hunk, and an
   unreviewable resolution is where content gets dropped without a conflict.
-- The five audits below only work **if they run**. They are cheap after a
+- The six audits below only work **if they run**. They are cheap after a
   five-commit merge and psychologically skippable after a ninety-commit one.
 - A dropped hunk is unrecoverable by any later merge (see the failure mode
   below), so the cost of a bad resolution is permanent, while the cost of merging
@@ -40,10 +40,11 @@ python dev/check_upstream_symbols.py    # no upstream def/class silently dropped
 python dev/find_dropped_hunks.py        # no upstream HUNK silently dropped
 python dev/check_upstream_deletions.py  # no upstream DELETION silently reverted
 python dev/check_fork_markers.py        # every fork hunk in a shared file is marked
+python dev/check_dead_helpers.py        # no upstream-called helper left unreachable
 cd mlx_vlm/ && pytest ./tests --ignore=tests/test_smoke.py
 ```
 
-**Run all five checks after every merge — this is not optional.** When a merge
+**Run all six checks after every merge — this is not optional.** When a merge
 resolution drops content from a commit that upstream already merged, that commit
 is still an ancestor of `main`, so git records the content as *deliberately
 deleted* and no later merge re-offers it. There is no conflict and no warning.
@@ -118,6 +119,46 @@ hunk `# Fork:` without running `git log -S` on it either.** Building this check
 found `gemma4_assistant/masks.py` — recorded in this very file as a deliberate
 divergence — to be half of a dropped commit; see the `[correction]` under
 "Deliberate divergences".
+
+### The fourth direction: is the thing that exists actually reachable?
+
+The three questions above are all about *code*. This one is about *wiring*, and it
+turned out to be the dominant residual failure mode. Call it **helper landed, call
+site dropped**:
+
+    upstream adds a helper AND its call site in one commit -> our merge applies the
+    helper's file but drops the call site's hunk -> the symbol exists, imports fine,
+    is often unit-tested, and is reachable from nothing
+
+Every other check is blind to it *by construction*: the file is present (parity),
+the `def` is present (symbols), nothing was deleted (deletions), and the missing
+hunk lives in a different file that is usually already allowlisted (fork markers).
+The tests keep passing, because the helper's own unit tests still exercise it
+directly. That is what makes this shape so durable.
+
+`dev/check_dead_helpers.py` is that check, and the instances it exists for were all
+real defects with no failing test:
+
+- `apc.apc_disk_namespace` — the on-disk APC namespace stopped fingerprinting the
+  KV-quant config, so two runs with different `--kv-bits` shared a prefix cache.
+- `embedding_loader.load_embedding_model` + `models.pooling.read_pooling_config` —
+  every embedding model silently used default pooling and ignored its
+  `1_Pooling/config.json`. Wrong embeddings, no error.
+- `apc.self_check_model_apc` — the APC layout dry-run never ran.
+- `apc.apc_lookup_plan`, `semantic_extra_hash`, `snapshot_prompt_cache_row` — still
+  open; `8422ece8`'s `dispatch.py` refactor. The last of these was found *by the
+  check*, not by hand, and was in no prior gap list.
+
+It compares against upstream rather than flagging every unused helper: a fork-only
+helper nothing calls yet is our business, one upstream *does* call is a dropped
+hunk. `.dead-helper-exclusions` distinguishes **REVIEWED** (intentionally
+unreachable here, say what you established) from **CONFIRMED-DROPPED** (a real
+dropped call site, restore tracked and pending — a debt marker, not approval).
+
+**"A dead parameter or an unreachable helper is a tell."** That phrase already
+appears in `docs/upstream-gaps.md` next to several fixed items; this check turns it
+from a habit into a gate. When something looks unused, ask whether upstream calls
+it before concluding it is fork scaffolding.
 
 When resolving conflicts, prefer a **union** over picking a side. Both sides add
 to shared lists (`__all__`, lazy-import tuples, skip-lists, registries); taking
@@ -409,7 +450,7 @@ fallback and by two test files.
   file had failures). Because it is PR-only, pushes straight to `main` are never
   style-checked — which is how style drift went unnoticed.
 - `upstream-parity.yml` — runs on pushes to `main` as well as PRs, since this fork
-  is usually committed to directly. Runs the four gating audit scripts.
+  is usually committed to directly. Runs the five gating audit scripts.
 
 ## Key dependencies
 
