@@ -88,9 +88,6 @@ mlx_vlm/server/generation.py::get_log_progress_interval  # baseline: pre-existin
 mlx_vlm/server/generation.py::on_result  # baseline: pre-existing divergence, unreviewed
 
 # --- mlx_vlm/server/openai.py
-mlx_vlm/server/openai.py::_prepare_chat_tool_choice  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/server/openai.py::_tool_function_name  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/server/openai.py::_with_tool_choice_instruction  # baseline: pre-existing divergence, unreviewed
 
 # --- mlx_vlm/server/responses_state.py
 mlx_vlm/server/responses_state.py::_reasoning_output_items  # baseline: pre-existing divergence, unreviewed
@@ -170,14 +167,9 @@ mlx_vlm/tests/test_server.py::test_build_gen_args_maps_none_reasoning_effort_to_
 mlx_vlm/tests/test_server.py::test_build_gen_args_maps_responses_reasoning_configuration  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_build_gen_args_preserves_diffusion_options  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_chat_completions_endpoint_preserves_assistant_reasoning_content  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_server.py::test_chat_completions_forced_tool_choice_filters_tools  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_server.py::test_chat_completions_rejects_invalid_tool_choice  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_server.py::test_chat_completions_required_tool_choice_adds_instruction  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_chat_completions_response_uses_reasoning_content  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_chat_completions_streaming_keeps_plain_output_as_content_when_thinking_enabled  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_chat_completions_streaming_uses_prompt_opened_thinking_without_flag  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_server.py::test_chat_completions_tool_choice_none_disables_tools  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_server.py::test_chat_request_schema_declares_tool_choice_fields  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_chunked_prefill_logging_reports_partial_progress  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_debug_decode_logging_adds_token_details  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_decode_logging_uses_one_rate_field  # baseline: pre-existing divergence, unreviewed
