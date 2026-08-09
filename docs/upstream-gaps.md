@@ -60,7 +60,7 @@ python dev/check_upstream_deletions.py    # ~70s
 python dev/find_dropped_hunks.py          # slow; ranked report
 ```
 
-`.symbol-exclusions` currently holds **111 entries**, down from 446 (the mlx-lm
+`.symbol-exclusions` currently holds **107 entries**, down from 446 (the mlx-lm
 vendoring retired 88, the `test_models.py` take another 57). That number is a
 snapshot of existing divergence, not a defect count: it mixes never-ported upstream
 features, modules this fork deliberately rewrote (`sample_utils`, `apc`, `cache`,
@@ -519,9 +519,9 @@ merged-then-dropped** — `git log HEAD..upstream/main` is empty and always was.
 invisible: the merge that dropped a feature hunk usually dropped its tests in the
 same resolution.
 
-**Progress as of 2026-08-09 (second pass).** 72 -> **34** commits with missing
-content, 39 -> **34** diverged files, 239 -> **111** `.symbol-exclusions`
-entries (zero of them stale). Suite 2380 -> **2510 passed, 5 skipped, 0 failed**.
+**Progress as of 2026-08-09 (second pass).** 72 -> **33** commits with missing
+content, 39 -> **34** diverged files, 239 -> **107** `.symbol-exclusions`
+entries (zero of them stale). Suite 2380 -> **2514 passed, 5 skipped, 0 failed**.
 **Everything that needed an operator decision landed** — #1 (auth), #6 (mRoPE)
 and #17 (`test_models.py`) after confirmation, plus #1454's `video_generate`
 removal. Also closed: #1611 `tool_choice`, #1491 empty-input rejection,
@@ -640,6 +640,67 @@ Plus: generation-logging subsystem (`cfcc36d9`), concurrent thinking-budget race
 (`ff295e36`), `reasoning_content` alias (`6a8cdff6`), multi-kind preload flags
 (`c6084344`), `/v1/responses/input_tokens` counting a different prompt than
 `/v1/responses` builds (`eda1ec4f`, half-landed).
+
+### Per-file convergence: which files can be retired, and which must not be
+
+The cheapest permanent win here is not restoring hunks, it is **shrinking the
+shared-file surface**. Every fork hunk in a file upstream also edits is a future
+conflict and a future silent-drop site. When a file's delta is no longer worth
+carrying, `git checkout upstream/main -- <path>` makes it byte-identical and
+retires it as a drop site forever. `convert.py` (`1d6e8c9b`) and `structured.py`
+(`b616f889`) both reached that state.
+
+The safe test is **not** the line count. It is: *does our copy define anything
+upstream does not?* Run this before considering any convergence:
+
+```python
+# for each diverged .py file, AST-compare def/class names both ways
+only_ours = ours_names - upstream_names      # fork-only definitions
+only_upstream = upstream_names - ours_names  # dropped or relocated
+```
+
+Current standing (2026-08-09): **12 diverged files have zero fork-only
+definitions**, and 22 carry some.
+
+**But zero fork-only definitions does NOT mean convergeable**, and this is the
+important half. Ten of those twelve also have *zero* missing upstream definitions
+— they diverge only in **bodies**, and a body can be load-bearing fork work. Two
+of the ten are divergences this very document tells you never to touch:
+
+- `models/base.py` — its `cache.quantized_attention` call is chunked with online
+  softmax so peak memory is ~O(chunk); upstream dequantizes the whole state.
+- `speculative/drafters/gemma4_assistant/masks.py` — the absolute import is
+  load-bearing; taking upstream's relative form broke two tests.
+
+So the symbol check narrows the candidate list; it does not authorise the
+checkout. Body diffs still need reading.
+
+The two candidates with genuinely missing upstream symbols were both classified:
+
+- `generate/dispatch.py` (10) — **not convergeable, and nothing is lost.** Seven
+  symbols were *relocated* by the fork's own `5e9b9503` generation-engine port and
+  now live in `generate/common.py` (verified present, and `GenerationResult` /
+  `wired_limit` are still re-exported from `dispatch`). The other two,
+  `_cache_fully_retained` and `_prefix_cache_trim_amount`, are upstream's
+  rotating-cache guard, deliberately superseded by the fork's
+  `_rotating_rewind_safe` + snapshot ring. All ten now carry real reasons in
+  `.symbol-exclusions` instead of "unreviewed".
+- `tests/test_utils.py` (4) — still open; that file is excluded from the suite.
+
+**Where the remaining 107 exclusions sit.** `tests/test_server.py` 31,
+`tests/test_generate.py` 22, `tests/test_batch_quantized_cache.py` 12,
+`tests/test_speculative.py` 11, `server/generation.py` 11 — five files hold 87 of
+107. All five carry substantial fork-only definitions (124, 11, 17, 23 and 14
+respectively), so none is a checkout candidate; they need per-symbol review.
+
+**The gap that remains, and it is a real one.** There is still no oracle for the
+*fork-content* direction — nothing tells you which hunks in a shared file are fork
+work. `cache.py`'s `# Fork:` marker convention is the right answer and exists in
+exactly one file. Extending it tree-wide, with a check that every hunk in a shared
+file carries a marker, would turn "which side is this?" from archaeology into a
+grep. That is the single highest-leverage piece of tooling left, and it is what
+makes a per-file convergence pass safe to do in bulk rather than one file at a
+time. Not built yet.
 
 ### The remaining cluster is a union, not a restore — read this before starting
 
