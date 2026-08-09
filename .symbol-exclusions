@@ -161,64 +161,6 @@ mlx_vlm/tests/test_generate.py::test_unwrapped_rotating_trims_and_stays_usable  
 mlx_vlm/tests/test_generate.py::test_wrapped_buffered_rotating_declined_and_survives_next_step  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::test_wrapped_rotating_is_not_reusable  # baseline: pre-existing divergence, unreviewed
 
-# --- mlx_vlm/tests/test_models.py
-mlx_vlm/tests/test_models.py::TestMRoPETrainingVJP  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::TestQwen35GatedDeltaTraining  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::_StubCache  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::_assert_qwen_chunked_prefill_slices_mrope_position_ids  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::_assert_qwen_request_owned_mrope_kwargs  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::_grads  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::_qk  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::_sum_loss  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::_tiny_inkling_config  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::loss  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::make_projector  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_chunked_update_allows_value_and_grad  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_deepseek_v32_language_model  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_deepseek_v3_language_model  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_deepseekocr_2_language_model  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_fused_apply_rotary_vjp  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_gemma3_text_language_model  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_glm_moe_dsa_language_model  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_inkling_language_model  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_inkling_towers_and_multimodal  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_kimi_k3  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_laguna_folds_nvfp4_shared_experts  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_laguna_fuses_split_switch_gate_up  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_laguna_nvfp4_compressed_tensors_config  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_laguna_sanitize_drops_input_global_scale  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_laguna_sanitize_fuses_prefixed_split_switch_gate_up  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_laguna_stacks_nvfp4_experts_before_scale_folding  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_lfm2_vl_projector_creates_layernorm_only_when_enabled  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_llada2_moe_language_model  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_llama_language_model  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_llmjpvl  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_mage_vl  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_minicpmv4_6_sanitize_offsets_source_norm_weights_when_needed  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_minicpmv4_6_sanitize_preserves_converted_norm_weights  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_minimax_m3_vl_language_model  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_mistral_language_model  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_molmo_point_config_accepts_eos_token_id  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_moondream2  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_nemotron_h_language_model  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_nemotron_labs_diffusion_language_model  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_paddleocr_vl_sanitize_idempotent  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_plamo2vl  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_precomputed_rotary_vjp_matches_pure_mlx  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_qwen2_language_model  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_qwen3_5_input_embeddings_owns_mrope_kwargs  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_qwen3_5_moe_chunked_prefill_slices_mrope_position_ids  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_qwen3_5_sanitize_offsets_source_norm_weights_when_needed  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_qwen3_5_sanitize_preserves_converted_norm_weights  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_qwen3_language_model  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_qwen3_omni_audio_sanitize_is_idempotent_for_conv2d_weights  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_qwen3_omni_code2wav_sanitize_is_idempotent_for_conv_weights  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_rfdetr_forward  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_sam3_1_config_and_model  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_sam3d_body_model  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_step3p7_language_model  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_unlimited_ocr  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_models.py::test_unlimited_ocr_input_embeddings  # baseline: pre-existing divergence, unreviewed
 
 # --- mlx_vlm/tests/test_processors.py
 
