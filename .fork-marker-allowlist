@@ -33,7 +33,21 @@
 # made both files byte-identical to upstream with the test still passing. Marking
 # masks.py `# Fork:` would have frozen that mistake permanently.
 #
-# Current standing (2026-08-09): 25 files / 312 sites, down from 32 / 349. Every
+# RESOLVED 2026-08-09 (second pass), removed from this list:
+#   models/qwen3_5_moe/qwen3_5_moe.py  — restored #1450's `mid` slicing (our copy had
+#     #722's pre-fix `mx.split`); the unfused branch is fork work (f0d50c90, landed in
+#     parallel with upstream's #1472) and now carries a `# Fork:` marker.
+#   trainer/utils.py + tests/test_trainer_utils.py — both now BYTE-IDENTICAL to
+#     upstream. 13d1ff4e unified the text-model LoRA path; our copy kept a separate
+#     `adapter_utils.load_adapters` branch whose config handling was strictly weaker
+#     (AttributeError on a missing `num_layers`, no `keys` targeting, legacy configs
+#     skipped). Same-named test on each side, adapted to each implementation.
+#   tests/test_utils.py — union-merged with upstream. Zero fork-only *definitions* but
+#     real fork content in *bodies*, so not a clean checkout. Its 5 "pre-existing
+#     failures" were stale test code; now 34 passed / 0 failed AND re-enabled in the
+#     suite (the --ignore is gone).
+#
+# Current standing (2026-08-09): 21 files / ~300 sites, down from 32 / 349. Every
 # diverged file NOT listed here is marked, including
 # server/request_normalization.py — the gen-args union added fork hunks to a file
 # that had been byte-identical to upstream, and this check caught them before the
@@ -62,13 +76,9 @@ mlx_vlm/turboquant.py  # LEADS. 8 sites; 1171888e (#1447) and e3906673 (#1433) r
 mlx_vlm/generate/__init__.py  # 5 sites, re-export surface — same open question as server/__init__.py
 mlx_vlm/models/qwen3_5/language.py  # 10 sites. AGENTS.md's note that the norm-shift gate here is protected fork work was WRONG (upstream landed the same fix in #1556); treat every site as unreviewed rather than trusting that note
 mlx_vlm/models/gemma4/language.py  # 5 sites, not reviewed
-mlx_vlm/models/qwen3_5_moe/qwen3_5_moe.py  # LEADS. 1 site (sanitize) but 6 hunks, and find_dropped_hunks reports TWO commits missing from it: b590c747 (#1472 split expert weights) and 57dc1fb5 (#1450 gate-up sanitization). Our unfused branch probes experts.0.gate_proj where upstream probes experts.0.up_proj — a real behavioural difference to establish before marking
 mlx_vlm/speculative/utils.py  # 5 sites, not reviewed
-mlx_vlm/trainer/utils.py  # LEADS. 1 site; 13d1ff4e reports 8 lines missing (89% of its hunk) — text-model LoRA adapter loading. Almost certainly dropped, not fork
 
 # --- Tests, not yet reviewed at site granularity.
 mlx_vlm/tests/test_generate.py  # LEADS. 10 sites; e029e2b3 reports 6 lines missing. Holds 22 "unreviewed" .symbol-exclusions entries
 mlx_vlm/tests/test_speculative.py  # 8 sites, 23 fork-only definitions, 11 "unreviewed" .symbol-exclusions entries
 mlx_vlm/tests/test_batch_quantized_cache.py  # 6 sites, 17 fork-only definitions, 12 "unreviewed" .symbol-exclusions entries
-mlx_vlm/tests/test_utils.py  # LEADS. 11 sites; 99c9a59f (#1535 mistral model type) reports 4 lines missing. This file is EXCLUDED from the suite (--ignore), so nothing here is verified by a green run — see AGENTS.md
-mlx_vlm/tests/test_trainer_utils.py  # LEADS. 1 site, and it is a DELETION: our copy drops upstream's test_apply_lora_layers_dispatches_text_model_adapters, which is 13d1ff4e's test. Pairs with trainer/utils.py above; resolve together

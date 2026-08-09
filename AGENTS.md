@@ -40,7 +40,7 @@ python dev/check_upstream_symbols.py    # no upstream def/class silently dropped
 python dev/find_dropped_hunks.py        # no upstream HUNK silently dropped
 python dev/check_upstream_deletions.py  # no upstream DELETION silently reverted
 python dev/check_fork_markers.py        # every fork hunk in a shared file is marked
-cd mlx_vlm/ && pytest ./tests --ignore=tests/test_smoke.py --ignore=tests/test_utils.py
+cd mlx_vlm/ && pytest ./tests --ignore=tests/test_smoke.py
 ```
 
 **Run all five checks after every merge — this is not optional.** When a merge
@@ -164,7 +164,7 @@ positives. Every hit still needs `git log -S` and a read.
 ## Tests
 
 ```bash
-cd mlx_vlm/ && pytest -s ./tests --ignore=tests/test_smoke.py --ignore=tests/test_utils.py
+cd mlx_vlm/ && pytest -s ./tests --ignore=tests/test_smoke.py
 ```
 
 The suite is **green: 2380 passed, 5 skipped, 0 failed.** Keep it that way.
@@ -173,7 +173,7 @@ The suite is **green: 2380 passed, 5 skipped, 0 failed.** Keep it that way.
 another shows the same total:
 
 ```bash
-pytest -q ./tests --ignore=tests/test_smoke.py --ignore=tests/test_utils.py \
+pytest -q ./tests --ignore=tests/test_smoke.py \
   | grep '^FAILED' | sed 's/ - .*//' | sort > /tmp/after.txt
 comm -13 /tmp/before.txt /tmp/after.txt   # regressions
 comm -23 /tmp/before.txt /tmp/after.txt   # fixed
@@ -182,9 +182,15 @@ comm -23 /tmp/before.txt /tmp/after.txt   # fixed
 **A green suite only proves that *collected* tests pass.** Check
 `pytest --collect-only` counts too. Two live examples:
 
-- `tests/test_utils.py` is **excluded from the suite** (`--ignore`, 5 pre-existing
-  failures). A regression test placed there never runs. Put fork tests in a
-  collected file; `tests/test_model_registry.py` is the fork-only example.
+- **[resolved 2026-08-09]** `tests/test_utils.py` used to be **excluded from the
+  suite** (`--ignore`, 5 pre-existing failures), so a regression test placed there
+  never ran. It is now collected and green. The 5 failures were **stale test code,
+  not product bugs**: our copy had been adapted around a `safetensors.safe_open`
+  metadata check that no longer exists in either tree, and upstream's copy passes
+  against our library. Taking upstream's file plus one genuine fork adaptation (our
+  `load_processor` reads the config first, so `load_config` must be patched too)
+  gives 34 passed / 0 failed. Note CI's `tests.yml` never excluded this file — only
+  `test_smoke.py` — so CI would have been red on any PR.
 - `TestLagunaProcessor` is defined **twice** in `tests/test_processors.py`, so the
   earlier definition is shadowed and its test is never collected — which is why a
   missing `utils.should_add_special_tokens` fails nothing. Our copy is
@@ -398,11 +404,12 @@ fallback and by two test files.
 
 - `tests.yml` — runs on **pull_request only**, macOS-14 / Python 3.10. Runs
   `pre-commit run --all` and fails if `git diff` is non-empty, then pytest
-  (excluding `test_smoke.py` and `test_utils.py`). Because it is PR-only, pushes
-  straight to `main` are never style-checked — which is how style drift went
-  unnoticed.
+  (excluding `test_smoke.py` only — this file previously claimed it also excluded
+  `test_utils.py`; it never did, so CI would have been red on any PR while that
+  file had failures). Because it is PR-only, pushes straight to `main` are never
+  style-checked — which is how style drift went unnoticed.
 - `upstream-parity.yml` — runs on pushes to `main` as well as PRs, since this fork
-  is usually committed to directly. Runs both audit scripts.
+  is usually committed to directly. Runs the four gating audit scripts.
 
 ## Key dependencies
 

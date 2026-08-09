@@ -3421,7 +3421,7 @@ def test_inference_routes_are_served_not_just_registered(client):
     assert client.get("/v1/models").status_code != 404
 
 
-def test_chat_completions_endpoint_preserves_assistant_reasoning(client):
+def test_chat_completions_endpoint_preserves_assistant_reasoning_content(client):
     model = SimpleNamespace()
     processor = SimpleNamespace()
     config = SimpleNamespace(model_type="qwen2_vl")
@@ -3453,7 +3453,7 @@ def test_chat_completions_endpoint_preserves_assistant_reasoning(client):
                     {
                         "role": "assistant",
                         "content": "Hello",
-                        "reasoning": "Prior thought",
+                        "reasoning_content": "Prior thought",
                     },
                     {"role": "user", "content": "Continue"},
                 ],
@@ -3464,6 +3464,7 @@ def test_chat_completions_endpoint_preserves_assistant_reasoning(client):
     assert mock_template.call_args.args[2][1] == {
         "role": "assistant",
         "content": "Hello",
+        "reasoning_content": "Prior thought",
         "reasoning": "Prior thought",
     }
 
@@ -6302,6 +6303,14 @@ class TestChatMessageSchema:
         msg = server.ChatMessage(
             role="assistant", content="answer", reasoning="thought"
         )
+        assert msg.reasoning == "thought"
+        assert msg.reasoning_content == "thought"
+
+    def test_reasoning_content_field(self):
+        msg = server.ChatMessage(
+            role="assistant", content="answer", reasoning_content="thought"
+        )
+        assert msg.reasoning_content == "thought"
         assert msg.reasoning == "thought"
 
 

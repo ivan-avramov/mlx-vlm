@@ -640,12 +640,25 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
     strict = kwargs.pop("strict", True)
     config = load_config(model_path, **kwargs)
 
-    # Find all .safetensors files in the model_path, excluding consolidated model weights
-    weight_files = [
-        wf
-        for wf in glob.glob(str(model_path / "*.safetensors"))
-        if not wf.endswith("consolidated.safetensors")
-    ]
+    index_file = model_path / "model.safetensors.index.json"
+    weight_files = []
+    if index_file.exists():
+        try:
+            with open(index_file) as f:
+                weight_map = json.load(f).get("weight_map", {})
+            weight_files = [
+                str(model_path / shard)
+                for shard in sorted(set(weight_map.values()))
+                if (model_path / shard).exists()
+            ]
+        except (ValueError, OSError):
+            weight_files = []
+    if not weight_files:
+        weight_files = [
+            wf
+            for wf in glob.glob(str(model_path / "*.safetensors"))
+            if not wf.endswith("consolidated.safetensors")
+        ]
 
     if not weight_files:
         logger.error("No safetensors found in %s", model_path)
@@ -736,6 +749,19 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             quantization_config = text_config.get("quantization_config", None)
             if quantization_config is not None:
                 config["quantization_config"] = quantization_config
+
+        if quantization_config is None:
+            hf_quant_path = model_path / "hf_quant_config.json"
+            if hf_quant_path.exists():
+                with open(hf_quant_path) as f:
+                    hf_quant = json.load(f).get("quantization", {})
+                if hf_quant.get("quant_algo") == "NVFP4":
+                    # nvfp4 implies group_size=16
+                    config["quantization"] = config["quantization_config"] = {
+                        "group_size": 16,
+                        "bits": 4,
+                        "mode": "nvfp4",
+                    }
 
         if quantization_config is not None:
             quant_method = quantization_config.get("quant_method")
@@ -1996,8 +2022,11 @@ def prepare_inputs(
             inputs["pixel_values"] = inputs["images"]
             inputs.pop("images")
 
+        attention_mask = inputs.get("attention_mask")
         model_inputs["attention_mask"] = (
-            mx.array(inputs["attention_mask"]) if "attention_mask" in inputs else None
+            attention_mask
+            if attention_mask is None or isinstance(attention_mask, mx.array)
+            else mx.array(attention_mask)
         )
 
         # Convert inputs to model_inputs with mx.array if present

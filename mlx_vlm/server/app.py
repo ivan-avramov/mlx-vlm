@@ -674,10 +674,14 @@ def get_cached_model(
                 detail="Adapters are not supported for embedding models.",
             )
         logger.info("Loading embedding model: %s", model_path)
-        from ..utils import load as load_embedding_model
+        from ..embedding_loader import load_embedding_model
+        from ..models.pooling import read_pooling_config
+        from ..utils import get_model_path, load_processor
 
         try:
-            model, processor = load_embedding_model(model_path)
+            model_dir = get_model_path(model_path)
+            model = load_embedding_model(model_dir)
+            processor = load_processor(model_dir, add_detokenizer=False)
         except RepositoryNotFoundError as e:
             raise HTTPException(
                 status_code=404,
@@ -694,6 +698,7 @@ def get_cached_model(
             raise HTTPException(
                 status_code=500, detail=f"Failed to load embedding model: {e}"
             ) from e
+        model.pooling_config = read_pooling_config(model_dir)
         config = SimpleNamespace(
             model_type=getattr(model, "model_type", "embedding"),
             text_config=None,
@@ -758,6 +763,13 @@ def get_cached_model(
         response_generator.stop_and_join()
         vision_cache.clear()
         raise
+
+    # Dry-run APC layout when the shared pool is enabled (log-only; never blocks serve).
+    if runtime.apc_manager is not None:
+        try:
+            _apc.self_check_model_apc(model, kv_bits=kv_bits)
+        except Exception as exc:
+            logger.warning("APC self-check raised unexpectedly: %s", exc)
 
     cache = {
         "cache_key": cache_key,

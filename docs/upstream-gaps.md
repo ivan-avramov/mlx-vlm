@@ -720,7 +720,12 @@ The two candidates with genuinely missing upstream symbols were both classified:
   rotating-cache guard, deliberately superseded by the fork's
   `_rotating_rewind_safe` + snapshot ring. All ten now carry real reasons in
   `.symbol-exclusions` instead of "unreviewed".
-- `tests/test_utils.py` (4) — still open; that file is excluded from the suite.
+- `tests/test_utils.py` (4) — **closed 2026-08-09.** Zero fork-only definitions, but
+  *not* a clean checkout: our copy had fork content in **bodies** (mocking a
+  `safetensors.safe_open` metadata check that exists in neither tree any more).
+  Union-merged instead — upstream's file plus one genuine fork adaptation. The 5
+  "pre-existing failures" that got the file excluded from the suite were stale test
+  code, not product bugs: it is now **34 passed / 0 failed and collected**.
 
 **Where the remaining 99 exclusions sit.** `tests/test_server.py` 31,
 `tests/test_generate.py` 22, `tests/test_batch_quantized_cache.py` 12,
@@ -899,9 +904,11 @@ reporting there.
 
 Two habits follow. A green suite proves only that *collected* tests pass — check
 collection counts, not just results (`pytest --collect-only`). And
-`tests/test_utils.py` is excluded from the suite entirely
-(`--ignore=tests/test_utils.py`, 5 pre-existing failures), so any guard placed
-there never runs; put fork regression tests in a file that is actually collected.
+`tests/test_utils.py` **was** excluded from the suite entirely
+(`--ignore=tests/test_utils.py`, 5 pre-existing failures), so any guard placed there
+never ran. Resolved 2026-08-09: the failures were stale test code, the file is now
+green and collected. The habit still stands — check what is collected, not just what
+passes — but this particular hole is closed.
 
 ### The methodological rule this page has now paid for six times
 

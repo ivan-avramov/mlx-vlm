@@ -60,7 +60,13 @@ mlx_vlm/server/generation.py::on_block  # ditto 29b6c00b (#1508) — nested help
 
 # --- mlx_vlm/tests
 mlx_vlm/tests/test_generate.py::test_generation_batch_uses_greedy_hidden_argmax_without_logprobs  # tests _greedy_argmax_step above; retire with 7fbc7bc9 (#1598)
-mlx_vlm/tests/test_server.py::test_chat_completions_endpoint_preserves_assistant_reasoning  # stale half of dropped 24f6f590 "fix interleaved reasoning" (#1370); upstream restructured this test
+# RESOLVED 2026-08-09: test_chat_completions_endpoint_preserves_assistant_reasoning
+# was excused here as "the stale half of dropped 24f6f590 (#1370)". The attribution
+# was wrong: the rename to ..._reasoning_content belongs to 6a8cdff6 (#1411, the
+# reasoning_content alias), which is now restored — schemas.py gained the field plus
+# the sync_reasoning_aliases model_validator, openai.py emits both keys, and the
+# test carries upstream's name and assertions. Provenance for a "stale half" claim
+# needs `git log -S` on the symbol, not just a plausible nearby commit.
 
 # --- mlx_vlm/utils.py
 mlx_vlm/utils.py::normalize_audio_features  # stale half of dropped b93707d8 "Always sanitize loaded weights and simplify audio preprocessing"; upstream folded it into the sanitize path

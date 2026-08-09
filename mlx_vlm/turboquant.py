@@ -3117,11 +3117,12 @@ def _fused_mse_quantize_kernel(bits: int, use_rht: bool = False):
         float sq = val * val;
         float sg_sum = simd_sum(sq);
 
-        threadgroup float sg_norms[8];
+        constexpr int n_sg = (Dim + 31) / 32;
+        threadgroup float sg_norms[32];
         if (sg_lid == 0) sg_norms[sg_id] = sg_sum;
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        float total_sq = (sg_id == 0 && sg_lid < 8) ? sg_norms[sg_lid] : 0.0f;
+        float total_sq = (sg_id == 0 && sg_lid < n_sg) ? sg_norms[sg_lid] : 0.0f;
         total_sq = simd_sum(total_sq);
         // Broadcast norm to all threads
         if (sg_id == 0 && sg_lid == 0) sg_norms[0] = total_sq;

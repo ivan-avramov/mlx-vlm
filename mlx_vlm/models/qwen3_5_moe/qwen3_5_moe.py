@@ -46,12 +46,20 @@ class Model(Qwen3_5Model):
                 # FUSED layout (Qwen3.6-VL): gate_up_proj is a single stacked
                 # [num_experts, 2 * intermediate_size, hidden_size] tensor.
                 gate_up_weight = weights.pop(f"{prefix}.experts.gate_up_proj")
-                gate_weight, up_weights = mx.split(gate_up_weight, 2, axis=-2)
-                weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_weight
-                weights[f"{prefix}.switch_mlp.up_proj.weight"] = up_weights
+                mid = gate_up_weight.shape[-2] // 2
+                weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_up_weight[
+                    ..., :mid, :
+                ]
+                weights[f"{prefix}.switch_mlp.up_proj.weight"] = gate_up_weight[
+                    ..., mid:, :
+                ]
                 weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(
                     f"{prefix}.experts.down_proj"
                 )
+            # Fork: the unfused branch is fork work (f0d50c90), landed in parallel
+            # with upstream's own #1472 and probing `gate_proj` where upstream probes
+            # `up_proj`. Equivalent for any real SwiGLU checkpoint, which ships all
+            # three projections per expert; kept rather than churned.
             elif f"{prefix}.experts.0.gate_proj.weight" in weights:
                 # UNFUSED layout (Ornith / Qwen3-Next style): one [out, in] tensor
                 # per expert. Stack into [num_experts, out, in] for SwitchGLU.
