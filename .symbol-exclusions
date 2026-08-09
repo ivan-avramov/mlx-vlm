@@ -86,7 +86,6 @@ mlx_vlm/server/generation.py::on_result  # baseline: pre-existing divergence, un
 # --- mlx_vlm/server/openai.py
 
 # --- mlx_vlm/server/responses_state.py
-mlx_vlm/server/responses_state.py::_reasoning_output_items  # baseline: pre-existing divergence, unreviewed
 
 # --- mlx_vlm/server/schemas.py
 mlx_vlm/server/schemas.py::StreamingTimings  # baseline: pre-existing divergence, unreviewed
@@ -150,7 +149,6 @@ mlx_vlm/tests/test_generate.py::test_wrapped_rotating_is_not_reusable  # baselin
 # --- mlx_vlm/tests/test_sample_utils.py
 
 # --- mlx_vlm/tests/test_server.py
-mlx_vlm/tests/test_server.py::_sse_events  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::fake_apply_chat_template  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::fake_stream_diffusion_generate_from_kwargs  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::generate_one  # baseline: pre-existing divergence, unreviewed
@@ -178,9 +176,6 @@ mlx_vlm/tests/test_server.py::test_prompt_must_end_with_open_thinking_marker_to_
 mlx_vlm/tests/test_server.py::test_prompt_open_marker_is_authoritative_when_flag_is_disabled  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_reasoning_content_field  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_response_generator_diffusion_forwards_generation_options  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_server.py::test_responses_endpoint_returns_reasoning_items  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_server.py::test_responses_streaming_emits_function_call_arguments_done  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_server.py::test_responses_streaming_emits_reasoning_events  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_responses_streaming_uses_prompt_opened_thinking_without_flag  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_stream_endpoints_do_not_clear_mlx_cache_on_close  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_unsupported_model_request_does_not_crash_server  # baseline: pre-existing divergence, unreviewed
