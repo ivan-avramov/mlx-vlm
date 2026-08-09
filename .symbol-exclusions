@@ -25,10 +25,6 @@
 # --- mlx_vlm/apc.py
 
 # --- mlx_vlm/convert.py
-mlx_vlm/convert.py::_apply_awq_calibration  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/convert.py::_build_multimodal_awq_run  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/convert.py::_has_decoder  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/convert.py::run  # baseline: pre-existing divergence, unreviewed
 
 # --- mlx_vlm/generate/ar.py
 mlx_vlm/generate/ar.py::_ensure_logits_processor_slots  # baseline: pre-existing divergence, unreviewed
