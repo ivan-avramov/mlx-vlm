@@ -11,6 +11,19 @@ from .config import ModelConfig
 from .language import LanguageModel
 from .vision import VisionModel
 
+
+def sanitize_key(key):
+    if key.startswith("model.language_model.visual"):
+        key = key.replace("model.language_model.visual", "vision_tower", 1)
+    elif key.startswith("model.language_model"):
+        key = key.replace("model.language_model", "language_model.model", 1)
+    elif key.startswith("model.visual"):
+        key = key.replace("model.visual", "vision_tower", 1)
+    elif key.startswith("lm_head"):
+        key = key.replace("lm_head", "language_model.lm_head", 1)
+    return key
+
+
 NORM_WEIGHT_SUFFIXES = (
     ".input_layernorm.weight",
     ".post_attention_layernorm.weight",
@@ -31,18 +44,6 @@ def should_shift_norm_weights(weights):
 
 def should_offset_norm_weight(original_key, shift_norm_weights):
     return shift_norm_weights or not original_key.startswith("language_model.")
-
-
-def sanitize_key(key):
-    if key.startswith("model.language_model.visual"):
-        key = key.replace("model.language_model.visual", "vision_tower", 1)
-    elif key.startswith("model.language_model"):
-        key = key.replace("model.language_model", "language_model.model", 1)
-    elif key.startswith("model.visual"):
-        key = key.replace("model.visual", "vision_tower", 1)
-    elif key.startswith("lm_head"):
-        key = key.replace("lm_head", "language_model.lm_head", 1)
-    return key
 
 
 class Model(Qwen3VLModel):
@@ -69,9 +70,13 @@ class Model(Qwen3VLModel):
         grid_thw = image_grid_thw if image_grid_thw is not None else video_grid_thw
 
         if pixel_values is None:
-            self.language_model._position_ids = None
+            position_ids, rope_deltas = self.language_model.get_rope_index(
+                input_ids, attention_mask=mask
+            )
             return InputEmbeddingsFeatures(
-                inputs_embeds=self.language_model.model.embed_tokens(input_ids)
+                inputs_embeds=self.language_model.model.embed_tokens(input_ids),
+                position_ids=position_ids,
+                rope_deltas=rope_deltas,
             )
 
         dtype = self.vision_tower.patch_embed.proj.weight.dtype
@@ -102,16 +107,14 @@ class Model(Qwen3VLModel):
             self.config.video_token_index,
         )
 
-        # Pre-calculate position_ids for chunked prefill
-        if image_grid_thw is not None or video_grid_thw is not None:
-            position_ids, rope_deltas = self.language_model.get_rope_index(
-                input_ids, image_grid_thw, video_grid_thw, mask
-            )
-            self.language_model._position_ids = position_ids
-            self.language_model._rope_deltas = rope_deltas
+        position_ids, rope_deltas = self.language_model.get_rope_index(
+            input_ids, image_grid_thw, video_grid_thw, mask
+        )
 
         return InputEmbeddingsFeatures(
             inputs_embeds=inputs_embeds,
+            position_ids=position_ids,
+            rope_deltas=rope_deltas,
         )
 
     @staticmethod

@@ -31,15 +31,8 @@ mlx_vlm/convert.py::_has_decoder  # baseline: pre-existing divergence, unreviewe
 mlx_vlm/convert.py::run  # baseline: pre-existing divergence, unreviewed
 
 # --- mlx_vlm/generate/ar.py
-mlx_vlm/generate/ar.py::_capture_rope_deltas_from_prompt_kwargs  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/generate/ar.py::_concat_prompt_kwarg_rows  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/generate/ar.py::_ensure_logits_processor_slots  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/generate/ar.py::_fused_greedy_step  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/generate/ar.py::_is_mrope_position_ids_prompt_kwarg  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/generate/ar.py::_mrope_position_ids_row  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/generate/ar.py::_normalize_rope_deltas  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/generate/ar.py::_prompt_kwarg_batch_size  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/generate/ar.py::_slice_sequence_aligned_prompt_kwarg  # baseline: pre-existing divergence, unreviewed
 
 # --- mlx_vlm/generate/diffusion.py
 
@@ -145,8 +138,6 @@ mlx_vlm/tests/test_generate.py::pop_forced_token_id  # baseline: pre-existing di
 mlx_vlm/tests/test_generate.py::record_async_eval  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::test_batch_generate_optional_input_annotations_match_defaults  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::test_batch_generator_apc_media_token_ids_handles_text_only_model  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_generate.py::test_capture_rope_deltas_prefers_prompt_kwargs  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_generate.py::test_cold_batch_merges_mixed_text_and_mrope_position_ids  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::test_empty_cache_is_reusable  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::test_flat_cache_trims_to_prefix  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::test_full_prefix_needs_no_trim  # baseline: pre-existing divergence, unreviewed
@@ -162,11 +153,9 @@ mlx_vlm/tests/test_generate.py::test_pop_forced_token_id_emits_forced_token_when
 mlx_vlm/tests/test_generate.py::test_pop_forced_token_id_safe_after_end_delimiter  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::test_pop_forced_token_id_safe_after_start_delimiter  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::test_pop_forced_token_id_safe_before_first_call  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_generate.py::test_prompt_processing_batch_slices_native_mrope_position_ids  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::test_prompt_step_keeps_exact_apc_checkpoint_async  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::test_prompt_step_schedules_cache_evaluation_asynchronously  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::test_public_generation_annotations_match_runtime_results  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_generate.py::test_split_prompt_kwargs_handles_native_mrope_position_ids  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::test_unwrapped_buffered_rotating_trims  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::test_unwrapped_rotating_trims_and_stays_usable  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::test_wrapped_buffered_rotating_declined_and_survives_next_step  # baseline: pre-existing divergence, unreviewed
@@ -264,7 +253,6 @@ mlx_vlm/tests/test_server.py::test_chunked_prefill_logging_reports_partial_progr
 mlx_vlm/tests/test_server.py::test_debug_decode_logging_adds_token_details  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_decode_logging_uses_one_rate_field  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_generate_serializes_budget_criteria_with_tokenizer_preprocessing  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_server.py::test_gpu_embed_drops_none_embedding_fields  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_info_decode_logging_uses_interval_without_token_details  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_load_model_resources_returns_load_failure_as_bad_request  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_log_progress_interval_is_configurable  # baseline: pre-existing divergence, unreviewed

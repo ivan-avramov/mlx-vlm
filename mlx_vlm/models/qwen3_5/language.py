@@ -2656,6 +2656,9 @@ class LanguageModel(nn.Module):
             self._rope_deltas = None
             self._position_ids = None
 
+        if rope_deltas_kw is not None:
+            self._rope_deltas = rope_deltas_kw
+
         cache_offset = 0
         cache_offsets = None  # per-element offsets for batched caches
         c0 = None
@@ -2668,6 +2671,13 @@ class LanguageModel(nn.Module):
                 and c0.offset.size > 1
             ):
                 cache_offsets = mx.maximum(c0.offset, 0)
+
+        if position_ids is not None and cache_offsets is None:
+            seq_length = inputs.shape[-1]
+            if position_ids.shape[-1] > seq_length:
+                position_ids = position_ids[
+                    ..., cache_offset : cache_offset + seq_length
+                ]
 
         if (
             mask is None
@@ -2756,6 +2766,15 @@ class LanguageModel(nn.Module):
                 position_ids = mx.arange(seq_length).reshape(1, -1)
                 position_ids = mx.broadcast_to(position_ids, (batch_size, seq_length))
                 position_ids = mx.add(position_ids, delta)
+                if (
+                    rope_deltas_kw is not None
+                    or self._position_ids is not None
+                    and self._position_ids.ndim == 3
+                ):
+                    position_ids = position_ids[None, ...]
+                    position_ids = mx.broadcast_to(
+                        position_ids, (3, batch_size, seq_length)
+                    )
 
         hidden_sink: Optional[List[mx.array]] = (
             [] if capture_layer_ids is not None else None
