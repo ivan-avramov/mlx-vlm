@@ -32,16 +32,23 @@ missing** while all 21 genuinely-new upstream files arrived normally.
 
 ## Tooling that now guards this
 
-Two checks, wired into `.github/workflows/upstream-parity.yml` (runs on pushes
-to `main` too, not just PRs, since this fork is usually committed to directly):
+**Four** checks. Three are wired into `.github/workflows/upstream-parity.yml`
+(which runs on pushes to `main` too, not just PRs, since this fork is usually
+committed to directly); `find_dropped_hunks.py` stays manual because it is a
+ranked report rather than a pass/fail gate.
 
 | Check | Catches | Baseline file |
 |---|---|---|
 | `dev/check_upstream_parity.py` | whole files in `upstream/main` missing here | `.merge-exclusions` |
 | `dev/check_upstream_symbols.py` | `def`/`class` names missing from our copy of a shared file | `.symbol-exclusions` |
+| `dev/check_upstream_deletions.py` | the **reverse**: files/symbols upstream deleted that we kept | `.deletion-exclusions` |
+| `dev/find_dropped_hunks.py` | dropped *hunks*, ranked by owning commit (Python **and** docs/config) | — |
 
-Both require a `# reason` on every exclusion and fail if one is missing. Both
-read the git **index**, so they can gate a commit rather than only report on one.
+All three gating checks require a `# reason` on every exclusion and fail if one is
+missing, and all read the git **index**, so they can gate a commit rather than only
+report on one. `check_upstream_symbols.py` additionally warns when an exclusion no
+longer excuses anything — a stale exclusion is a hole in the next audit, and it has
+caught retired entries three times since it was added.
 
 Run locally before pushing a merge:
 
@@ -49,16 +56,17 @@ Run locally before pushing a merge:
 git fetch upstream
 python dev/check_upstream_parity.py
 python dev/check_upstream_symbols.py
+python dev/check_upstream_deletions.py    # ~70s
+python dev/find_dropped_hunks.py          # slow; ranked report
 ```
 
-`.symbol-exclusions` currently holds a **300-entry baseline**, down from 446 as gaps
-were closed (the mlx-lm vendoring alone retired 88). It was captured against
-`upstream/main`. That number is a snapshot of existing divergence, not a defect
-count: it mixes never-ported upstream features, modules this fork deliberately
-rewrote (`sample_utils`, `apc`, `cache`, `server/generation`), and genuine
-dropped hunks. It is entry-per-symbol rather than per-file on purpose, so the
-*next* symbol lost from an already-diverged file still trips the check.
-Shrinking it is good; adding to it needs a specific reason.
+`.symbol-exclusions` currently holds **117 entries**, down from 446 (the mlx-lm
+vendoring retired 88, the `test_models.py` take another 57). That number is a
+snapshot of existing divergence, not a defect count: it mixes never-ported upstream
+features, modules this fork deliberately rewrote (`sample_utils`, `apc`, `cache`,
+`server/generation`), and genuine dropped hunks. It is entry-per-symbol rather than
+per-file on purpose, so the *next* symbol lost from an already-diverged file still
+trips the check. Shrinking it is good; adding to it needs a specific reason.
 
 ## Restored, with a caveat
 
@@ -511,14 +519,20 @@ merged-then-dropped** — `git log HEAD..upstream/main` is empty and always was.
 invisible: the merge that dropped a feature hunk usually dropped its tests in the
 same resolution.
 
-**Progress as of 2026-08-08 (second pass).** 72 -> **44** commits with missing
-content, 39 -> **34** diverged files, 239 -> **145** `.symbol-exclusions`
-entries (zero of them stale). Suite 2380 -> **2485 passed, 5 skipped, 0 failed**.
-**Eleven items closed, including all three that needed an operator decision** —
-#1 (auth), #6 (mRoPE) and #17 (`test_models.py`) all landed after confirmation.
-The `.symbol-exclusions` drop is the largest since the mlx-lm vendoring: the
-`test_models.py` take alone retired 57 entries and ~24 commits' worth of missing
-test content.
+**Progress as of 2026-08-09 (second pass).** 72 -> **35** commits with missing
+content, 39 -> **34** diverged files, 239 -> **117** `.symbol-exclusions`
+entries (zero of them stale). Suite 2380 -> **2504 passed, 5 skipped, 0 failed**.
+**Everything that needed an operator decision landed** — #1 (auth), #6 (mRoPE)
+and #17 (`test_models.py`) after confirmation, plus #1454's `video_generate`
+removal. Also closed: #1611 `tool_choice`, #1491 empty-input rejection,
+`load_image(PIL)`, the 1-bit wiring, laguna tokenization, the TurboQuant trim
+cluster, three dropped dependency commits, and the whole `convert.py` cluster
+(#1439, #1666 AWQ, 2066c930) — `convert.py` is now byte-identical to upstream.
+
+Both audit blind spots found this pass are now closed by tooling:
+`dev/check_upstream_deletions.py` covers the reverse direction (deletions we
+reverted), and `find_dropped_hunks.py` now scans docs/config with a threshold that
+fits them. Four checks, not three; see AGENTS.md.
 
 Re-run the scanner after every merge:
 
@@ -606,18 +620,18 @@ Three more from the second half of the pass, all new:
 |---|---|---|---|
 | 1 | ~~Inference routes unauthenticated~~ **FIXED `8839c2ff`** | `4993eac1` (#1714) | with `MLX_VLM_SERVER_API_KEY` set, `/v1/models` returns 200 and `/v1/chat/completions` reaches body validation without auth, while `/v1/cache/stats` correctly 401s. Upstream wraps them in `APIRouter(dependencies=[Depends(_require_management_api_key)])`; we register on `app` directly |
 | 2 | ~~MiniMax M3 VL cannot run on any batch/server path~~ **FIXED `c8609a0c`** | `ecc457b2` (#1374) | `ar._make_cache(model, [0,1])` -> `ValueError: MiniMaxM3KVCache does not yet support batching`. 3-line `to_batch` guard at the top of `to_batch_cache` |
-| 3 | **Streaming `/v1/responses` streams raw chain-of-thought as visible output** | `7c233155`, `cfcc36d9` | `openai.py` streaming path is `delta = chunk.text`; zero `response.reasoning*` events. Non-streaming drops the item too: `_response_output_items_from_text` yields `['message']` where upstream yields `['reasoning','message']` |
+| 3 | **Streaming `/v1/responses` streams raw chain-of-thought as visible output** — now the top open item | `7c233155`, `cfcc36d9` | `openai.py` streaming path is `delta = chunk.text`; zero `response.reasoning*` events. Non-streaming drops the item too: `_response_output_items_from_text` yields `['message']` where upstream yields `['reasoning','message']` |
 | 4 | ~~`/v1/embeddings` 404s although the implementation ships~~ **FIXED `609bdf95`** | `40757df3` | `server/embeddings.py` + `models/pooling.py` byte-identical to upstream with **zero importers**; the `app.py`/`cli.py` wiring was dropped |
 | 5 | ~~`--quantized-kv-start` silently ignored on the server~~ **FIXED `f5b74a9a`** | `dab4cb45` (#1582) | plumbed all the way to `ar.py`'s `self.quantized_kv_start = ...` and **read by nothing**. TurboQuant quantizes from token 0 regardless. A dead-parameter tell |
 | 6 | ~~mRoPE cluster~~ **FIXED `540a3189`** | `a8642018`, `b8671991`, `#1527`, `#1741` | must land WITH `generate/ar.py`: our batcher lacks the MRoPE helpers, so `(3,B,L)` `position_ids` is truncated to `(1,B,L)`. Restoring `qwen3_5` alone *creates* a bug. **Live today for qwen2_vl / qwen2_5_vl / qwen3_vl / qwen3_vl_moe** — qwen3_5's staleness is what masks it |
 | 7 | ~~TurboQuant trim cluster~~ **FIXED `92620167`** | `#1447`, `#1453`, `#1432` | `BatchTurboQuantKVCache.is_trimmable()` -> `False`, `trim(2)` -> `0` (upstream: `True`, `2`). Under `--kv-bits` the cache falls into the SSM branch and is indexed `c[0]`/`c[1]` -> `TypeError`; on the non-crashing path every later `gdn_states[j]` index shifts, restoring GatedDeltaNet state from the wrong layer. `zero_row_tail` exists with **no caller anywhere** |
-| 8 | **`tool_choice` ignored on `/v1/chat/completions`** | `2394fcf1` (#1611) | `"tools" in ChatRequest.model_fields` -> False; also lost the `if not tools: tool_module = None` guard, so tool markup is parsed for callers who sent no tools |
+| 8 | ~~`tool_choice` ignored on `/v1/chat/completions`~~ **FIXED `0bb0b07f`** | `2394fcf1` (#1611) | `"tools" in ChatRequest.model_fields` -> False; also lost the `if not tools: tool_module = None` guard, so tool markup is parsed for callers who sent no tools |
 | 9 | **`skip_special_tokens` is an undeclared attribute** | `cfcc36d9`/`29b6c00b` | `anthropic.py:489` writes `gen_args.skip_special_tokens = False`; the field does not exist on `GenerationArguments` and `generation.py` hardcodes `True`. The recorded "Anthropic tool-markup" fix is **inert** |
 | 10 | ~~1-bit repos cannot load~~ **FIXED `510f16e9`** | `960b26f9` (#1597) | kernel, `__init__` export and 123-line test all landed; only `utils.py`'s 7 lines of `replace_one_bit_modules` wiring dropped |
-| 11 | **AWQ quantization absent** | `3c0232ed` (#1666) | 104 lines of `convert.py`, 91% of the hunk |
-| 12 | **Empty-input rejection absent** | `a344713a` (#1491) | empty requests reach model load instead of a 400 |
+| 11 | ~~AWQ quantization absent~~ **FIXED `1d6e8c9b`** | `3c0232ed` (#1666) | 104 lines of `convert.py`, 91% of the hunk |
+| 12 | ~~Empty-input rejection absent~~ **FIXED `4d91b912`** | `a344713a` (#1491) | empty requests reach model load instead of a 400 |
 | 13 | ~~`should_add_special_tokens` missing~~ **FIXED `510f16e9`** | `53052569` | see the shadowed-test note below; gemma3/3n/4/4_unified/laguna get markers added outside the template |
-| 14 | `load_image(PIL.Image)` raises | `84025353` | `ValueError: Unsupported image source type: Image` |
+| 14 | ~~`load_image(PIL.Image)` raises~~ **FIXED `4d91b912`** | `84025353` | `ValueError: Unsupported image source type: Image` |
 | 15 | `request_normalization.py` orphaned | `221fe0b3` (#1644) | 242 lines, byte-identical, **zero importers**, and it *raises on first call* (passes `top_n_sigma` to a `GenerationArguments` that lacks it) — a landmine for anyone who "fixes" the import |
 | 16 | Three sampler modes unreachable | `36331ea7`, `#1653`, `#1663` | `sample_utils.make_sampler` accepts `top_n_sigma`/`p_less`/`typical_p`; no request field reaches them |
 | 17 | ~~`test_models.py` wholesale take~~ **FIXED `d684708e`** | 24 commits | proven strict subset (AST: 52 methods only upstream, **0** only ours); +46 tests, retires all 57 `test_models.py` exclusions. 3 fail until item 6 lands |
