@@ -2864,6 +2864,11 @@ class BatchGenerator:
         prompt_responses = []
 
         # Decode-first: always emit a generation step before touching prefill.
+        yield_after_decode = any(
+            getattr(processor, "requires_immediate_decode_yield", False)
+            for processors in getattr(self._generation_batch, "logits_processors", [])
+            for processor in processors or []
+        )
         if len(self._generation_batch) > 0:
             generation_responses = self._generation_batch.next()
             self._gen_tokens_counter += len(generation_responses)
@@ -2878,6 +2883,8 @@ class BatchGenerator:
                 else:
                     mx.eval([c.state for c in self._generation_batch.prompt_cache])
                 mx.clear_cache()
+            if yield_after_decode:
+                return prompt_responses, generation_responses
 
         if (
             getattr(self._generation_batch, "is_speculative", False)

@@ -163,6 +163,83 @@ class TestOneBitLoaderWiring:
         assert _quantization_for_path(quantization, "model.layers.1.mlp")["bits"] == 4
 
 
+class TestLLGuidanceFastPath:
+    """`6d5603b3` — Speed up llguidance structured decoding (#1628).
+
+    `tests/test_structured.py` is byte-identical to upstream and passed with the
+    *old* implementation, because #1628 is a behaviour-preserving performance
+    rewrite: same masked logits, different machinery. So nothing in the suite
+    distinguished the two, which is why 4 unreviewed `.symbol-exclusions` entries
+    sat on this file. These guards assert the machinery, not the output.
+    """
+
+    def test_mask_kernel_masks_exactly_the_disallowed_tokens(self):
+        """The Metal kernel replaced a per-row Python loop over the batch."""
+        import mlx.core as mx
+
+        from mlx_vlm.structured import _allocate_shared_bitmask, _apply_llguidance_mask
+
+        mask_mx, view = _allocate_shared_bitmask(1, 64)
+        view[:] = 0
+        view[0, 0] = 0b1011  # allow tokens 0, 1 and 3
+        logits = mx.arange(64, dtype=mx.float32)[None, :]
+
+        out = _apply_llguidance_mask(logits, mask_mx)
+        mx.eval(out)
+        row = out[0].tolist()
+
+        allowed = [i for i, v in enumerate(row) if v != float("-inf")]
+        assert allowed == [0, 1, 3]
+        assert [row[i] for i in allowed] == [0.0, 1.0, 3.0]
+
+    def test_shared_bitmask_is_a_writable_contiguous_view(self):
+        """The whole speedup rests on CPU-writable MLX memory.
+
+        `_allocate_shared_bitmask` raises if MLX ever stops exposing that, so this
+        pins the property rather than trusting it.
+        """
+        from mlx_vlm.structured import _allocate_shared_bitmask
+
+        mask_mx, view = _allocate_shared_bitmask(2, 100)
+
+        assert mask_mx.shape == (2, (100 + 31) // 32)
+        assert view.flags["C_CONTIGUOUS"] and view.flags["WRITEABLE"]
+
+    def test_processor_requests_an_immediate_decode_yield(self):
+        """A constrained token must not wait behind unrelated prefill work.
+
+        `BatchGenerator._next` reads this flag to return right after decoding; a
+        latency fix that is invisible to any correctness test.
+        """
+        from mlx_vlm.structured import LLGuidanceLogitsProcessor
+
+        assert LLGuidanceLogitsProcessor.requires_immediate_decode_yield is True
+
+    def test_batch_generator_honours_the_yield_flag(self):
+        import ast
+        import inspect
+        import textwrap
+
+        from mlx_vlm.generate import ar
+
+        source = inspect.getsource(ar.BatchGenerator._next)
+        assert "requires_immediate_decode_yield" in source
+        assert "yield_after_decode" in source
+        # The flag is only useful if something returns on it. `textwrap.dedent`,
+        # not `inspect.cleandoc` — the latter is for docstrings and leaves method
+        # source indented, so `ast.parse` raises and the walk silently finds
+        # nothing, which passes a badly-written version of this assertion.
+        tree = ast.parse(textwrap.dedent(source))
+        returns_on_flag = any(
+            isinstance(node, ast.If)
+            and isinstance(node.test, ast.Name)
+            and node.test.id == "yield_after_decode"
+            and any(isinstance(s, ast.Return) for s in node.body)
+            for node in ast.walk(tree)
+        )
+        assert returns_on_flag
+
+
 class TestSamplerModesAreReachable:
     """`36331ea7` / #1653 / #1663 — top-nσ, p-less and locally-typical sampling.
 

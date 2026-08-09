@@ -92,11 +92,6 @@ mlx_vlm/server/schemas.py::sync_reasoning_aliases  # baseline: pre-existing dive
 
 # --- mlx_vlm/speculative/drafters/qwen3_dflash/dflash.py
 
-# --- mlx_vlm/structured.py
-mlx_vlm/structured.py::_allocate_shared_bitmask  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/structured.py::_apply_llguidance_mask  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/structured.py::_fill_next_token_mask  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/structured.py::prepare_next_token_mask  # baseline: pre-existing divergence, unreviewed
 
 # --- mlx_vlm/tests/test_batch_quantized_cache.py
 mlx_vlm/tests/test_batch_quantized_cache.py::FakeModelDeep  # baseline: pre-existing divergence, unreviewed
