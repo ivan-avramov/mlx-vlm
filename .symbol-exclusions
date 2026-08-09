@@ -134,7 +134,6 @@ mlx_vlm/tests/test_generate.py::FallbackArgmaxModel  # baseline: pre-existing di
 mlx_vlm/tests/test_generate.py::_fill  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::fused_greedy_decode  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::make_batch  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_generate.py::pop_forced_token_id  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::record_async_eval  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::test_batch_generate_optional_input_annotations_match_defaults  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::test_batch_generator_apc_media_token_ids_handles_text_only_model  # baseline: pre-existing divergence, unreviewed
@@ -148,11 +147,6 @@ mlx_vlm/tests/test_generate.py::test_generation_batch_ignores_speculative_argmax
 mlx_vlm/tests/test_generate.py::test_generation_batch_thinking_budget_does_not_sync_next_token  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::test_generation_batch_uses_fused_greedy_decode_without_logprobs  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::test_mixed_flat_and_wrapped_rotating_is_not_reusable  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_generate.py::test_pop_forced_token_id_consumes_pending_token_id  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_generate.py::test_pop_forced_token_id_emits_forced_token_when_budget_exceeded  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_generate.py::test_pop_forced_token_id_safe_after_end_delimiter  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_generate.py::test_pop_forced_token_id_safe_after_start_delimiter  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_generate.py::test_pop_forced_token_id_safe_before_first_call  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::test_prompt_step_keeps_exact_apc_checkpoint_async  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::test_prompt_step_schedules_cache_evaluation_asynchronously  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_generate.py::test_public_generation_annotations_match_runtime_results  # baseline: pre-existing divergence, unreviewed
@@ -246,4 +240,3 @@ mlx_vlm/tests/test_utils.py::test_prepare_inputs_preserves_mlx_attention_mask_fo
 mlx_vlm/turboquant.py::_z  # baseline: pre-existing divergence, unreviewed
 
 # --- mlx_vlm/utils.py
-mlx_vlm/utils.py::pop_forced_token_id  # baseline: pre-existing divergence, unreviewed

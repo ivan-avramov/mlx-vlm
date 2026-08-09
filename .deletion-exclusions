@@ -1,0 +1,58 @@
+# Baseline for dev/check_upstream_deletions.py — the reverse-direction audit.
+#
+# Format matches .symbol-exclusions: `path/glob::symbol_glob  # reason`, or
+# `path/glob  # reason` for a whole file. Every entry MUST carry a reason; the
+# script refuses to run otherwise. "Unreviewed" is not a reason — say what you
+# established and how.
+#
+# What this file is for: this audit asks the mirror of the other checks — what
+# content did upstream DELETE that we still carry? Every hit is either FORK (we
+# added it; keep) or STALE (upstream removed it; delete ours). See AGENTS.md.
+#
+# Almost every entry below is the *second half of a dropped commit*. When upstream
+# moves or renames a symbol A -> B and our merge resolution drops the B half, we
+# keep A. `check_upstream_symbols.py` then reports B as "missing" and this script
+# reports A as "we kept something upstream deleted" — two halves of one event that
+# neither check can connect. These resolve when the owning commit is restored;
+# delete the entry then, do not let it rot.
+#
+# Already resolved by acting on this audit's first run (kept here as the record):
+#   models/cache.py::SlidingWindowCache, ::StaticKVCache, ::get_max_cache_shape
+#     Deleted. Upstream removed all three in a492e47d "Consolidate caches + RoPE
+#     handling (#1494)" (ancestor of both HEAD and upstream/main). They had ZERO
+#     references anywhere outside cache.py — dead stale upstream code. AGENTS.md
+#     had listed two of them as protected "fork-only classes", which is exactly
+#     the trap it warns about elsewhere.
+#   utils.py::apply_forced_token (+ its 4 tests)
+#     Renamed. 565ca595 "Rename forced token consumer" renamed it to
+#     pop_forced_token_id and changed the contract from
+#     (next_y: mx.array) -> mx.array to () -> Optional[int]. We had the old name
+#     only; 7 .symbol-exclusions entries excused the "missing" new one.
+
+# --- mlx_vlm/apc.py
+mlx_vlm/apc.py::_merge_arrays_cache_entries  # stale half of dropped 8422ece8 "implement apc as a pluggable, capability driven cache adapter" (#1620); 49 lines still missing per find_dropped_hunks.py
+
+# --- mlx_vlm/generate/ar.py
+mlx_vlm/generate/ar.py::_greedy_argmax_step  # stale half of dropped 7fbc7bc9 "Optimize 1-bit decode and fused greedy routing" (#1598); upstream replaced it with _fused_greedy_step, which we also lack
+
+# --- mlx_vlm/server/app.py
+# All three are DUPLICATED: they exist here in app.py AND in
+# server/request_normalization.py, which is the file upstream moved them to and
+# which we carry with zero importers. Upstream defines them only in
+# request_normalization.py. This is the clearest instance of the pattern above,
+# and it explains why that module is orphaned rather than merely unused.
+mlx_vlm/server/app.py::_as_plain_dict  # stale half of dropped 221fe0b3 (#1644); upstream's copy lives in server/request_normalization.py
+mlx_vlm/server/app.py::_model_config_field_or_default  # stale half of dropped 221fe0b3 (#1644); upstream's copy lives in server/request_normalization.py
+mlx_vlm/server/app.py::_request_field_or_default  # stale half of dropped 221fe0b3 (#1644); upstream's copy lives in server/request_normalization.py
+
+# --- mlx_vlm/server/generation.py
+mlx_vlm/server/generation.py::_generate_masked_diffusion  # stale half of dropped 29b6c00b "Unify diffusion generation path" (#1508); 191 lines still missing
+mlx_vlm/server/generation.py::flush  # ditto 29b6c00b (#1508) — nested helper of the pre-unification diffusion path
+mlx_vlm/server/generation.py::on_block  # ditto 29b6c00b (#1508) — nested helper of the pre-unification diffusion path
+
+# --- mlx_vlm/tests
+mlx_vlm/tests/test_generate.py::test_generation_batch_uses_greedy_hidden_argmax_without_logprobs  # tests _greedy_argmax_step above; retire with 7fbc7bc9 (#1598)
+mlx_vlm/tests/test_server.py::test_chat_completions_endpoint_preserves_assistant_reasoning  # stale half of dropped 24f6f590 "fix interleaved reasoning" (#1370); upstream restructured this test
+
+# --- mlx_vlm/utils.py
+mlx_vlm/utils.py::normalize_audio_features  # stale half of dropped b93707d8 "Always sanitize loaded weights and simplify audio preprocessing"; upstream folded it into the sanitize path

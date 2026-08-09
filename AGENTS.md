@@ -22,13 +22,60 @@ git merge upstream/main
 python dev/check_upstream_parity.py     # no upstream file silently dropped
 python dev/check_upstream_symbols.py    # no upstream def/class silently dropped
 python dev/find_dropped_hunks.py        # no upstream HUNK silently dropped
+python dev/check_upstream_deletions.py  # no upstream DELETION silently reverted
 cd mlx_vlm/ && pytest ./tests --ignore=tests/test_smoke.py --ignore=tests/test_utils.py
 ```
 
-**Run all three checks after every merge — this is not optional.** When a merge
+**Run all four checks after every merge — this is not optional.** When a merge
 resolution drops content from a commit that upstream already merged, that commit
 is still an ancestor of `main`, so git records the content as *deliberately
 deleted* and no later merge re-offers it. There is no conflict and no warning.
+
+### Divergence has two directions — always check both
+
+The first three checks all ask the same question: *what does upstream have that we
+lack?* For a long time nothing asked the mirror: **what did upstream delete that we
+kept?** Same mechanism, opposite sign.
+
+    upstream deletes a file or symbol -> its deleting commit becomes an ancestor
+    of `main` through a merge -> our resolution keeps our side -> the content
+    lives on as stale upstream code that reads exactly like fork work
+
+`dev/check_upstream_deletions.py` is that check. It reports two things, and like
+`find_dropped_hunks.py` it is a **lead generator, not an oracle** — confirm every
+hit with `git log -S` before acting:
+
+- **Files** we carry that `upstream/main` lacks, where a commit that deleted the
+  file is an ancestor of `upstream/main`. The conclusive test is
+  `git diff <deleting-commit>^:<path> <path>`: **empty output means our copy is
+  upstream's last pre-deletion copy**, so we never touched it — STALE, not FORK.
+- **Symbols** we define in a shared file that upstream defined there once and no
+  longer does.
+
+Reviewed hits go in `.deletion-exclusions` with a real reason. It reads the git
+**index**, like the other two audits, so it can gate a commit. Takes ~70s.
+
+**Most symbol hits are the second half of a dropped commit.** When upstream moves
+or renames a symbol A -> B and the resolution drops the B half, we keep A.
+`check_upstream_symbols.py` then reports B as *missing* while this script reports A
+as *kept*, and nothing connects the two halves of one event. Three examples, all
+real:
+
+- `server/app.py`'s `_as_plain_dict`, `_request_field_or_default` and
+  `_model_config_field_or_default` are defined **twice** in this tree — here, and
+  in `server/request_normalization.py`, which is where upstream moved them
+  (#1644). Upstream has only the latter. That is *why* that module is orphaned.
+- `utils.py::apply_forced_token` was renamed to `pop_forced_token_id` with a
+  changed contract (`(next_y) -> mx.array` became `() -> Optional[int]`). We had
+  the old name; seven `.symbol-exclusions` entries excused the "missing" new one.
+- `mlx_vlm/video_generate.py` was 645 lines of code upstream removed in #1454.
+  7 of that commit's 8 files had applied, so every doc reference was stripped
+  while the module and its `__main__.py` registration survived — a working,
+  undocumented command no check could see.
+
+**Corollary for `AGENTS.md` itself: do not describe a symbol as "fork-only"
+without running `git log -S` on it first.** This section's own guidance got this
+wrong — see the KV-cache note below.
 
 When resolving conflicts, prefer a **union** over picking a side. Both sides add
 to shared lists (`__all__`, lazy-import tuples, skip-lists, registries); taking
@@ -226,9 +273,18 @@ registry and `CACHE_ALIGNMENT_KWARGS`.
 **This file has a boundary comment.** Everything above it is vendored from
 upstream and should stay byte-identical apart from two hunks marked `# Fork:`
 (`prealloc_tokens`). Add fork work **below** the boundary. Fork-only classes:
-`PreallocKVCache`, `PreallocQuantizedKVCache`, `SlidingWindowCache`,
-`StaticKVCache`. `turboquant.py` holds compressed KV caches with custom Metal
-kernels.
+`PreallocKVCache`, `PreallocQuantizedKVCache`. `turboquant.py` holds compressed
+KV caches with custom Metal kernels.
+
+**[correction]** This list used to include `SlidingWindowCache` and
+`StaticKVCache` as fork-only. They were not. Both came from upstream's #391
+(Gemma3n) and upstream **removed** them in `a492e47d` "Consolidate caches + RoPE
+handling (#1494)", which is an ancestor of both `HEAD` and `upstream/main`. They
+had **zero references anywhere** outside `cache.py` — 148 lines of dead stale
+upstream code, deleted now. Being *below* the boundary comment is not evidence of
+fork authorship; a resolution can leave stale code anywhere. This is exactly the
+trap the "divergence has two directions" section warns about, and this file fell
+into it.
 
 ### Fine-tuning (`trainer/`)
 

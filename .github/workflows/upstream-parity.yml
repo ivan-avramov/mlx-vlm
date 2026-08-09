@@ -46,3 +46,10 @@ jobs:
 
       - name: Check no upstream symbol is silently missing
         run: python dev/check_upstream_symbols.py --upstream-ref upstream/main
+
+      # The mirror image of the two checks above, and the one that was missing:
+      # content upstream *deleted* that a merge resolution kept. Same mechanism,
+      # opposite sign — see the module docstring and AGENTS.md. --strict because
+      # the baseline is clean; keep it that way.
+      - name: Check no upstream deletion was silently reverted
+        run: python dev/check_upstream_deletions.py --upstream-ref upstream/main --strict
