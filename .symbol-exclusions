@@ -87,18 +87,13 @@ mlx_vlm/server/schemas.py::StreamingTimings  # baseline: pre-existing divergence
 
 
 # --- mlx_vlm/tests/test_batch_quantized_cache.py
-mlx_vlm/tests/test_batch_quantized_cache.py::FakeModelDeep  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_batch_quantized_cache.py::FakeModelShallow  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_batch_quantized_cache.py::TestPrepareFinalize  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_batch_quantized_cache.py::TestShouldQuantizeKvLayerPolicy  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_batch_quantized_cache.py::test_deep_stack_boundary  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_batch_quantized_cache.py::test_deep_stack_skips_last  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_batch_quantized_cache.py::test_finalize_noop_without_prepare  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_batch_quantized_cache.py::test_finalize_updates_left_padding_like_batch_kv  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_batch_quantized_cache.py::test_make_cache_uses_should_quantize_kv_layer_policy  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_batch_quantized_cache.py::test_prepare_finalize_methods_exist  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_batch_quantized_cache.py::test_prepare_stores_right_padding  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_batch_quantized_cache.py::test_shallow_stack_quantizes_all  # baseline: pre-existing divergence, unreviewed
+# CONVERGED 2026-08-09: all 12 entries retired by union-merging with upstream.
+# 17 fork-only definitions vs 12 upstream-only, and the one shared class
+# (TestMakeCache) differed only by a method upstream has and we lacked -- no
+# weakened assertion. Took upstream's file as the base, unioned the import list
+# (ArraysCache / BatchRotatingKVCache / QuantizedKVCache are fork additions, marked)
+# and re-appended the two fork contract classes below a boundary banner.
+# c84cf87b (#1568) and e4a7867b (#1596) are now whole. 29 -> 41 tests.
 
 # --- mlx_vlm/tests/test_cli.py
 
@@ -158,17 +153,13 @@ mlx_vlm/tests/test_server.py::test_stream_endpoints_do_not_clear_mlx_cache_on_cl
 mlx_vlm/tests/test_server.py::test_unsupported_model_request_does_not_crash_server  # baseline: pre-existing divergence, unreviewed
 
 # --- mlx_vlm/tests/test_speculative.py
-mlx_vlm/tests/test_speculative.py::Model  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_speculative.py::_qwen3_5_batch_cache  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_speculative.py::_qwen3_5_hybrid_batch_model  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_speculative.py::speculative_logits_from_hidden  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_speculative.py::test_kind_none_autodetects_mtp_for_glm4_moe_lite_mtp  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_speculative.py::test_qwen3_5_all_rows_fully_padded_prefill  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_speculative.py::test_qwen3_5_fully_padded_prefill_row_survives_chunks  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_speculative.py::test_qwen3_5_partially_padded_rows_match_unbatched  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_speculative.py::test_qwen_fused_greedy_decode_support_matches_lm_head  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_speculative.py::test_qwen_fused_greedy_decode_uses_quantized_argmax  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_speculative.py::test_split_glm4_moe_lite_mtp_flattens_nextn_layer  # baseline: pre-existing divergence, unreviewed
+# CONVERGED 2026-08-09: all 11 entries retired by union-merging with upstream. Only
+# TWO fork-only definitions in a 3371-line file, and the single shared test that
+# differed did so by the deliberate one-ULP bound from 4b15cc5 (the fused Metal
+# kernel accumulates in a different order than the reference, so upstream's
+# `mx.array_equal` is too strict here) -- now marked `# Fork:`. This retires the test
+# halves of 822f13e9 (#1573), 7fbc7bc9 (#1598) and 8e2638b7 (#1558), whose library
+# halves landed earlier in this pass. 151 -> 156 tests.
 
 # --- mlx_vlm/tests/test_tokenizer_utils.py
 

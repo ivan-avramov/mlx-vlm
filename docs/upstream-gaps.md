@@ -811,10 +811,12 @@ The two candidates with genuinely missing upstream symbols were both classified:
   "pre-existing failures" that got the file excluded from the suite were stale test
   code, not product bugs: it is now **34 passed / 0 failed and collected**.
 
-**Where the remaining 99 exclusions sit.** `tests/test_server.py` 31,
-`tests/test_generate.py` 22, `tests/test_batch_quantized_cache.py` 12,
-`tests/test_speculative.py` 11, `server/generation.py` 11 — five files hold 87 of
-99. All five carry substantial fork-only definitions (124, 11, 17, 23 and 14
+**Where the remaining 57 exclusions sit.** Down from 107. The two test files that
+held 23 of them are **converged**: `tests/test_batch_quantized_cache.py` (12) and
+`tests/test_speculative.py` (11) were union-merged with upstream on 2026-08-09 and
+both left `.fork-marker-allowlist` as well. What is left is concentrated in
+`tests/test_server.py` (31, gated on `cfcc36d9` and `29b6c00b`),
+`tests/test_generate.py` (22) and `server/generation.py` (11). All five carry substantial fork-only definitions (124, 11, 17, 23 and 14
 respectively), so none is a checkout candidate; they need per-symbol review. (Was
 107; the 2026-08-09 merge retired the 8 `dispatch.py` entries when #1807 deleted
 upstream's own duplicates of the symbols the fork had relocated.)

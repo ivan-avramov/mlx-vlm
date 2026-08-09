@@ -47,7 +47,16 @@
 #     failures" were stale test code; now 34 passed / 0 failed AND re-enabled in the
 #     suite (the --ignore is gone).
 #
-# Current standing (2026-08-09): 21 files / ~300 sites, down from 32 / 349. Every
+#   tests/test_batch_quantized_cache.py — union-merged with upstream (fourth pass).
+#     17 fork-only definitions, 12 upstream-only, and the one shared class differed
+#     only by a method we lacked. Fork content is now two classes below a boundary
+#     banner plus three marked imports; 12 .symbol-exclusions entries retired.
+#
+#   tests/test_speculative.py — union-merged (fourth pass). Only TWO fork-only
+#     definitions in 3371 lines; the single shared test that differed did so by
+#     4b15cc5's deliberate one-ULP bound, now marked. 11 .symbol-exclusions retired.
+#
+# Current standing (2026-08-09): 19 files, down from 32. Every
 # diverged file NOT listed here is marked, including
 # server/request_normalization.py — the gen-args union added fork hunks to a file
 # that had been byte-identical to upstream, and this check caught them before the
@@ -80,5 +89,3 @@ mlx_vlm/speculative/utils.py  # 5 sites, not reviewed
 
 # --- Tests, not yet reviewed at site granularity.
 mlx_vlm/tests/test_generate.py  # LEADS. 10 sites; e029e2b3 reports 6 lines missing. Holds 22 "unreviewed" .symbol-exclusions entries
-mlx_vlm/tests/test_speculative.py  # 8 sites, 23 fork-only definitions, 11 "unreviewed" .symbol-exclusions entries
-mlx_vlm/tests/test_batch_quantized_cache.py  # 6 sites, 17 fork-only definitions, 12 "unreviewed" .symbol-exclusions entries

@@ -6,7 +6,7 @@ and Qwen3.5 DFlash cache rollback coverage in one place.
 
 import importlib
 import json
-import math
+import math  # Fork: for the one-ULP bound below
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 from unittest.mock import patch
@@ -31,6 +31,7 @@ from mlx_vlm.models.cache import (
     PoolingCache,
     RotatingKVCache,
 )
+from mlx_vlm.quantization.one_bit import OneBitLinear
 from mlx_vlm.speculative.common import _SpeculativeSamplerRNG
 from mlx_vlm.speculative.drafters import (
     DEFAULT_DRAFTER_KIND,
@@ -52,6 +53,7 @@ from mlx_vlm.speculative.drafters.gemma4_assistant.masks import (
     normalize_batched_shared_kv_states,
 )
 from mlx_vlm.speculative.drafters.gemma4_dflash import ModelConfig as Gemma4DFlashConfig
+from mlx_vlm.speculative.drafters.glm4_moe_lite_mtp.split import split_glm4_moe_lite_mtp
 from mlx_vlm.speculative.drafters.qwen3_5_mtp import ModelConfig as Qwen3_5MTPConfig
 from mlx_vlm.speculative.drafters.qwen3_5_mtp import Qwen3_5MTPDraftModel
 from mlx_vlm.speculative.drafters.qwen3_5_mtp.split import split_qwen3_5_mtp
@@ -599,25 +601,83 @@ def test_qwen_target_verify_quantized_linear_matches_singleton_batch_path():
     out = qwen_language._target_verify_quantized_linear(linear, x)
     mx.eval(ref, out)
 
-    # This is a hand-written Metal kernel standing in for nn.QuantizedLinear, so
-    # it cannot be held to bitwise equality across mlx versions: it accumulates
-    # in a different order than mlx's own quantized matmul, which shows up as
-    # last-bit differences (on mlx 0.32.0: 17/48 elements exact, the rest within
-    # one bfloat16 ULP). Asserting array_equal here was really asserting that two
-    # independent reduction orders happen to coincide.
-    #
-    # Bound the error at one ULP instead, so a genuine kernel regression (wrong
-    # indexing, wrong dequant, wrong group handling) still fails loudly. The
-    # property speculative verification actually depends on -- that argmax agrees
-    # with the reference path -- is covered by
-    # test_qwen_target_verify_quantized_argmax_matches_singleton_path.
+    # Fork: upstream asserts bitwise equality here. The fused Metal kernel and the
+    # reference path accumulate in a different order, so they agree to within one ULP
+    # rather than exactly; bounding it is what 4b15cc5 established.
     diff = mx.abs(ref.astype(mx.float32) - out.astype(mx.float32))
-    # bfloat16 keeps 7 explicit mantissa bits, so for a value in [2**e, 2**(e+1))
-    # one ULP is 2**(e-7); for the observed scale (~1.5) that is 2**-7.
     scale = float(mx.abs(ref.astype(mx.float32)).max())
     exponent = math.floor(math.log2(scale)) if scale > 0 else 0
     one_ulp = 2.0 ** (exponent - 7)
     assert float(diff.max()) <= one_ulp
+
+
+def test_qwen_fused_greedy_decode_support_matches_lm_head():
+    linear = nn.QuantizedLinear(512, 16, bias=False, group_size=32, bits=4)
+    linear.scales = linear.scales.astype(mx.bfloat16)
+    linear.biases = linear.biases.astype(mx.bfloat16)
+    model = SimpleNamespace(
+        args=SimpleNamespace(tie_word_embeddings=False),
+        lm_head=linear,
+    )
+    assert qwen_language._can_target_verify_quantized_head(model.lm_head)
+
+    model.lm_head = OneBitLinear(512, 16, bias=False, group_size=32)
+    assert not qwen_language._can_target_verify_quantized_head(model.lm_head)
+    assert (
+        qwen_language.LanguageModel.fused_greedy_decode(
+            model, mx.array([[1]], dtype=mx.int32), cache=[]
+        )
+        is None
+    )
+
+    model.lm_head = linear
+    model.args.tie_word_embeddings = True
+    assert (
+        qwen_language.LanguageModel.fused_greedy_decode(
+            model, mx.array([[1]], dtype=mx.int32), cache=[]
+        )
+        is None
+    )
+
+
+def test_qwen_fused_greedy_decode_uses_quantized_argmax():
+    mx.random.seed(19)
+    hidden = mx.random.normal((1, 1, 512)).astype(mx.bfloat16)
+
+    class Model:
+        args = SimpleNamespace(tie_word_embeddings=False)
+
+        def __init__(self):
+            self.lm_head = nn.QuantizedLinear(
+                512, 16, bias=False, group_size=32, bits=4
+            )
+            self.lm_head.scales = self.lm_head.scales.astype(mx.bfloat16)
+            self.lm_head.biases = self.lm_head.biases.astype(mx.bfloat16)
+            self.calls = []
+
+        def __call__(self, inputs, cache=None, **kwargs):
+            self.calls.append((inputs.tolist(), cache, kwargs))
+            return SimpleNamespace(hidden_states=[hidden])
+
+        def speculative_logits_from_hidden(self, value):
+            return self.lm_head(value)
+
+    model = Model()
+    inputs = mx.array([[1]], dtype=mx.int32)
+    out = qwen_language.LanguageModel.fused_greedy_decode(
+        model, inputs, cache=["cache"]
+    )
+    ref = qwen_language._target_verify_quantized_argmax(model.lm_head, hidden)
+    mx.eval(out, ref)
+
+    assert bool(mx.array_equal(out, ref).item())
+    assert model.calls == [
+        (
+            [[1]],
+            ["cache"],
+            {"return_hidden": True, "skip_logits": True},
+        )
+    ]
 
 
 def test_qwen3_5_decode_quantized_linears_fused_matches_separate():
@@ -937,6 +997,66 @@ def test_qwen3_5_single_row_batch_cache_matches_singleton_cache():
 
     assert bool(mx.array_equal(singleton_decode, batch_decode).item())
     assert isinstance(batch_cache[1], BatchKVCache)
+
+
+def _qwen3_5_hybrid_batch_model():
+    text_config = _tiny_qwen3_5_text_config()
+    text_config.num_hidden_layers = 2
+    text_config.full_attention_interval = 2
+    return qwen_language.Qwen3_5Model(text_config), text_config
+
+
+def _qwen3_5_batch_cache(left_padding):
+    arrays = ArraysCache(size=2)
+    arrays.left_padding = mx.array(left_padding, dtype=mx.int32)
+    return [arrays, BatchKVCache(list(left_padding))]
+
+
+def test_qwen3_5_fully_padded_prefill_row_survives_chunks():
+    model, text_config = _qwen3_5_hybrid_batch_model()
+    cache = _qwen3_5_batch_cache([5, 0])
+
+    first = model(mx.array([[0, 0, 0], [1, 2, 3]], dtype=mx.int32), cache=cache)
+    mx.eval(first, cache[1].offset, cache[1].left_padding)
+    assert first.shape == (2, 3, text_config.hidden_size)
+    assert cache[1].offset.tolist() == [-2, 3]
+    assert cache[1].left_padding.tolist() == [5, 0]
+
+    second = model(mx.array([[0, 0, 4], [4, 5, 6]], dtype=mx.int32), cache=cache)
+    mx.eval(second, cache[1].offset, cache[1].left_padding)
+    assert second.shape == (2, 3, text_config.hidden_size)
+    assert cache[1].offset.tolist() == [1, 6]
+    assert cache[1].left_padding.tolist() == [5, 0]
+
+
+def test_qwen3_5_all_rows_fully_padded_prefill():
+    model, text_config = _qwen3_5_hybrid_batch_model()
+    cache = _qwen3_5_batch_cache([5, 5])
+    out = model(mx.array([[0, 0, 0], [0, 0, 0]], dtype=mx.int32), cache=cache)
+    mx.eval(out)
+    assert out.shape == (2, 3, text_config.hidden_size)
+
+
+def test_qwen3_5_partially_padded_rows_match_unbatched():
+    model, text_config = _qwen3_5_hybrid_batch_model()
+    mx.eval(model.parameters())
+
+    batched = model(
+        mx.array([[0, 7, 8], [1, 2, 3]], dtype=mx.int32),
+        cache=_qwen3_5_batch_cache([1, 0]),
+    )
+    row0 = model(
+        mx.array([[7, 8]], dtype=mx.int32),
+        cache=[ArraysCache(size=2), KVCache()],
+    )
+    row1 = model(
+        mx.array([[1, 2, 3]], dtype=mx.int32),
+        cache=[ArraysCache(size=2), KVCache()],
+    )
+    mx.eval(batched, row0, row1)
+
+    assert bool(mx.array_equal(batched[0:1, 1:], row0).item())
+    assert bool(mx.array_equal(batched[1:2], row1).item())
 
 
 def test_qwen3_5_single_row_quantized_batch_cache_keeps_prompt_state():
@@ -2276,6 +2396,12 @@ def test_kind_none_autodetects_mtp_for_deepseek_v4_mtp(tmp_path):
     assert resolve_drafter_kind(path, "dflash") == "mtp"
 
 
+def test_kind_none_autodetects_mtp_for_glm4_moe_lite_mtp(tmp_path):
+    path = _make_drafter_dir(tmp_path, "glm4_moe_lite_mtp")
+    assert resolve_drafter_kind(path, None) == "mtp"
+    assert resolve_drafter_kind(path, "dflash") == "mtp"
+
+
 def test_kind_none_autodetects_eagle3_speculators_config(tmp_path):
     path = tmp_path / "drafter"
     path.mkdir()
@@ -3053,47 +3179,6 @@ def test_split_qwen3_5_mtp_writes_sidecar_without_index_mtp_entries(tmp_path):
     assert weights["pre_fc_norm_hidden.weight"][0].item() == 1.0
 
 
-def test_split_qwen3_5_mtp_finds_sidecar_via_config_mtp_file(tmp_path):
-    # mlx-optiq packages some quants with the mtp sidecar moved into a
-    # subfolder (e.g. optiq/mtp.safetensors) so non-recursive *.safetensors
-    # globs (mlx-vlm's load_model, LM Studio) don't choke on the extra
-    # tensors. config.json's mtp_file points at the real location.
-    source = tmp_path / "source"
-    output = tmp_path / "mtp"
-    (source / "optiq").mkdir(parents=True)
-    text_config = _tiny_qwen3_5_text_config()
-    text_config.mtp_num_hidden_layers = 1
-    (source / "config.json").write_text(
-        json.dumps(
-            {
-                "model_type": "qwen3_5",
-                "text_config": text_config.to_dict(),
-                "mtp_file": "optiq/mtp.safetensors",
-            }
-        )
-    )
-    mx.save_safetensors(
-        str(source / "optiq" / "mtp.safetensors"),
-        {
-            "mtp.fc.weight": mx.ones((16, 32)),
-            "mtp.pre_fc_norm_hidden.weight": mx.zeros((16,)),
-        },
-        metadata={},
-    )
-    (source / "model.safetensors.index.json").write_text(
-        json.dumps({"weight_map": {"model.foo": "model.safetensors"}})
-    )
-
-    split_qwen3_5_mtp(str(source), str(output))
-
-    with open(output / "config.json") as f:
-        cfg = json.load(f)
-    weights = mx.load(str(output / "model.safetensors"))
-    assert cfg["model_type"] == "qwen3_5_mtp"
-    assert "fc.weight" in weights
-    assert weights["pre_fc_norm_hidden.weight"][0].item() == 1.0
-
-
 def test_deepseek_v4_returns_mtp_hidden_and_trims_without_snapshot():
     cfg = _tiny_deepseek_v4_config()
     lm = deepseek_language.LanguageModel(cfg)
@@ -3339,6 +3424,129 @@ def test_split_deepseek_v4_mtp_writes_sidecar_without_index_mtp_entries(tmp_path
     assert "e_proj.weight" in weights
     assert "e_proj.scales" in weights
     assert "enorm.weight" in weights
+
+
+def test_split_glm4_moe_lite_mtp_flattens_nextn_layer(tmp_path):
+    source = tmp_path / "source"
+    output = tmp_path / "mtp"
+    source.mkdir()
+    cfg = {
+        "model_type": "glm4_moe_lite",
+        "hidden_size": 8,
+        "vocab_size": 16,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 2,
+        "qk_nope_head_dim": 4,
+        "v_head_dim": 6,
+        "kv_lora_rank": 4,
+        "moe_intermediate_size": 4,
+        "n_routed_experts": 2,
+        "num_nextn_predict_layers": 1,
+        "tie_word_embeddings": False,
+    }
+    (source / "config.json").write_text(json.dumps(cfg))
+    p = "model.layers.2."
+    weights = {
+        f"{p}embed_tokens.weight": mx.zeros((16, 8)),
+        f"{p}enorm.weight": mx.ones((8,)),
+        f"{p}hnorm.weight": mx.ones((8,)),
+        f"{p}eh_proj.weight": mx.zeros((8, 16)),
+        f"{p}input_layernorm.weight": mx.ones((8,)),
+        f"{p}post_attention_layernorm.weight": mx.ones((8,)),
+        f"{p}self_attn.kv_b_proj.weight": mx.arange(20 * 4)
+        .reshape(20, 4)
+        .astype(mx.bfloat16),
+        f"{p}self_attn.o_proj.weight": mx.zeros((8, 12)),
+        f"{p}self_attn.rotary_emb.inv_freq": mx.ones((2,)),
+        f"{p}mlp.gate.weight": mx.zeros((2, 8)),
+        f"{p}mlp.gate.e_score_correction_bias": mx.ones((2,), dtype=mx.float32),
+        f"{p}mlp.shared_experts.gate_proj.weight": mx.zeros((4, 8)),
+        f"{p}mlp.shared_experts.up_proj.weight": mx.zeros((4, 8)),
+        f"{p}mlp.shared_experts.down_proj.weight": mx.zeros((8, 4)),
+        f"{p}shared_head.norm.weight": mx.ones((8,)),
+        f"{p}shared_head.head.weight": mx.zeros((16, 8)),
+    }
+    for e in range(2):
+        weights[f"{p}mlp.experts.{e}.gate_proj.weight"] = mx.zeros((4, 8))
+        weights[f"{p}mlp.experts.{e}.up_proj.weight"] = mx.zeros((4, 8))
+        weights[f"{p}mlp.experts.{e}.down_proj.weight"] = mx.zeros((8, 4))
+    mx.save_safetensors(str(source / "model.safetensors"), weights, metadata={})
+    (source / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"model.foo": "model.safetensors"}})
+    )
+
+    split_glm4_moe_lite_mtp(str(source), str(output))
+
+    with open(output / "config.json") as f:
+        out_cfg = json.load(f)
+    out = mx.load(str(output / "model.safetensors"))
+    assert out_cfg["model_type"] == "glm4_moe_lite_mtp"
+    assert out_cfg["block_size"] == 2
+    assert out_cfg["text_config"]["model_type"] == "glm4_moe_lite"
+    # dedicated nextn embedding and untied head
+    assert "model.embed_tokens.weight" in out
+    assert "lm_head.weight" in out
+    # absorbed-MLA split replaces the fused kv_b_proj
+    assert "model.mtp_block.self_attn.kv_b_proj.weight" not in out
+    assert out["model.mtp_block.self_attn.embed_q.weight"].shape == (2, 4, 4)
+    assert out["model.mtp_block.self_attn.unembed_out.weight"].shape == (2, 6, 4)
+    # experts stacked into switch_mlp
+    assert out["model.mtp_block.mlp.switch_mlp.gate_proj.weight"].shape == (2, 4, 8)
+    assert not any(".experts.0." in k for k in out)
+    # router correction bias stays fp32
+    assert out["model.mtp_block.mlp.gate.e_score_correction_bias"].dtype == mx.float32
+    # non-parameter buffers are dropped
+    assert not any(k.endswith("rotary_emb.inv_freq") for k in out)
+
+
+# ---------------------------------------------------------------------------
+# Fork additions below this line.
+#
+# Everything above is vendored from upstream mlx-vlm and should stay
+# byte-identical so `git merge upstream/main` applies cleanly, apart from the
+# one-ULP bound marked `# Fork:` above. Add fork tests here, not above.
+# ---------------------------------------------------------------------------
+
+
+def test_split_qwen3_5_mtp_finds_sidecar_via_config_mtp_file(tmp_path):
+    # mlx-optiq packages some quants with the mtp sidecar moved into a
+    # subfolder (e.g. optiq/mtp.safetensors) so non-recursive *.safetensors
+    # globs (mlx-vlm's load_model, LM Studio) don't choke on the extra
+    # tensors. config.json's mtp_file points at the real location.
+    source = tmp_path / "source"
+    output = tmp_path / "mtp"
+    (source / "optiq").mkdir(parents=True)
+    text_config = _tiny_qwen3_5_text_config()
+    text_config.mtp_num_hidden_layers = 1
+    (source / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3_5",
+                "text_config": text_config.to_dict(),
+                "mtp_file": "optiq/mtp.safetensors",
+            }
+        )
+    )
+    mx.save_safetensors(
+        str(source / "optiq" / "mtp.safetensors"),
+        {
+            "mtp.fc.weight": mx.ones((16, 32)),
+            "mtp.pre_fc_norm_hidden.weight": mx.zeros((16,)),
+        },
+        metadata={},
+    )
+    (source / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"model.foo": "model.safetensors"}})
+    )
+
+    split_qwen3_5_mtp(str(source), str(output))
+
+    with open(output / "config.json") as f:
+        cfg = json.load(f)
+    weights = mx.load(str(output / "model.safetensors"))
+    assert cfg["model_type"] == "qwen3_5_mtp"
+    assert "fc.weight" in weights
+    assert weights["pre_fc_norm_hidden.weight"][0].item() == 1.0
 
 
 def test_qwen3_5_mtp_sanitize_is_idempotent_on_mlx_layout_weights():
