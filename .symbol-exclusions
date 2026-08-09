@@ -78,7 +78,6 @@ mlx_vlm/server/generation.py::_log_prefill_progress  # baseline: pre-existing di
 mlx_vlm/server/generation.py::_log_prefill_started  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/server/generation.py::_request_log_id  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/server/generation.py::_sample_top_p_one  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/server/generation.py::diffusion_kwargs  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/server/generation.py::feed  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/server/generation.py::get_log_progress_interval  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/server/generation.py::on_result  # baseline: pre-existing divergence, unreviewed

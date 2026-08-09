@@ -790,6 +790,9 @@ class GenerationArguments:
     top_p: float = DEFAULT_TOP_P
     top_k: int = 0
     min_p: float = 0.0
+    top_n_sigma: float = 0.0
+    p_less: bool = False
+    typical_p: float = 1.0
     seed: Optional[int] = None
     logprobs: bool = False
     repetition_penalty: Optional[float] = None
@@ -798,16 +801,55 @@ class GenerationArguments:
     presence_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE
     frequency_penalty: Optional[float] = None
     frequency_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE
+    max_denoising_steps: Optional[int] = None
+    block_length: Optional[int] = None
+    num_to_transfer: Optional[int] = None
+    max_transfer_per_step: Optional[int] = None
+    editing_threshold: Optional[float] = None
+    max_post_steps: Optional[int] = None
+    stability_steps: Optional[int] = None
+    diffusion_full_canvas: Optional[bool] = None
+    diffusion_min_canvas_length: Optional[int] = None
+    diffusion_max_canvas_length: Optional[int] = None
+    diffusion_sampler: Optional[str] = None
+    threshold: Optional[float] = None
+    min_threshold: Optional[float] = None
     logit_bias: Optional[dict] = None
     enable_thinking: bool = DEFAULT_ENABLE_THINKING
+    reasoning: Optional[bool] = None
+    reasoning_effort: Optional[str] = None
     thinking_budget: Optional[int] = None
     thinking_start_token: Optional[str] = None
     thinking_end_token: Optional[str] = None
+    skip_special_tokens: bool = True
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None
     # Per-tenant salt for APC. When set, it's mixed into ``extra_hash`` so
     # cached blocks from one tenant can't be reused (or detected via timing)
     # by another. None = no salt = single-tenant behaviour.
     tenant_id: Optional[str] = None
+
+    def diffusion_kwargs(self) -> dict:
+        """Diffusion-only generation kwargs explicitly supplied by a request."""
+        kw = {}
+        for key in (
+            "max_denoising_steps",
+            "block_length",
+            "num_to_transfer",
+            "max_transfer_per_step",
+            "editing_threshold",
+            "max_post_steps",
+            "stability_steps",
+            "diffusion_full_canvas",
+            "diffusion_min_canvas_length",
+            "diffusion_max_canvas_length",
+            "diffusion_sampler",
+            "threshold",
+            "min_threshold",
+        ):
+            value = getattr(self, key)
+            if value is not None:
+                kw[key] = value
+        return kw
 
     def to_generate_kwargs(self) -> dict:
         """Convert to kwargs dict for generate()/stream_generate()."""
@@ -817,6 +859,9 @@ class GenerationArguments:
             "top_p": self.top_p,
             "top_k": self.top_k,
             "min_p": self.min_p,
+            "top_n_sigma": self.top_n_sigma,
+            "p_less": self.p_less,
+            "typical_p": self.typical_p,
             "enable_thinking": self.enable_thinking,
         }
         if self.seed is not None:
@@ -845,11 +890,16 @@ class GenerationArguments:
             kw["logits_processors"] = self.logits_processors
         if self.tenant_id is not None:
             kw["apc_tenant"] = self.tenant_id
+        kw.update(self.diffusion_kwargs())
         return kw
 
     def to_template_kwargs(self) -> dict:
         """Convert to kwargs for apply_chat_template()."""
         kw = {"enable_thinking": self.enable_thinking}
+        if self.reasoning is not None:
+            kw["reasoning"] = self.reasoning
+        if self.reasoning_effort is not None:
+            kw["reasoning_effort"] = self.reasoning_effort
         if self.thinking_budget is not None:
             kw["thinking_budget"] = self.thinking_budget
         if self.thinking_start_token is not None:

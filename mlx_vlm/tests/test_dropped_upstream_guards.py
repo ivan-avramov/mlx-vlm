@@ -163,6 +163,77 @@ class TestOneBitLoaderWiring:
         assert _quantization_for_path(quantization, "model.layers.1.mlp")["bits"] == 4
 
 
+class TestSamplerModesAreReachable:
+    """`36331ea7` / #1653 / #1663 — top-nσ, p-less and locally-typical sampling.
+
+    `sample_utils.make_sampler` accepted all three the whole time; nothing carried
+    a request's value to it. `GenerationArguments` had no fields for them and the
+    request schemas did not declare them, so the three modes were unreachable
+    through the API — a dead-end at the *entry* rather than the exit.
+
+    This guard walks the whole chain, because each link was independently broken
+    and a unit test on any single one would have passed.
+    """
+
+    def test_request_schemas_declare_the_three_modes(self):
+        from mlx_vlm.server.schemas import OpenAIRequest, VLMRequest
+
+        for cls in (OpenAIRequest, VLMRequest):
+            fields = cls.model_fields
+            for name in ("top_n_sigma", "p_less", "typical_p"):
+                assert name in fields, f"{cls.__name__} is missing {name}"
+
+    def test_request_value_reaches_the_sampler(self):
+        from types import SimpleNamespace
+
+        from mlx_vlm.sample_utils import make_sampler
+        from mlx_vlm.server.app import _build_gen_args
+
+        request = SimpleNamespace(
+            max_tokens=8,
+            temperature=0.7,
+            top_p=0.9,
+            top_k=0,
+            min_p=0.0,
+            top_n_sigma=1.5,
+            p_less=True,
+            typical_p=0.9,
+            seed=None,
+            logprobs=False,
+            model_fields_set=set(),
+        )
+
+        args = _build_gen_args(request)
+        assert (args.top_n_sigma, args.p_less, args.typical_p) == (1.5, True, 0.9)
+
+        kwargs = args.to_generate_kwargs()
+        assert kwargs["top_n_sigma"] == 1.5
+        assert kwargs["p_less"] is True
+        assert kwargs["typical_p"] == 0.9
+
+        # The exit was never the problem; assert it still lines up anyway.
+        assert callable(
+            make_sampler(
+                temp=0.7,
+                top_p=0.9,
+                top_n_sigma=kwargs["top_n_sigma"],
+                p_less=kwargs["p_less"],
+                typical_p=kwargs["typical_p"],
+            )
+        )
+
+    def test_diffusion_kwargs_are_inert_by_default(self):
+        """The restored diffusion fields must not leak kwargs into normal requests.
+
+        `to_generate_kwargs` now merges `diffusion_kwargs()`, which emits only
+        explicitly-supplied values. If that ever started emitting defaults, every
+        text request would carry 13 unexpected kwargs into `generate()`.
+        """
+        from mlx_vlm.server.generation import GenerationArguments
+
+        assert GenerationArguments().diffusion_kwargs() == {}
+
+
 class TestLagunaTokenizationContract:
     """`53052569` — fix(laguna): preserve provider tokenization contract.
 
