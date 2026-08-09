@@ -620,6 +620,23 @@ It is a lead generator, not an oracle — a commit whose content upstream later
 replaced also surfaces, and heavy fork rewrites (`server/generation.py`) show up
 as false positives. Every hit still needs `git log -S` and a read.
 
+**[correction, 2026-08-09] The default `--min-lines 3` Python floor is itself a blind
+spot, and it hid a live regression.** `f044f36a` (#1359) touches three files. The
+report listed two — `generate/dispatch.py` (9 lines) and `server/openai.py` (3) — and
+omitted its `server/generation.py` half entirely, because that hunk is 18 lines made
+of 1-2 line changes and every individual change falls under the floor. The commit was
+then "restored" from the report's own file list, leaving two hardcoded
+`skip_special_tokens=True` where upstream reads `args.skip_special_tokens`.
+
+Two habits follow, and they are cheap:
+
+- **Re-run at `--min-lines 1` before calling the report clean.** The floor exists to
+  suppress noise and succeeds at suppressing signal too. This is the Python-side twin
+  of the `--min-lines-config 1` fix that recovered three dropped dependency commits.
+- **Never take the report's per-commit file list as that commit's file set.** Use
+  `git show --stat <commit>` and diff every file it touches. The report tells you
+  *which commits to look at*, never *how much of one is missing*.
+
 ### Fixed already
 
 `#1492`, `ff2a6daa`, `bc3461b1`, `#1503`, `46ee12dd`, `#1554` (MTP `+2.0` norm
@@ -702,7 +719,7 @@ Three more from the second half of the pass, all new:
 | 6 | ~~mRoPE cluster~~ **FIXED `540a3189`** | `a8642018`, `b8671991`, `#1527`, `#1741` | must land WITH `generate/ar.py`: our batcher lacks the MRoPE helpers, so `(3,B,L)` `position_ids` is truncated to `(1,B,L)`. Restoring `qwen3_5` alone *creates* a bug. **Live today for qwen2_vl / qwen2_5_vl / qwen3_vl / qwen3_vl_moe** — qwen3_5's staleness is what masks it |
 | 7 | ~~TurboQuant trim cluster~~ **FIXED `92620167`** | `#1447`, `#1453`, `#1432` | `BatchTurboQuantKVCache.is_trimmable()` -> `False`, `trim(2)` -> `0` (upstream: `True`, `2`). Under `--kv-bits` the cache falls into the SSM branch and is indexed `c[0]`/`c[1]` -> `TypeError`; on the non-crashing path every later `gdn_states[j]` index shifts, restoring GatedDeltaNet state from the wrong layer. `zero_row_tail` exists with **no caller anywhere** |
 | 8 | ~~`tool_choice` ignored on `/v1/chat/completions`~~ **FIXED `0bb0b07f`** | `2394fcf1` (#1611) | `"tools" in ChatRequest.model_fields` -> False; also lost the `if not tools: tool_module = None` guard, so tool markup is parsed for callers who sent no tools |
-| 9 | `skip_special_tokens` — **RECLASSIFIED 2026-08-09: mostly an upstream bug, not dropped content** | `29b6c00b` (partly); upstream for the rest | The field exists as of `7ebb5690` and `anthropic.py:489` writes `False` to it, so the "Anthropic tool-markup" fix is still **inert** — but the cause is not ours. Upstream honours `args.skip_special_tokens` **only inside `_generate_diffusion`** (`generation.py` lines 1906/1971 and nowhere else), and upstream's `anthropic.py:489` is byte-identical to ours. So on the normal text path the write is ignored **in both trees**: an upstream bug worth reporting there, not a hunk to restore. The diffusion half *is* ours to fix, and is blocked behind `29b6c00b`: our two hardcoded `skip_special_tokens=True` sites live in `_generate_masked_diffusion`, which `.deletion-exclusions` already records as that commit's stale pre-unification half. Deliberately **not** patched — inventing the behaviour on the normal path would add fork divergence to the exact file we are trying to converge |
+| 9 | `skip_special_tokens` — **RECLASSIFIED TWICE; the diffusion half is a REGRESSION, not a gap** | `f044f36a` (#1359) / upstream for the rest | Two separate things wear this name. **(a) The diffusion half is ours and is a regression.** `f044f36a` introduced `skip_special_tokens=args.skip_special_tokens` in `server/generation.py`; our copy hardcodes `True` in two spots. That commit was restored on 2026-08-09 — but only its `dispatch.py` and `openai.py` halves, because `find_dropped_hunks.py`'s default `--min-lines 3` Python floor hid an 18-line hunk made of 1-2 line changes. Fixable directly; **not** blocked behind `29b6c00b` as an earlier note claimed. **(b) The normal text path is an upstream bug**: upstream honours the flag only inside `_generate_diffusion` and its `anthropic.py:489` is byte-identical to ours, so `gen_args.skip_special_tokens = False` is inert in both trees. Report upstream; do not invent it here |
 | 10 | ~~1-bit repos cannot load~~ **FIXED `510f16e9`** | `960b26f9` (#1597) | kernel, `__init__` export and 123-line test all landed; only `utils.py`'s 7 lines of `replace_one_bit_modules` wiring dropped |
 | 11 | ~~AWQ quantization absent~~ **FIXED `1d6e8c9b`** | `3c0232ed` (#1666) | 104 lines of `convert.py`, 91% of the hunk |
 | 12 | ~~Empty-input rejection absent~~ **FIXED `4d91b912`** | `a344713a` (#1491) | empty requests reach model load instead of a 400 |
