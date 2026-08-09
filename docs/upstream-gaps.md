@@ -810,8 +810,10 @@ of the ten are divergences this very document tells you never to touch:
 
 - `models/base.py` — its `cache.quantized_attention` call is chunked with online
   softmax so peak memory is ~O(chunk); upstream dequantizes the whole state.
-- `speculative/drafters/gemma4_assistant/masks.py` — the absolute import is
-  load-bearing; taking upstream's relative form broke two tests.
+- ~~`speculative/drafters/gemma4_assistant/masks.py`~~ — **RETRACTED.** The absolute
+  import was not load-bearing; it was half of dropped `a492e47d`. Both that file and
+  its test are byte-identical to upstream now. See "The deliberate divergence that
+  wasn't" below — this bullet contradicted it for a while.
 
 So the symbol check narrows the candidate list; it does not authorise the
 checkout. Body diffs still need reading.
