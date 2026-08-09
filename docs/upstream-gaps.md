@@ -64,7 +64,7 @@ python dev/check_dead_helpers.py          # ~10s; dropped call sites
 python dev/find_dropped_hunks.py          # slow; ranked report
 ```
 
-`.symbol-exclusions` currently holds **99 entries**, down from 446 (the mlx-lm
+`.symbol-exclusions` currently holds **82 entries**, down from 446 (the mlx-lm
 vendoring retired 88, the `test_models.py` take another 57). That number is a
 snapshot of existing divergence, not a defect count: it mixes never-ported upstream
 features, modules this fork deliberately rewrote (`sample_utils`, `apc`, `cache`,
@@ -559,6 +559,32 @@ the KV-quant config, and both halves of `a492e47d`'s (#1494) `masks.py`/test pai
 `.symbol-exclusions` lost 8 entries (107 -> 99) to convergence when #1807 deleted
 upstream's own `dispatch.py` duplicates; `.deletion-exclusions` 11 -> 8. **Fifth
 check added:** `dev/check_fork_markers.py`, the fork-content oracle — see below.
+
+**Progress as of 2026-08-09 (fourth pass, same day).** `find_dropped_hunks.py`
+**34 -> 17** commits; diverged files 31 -> 28. Suite **2608 passed / 5 skipped / 0
+failed**, and `tests/test_utils.py` is collected again (its 5 "pre-existing failures"
+were stale test code — the only remaining `--ignore` is `test_smoke.py`). Exclusions:
+`.symbol-exclusions` 107 -> **82**, `.deletion-exclusions` 11 -> **4**,
+`.fork-marker-allowlist` 32 -> **21 files**. **Sixth check added:**
+`dev/check_dead_helpers.py`.
+
+Restored this pass, all with `git log -S` provenance first: `8e2638b7` (#1558),
+`c1821e93` (#1329), `26220e71`, `9afc59ce`, `57dc1fb5` (#1450), `e3906673` (#1433,
+kernel half only), `6a8cdff6` (#1411), `13d1ff4e`, `e7a0f0f0` + `21aeb8a5` +
+`3de5bada`, `7fbc7bc9` (#1598) with `6d5603b3` (#1628) and `ea2edd68` (#1583) riding
+on it, `36331ea7` + `67ca1f05` + `b739dfa4`, `e029e2b3`, `a30180a6`, `8422ece8`
+(#1638), `ff295e36`, `f044f36a` (#1359). Converged to byte-identical:
+`trainer/utils.py`, `tests/test_trainer_utils.py`, `models/gemma4/README.md`,
+`generate/image.py`, `gemma4_assistant/masks.py` + its test.
+
+**The through-line of this pass: five of the defects were "the symbol exists, and
+nothing calls it."** Not missing code — missing *wiring*, with the helper present,
+importable and usually unit-tested. That is why the suite stayed green through all of
+them, and why `dev/check_dead_helpers.py` now gates it. Three had user-visible
+consequences: embedding models silently ignored their `1_Pooling/config.json`, the
+APC cache key ignored audio/video/embeddings/masks so requests differing only in
+media **shared a prefix cache**, and three sampler modes were accepted by the API and
+discarded.
 
 > **[correction]** Commit `70c99d01`'s message, and an earlier version of this
 > paragraph, claim `find_dropped_hunks.py` went "33 -> 18 commits". **That is
