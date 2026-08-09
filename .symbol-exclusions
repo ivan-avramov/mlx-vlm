@@ -33,16 +33,13 @@ mlx_vlm/generate/ar.py::_fused_greedy_step  # baseline: pre-existing divergence,
 # --- mlx_vlm/generate/diffusion.py
 
 # --- mlx_vlm/generate/dispatch.py
-mlx_vlm/generate/dispatch.py::GenerationResult  # relocated by fork commit 5e9b9503 (generation-engine port) to generate/common.py; re-exported from dispatch, so callers are unaffected
-mlx_vlm/generate/dispatch.py::PromptCacheState  # relocated by fork commit 5e9b9503 to generate/common.py; internal, not re-exported from dispatch
-mlx_vlm/generate/dispatch.py::__init__  # relocated by fork commit 5e9b9503 — PromptCacheState's ctor, now in generate/common.py
+# CONVERGED 2026-08-09: eight entries here excused symbols the fork's 5e9b9503 had
+# relocated to generate/common.py. Upstream's ffd7aeff (#1807) deleted its own
+# copies for the same reason ("the import won at runtime, so the local copies were
+# dead"), so upstream no longer defines them in dispatch.py either and there is
+# nothing left to excuse. The two below are still real divergences.
 mlx_vlm/generate/dispatch.py::_cache_fully_retained  # deliberate divergence: upstream's rotating-cache guard from c503fa7b; this fork uses _rotating_rewind_safe + a snapshot ring instead. See docs/upstream-gaps.md 'The rotating-cache bug, in detail'
 mlx_vlm/generate/dispatch.py::_prefix_cache_trim_amount  # deliberate divergence: upstream's rotating-cache guard from c503fa7b; superseded by the fork's snapshot-ring design. See docs/upstream-gaps.md
-mlx_vlm/generate/dispatch.py::find_prefix_length  # relocated by fork commit 5e9b9503 to generate/common.py
-mlx_vlm/generate/dispatch.py::maybe_quantize_kv_cache  # relocated by fork commit 5e9b9503 to generate/common.py
-mlx_vlm/generate/dispatch.py::quantize_entry  # relocated by fork commit 5e9b9503 to generate/common.py (nested in maybe_quantize_kv_cache)
-mlx_vlm/generate/dispatch.py::update  # relocated by fork commit 5e9b9503 to generate/common.py (nested method)
-mlx_vlm/generate/dispatch.py::wired_limit  # relocated by fork commit 5e9b9503 to generate/common.py; re-exported from dispatch
 
 # --- mlx_vlm/generate/image.py
 

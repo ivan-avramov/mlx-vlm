@@ -12,6 +12,7 @@ import mlx.nn as nn
 from transformers import PreTrainedTokenizer
 
 from .. import apc as _apc
+from ..kv_quant import from_legacy as kv_quant_from_legacy
 from ..models import cache
 from ..prompt_utils import (
     apply_chat_template,
@@ -27,6 +28,24 @@ from ..utils import (
     load,
     prepare_inputs,
     should_add_special_tokens,
+)
+from .common import (
+    DEFAULT_KV_GROUP_SIZE,
+    DEFAULT_KV_QUANT_SCHEME,
+    DEFAULT_QUANTIZED_KV_START,
+    GenerationResult,
+    _capture_rotating_layers_for_snapshot,
+    _compute_anchor_before_latest_user_offset,
+    _get_generation_stream,
+    _has_non_trimmable,
+    _is_rotating_kv_layer,
+    _restore_arrays_layers_from_snapshots,
+    _restore_deltanet_state,
+    _restore_rotating_layers_from_snapshots,
+    _rotating_rewind_safe,
+    _trim_cache,
+    generation_stream,
+    wired_limit,
 )
 from .image import (
     DEFAULT_IMAGE_GUIDANCE,
@@ -51,13 +70,10 @@ DEFAULT_SEED = 0
 DEFAULT_TOP_K = 0
 DEFAULT_MIN_P = 0.0
 DEFAULT_REPETITION_CONTEXT_SIZE = 20
-DEFAULT_KV_GROUP_SIZE = 64
-DEFAULT_KV_QUANT_SCHEME = "uniform"
 DEFAULT_COMPLETION_BATCH_SIZE = 32
 DEFAULT_PREFILL_BATCH_SIZE = 8
 DEFAULT_THINKING_START_TOKEN = "<think>"
 DEFAULT_THINKING_END_TOKEN = "</think>"
-DEFAULT_QUANTIZED_KV_START = 5000
 DEFAULT_PREFILL_STEP_SIZE = 2048
 DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH = 64
 DEFAULT_DIFFUSION_MAX_DENOISING_STEPS = 48
@@ -405,6 +421,32 @@ def parse_arguments():
         help="Number of bits to quantize the KV cache to.",
     )
     parser.add_argument(
+        "--kv-key-bits",
+        type=float,
+        default=None,
+        help="Override the TurboQuant key bit-width (defaults to floor(--kv-bits)).",
+    )
+    parser.add_argument(
+        "--kv-value-bits",
+        type=float,
+        default=None,
+        help="Override the TurboQuant value bit-width (defaults to ceil(--kv-bits)).",
+    )
+    parser.add_argument(
+        "--kv-key-scheme",
+        type=str,
+        choices=("uniform", "turboquant"),
+        default=None,
+        help="Override the KV quantization backend for keys only.",
+    )
+    parser.add_argument(
+        "--kv-value-scheme",
+        type=str,
+        choices=("uniform", "turboquant"),
+        default=None,
+        help="Override the KV quantization backend for values only.",
+    )
+    parser.add_argument(
         "--kv-quant-scheme",
         type=str,
         choices=("uniform", "turboquant"),
@@ -567,20 +609,6 @@ def normalize_resize_shape(
     return (values[0], values[0]) if len(values) == 1 else tuple(values)
 
 
-from .common import (
-    GenerationResult,
-    _capture_rotating_layers_for_snapshot,
-    _compute_anchor_before_latest_user_offset,
-    _get_generation_stream,
-    _has_non_trimmable,
-    _is_rotating_kv_layer,
-    _restore_arrays_layers_from_snapshots,
-    _restore_deltanet_state,
-    _restore_rotating_layers_from_snapshots,
-    _rotating_rewind_safe,
-    _trim_cache,
-    wired_limit,
-)
 from .diffusion import (
     DEFAULT_DIFFUSION_MIN_CANVAS_LENGTH,
     DiffusionOutputHandler,
@@ -1007,15 +1035,17 @@ def stream_generate(
                     # `extend` can try to join differently-typed peers. Without
                     # this the warm cache was always float KVCache even with
                     # kv-bits on.
-                    _kv_bits = kwargs.get("kv_bits")
+                    _quant_policy = kv_quant_from_legacy(
+                        kwargs.get("kv_bits"),
+                        kwargs.get("kv_quant_scheme"),
+                        kwargs.get("kv_group_size", 64),
+                        kwargs.get("kv_key_bits"),
+                        kwargs.get("kv_value_bits"),
+                        kwargs.get("kv_key_scheme"),
+                        kwargs.get("kv_value_scheme"),
+                    )
                     _quant_cfg = (
-                        {
-                            "bits": _kv_bits,
-                            "group_size": kwargs.get("kv_group_size", 64),
-                            "scheme": kwargs.get("kv_quant_scheme"),
-                        }
-                        if _kv_bits is not None
-                        else None
+                        _quant_policy.to_config() if _quant_policy is not None else None
                     )
                     kwargs["prompt_cache"] = _apc.make_warm_kv_cache(
                         matched_blocks,
@@ -1749,6 +1779,10 @@ def main():
             "verbose": args.verbose,
             "max_kv_size": args.max_kv_size,
             "kv_bits": args.kv_bits,
+            "kv_key_bits": getattr(args, "kv_key_bits", None),
+            "kv_value_bits": getattr(args, "kv_value_bits", None),
+            "kv_key_scheme": getattr(args, "kv_key_scheme", None),
+            "kv_value_scheme": getattr(args, "kv_value_scheme", None),
             "kv_group_size": args.kv_group_size,
             "kv_quant_scheme": getattr(
                 args, "kv_quant_scheme", DEFAULT_KV_QUANT_SCHEME
