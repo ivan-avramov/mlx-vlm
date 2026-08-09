@@ -30,7 +30,25 @@
 #     only; 7 .symbol-exclusions entries excused the "missing" new one.
 
 # --- mlx_vlm/apc.py
-mlx_vlm/apc.py::_merge_arrays_cache_entries  # stale half of dropped 8422ece8 "implement apc as a pluggable, capability driven cache adapter" (#1620); 49 lines still missing per find_dropped_hunks.py
+# RESOLVED 2026-08-09: 8422ece8 (#1638) restored, and _merge_arrays_cache_entries
+# DELETED as stale. It had zero references anywhere in the tree, upstream does not
+# define it at all, and our copy is byte-identical to upstream's last pre-deletion
+# version — so the fork never touched it: STALE, not FORK, by the conclusive test in
+# AGENTS.md. Its only caller went away with 8422ece8's refactor. Same shape as
+# models/cache.py::SlidingWindowCache.
+#
+# The rest of that commit is now in: dispatch.py's ~113-line inline APC lookup block
+# became an 8-line `_apc.apc_lookup_plan(...)` call, `apc_extra_hash` now goes
+# through `semantic_extra_hash` (see below), and ar.py's `_apc_prompt_cache_for_store`
+# delegates to `snapshot_prompt_cache_row`.
+#
+# Two real bugs came out of it, neither with a failing test:
+#   * The APC cache key was `tenant_scoped_hash(tenant, image_hash)` — audio, video,
+#     inputs_embeds and masks were NOT in the key, so two requests differing only in
+#     audio would share a prefix cache and reuse KV computed for other media.
+#   * `_apc_prompt_cache_for_store` returned the LIVE prompt cache for single-row
+#     batches instead of a clone, so a stored "checkpoint at N tokens" kept growing
+#     as generation continued; it also never dequantized quantized layers.
 
 # --- mlx_vlm/generate/ar.py
 # RESOLVED 2026-08-09: 7fbc7bc9 (#1598) restored. _greedy_argmax_step ->

@@ -189,6 +189,17 @@ snapshot existed) and then fell into the trim branch. Fixed, together with
 `restore_rotating`, since restoring K/V and offset while leaving the eviction
 watermark stale would leave the layer claiming tokens the buffer no longer holds.
 
+**`c503fa7b` is therefore CLOSED as a reviewed deliberate divergence, not a gap.**
+`find_dropped_hunks.py` ranks it third (87 lines: 51 in `tests/test_generate.py`,
+36 in `generate/dispatch.py`) and will keep doing so, because the fork solved the
+same problem a different way. Both of its symbols are excused with real reasons in
+`.symbol-exclusions`, and its 51 test lines are the tests *for those symbols*, so
+they are superseded by `TestPrefixCacheReuseTrim` rather than missing. Do not
+"restore" it: adopting `_prefix_cache_trim_amount`/`_cache_fully_retained` alongside
+the snapshot ring would give two guards with different notions of when a rewind is
+safe. This is the clearest standing example of a permanent, legitimate entry in that
+report — the report is a lead generator, and this lead has been followed.
+
 **`_rotating_post_gen_trim_safe` is intentionally dead — do not wire it in.**
 Commit `087c91a3`'s message called it "a guard not wired into the path it was
 written to protect"; that was wrong. `memory.md:274` records it being
@@ -670,10 +681,55 @@ Three more from the second half of the pass, all new:
 | 16 | ~~Three sampler modes unreachable~~ **FIXED `7ebb5690`** | `36331ea7`, `#1653`, `#1663` | reachable end to end now: schema -> `_build_gen_args` -> `to_generate_kwargs` -> `make_sampler` |
 | 17 | ~~`test_models.py` wholesale take~~ **FIXED `d684708e`** | 24 commits | proven strict subset (AST: 52 methods only upstream, **0** only ours); +46 tests, retires all 57 `test_models.py` exclusions. 3 fail until item 6 lands |
 
-Plus: generation-logging subsystem (`cfcc36d9`), concurrent thinking-budget race
-(`ff295e36`), `reasoning_content` alias (`6a8cdff6`), multi-kind preload flags
-(`c6084344`), `/v1/responses/input_tokens` counting a different prompt than
-`/v1/responses` builds (`eda1ec4f`, half-landed).
+Plus: generation-logging subsystem (`cfcc36d9`), ~~concurrent thinking-budget
+race (`ff295e36`)~~ **FIXED**, ~~`reasoning_content` alias (`6a8cdff6`)~~
+**FIXED**, multi-kind preload flags (`c6084344`),
+`/v1/responses/input_tokens` counting a different prompt than `/v1/responses`
+builds (`eda1ec4f`, half-landed).
+
+`ff295e36` was a live data race, not a missing feature.
+`_make_thinking_budget_criteria` tokenizes, and it was being called on the **GPU
+worker thread** while request threads tokenized concurrently in
+`_preprocess_request` — two threads through the same mutable fast-tokenizer
+backend. The fix moves it to the caller side under a new `_tokenizer_lock` and
+carries the result on `QueuedGenerationRequest`. Upstream's own test makes the race
+visible (four threads, `assert max_active == 1`); neutering the lock turns it into
+`assert 4 == 1`.
+
+### `8422ece8` (#1638) — the APC adapter refactor, and two silent bugs in it
+
+Closed 2026-08-09. This one is worth its own entry because it is the best example of
+why "the symbol exists" proves nothing, and because both bugs it was hiding were
+invisible to the whole suite.
+
+The commit replaced `dispatch.py`'s inline APC lookup with a pluggable
+`_apc.apc_lookup_plan(...)`. Our tree had `apc.py`'s half — `apc_lookup_plan`,
+`semantic_extra_hash`, `snapshot_prompt_cache_row`, all **byte-identical to
+upstream** and all unit-tested — and none of the three call sites. `0f359e5` had even
+recorded "`apc.py` fully converged with upstream", which was true of the file and
+false of the feature. The three helpers are what motivated
+`dev/check_dead_helpers.py`; it found the third one, which no gap list had.
+
+Restoring the call sites (113 inline lines in `dispatch.py` became an 8-line call)
+fixed two defects, neither with a failing test:
+
+- **The APC cache key ignored non-image media.** Ours computed
+  `tenant_scoped_hash(tenant, image_hash)`; `semantic_extra_hash` also folds in
+  audio, video, `inputs_embeds` and masks. So two requests differing *only* in audio
+  hashed identically and **shared a prefix cache**, reusing KV computed for other
+  media. `0f359e5`'s note that "`semantic_extra_hash` reduces exactly to
+  `tenant_scoped_hash` with no extras" is correct — and was read as "so the call site
+  does not matter", when the extras are the entire point.
+- **APC stored a live, growing cache.** `_apc_prompt_cache_for_store` returned
+  `self.prompt_cache` **by reference** for single-row batches. The APC store then
+  held the cache generation was still mutating, so a checkpoint keyed at N tokens
+  kept growing past N. `snapshot_prompt_cache_row` clones, and also dequantizes
+  quantized layers into float `KVCache` entries, which our path never did.
+
+Its last piece, `apc.py::_merge_arrays_cache_entries`, was **deleted** rather than
+kept: zero references anywhere, absent from upstream entirely, and byte-identical to
+upstream's last pre-deletion copy — STALE by the conclusive test, its only caller
+having gone with the refactor.
 
 ### Per-file convergence: which files can be retired, and which must not be
 
@@ -966,6 +1022,21 @@ Two notes for whoever runs this next:
   not re-exports. `models/base.py` and `models/cache.py` are excluded from
   autoflake in `.pre-commit-config.yaml` precisely because they *are* re-export
   surfaces; keep that exclusion, and check any new removal by hand.
+
+  **[correction, 2026-08-09] "Unreferenced" is not the same as "dead", and one of
+  those two removals proves it.** `DEFAULT_DIFFUSION_CONFIDENCE_THRESHOLD` was
+  unreferenced in `generate/dispatch.py` *because* `f044f36a` (#1359) had been
+  dropped — that commit is the only thing that uses it, in the `--threshold` help
+  string. Deleting the import tidied away the last trace of a missing hunk, and
+  `find_dropped_hunks.py` lost a line of evidence with it. Restoring #1359 put the
+  import straight back.
+
+  So before accepting an autoflake removal in a file that diverges from upstream,
+  check whether **upstream** references the name. If it does, the import is not
+  dead — it is the shadow of a dropped call site, and the right response is to
+  restore the hunk, not delete the import. This is the same reasoning
+  `dev/check_dead_helpers.py` automates one level up, for definitions rather than
+  imports.
 - `black` warns "Python 3.12 cannot parse code formatted for Python 3.14" and
   skips its AST safety check. It still exits 0, so this does not fail
   `pre-commit`, and formatting is derived from file content rather than the

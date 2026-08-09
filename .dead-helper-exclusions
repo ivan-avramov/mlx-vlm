@@ -28,17 +28,9 @@
 # `apc_disk_namespace` call site makes it report 4 hits and exit 1; restoring it
 # drops back to 3. Runs in ~10s.
 
-# --- mlx_vlm/apc.py
-# All three are CONFIRMED-DROPPED, all from 8422ece8 "implement apc as a pluggable,
-# capability driven cache adapter" (#1638) — the same commit whose `server/app.py`
-# half was restored during the 2026-08-09 merge and whose `apc.py` half
-# `.deletion-exclusions` still records. What remains is its `generate/dispatch.py`
-# refactor: upstream replaced the inline APC lookup block with
-# `_apc.apc_lookup_plan(...)` returning a plan dict, and our dispatch.py still has
-# the pre-refactor inline version. `find_dropped_hunks.py` reports 32 lines for
-# dispatch.py; 17 more it attributes to `generate/ar.py` are coincidental
-# line-content matches (`model=model,`, `processor=processor,`, `},`) and NOT part of
-# the commit's file set — checked against `git show --stat 8422ece8`.
-mlx_vlm/apc.py::apc_lookup_plan  # CONFIRMED-DROPPED: 8422ece8 (#1638) dispatch.py refactor not applied; dispatch.py still has the inline lookup. Tracked.
-mlx_vlm/apc.py::semantic_extra_hash  # CONFIRMED-DROPPED: ditto 8422ece8 (#1638). Called only from tests/test_apc_semantic_key.py, which is why 0f359e5's "apc.py fully converged" claim held while the caller was missing.
-mlx_vlm/apc.py::snapshot_prompt_cache_row  # CONFIRMED-DROPPED: ditto 8422ece8 (#1638); upstream calls it from generate/ar.py. Found by this check, not by hand — it was not in any prior gap list.
+# --- No entries.
+#
+# All three CONFIRMED-DROPPED entries this file opened with (apc_lookup_plan,
+# semantic_extra_hash, snapshot_prompt_cache_row — 8422ece8 / #1638) were restored in
+# the same session, so the list is empty. Keep the file: an empty baseline is the
+# steady state to defend, and the format notes above are what a future entry needs.

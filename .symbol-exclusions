@@ -134,9 +134,6 @@ mlx_vlm/tests/test_generate.py::test_wrapped_rotating_is_not_reusable  # baselin
 # --- mlx_vlm/tests/test_server.py
 mlx_vlm/tests/test_server.py::fake_apply_chat_template  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::fake_stream_diffusion_generate_from_kwargs  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_server.py::generate_one  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_server.py::make_criteria  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_server.py::preprocess  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::reject_model  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_build_gen_args_explicit_thinking_overrides_standard_reasoning  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_build_gen_args_maps_chat_reasoning_effort  # baseline: pre-existing divergence, unreviewed
@@ -149,7 +146,6 @@ mlx_vlm/tests/test_server.py::test_chat_completions_streaming_uses_prompt_opened
 mlx_vlm/tests/test_server.py::test_chunked_prefill_logging_reports_partial_progress  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_debug_decode_logging_adds_token_details  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_decode_logging_uses_one_rate_field  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_server.py::test_generate_serializes_budget_criteria_with_tokenizer_preprocessing  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_info_decode_logging_uses_interval_without_token_details  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_load_model_resources_returns_load_failure_as_bad_request  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_log_progress_interval_is_configurable  # baseline: pre-existing divergence, unreviewed
@@ -160,7 +156,6 @@ mlx_vlm/tests/test_server.py::test_response_generator_diffusion_forwards_generat
 mlx_vlm/tests/test_server.py::test_responses_streaming_uses_prompt_opened_thinking_without_flag  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_stream_endpoints_do_not_clear_mlx_cache_on_close  # baseline: pre-existing divergence, unreviewed
 mlx_vlm/tests/test_server.py::test_unsupported_model_request_does_not_crash_server  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_server.py::tokenizer_work  # baseline: pre-existing divergence, unreviewed
 
 # --- mlx_vlm/tests/test_speculative.py
 mlx_vlm/tests/test_speculative.py::Model  # baseline: pre-existing divergence, unreviewed

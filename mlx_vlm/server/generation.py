@@ -6,6 +6,7 @@ import os
 import time
 import traceback
 from collections import deque
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from queue import Empty as QueueEmpty
 from queue import Queue
@@ -955,6 +956,7 @@ class QueuedGenerationRequest:
     raw_inputs: dict
     prompt_tokens: int
     args: GenerationArguments
+    thinking_budget_criteria: Optional[ThinkingBudgetCriteria] = None
     images: Optional[List] = None
     videos: Optional[List] = None
     prompt_cache_state: Optional["PromptCacheState"] = None
@@ -1218,6 +1220,7 @@ class ResponseGenerator:
         self._load_error: Optional[Exception] = None
         self._cancelled: set = set()
         self._cancel_lock = Lock()
+        self._tokenizer_lock = Lock()
         self._thread = Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -1375,9 +1378,16 @@ class ResponseGenerator:
             )
         rqueue: Queue = Queue()
 
-        # CPU preprocessing (tokenize, load images/videos) on caller thread.
-        # GPU work (vision encoder) deferred to GPU thread.
-        raw_inputs = self._preprocess_request(prompt, images, audio, videos)
+        # CPU preprocessing and thinking-token resolution share tokenizer state.
+        # Keep both on the caller side and serialize them so the GPU worker never
+        # races request threads through the mutable fast-tokenizer backend.
+        # GPU work (vision encoder) stays deferred to the GPU thread.
+        tokenizer_lock = getattr(self, "_tokenizer_lock", None)
+        with tokenizer_lock if tokenizer_lock is not None else nullcontext():
+            raw_inputs = self._preprocess_request(prompt, images, audio, videos)
+            thinking_budget_criteria = self._make_thinking_budget_criteria(
+                args, raw_inputs.get("input_ids")
+            )
         prompt_tokens = _count_prompt_tokens(raw_inputs)
         _apply_generation_budget(args, prompt_tokens)
 
@@ -1391,6 +1401,7 @@ class ResponseGenerator:
                 raw_inputs=raw_inputs,
                 prompt_tokens=prompt_tokens,
                 args=args,
+                thinking_budget_criteria=thinking_budget_criteria,
                 images=images,
                 videos=videos,
                 prompt_cache_state=prompt_cache_state,
@@ -2082,9 +2093,7 @@ class ResponseGenerator:
                         self._flush(batch_gen, active)
 
                     try:
-                        thinking_budget_criteria = self._make_thinking_budget_criteria(
-                            args, input_ids
-                        )
+                        thinking_budget_criteria = request.thinking_budget_criteria
                         (uid,) = batch_gen.insert(
                             [input_ids.squeeze(0).tolist()],
                             max_tokens=args.max_tokens,

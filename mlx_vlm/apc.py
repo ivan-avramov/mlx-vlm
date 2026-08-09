@@ -4232,32 +4232,6 @@ def _collect_mx_arrays(x: Any, out: List[mx.array]) -> None:
             _collect_mx_arrays(item, out)
 
 
-def _merge_arrays_cache_entries(
-    entries: Sequence[Any],
-    prefix_lens: Sequence[int],
-) -> Any:
-    from .models import cache as lm_cache
-
-    size = len(entries[0].cache)
-    out = lm_cache.ArraysCache(size)
-    merged_states: List[Optional[mx.array]] = []
-    for state_idx in range(size):
-        states = [entry.cache[state_idx] for entry in entries]
-        sample = next((s for s in states if s is not None), None)
-        if sample is None:
-            merged_states.append(None)
-            continue
-        rows = []
-        for state in states:
-            if state is None:
-                rows.append(mx.zeros((1,) + sample.shape[1:], dtype=sample.dtype))
-            else:
-                rows.append(state[:1])
-        merged_states.append(mx.concatenate(rows, axis=0))
-    out.cache = merged_states
-    return out
-
-
 def _merge_exact_cache_entries(
     entries: Sequence[Any],
     prefix_lens: Sequence[int],
