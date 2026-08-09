@@ -43,7 +43,6 @@ IMAGE_METADATA_DOWNLOAD_PATTERNS = (
     "manifest.json",
     "**/config.json",
 )
-
 IMAGE_COMPONENT_INDEX_DOWNLOAD_PATTERNS = (
     *IMAGE_METADATA_DOWNLOAD_PATTERNS,
     "**/model.safetensors.index.json",
@@ -238,6 +237,26 @@ def _image_model_type_from_manifest(metadata: dict[str, Any]) -> str | None:
     return None
 
 
+def _image_model_type_from_component_indexes(root: Path) -> str | None:
+    transformer_index = _load_json_file(
+        root / "transformer" / "model.safetensors.index.json"
+    )
+    if transformer_index is None:
+        return None
+    weight_map = transformer_index.get("weight_map")
+    if not isinstance(weight_map, dict):
+        return None
+    keys = set(weight_map)
+    flux2_markers = {
+        "time_guidance_embed.linear_1.weight",
+        "double_stream_modulation_img.linear.weight",
+        "single_transformer_blocks.0.attn.to_qkv_mlp_proj.weight",
+    }
+    if flux2_markers <= keys:
+        return "flux2"
+    return None
+
+
 def _load_json_file(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
@@ -348,26 +367,6 @@ def _resolve_image_model_metadata_path(
         model,
         allow_patterns=list(patterns),
     )
-
-
-def _image_model_type_from_component_indexes(root: Path) -> str | None:
-    transformer_index = _load_json_file(
-        root / "transformer" / "model.safetensors.index.json"
-    )
-    if transformer_index is None:
-        return None
-    weight_map = transformer_index.get("weight_map")
-    if not isinstance(weight_map, dict):
-        return None
-    keys = set(weight_map)
-    flux2_markers = {
-        "time_guidance_embed.linear_1.weight",
-        "double_stream_modulation_img.linear.weight",
-        "single_transformer_blocks.0.attn.to_qkv_mlp_proj.weight",
-    }
-    if flux2_markers <= keys:
-        return "flux2"
-    return None
 
 
 def _image_generation_model_class_from_path(

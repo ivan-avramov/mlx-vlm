@@ -12,7 +12,7 @@ from typing import Optional, Tuple, Union
 
 import mlx.core as mx
 
-from mlx_vlm.models.cache import dynamic_roll
+from ....models.cache import dynamic_roll
 
 
 def _single_value_or_none(value):

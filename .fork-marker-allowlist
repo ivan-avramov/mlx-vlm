@@ -1,0 +1,70 @@
+# Baseline for dev/check_fork_markers.py — the fork-content audit.
+#
+# Format: `path/glob  # reason`. Every entry MUST carry a reason; the script
+# refuses to run otherwise. This list is a ROLLOUT SCHEDULE, not a set of
+# permanent exemptions: each entry means "the fork hunks in this file are not yet
+# annotated", and the list is meant to shrink. Removing an entry is the definition
+# of done for bringing a file under the convention.
+#
+# A file leaves this list one of two ways:
+#
+#   1. CONVERGE — make it byte-identical to upstream/main, retiring it as a
+#      drop site forever. Only when our delta is genuinely not worth carrying.
+#   2. MARK — put a `# Fork:` comment inside every diverging top-level
+#      definition saying what deviates and why, or a fork boundary banner if the
+#      fork content is a contiguous tail block.
+#
+# THE TRAP, and it is the whole reason this file has reasons rather than just
+# paths: a site that differs from upstream is NOT automatically fork work. It can
+# equally be content a merge resolution DROPPED, in which case marking it
+# `# Fork:` launders a bug into a documented feature and no later audit will ever
+# question it again. Establish provenance first (`git log -S`, `git merge-base
+# --is-ancestor` against BOTH HEAD and upstream/main) exactly as AGENTS.md
+# requires. Entries below tagged LEADS have known dropped-hunk candidates from
+# `dev/find_dropped_hunks.py`; resolve those before marking anything in the file.
+#
+# Worked example of the trap, found while building this check:
+# speculative/drafters/gemma4_assistant/masks.py was documented in AGENTS.md as a
+# "deliberate divergence — must keep its absolute import". It was not. Upstream's
+# a492e47d (#1494) changed masks.py to a relative import AND rewrote its test's
+# module fakes to match; only the first half was dropped here, so our test still
+# faked `mlx_lm.models.cache` (inert — the real mlx_vlm module loads anyway) and
+# the absolute import was a workaround for the missing half. Taking BOTH halves
+# made both files byte-identical to upstream with the test still passing. Marking
+# masks.py `# Fork:` would have frozen that mistake permanently.
+#
+# Current standing (2026-08-09): 25 files / 334 sites, down from 32 / 349.
+
+# --- Heavy fork rewrites. AGENTS.md names these as the false-positive-prone
+# --- files; site-by-site provenance is the bulk of the remaining work.
+mlx_vlm/apc.py  # LEADS. 100 sites, the largest single block. A rewrite, not a set of hunks: 361 -U0 hunks collapse into 4 default-context regions. .deletion-exclusions already records _merge_arrays_cache_entries as the stale half of dropped 8422ece8 (#1638), whose server/app.py half was restored in the 2026-08-09 merge, so this file's half is a live open question
+mlx_vlm/server/generation.py  # LEADS. 27 sites. Carries the fork's ResponseGenerator + GPU worker rewrite AND the dropped halves of cfcc36d9 (#1634, generation logging — 7 .symbol-exclusions entries) and 29b6c00b (#1508, diffusion unification, 3 .deletion-exclusions entries), plus sampler commits 36331ea7/b739dfa4/67ca1f05. Do not mark until those are resolved
+mlx_vlm/generate/ar.py  # LEADS. 13 sites. find_dropped_hunks reports e029e2b3, 36331ea7, 6d5603b3 (#1628 second half), b739dfa4, 67ca1f05 here; .deletion-exclusions records _greedy_argmax_step as the stale side of dropped 7fbc7bc9 (#1598)
+mlx_vlm/generate/dispatch.py  # LEADS. 11 sites. f044f36a reported missing. Two .symbol-exclusions entries here are reviewed deliberate divergences (_cache_fully_retained, _prefix_cache_trim_amount, superseded by the fork's snapshot ring) — those two are ready to mark; the rest are not reviewed
+mlx_vlm/server/openai.py  # LEADS. 19 sites. 6a8cdff6 (#1411 reasoning_content alias) and f044f36a reported missing
+mlx_vlm/tests/test_server.py  # LEADS. 19 sites and 124 fork-only definitions. Holds 31 of the "unreviewed" .symbol-exclusions entries plus one .deletion-exclusions entry (the stale half of dropped 24f6f590, #1370)
+
+# --- Server surfaces, not yet reviewed at site granularity.
+mlx_vlm/server/app.py  # LEADS. 14 sites; e7a0f0f0, 21aeb8a5, 3de5bada reported missing. Three .deletion-exclusions entries here (_as_plain_dict, _request_field_or_default, _model_config_field_or_default) are duplicates of server/request_normalization.py and retire with the gen-args union
+mlx_vlm/server/__init__.py  # 15 sites, all module scope: this file is a re-export surface (lazy import tuples and __all__), so each divergence is one name in a list. Union-resolved by hand at every merge; a marker per name would be noise, and the right convention for a re-export list has not been decided
+mlx_vlm/server/schemas.py  # LEADS. 10 sites; 6a8cdff6 (#1411) reports 10 lines missing here, 91% of its hunk — likely most of this file's divergence IS the dropped commit
+mlx_vlm/server/responses_state.py  # 7 sites, not reviewed. Also defines a second copy of _as_plain_dict (see server/app.py above)
+mlx_vlm/server/cli.py  # 6 sites / 24 hunks, not reviewed. Mostly argparse blocks, so the natural unit is one marker per fork flag group
+
+# --- Library modules, not yet reviewed at site granularity.
+mlx_vlm/utils.py  # LEADS. 14 sites; 9afc59ce (Inkling Small) and c1821e93 (safetensors index selection) reported missing. .deletion-exclusions records normalize_audio_features as the stale half of dropped b93707d8
+mlx_vlm/generate/common.py  # 8 sites. Fork-authored module (the 5e9b9503 generation-engine port) that upstream also has, so both sides edit it; the 2026-08-09 merge added four upstream params to maybe_quantize_kv_cache. Not reviewed
+mlx_vlm/turboquant.py  # LEADS. 8 sites; 1171888e (#1447) and e3906673 (#1433) reported missing. The 2026-08-09 merge marked one hunk (_ensure_codecs' kv_quant_mode); the other seven are not reviewed
+mlx_vlm/generate/__init__.py  # 5 sites, re-export surface — same open question as server/__init__.py
+mlx_vlm/models/qwen3_5/language.py  # 10 sites. AGENTS.md's note that the norm-shift gate here is protected fork work was WRONG (upstream landed the same fix in #1556); treat every site as unreviewed rather than trusting that note
+mlx_vlm/models/gemma4/language.py  # 5 sites, not reviewed
+mlx_vlm/models/qwen3_5_moe/qwen3_5_moe.py  # LEADS. 1 site (sanitize) but 6 hunks, and find_dropped_hunks reports TWO commits missing from it: b590c747 (#1472 split expert weights) and 57dc1fb5 (#1450 gate-up sanitization). Our unfused branch probes experts.0.gate_proj where upstream probes experts.0.up_proj — a real behavioural difference to establish before marking
+mlx_vlm/speculative/utils.py  # 5 sites, not reviewed
+mlx_vlm/trainer/utils.py  # LEADS. 1 site; 13d1ff4e reports 8 lines missing (89% of its hunk) — text-model LoRA adapter loading. Almost certainly dropped, not fork
+
+# --- Tests, not yet reviewed at site granularity.
+mlx_vlm/tests/test_generate.py  # LEADS. 10 sites; e029e2b3 reports 6 lines missing. Holds 22 "unreviewed" .symbol-exclusions entries
+mlx_vlm/tests/test_speculative.py  # 8 sites, 23 fork-only definitions, 11 "unreviewed" .symbol-exclusions entries
+mlx_vlm/tests/test_batch_quantized_cache.py  # 6 sites, 17 fork-only definitions, 12 "unreviewed" .symbol-exclusions entries
+mlx_vlm/tests/test_utils.py  # LEADS. 11 sites; 99c9a59f (#1535 mistral model type) reports 4 lines missing. This file is EXCLUDED from the suite (--ignore), so nothing here is verified by a green run — see AGENTS.md
+mlx_vlm/tests/test_trainer_utils.py  # LEADS. 1 site, and it is a DELETION: our copy drops upstream's test_apply_lora_layers_dispatches_text_model_adapters, which is 13d1ff4e's test. Pairs with trainer/utils.py above; resolve together

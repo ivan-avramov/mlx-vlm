@@ -1,5 +1,8 @@
 """Tests for prompt_utils module, specifically multimodal content handling."""
 
+# Fork: everything imported here beyond apply_chat_template and
+# extract_text_from_content is fork-only, and is exercised by the fork test
+# classes below the boundary at the bottom of this file.
 import pytest
 
 from mlx_vlm.prompt_utils import (
@@ -776,6 +779,15 @@ class TestModelSpecificPromptContracts:
             "text",
         ]
         assert result[0]["content"][-1]["text"] == "OCR:"
+
+
+# ---------------------------------------------------------------------------
+# Fork additions below this line.
+#
+# Everything above is vendored from upstream mlx-vlm and should stay
+# byte-identical so `git merge upstream/main` applies cleanly. The classes below
+# cover fork-only registries in prompt_utils.py. Add fork tests here, not above.
+# ---------------------------------------------------------------------------
 
 
 class TestCacheAlignmentKwargs:

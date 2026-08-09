@@ -32,7 +32,7 @@ missing** while all 21 genuinely-new upstream files arrived normally.
 
 ## Tooling that now guards this
 
-**Four** checks. Three are wired into `.github/workflows/upstream-parity.yml`
+**Five** checks. Four are wired into `.github/workflows/upstream-parity.yml`
 (which runs on pushes to `main` too, not just PRs, since this fork is usually
 committed to directly); `find_dropped_hunks.py` stays manual because it is a
 ranked report rather than a pass/fail gate.
@@ -42,13 +42,14 @@ ranked report rather than a pass/fail gate.
 | `dev/check_upstream_parity.py` | whole files in `upstream/main` missing here | `.merge-exclusions` |
 | `dev/check_upstream_symbols.py` | `def`/`class` names missing from our copy of a shared file | `.symbol-exclusions` |
 | `dev/check_upstream_deletions.py` | the **reverse**: files/symbols upstream deleted that we kept | `.deletion-exclusions` |
+| `dev/check_fork_markers.py` | fork changes to a shared file that carry no `# Fork:` marker | `.fork-marker-allowlist` |
 | `dev/find_dropped_hunks.py` | dropped *hunks*, ranked by owning commit (Python **and** docs/config) | — |
 
-All three gating checks require a `# reason` on every exclusion and fail if one is
+All four gating checks require a `# reason` on every exclusion and fail if one is
 missing, and all read the git **index**, so they can gate a commit rather than only
-report on one. `check_upstream_symbols.py` additionally warns when an exclusion no
-longer excuses anything — a stale exclusion is a hole in the next audit, and it has
-caught retired entries three times since it was added.
+report on one. `check_upstream_symbols.py` and `check_fork_markers.py` additionally
+warn when an entry no longer excuses anything — a stale exclusion is a hole in the
+next audit, and it has caught retired entries three times since it was added.
 
 Run locally before pushing a merge:
 
@@ -57,10 +58,11 @@ git fetch upstream
 python dev/check_upstream_parity.py
 python dev/check_upstream_symbols.py
 python dev/check_upstream_deletions.py    # ~70s
+python dev/check_fork_markers.py          # ~35s; --summary ranks the rollout
 python dev/find_dropped_hunks.py          # slow; ranked report
 ```
 
-`.symbol-exclusions` currently holds **107 entries**, down from 446 (the mlx-lm
+`.symbol-exclusions` currently holds **99 entries**, down from 446 (the mlx-lm
 vendoring retired 88, the `test_models.py` take another 57). That number is a
 snapshot of existing divergence, not a defect count: it mixes never-ported upstream
 features, modules this fork deliberately rewrote (`sample_utils`, `apc`, `cache`,
@@ -534,6 +536,17 @@ Both audit blind spots found this pass are now closed by tooling:
 reverted), and `find_dropped_hunks.py` now scans docs/config with a threshold that
 fits them. Four checks, not three; see AGENTS.md.
 
+**Progress as of 2026-08-09 (third pass).** Merged four upstream commits — #1807
+(per-tensor KV quantization), #1814, Bonsai detection — the first merge under the
+weekly rule; seven files conflicted and the resolutions are itemised in that merge
+commit. 33 -> **18** commits with missing content. Suite 2514 -> **2557 passed, 5
+skipped, 0 failed**. Two dropped hunks restored out of merge conflicts rather than
+from the backlog: `8422ece8`'s (#1638) `server/app.py` half, which had left the
+on-disk APC namespace not fingerprinting the KV-quant config, and both halves of
+`a492e47d`'s (#1494) `masks.py`/test pair. `.symbol-exclusions` lost 8 entries to
+convergence when #1807 deleted upstream's own `dispatch.py` duplicates. **Fifth
+check added:** `dev/check_fork_markers.py`, the fork-content oracle — see below.
+
 Re-run the scanner after every merge:
 
 ```bash
@@ -648,7 +661,10 @@ shared-file surface**. Every fork hunk in a file upstream also edits is a future
 conflict and a future silent-drop site. When a file's delta is no longer worth
 carrying, `git checkout upstream/main -- <path>` makes it byte-identical and
 retires it as a drop site forever. `convert.py` (`1d6e8c9b`) and `structured.py`
-(`b616f889`) both reached that state.
+(`b616f889`) both reached that state, and three more did on 2026-08-09:
+`generate/image.py` (its entire delta was one blank line plus a 20-line function
+relocation), and the `gemma4_assistant/masks.py` + `test_gemma4_assistant_masks_static.py`
+pair described under "The deliberate divergence that wasn't".
 
 The safe test is **not** the line count. It is: *does our copy define anything
 upstream does not?* Run this before considering any convergence:
@@ -687,20 +703,50 @@ The two candidates with genuinely missing upstream symbols were both classified:
   `.symbol-exclusions` instead of "unreviewed".
 - `tests/test_utils.py` (4) — still open; that file is excluded from the suite.
 
-**Where the remaining 107 exclusions sit.** `tests/test_server.py` 31,
+**Where the remaining 99 exclusions sit.** `tests/test_server.py` 31,
 `tests/test_generate.py` 22, `tests/test_batch_quantized_cache.py` 12,
 `tests/test_speculative.py` 11, `server/generation.py` 11 — five files hold 87 of
-107. All five carry substantial fork-only definitions (124, 11, 17, 23 and 14
-respectively), so none is a checkout candidate; they need per-symbol review.
+99. All five carry substantial fork-only definitions (124, 11, 17, 23 and 14
+respectively), so none is a checkout candidate; they need per-symbol review. (Was
+107; the 2026-08-09 merge retired the 8 `dispatch.py` entries when #1807 deleted
+upstream's own duplicates of the symbols the fork had relocated.)
 
-**The gap that remains, and it is a real one.** There is still no oracle for the
-*fork-content* direction — nothing tells you which hunks in a shared file are fork
-work. `cache.py`'s `# Fork:` marker convention is the right answer and exists in
-exactly one file. Extending it tree-wide, with a check that every hunk in a shared
-file carries a marker, would turn "which side is this?" from archaeology into a
-grep. That is the single highest-leverage piece of tooling left, and it is what
-makes a per-file convergence pass safe to do in bulk rather than one file at a
-time. Not built yet.
+**The fork-content oracle — built 2026-08-09, `dev/check_fork_markers.py`.**
+Nothing used to tell you which hunks in a shared file are fork work; `cache.py`'s
+`# Fork:` convention was the right answer and existed in exactly one file. The
+check now enforces it, and "which side is this?" is a grep.
+
+Three design decisions, each of which was forced by something that went wrong:
+
+- **The unit is the enclosing top-level definition, not the hunk.** Calibrating
+  against `cache.py` — the one file already following the convention — showed a
+  per-hunk rule *fails the file that defines the convention*: it diverges in 7
+  hunks but carries 3 markers, because the `prealloc_tokens` feature touches a
+  signature, a constructor body and a growth calculation and one marker on the body
+  explains all three. A rule that fails its own exemplar is the wrong rule.
+- **Raw `-U0` hunk counts are meaningless for a rewritten file.** `apc.py` reports
+  **361** of them inside just **4** default-context regions, because diff finds
+  many small common substrings in a rewrite. The report counts *sites* instead.
+  Tree-wide that is **334 sites**, not the ~658 hunks previously estimated.
+- **The allowlist is consulted after coverage is computed, not before.** Checking
+  it first looks equivalent and is not: an entry naming an already-marked file
+  would be silently accepted as if it were doing work, so the stale-entry warning
+  could never fire for it. Caught by adding an entry for `models/base.py` (already
+  marked) and watching it pass unremarked.
+
+**The trap this check sets, and it must be stated wherever the check is
+mentioned.** A site that differs from upstream is *not* automatically fork work —
+it can equally be content a merge resolution dropped. Marking such a site
+`# Fork:` launders a bug into a documented feature that no later audit will ever
+question. So a marker is a *provenance conclusion*, and requires the same
+`git log -S` / `git merge-base --is-ancestor` work AGENTS.md demands. The
+allowlist tags files with known `find_dropped_hunks.py` leads accordingly.
+
+That trap is not hypothetical; building the check found an instance of it already
+recorded as fact. See "the deliberate divergence that wasn't" below.
+
+Standing at introduction: **7 of 32 files** under the convention (3 converged to
+byte-identical, 4 marked), **25 files / 334 sites** allowlisted with reasons.
 
 ### The remaining cluster is a union, not a restore — read this before starting
 
@@ -740,6 +786,48 @@ two files, so they can be deleted in favour of the module the moment
 Also note item 15's original description is now stale: the module no longer
 "raises on first call", because the `top_n_sigma` it passes exists as of
 `7ebb5690`. That was the entire reason it was marked a landmine.
+
+### The deliberate divergence that wasn't — `gemma4_assistant/masks.py`
+
+AGENTS.md carried this as a rule for a while:
+
+> `gemma4_assistant/masks.py` must keep its absolute import. It looks like
+> gratuitous divergence from upstream's relative form, but that module is imported
+> standalone by its test, where a relative import has no parent package. Taking
+> upstream's broke two tests.
+
+Every clause of that is an accurate observation. The conclusion is still wrong, and
+the shape of the error is worth more than the fix.
+
+`a492e47d` (#1494) is a merged-then-dropped commit that changed **two** files as one
+atomic edit:
+
+- `masks.py`: `from mlx_lm.models.cache import dynamic_roll` -> `from ....models.cache import dynamic_roll`
+- `tests/test_gemma4_assistant_masks_static.py`: fake the `mlx_vlm.*` package chain
+  and load the module under its real dotted name, so the *relative* import resolves
+
+Only the first half was dropped. So our tree had a test still faking
+`mlx_lm.models.cache` — inert, because nothing imports that any more and the real
+`mlx_vlm.models.cache` loads regardless — and an absolute import in `masks.py` that
+was invented as a workaround for the missing half. Someone then tried upstream's
+`masks.py` *alone*, correctly observed two tests break, and codified the workaround
+as a deliberate divergence. Taking **both** halves makes both files byte-identical
+to upstream with the two tests passing.
+
+Three things generalise:
+
+- This is AGENTS.md's own "a dropped commit usually spans several files, and
+  restoring one file of a multi-file dropped commit is worse than restoring none"
+  rule, encountered from the other end: *testing* one file of a multi-file dropped
+  commit and concluding from the failure that our side is load-bearing.
+- "Taking upstream's version broke a test" is not evidence that our version is
+  correct. It is evidence that the two sides are internally consistent and you are
+  holding half of each.
+- The note that got this wrong is the second AGENTS.md "do not touch this"
+  guardrail found to be protecting a non-divergence, after the `qwen3_5` norm-shift
+  gate. Both deterred inspection of exactly the file that needed it. A guardrail
+  needs a `git log -S` behind it, and the ones written without that are liabilities
+  precisely because they read as settled.
 
 ### A test that cannot fail — worth internalising
 

@@ -53,3 +53,10 @@ jobs:
       # the baseline is clean; keep it that way.
       - name: Check no upstream deletion was silently reverted
         run: python dev/check_upstream_deletions.py --upstream-ref upstream/main --strict
+
+      # The fourth direction: not "what is missing" or "what did we wrongly keep"
+      # but "which side wrote this hunk?" — the question every merge conflict asks
+      # and nothing could answer. Enforces the `# Fork:` convention on files
+      # outside .fork-marker-allowlist, which is a shrinking rollout schedule.
+      - name: Check every fork change in a shared file is marked
+        run: python dev/check_fork_markers.py --upstream-ref upstream/main

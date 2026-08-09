@@ -22,7 +22,7 @@ silently dropped content — came out of resolving large accumulations, because:
 
 - A 90-commit merge produces a resolution nobody can review hunk by hunk, and an
   unreviewable resolution is where content gets dropped without a conflict.
-- The four audits below only work **if they run**. They are cheap after a
+- The five audits below only work **if they run**. They are cheap after a
   five-commit merge and psychologically skippable after a ninety-commit one.
 - A dropped hunk is unrecoverable by any later merge (see the failure mode
   below), so the cost of a bad resolution is permanent, while the cost of merging
@@ -39,10 +39,11 @@ python dev/check_upstream_parity.py     # no upstream file silently dropped
 python dev/check_upstream_symbols.py    # no upstream def/class silently dropped
 python dev/find_dropped_hunks.py        # no upstream HUNK silently dropped
 python dev/check_upstream_deletions.py  # no upstream DELETION silently reverted
+python dev/check_fork_markers.py        # every fork hunk in a shared file is marked
 cd mlx_vlm/ && pytest ./tests --ignore=tests/test_smoke.py --ignore=tests/test_utils.py
 ```
 
-**Run all four checks after every merge — this is not optional.** When a merge
+**Run all five checks after every merge — this is not optional.** When a merge
 resolution drops content from a commit that upstream already merged, that commit
 is still an ancestor of `main`, so git records the content as *deliberately
 deleted* and no later merge re-offers it. There is no conflict and no warning.
@@ -92,6 +93,31 @@ real:
 **Corollary for `AGENTS.md` itself: do not describe a symbol as "fork-only"
 without running `git log -S` on it first.** This section's own guidance got this
 wrong — see the KV-cache note below.
+
+### The third direction: which side wrote this hunk?
+
+Both questions above are about *presence*. Neither can tell you, for a file both
+trees have, **which side authored a given change** — the question every conflict
+resolution actually turns on. `dev/check_fork_markers.py` is that check: for each
+file `upstream/main` also has, every diverging top-level `def`/`class` must carry a
+`# Fork:` comment saying what deviates and why, or sit below a fork-boundary banner
+(`models/cache.py` is the model). Files not yet annotated live in
+`.fork-marker-allowlist`, which is a **rollout schedule, not an exemption list** —
+each entry means "not yet reviewed", and removing one is the definition of done.
+`--summary` ranks the remaining work by file.
+
+**A marker is a provenance conclusion, not a label.** A site that differs from
+upstream is *not* automatically fork work — it can equally be content a merge
+resolution dropped, and marking that `# Fork:` launders a bug into a documented
+feature that no later audit will ever question. Establish provenance the usual way
+first. Allowlist entries tagged `LEADS` have open `find_dropped_hunks.py`
+candidates; resolve those before marking anything in the file.
+
+The reverse of the AGENTS.md corollary above therefore also holds: **do not mark a
+hunk `# Fork:` without running `git log -S` on it either.** Building this check
+found `gemma4_assistant/masks.py` — recorded in this very file as a deliberate
+divergence — to be half of a dropped commit; see the `[correction]` under
+"Deliberate divergences".
 
 When resolving conflicts, prefer a **union** over picking a side. Both sides add
 to shared lists (`__all__`, lazy-import tuples, skip-lists, registries); taking
@@ -331,11 +357,20 @@ fallback and by two test files.
 
 ## Deliberate divergences — do not "fix" these
 
-- **`gemma4_assistant/masks.py` must keep its absolute import**
-  (`from mlx_vlm.models.cache import dynamic_roll`). It looks like gratuitous
-  divergence from upstream's relative form, but that module is imported standalone
-  by its test, where a relative import has no parent package. Taking upstream's
-  broke two tests.
+- **[correction]** This list used to open with "`gemma4_assistant/masks.py` must
+  keep its absolute import ... taking upstream's broke two tests." **It was not a
+  divergence at all.** `a492e47d` (#1494) changed `masks.py` to a relative import
+  *and* rewrote its test's module fakes to match, as one atomic edit; only the
+  first half survived our merge. So the test still faked `mlx_lm.models.cache`
+  (inert) and the absolute import was a workaround for the missing half. Taking
+  **both** halves makes both files byte-identical to upstream with the tests
+  passing, which is now the state of the tree. "Taking upstream's version broke a
+  test" means the two sides are internally consistent and you are holding half of
+  each — it is not evidence that our side is load-bearing. See
+  `docs/upstream-gaps.md`, "The deliberate divergence that wasn't". This is the
+  second guardrail in this file found to protect a non-divergence, after the
+  `qwen3_5` norm-shift gate below; **do not add one without `git log -S` behind
+  it.**
 - **`_rotating_post_gen_trim_safe` is intentionally unwired.** The mid-prefill
   snapshot supersedes it; wiring it in would force full re-prefill on wrapped SWA
   rings. See `memory.md:274` and `docs/upstream-gaps.md`.

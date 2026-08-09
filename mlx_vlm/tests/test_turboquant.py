@@ -457,7 +457,7 @@ def test_turboquant_decode_attention_separate_path_bypasses_fused_split(monkeypa
     assert output.shape == queries.shape
 
 
-# Reference of record (design spec §8): full fp32 dequant of the KV -> fp32
+# Fork: fork-only. Reference of record (design spec §8): full fp32 dequant of the KV -> fp32
 # mx.fast.scaled_dot_product_attention. Both the fused kernel and the reference
 # see identical dequantized values, so this bounds pure kernel numerics (fp32
 # accumulation differences), NOT the codec's quantization error.
@@ -541,9 +541,9 @@ def test_turboquant_prefill_attention_matches_dequantized_attention():
     fp_cache = KVCache()
     fp_cache.update_and_fetch(keys, values)
     turbo_cache = TurboQuantKVCache.from_cache(fp_cache, bits=3.5)
-    # This test asserts quantized_attention's fp32-tight (1e-4) match; pin it off
-    # the fp16 fused/decomposed MSE prefill path (covered in its own test file
-    # with an fp16-appropriate tolerance).
+    # Fork: this test asserts quantized_attention's fp32-tight (1e-4) match; pin
+    # it off the fork's fp16 fused/decomposed MSE prefill path, which upstream
+    # does not have (covered in its own test file with an fp16 tolerance).
     turbo_cache._fused_prefill_enabled = False
     turbo_keys, turbo_values = turbo_cache.state
     dequantized_keys, dequantized_values = turbo_cache.dequantize(
@@ -573,7 +573,7 @@ def test_turboquant_prefill_attention_matches_dequantized_attention():
 
 
 def test_turboquant_quantized_attention_invariant_to_query_block_size():
-    # prefill_query_block_size is a pure performance knob: the flash-style online
+    # Fork: fork-only test. prefill_query_block_size is a pure performance knob: the flash-style online
     # softmax accumulates the same result regardless of how the queries are
     # blocked, so the output must be (bit-)identical across block sizes. Guards
     # the perf default (16 -> 256), which is ~15x faster prefill attention.

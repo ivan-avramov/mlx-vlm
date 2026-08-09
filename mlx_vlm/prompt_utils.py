@@ -1,10 +1,21 @@
 import inspect
 import json
+
+# Fork: `threading` and `dataclass` (and Optional/Tuple) are imported for the
+# fork-only registries below — CACHE_ALIGNMENT_KWARGS, THINKING_FORMATS and
+# USER_TURN_OPEN_MARKERS. Upstream's import list has neither.
 import threading
 from dataclasses import dataclass
 from enum import Enum
 from functools import partial
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import (  # Fork: Optional/Tuple are for the registries below
+    Any,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
 
 # ---------------------------------------------------------------------------
 # Chat-template kwargs for prefix-cache-friendly multi-turn rendering.
@@ -529,8 +540,11 @@ class MessageFormatter:
     def __init__(self, model_name: str):
         self.model_name = model_name.lower()
         self.format_type = MODEL_CONFIG.get(self.model_name)
-        # Unknown models (e.g. text-only models loaded via mlx_lm fallback)
-        # get plain text formatting — no image/audio tokens to insert.
+        # Fork: upstream raises for a model_name absent from MODEL_CONFIG. Pure
+        # text models (Qwen 2.5, gemma3_text) load via the mlx_lm fallback and are
+        # not in that map, so they must degrade to plain text formatting rather
+        # than fail. See tests/test_prompt_utils.py
+        # ::TestMessageFormatterTextOnlyFallback.
         if not self.format_type:
             self.format_type = None
 

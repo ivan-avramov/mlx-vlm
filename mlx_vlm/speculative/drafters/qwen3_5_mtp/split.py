@@ -30,6 +30,8 @@ def _weight_map(model_path: Path) -> Dict[str, str]:
 
 
 def _config_mtp_file(model_path: Path) -> Optional[Path]:
+    # Fork: fork-only. Upstream has no config.json fallback for locating the MTP
+    # sidecar; see the caller in _iter_mtp_keys for why it is needed.
     config_path = model_path / "config.json"
     if not config_path.exists():
         return None
@@ -56,9 +58,9 @@ def _iter_mtp_keys(model_path: Path) -> Iterable[tuple[Path, list[str]]]:
                 yield model_path / filename, keys
             return
 
-    # Some converters (e.g. mlx-optiq) relocate the mtp sidecar out of the
-    # repo root (so non-recursive *.safetensors globs skip it) and record
-    # its real path in config.json instead.
+    # Fork: some converters (e.g. mlx-optiq) relocate the mtp sidecar out of the
+    # repo root (so non-recursive *.safetensors globs skip it) and record its real
+    # path in config.json instead. Upstream iterates _safetensor_files only.
     sidecar = _config_mtp_file(model_path)
     candidates = [sidecar] if sidecar else _safetensor_files(model_path)
 
