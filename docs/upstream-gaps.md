@@ -539,13 +539,32 @@ fits them. Four checks, not three; see AGENTS.md.
 **Progress as of 2026-08-09 (third pass).** Merged four upstream commits — #1807
 (per-tensor KV quantization), #1814, Bonsai detection — the first merge under the
 weekly rule; seven files conflicted and the resolutions are itemised in that merge
-commit. 33 -> **18** commits with missing content. Suite 2514 -> **2557 passed, 5
-skipped, 0 failed**. Two dropped hunks restored out of merge conflicts rather than
-from the backlog: `8422ece8`'s (#1638) `server/app.py` half, which had left the
-on-disk APC namespace not fingerprinting the KV-quant config, and both halves of
-`a492e47d`'s (#1494) `masks.py`/test pair. `.symbol-exclusions` lost 8 entries to
-convergence when #1807 deleted upstream's own `dispatch.py` duplicates. **Fifth
+commit. Suite 2514 -> **2564 passed, 5 skipped, 0 failed**. Two dropped hunks
+restored out of merge conflicts rather than from the backlog: `8422ece8`'s (#1638)
+`server/app.py` half, which had left the on-disk APC namespace not fingerprinting
+the KV-quant config, and both halves of `a492e47d`'s (#1494) `masks.py`/test pair.
+`.symbol-exclusions` lost 8 entries (107 -> 99) to convergence when #1807 deleted
+upstream's own `dispatch.py` duplicates; `.deletion-exclusions` 11 -> 8. **Fifth
 check added:** `dev/check_fork_markers.py`, the fork-content oracle — see below.
+
+> **[correction]** Commit `70c99d01`'s message, and an earlier version of this
+> paragraph, claim `find_dropped_hunks.py` went "33 -> 18 commits". **That is
+> wrong**, and the mistake is instructive: the number was read off a
+> `find_dropped_hunks.py | tail -60` and only the visible tail was counted. The
+> real figure is **34**, against 33 before the merge — essentially flat, and up by
+> one because merging four upstream commits widens the scan's scope. The commit
+> message cannot be fixed without rewriting a merge commit, so the correction lives
+> here. **Count the report's own header line** (`N upstream commit(s) with content
+> missing here`); never a truncated pipe.
+>
+> The related claim that the report "no longer reports `8422ece8`" is also wrong.
+> It still does, at 49 lines — but now for `generate/dispatch.py` and
+> `generate/ar.py`, not the `server/app.py` half that was restored. This is how the
+> report behaves in general: it is *per commit*, aggregated over files, so
+> restoring one file of a multi-file commit removes that file's line and leaves the
+> commit listed. `a492e47d` and `221fe0b3` both still appear for the same reason
+> after having a half fixed each. A commit leaving the report entirely is the
+> exception, not the measure of progress.
 
 Re-run the scanner after every merge:
 
@@ -639,7 +658,7 @@ Three more from the second half of the pass, all new:
 | 6 | ~~mRoPE cluster~~ **FIXED `540a3189`** | `a8642018`, `b8671991`, `#1527`, `#1741` | must land WITH `generate/ar.py`: our batcher lacks the MRoPE helpers, so `(3,B,L)` `position_ids` is truncated to `(1,B,L)`. Restoring `qwen3_5` alone *creates* a bug. **Live today for qwen2_vl / qwen2_5_vl / qwen3_vl / qwen3_vl_moe** — qwen3_5's staleness is what masks it |
 | 7 | ~~TurboQuant trim cluster~~ **FIXED `92620167`** | `#1447`, `#1453`, `#1432` | `BatchTurboQuantKVCache.is_trimmable()` -> `False`, `trim(2)` -> `0` (upstream: `True`, `2`). Under `--kv-bits` the cache falls into the SSM branch and is indexed `c[0]`/`c[1]` -> `TypeError`; on the non-crashing path every later `gdn_states[j]` index shifts, restoring GatedDeltaNet state from the wrong layer. `zero_row_tail` exists with **no caller anywhere** |
 | 8 | ~~`tool_choice` ignored on `/v1/chat/completions`~~ **FIXED `0bb0b07f`** | `2394fcf1` (#1611) | `"tools" in ChatRequest.model_fields` -> False; also lost the `if not tools: tool_module = None` guard, so tool markup is parsed for callers who sent no tools |
-| 9 | **`skip_special_tokens` is an undeclared attribute** — field now exists (`7ebb5690`), writes still unwired | `cfcc36d9`/`29b6c00b` | `anthropic.py:489` writes `gen_args.skip_special_tokens = False`; the field does not exist on `GenerationArguments` and `generation.py` hardcodes `True`. The recorded "Anthropic tool-markup" fix is **inert** |
+| 9 | `skip_special_tokens` — **RECLASSIFIED 2026-08-09: mostly an upstream bug, not dropped content** | `29b6c00b` (partly); upstream for the rest | The field exists as of `7ebb5690` and `anthropic.py:489` writes `False` to it, so the "Anthropic tool-markup" fix is still **inert** — but the cause is not ours. Upstream honours `args.skip_special_tokens` **only inside `_generate_diffusion`** (`generation.py` lines 1906/1971 and nowhere else), and upstream's `anthropic.py:489` is byte-identical to ours. So on the normal text path the write is ignored **in both trees**: an upstream bug worth reporting there, not a hunk to restore. The diffusion half *is* ours to fix, and is blocked behind `29b6c00b`: our two hardcoded `skip_special_tokens=True` sites live in `_generate_masked_diffusion`, which `.deletion-exclusions` already records as that commit's stale pre-unification half. Deliberately **not** patched — inventing the behaviour on the normal path would add fork divergence to the exact file we are trying to converge |
 | 10 | ~~1-bit repos cannot load~~ **FIXED `510f16e9`** | `960b26f9` (#1597) | kernel, `__init__` export and 123-line test all landed; only `utils.py`'s 7 lines of `replace_one_bit_modules` wiring dropped |
 | 11 | ~~AWQ quantization absent~~ **FIXED `1d6e8c9b`** | `3c0232ed` (#1666) | 104 lines of `convert.py`, 91% of the hunk |
 | 12 | ~~Empty-input rejection absent~~ **FIXED `4d91b912`** | `a344713a` (#1491) | empty requests reach model load instead of a 400 |
@@ -761,10 +780,12 @@ with all three fork behaviours carried into the module and the four byte-identic
 helper duplicates deleted. That made `reasoning` / `reasoning_effort` and the 13
 diffusion pass-throughs live for the first time. Still open in this cluster:
 
-- **item 9** — `skip_special_tokens`. The field exists and `anthropic.py:489`
-  writes `False` to it, but `generation.py` still passes a literal
-  `skip_special_tokens=True` at both decode sites, so the write remains inert.
-  Unblocked by the union but not fixed by it.
+- **item 9** — `skip_special_tokens`, now **reclassified**. Investigated after the
+  union and it is mostly *not* a fork gap: upstream honours the flag only inside
+  `_generate_diffusion`, and upstream's `anthropic.py:489` is byte-identical to
+  ours, so the write is ignored on the normal text path in both trees. The
+  diffusion half is ours and is blocked behind `29b6c00b`, because our two
+  hardcoded sites sit in the stale `_generate_masked_diffusion`. See the table row.
 - **`cfcc36d9`** (#1634, generation logging) — a 9-file, 716-line dropped commit,
   surfaced independently by the 2026-08-09 merge when `server/__init__.py`
   conflicted over importing `get_log_progress_interval`, which exists nowhere in
