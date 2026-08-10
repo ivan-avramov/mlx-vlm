@@ -22,13 +22,35 @@ fails the file that defines the convention, which would mean the rule is wrong. 
 a hunk is covered when the top-level `def`/`class` containing it carries a marker
 anywhere inside it -- which is also the unit a reader actually asks about.
 
-Three ways a hunk is covered:
+Four ways a hunk is covered:
 
   1. a `# Fork:` marker inside the enclosing top-level definition;
   2. the hunk starts after the file's fork-boundary comment (see BOUNDARY_RE) --
      everything below that line is fork territory by declaration;
   3. for changes outside any definition (imports, module constants), a marker
      inside the hunk itself, since there is no enclosing span to attach to.
+  4. it is a pure DELETION of top-level symbols that are all already excused in
+     `.symbol-exclusions` for this path.
+
+Case 4 exists because there is nothing a marker can attach to. When upstream defines
+a top-level symbol we legitimately do not have, diff attributes the deletion to
+whatever line of ours sits at the seam -- in practice a blank one -- so there is no
+enclosing definition to annotate and no whitespace to converge. Before this, every
+such file was permanently un-drainable no matter how carefully its real sites were
+marked: `generate/dispatch.py` (`_cache_fully_retained`,
+`_prefix_cache_trim_amount`) and `server/generation.py`
+(`_check_configured_context_budget`) both sat at one residual site each with every
+genuine site marked. It also looks exactly like the whitespace probe that trap 9 in
+the handoff warns about, and is not one -- which is the other reason to resolve it
+here rather than leave a reader to tell them apart by hand.
+
+The rule is deliberately narrow. It fires only when the deleted lines define at
+least one top-level `def`/`class` AND every such name is excused, so a
+whitespace-only deletion still reports (it is a real alignment artifact), and a
+deletion that removes an unexcused symbol still reports (that is a dropped hunk, and
+`check_upstream_symbols.py` should be catching it too). This does not weaken the
+audit: `.symbol-exclusions` already gates on those same names, with a written reason
+each, so the content is reviewed -- case 4 only stops it being counted twice.
 
 Whole files still being brought under the convention go in
 `.fork-marker-allowlist` with a reason, and that list is meant to shrink. A
@@ -54,6 +76,10 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ALLOWLIST_FILE = REPO_ROOT / ".fork-marker-allowlist"
+SYMBOL_EXCLUSIONS_FILE = REPO_ROOT / ".symbol-exclusions"
+
+# A top-level `def`/`class` in a deletion hunk body: column 0 after diff's `-`.
+TOP_LEVEL_DEF_RE = re.compile(r"^-(?:async\s+)?(?:def|class)\s+([A-Za-z_]\w*)")
 
 # `# Fork:` is the established spelling in models/cache.py. `# Fork-only:` and
 # `# Fork (…):` are accepted so the marker can carry a short qualifier.
@@ -91,6 +117,56 @@ def load_allowlist() -> list[tuple[str, str]]:
             )
         out.append((rule, reason))
     return out
+
+
+def load_symbol_exclusions() -> list[tuple[str, str]]:
+    """Return [(path_glob, symbol_glob)] from .symbol-exclusions.
+
+    Same `path_glob::symbol_glob  # reason` format `check_upstream_symbols.py`
+    reads. Parsed leniently here on purpose: that script is the one that validates
+    the file and exits on a malformed line, so duplicating its `sys.exit` calls
+    would only give two scripts to fix when the format drifts.
+    """
+    if not SYMBOL_EXCLUSIONS_FILE.exists():
+        return []
+
+    out: list[tuple[str, str]] = []
+    for raw in SYMBOL_EXCLUSIONS_FILE.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        rule, _, _reason = line.partition("#")
+        rule = rule.strip()
+        if "::" not in rule:
+            continue
+        path_glob, _, symbol_glob = rule.partition("::")
+        out.append((path_glob.strip(), symbol_glob.strip()))
+    return out
+
+
+def excused_symbols(path: str, exclusions: list[tuple[str, str]]) -> list[str]:
+    """Symbol globs excused for `path` by .symbol-exclusions."""
+    return [
+        sym
+        for path_glob, sym in exclusions
+        if path == path_glob or fnmatch.fnmatch(path, path_glob)
+    ]
+
+
+def deletion_of_excused_symbols(
+    body: list[str], excused: list[str]
+) -> tuple[bool, list[str]]:
+    """(covered, names) for a pure-deletion hunk body.
+
+    Covered when the body defines at least one top-level `def`/`class` and every
+    one of those names is excused. Returns the names either way so the caller can
+    report what it saw.
+    """
+    names = [m.group(1) for l in body if (m := TOP_LEVEL_DEF_RE.match(l))]
+    if not names:
+        return False, names
+    covered = all(any(n == g or fnmatch.fnmatch(n, g) for g in excused) for n in names)
+    return covered, names
 
 
 def top_level_spans(source: str) -> list[tuple[int, int]]:
@@ -195,7 +271,11 @@ def main() -> int:
     shared = sorted(upstream_files & our_files & diverged)
 
     allowlist = load_allowlist()
+    symbol_exclusions = load_symbol_exclusions()
     used: set[str] = set()
+    # path -> the excused symbol names whose deletion hunks case 4 covered, so the
+    # coverage is auditable rather than silent.
+    excused_deletions: dict[str, list[str]] = {}
 
     # Keyed by the *site* that needs one marker -- an enclosing top-level
     # definition, or a module-scope hunk -- not by raw hunk. Raw -U0 hunks are a
@@ -224,6 +304,7 @@ def main() -> int:
         lines = source.splitlines()
         spans = top_level_spans(source)
         bound = boundary_line(lines)
+        file_excused = excused_symbols(path, symbol_exclusions)
 
         def span_of(line_no: int) -> tuple[int, int] | None:
             for start, end in spans:
@@ -241,6 +322,16 @@ def main() -> int:
             if bound is not None and probe >= bound:
                 covered_total += 1
                 continue
+            # Case 4: a deletion-only hunk removing top-level symbols that
+            # .symbol-exclusions already excuses. There is no enclosing definition
+            # to mark and no whitespace to converge, so without this every file
+            # holding a reviewed absent symbol stayed permanently un-drainable.
+            if new_count == 0:
+                ok, names = deletion_of_excused_symbols(body, file_excused)
+                if ok:
+                    covered_total += 1
+                    excused_deletions.setdefault(path, []).extend(names)
+                    continue
             span = span_of(probe)
             if span is not None and marked(*span):
                 covered_total += 1
@@ -280,6 +371,18 @@ def main() -> int:
                 f"{ALLOWLIST_FILE.name} (not yet under the convention)."
             )
         print(f"{covered_total} fork hunk(s) covered by a marker or the boundary.")
+        if excused_deletions:
+            # Named, not just counted: this is the one coverage rule that rests on
+            # another file's review rather than on a marker in this one, so it
+            # should be visible every run.
+            total = sum(len(v) for v in excused_deletions.values())
+            print(
+                f"{total} deletion-only hunk symbol(s) covered by "
+                f"{SYMBOL_EXCLUSIONS_FILE.name} (case 4):"
+            )
+            for path in sorted(excused_deletions):
+                names = ", ".join(sorted(set(excused_deletions[path])))
+                print(f"  {path}: {names}")
 
     if args.summary:
         if not uncovered:

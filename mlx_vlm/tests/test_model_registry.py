@@ -9,9 +9,17 @@ outright with "Model type X not supported" while their implementations sat in th
 tree byte-identical to upstream. The only way to catch that shape is to exercise
 the entries.
 
-Deliberately a fork-only file rather than an addition to `tests/test_utils.py`:
-that file is excluded from the suite (`--ignore=tests/test_utils.py`, 5
-pre-existing failures), so a guard placed there would never actually run.
+Deliberately a fork-only file rather than an addition to `tests/test_utils.py`,
+which at the time was excluded from the suite (`--ignore=tests/test_utils.py`, 5
+pre-existing failures) so a guard placed there would never actually run.
+
+**[correction 2026-08-10]** That exclusion is gone — `test_utils.py` has been
+collected and green since 2026-08-09, and its 5 "pre-existing failures" turned out
+to be stale test code rather than product bugs. The sentence above stated it as a
+present fact, which would have sent the next reader looking for an `--ignore` that
+no longer exists. Keeping this file separate is still right, but for the reason in
+the first paragraph (registries need exercising, and a fork-only file is where
+fork-only guards belong) and not because of a suite exclusion.
 """
 
 import importlib

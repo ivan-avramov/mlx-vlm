@@ -223,7 +223,7 @@
 #     against a README that promises it. Guard:
 #     test_dropped_upstream_guards.py::TestApcStoreEmitsItsTrace.
 #
-# Current standing (2026-08-09): 4 files / 42 sites / 83 hunks, down from 32 files /
+# Current standing (2026-08-09): 3 files / 41 sites / 82 hunks, down from 32 files /
 # 175 sites. Re-run `--summary`; do not trust this line either. Every
 # diverged file NOT listed here is marked, including
 # server/request_normalization.py — the gen-args union added fork hunks to a file
@@ -257,7 +257,8 @@ mlx_vlm/utils.py  # REVIEWED site-by-site 2026-08-09; ONE named blocker, not a g
 # ---   openai.py 76/905 · generation.py 92/665
 # ---   [turboquant.py 118/529 CLEARED: 91 of 96 bodies byte-identical; the AST-body
 # ---    method found #1433 where three earlier report-based passes had not]
-# ---   [dispatch.py 125/377 FULLY MARKED, 8 sites -> 1 unmarkable deletion-only hunk]
+# ---   [dispatch.py 125/377 CLEARED: fully marked, and its last deletion-only hunk is
+# ---    now covered by check_fork_markers.py case 4]
 # ---   [test_generate.py 251/297 CONVERGED by reordering, now 70/116; all 70 are
 # ---    TestPrefixCacheReuseTrim's 9 REVIEWED .symbol-exclusions methods]
 # --- ar.py was 26/233 and is now cleared: all 26 were rewrite artifacts, confirmed by
@@ -271,10 +272,16 @@ mlx_vlm/utils.py  # REVIEWED site-by-site 2026-08-09; ONE named blocker, not a g
 
 # --- Tests, not yet reviewed at site granularity.
 
-# --- Blocked by a TOOL limitation, not by unreviewed content. Both files below are
-# --- fully marked; each keeps its entry only because of a pure-DELETION hunk that
-# --- `check_fork_markers.py` cannot attribute to any definition (see the note in
-# --- dispatch.py's reason). Teaching the check to consult `.symbol-exclusions` for
-# --- deletion-only hunks would drain both immediately, and is the cheapest remaining
-# --- tooling win in this rollout.
-mlx_vlm/generate/dispatch.py  # FULLY MARKED 2026-08-09, 8 sites -> 1, and the 1 is not markable. All four real sites carry `# Fork:` markers: the .common snapshot-ring import, `parse_arguments` (+23/-0, the "suffix" draft kind), `main` (+17/-0, the SuffixDecodingProposer arm) and `stream_generate` (a 405->647 rewrite whose 80 absent upstream lines are accounted for per site in the marker: upstream's `_prefix_cache_trim_amount` gate, a REVIEWED .symbol-exclusions divergence superseded by the snapshot ring, and its `thinking_start_token_id in input_ids` gate, deliberately replaced by `prompt_is_inside_thinking` because Gemma 4's markers are not single tokens). THE RESIDUAL SITE is a DELETION-ONLY hunk: upstream lines 635-673 define `_cache_fully_retained` and `_prefix_cache_trim_amount`, both legitimately absent here and both in .symbol-exclusions, and the check keys that deletion to our line 673 -- a blank line. There is no definition to put a marker inside, and both trees have identical whitespace there, so nothing can be converged either. Verified: this is NOT the trap-9 whitespace probe it looks like
+# --- [The TOOL LIMITATION recorded here on 2026-08-09 is FIXED.] It said two files
+# --- were fully marked yet un-drainable because a pure-DELETION hunk cannot carry a
+# --- marker, and that teaching the check to consult `.symbol-exclusions` was the
+# --- cheapest remaining tooling win. Done: `check_fork_markers.py` now has a case 4 —
+# --- a deletion-only hunk whose removed top-level symbols are ALL already excused in
+# --- `.symbol-exclusions` counts as covered, and the script names them on every run so
+# --- the coverage is auditable rather than silent. `generate/dispatch.py` drained on
+# --- the spot. The rule is narrow by construction (>= 1 top-level def AND all names
+# --- excused), so a whitespace-only deletion still reports and a deletion touching any
+# --- unexcused symbol still reports; `mlx_vlm/tests/test_fork_marker_check.py` is the
+# --- first test of any dev/ audit and pins exactly that. `server/generation.py` is the
+# --- other file this unblocks — its `_check_configured_context_budget` is an existing
+# --- exclusion entry.
