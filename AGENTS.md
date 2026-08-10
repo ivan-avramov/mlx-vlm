@@ -689,6 +689,8 @@ pip install -e .
 # local venv with test deps (used by the commands above):
 uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python -e . pytest pytest-asyncio
+# only for dev/fork_coverage_report.py; not a package dependency:
+uv pip install --python .venv/bin/python coverage
 ```
 
 ## Formatting & linting
