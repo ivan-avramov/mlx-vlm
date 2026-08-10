@@ -1,16 +1,29 @@
-# Upstream bugs found here — evidence, and filing status
+# Upstream bugs found here — our own record of what comes from where
 
 Bugs that live in `Blaizzy/mlx-vlm` itself, not in this fork. Each was found while
 resolving a merge or draining an audit, and each is reproducible against
-`upstream/main` with no fork code involved. **None of them should be patched
-locally**: a local fix to upstream code is a new permanent conflict site, and for two
-of the three our copy is byte-identical to upstream's, which is the state we want.
+`upstream/main` with no fork code involved.
+
+**This file is bookkeeping, and that is the whole of its purpose.** Its job is to
+stop each of these being re-investigated as a fork problem every time it surfaces in
+an audit, and to record which `.symbol-exclusions` entries exist *because* upstream
+has a defect. Two consequences, both deliberate:
+
+* **These are not to be filed with upstream.** Engaging upstream's issue tracker is
+  out of scope for this fork (decided 2026-08-10). An earlier handoff invented that
+  task; it was never asked for and nothing else in `AGENTS.md`, `upstream-gaps.md` or
+  `memory.md` ever proposed it. Don't re-propose it.
+* **These are not to be patched locally either.** A local fix to upstream code is a
+  new permanent conflict site, and for two of the three our copy is byte-identical to
+  upstream's — which is the state worth keeping.
+
+So the correct action on every entry below is: read it, understand why our tree looks
+the way it does, and move on.
 
 Line numbers are `upstream/main` at base `ffd7aeff` unless stated. Verified
-2026-08-10.
-
-**Filing status: all three searched for on 2026-08-10 (`gh search issues --repo
-Blaizzy/mlx-vlm`), none filed. Not yet filed — awaiting the go-ahead.**
+2026-08-10; none of the three had been filed by anyone else as of that date
+(`gh search issues --repo Blaizzy/mlx-vlm`), which is recorded only because it
+confirms they are genuinely unreported rather than known-and-wontfix.
 
 ---
 
