@@ -1299,3 +1299,84 @@ class TestThinkingBudgetDoesNotSynchronizeDecode:
         # The mask-based substitution is what replaces it.
         assert "mx.where(" in source
         assert "mx.async_eval(self._next_tokens)" in source
+
+
+class TestQwen35MetalOnlyFastPathsAreGuarded:
+    """`16cf6140` (#1423) — Qwen3.5 on CUDA: fix Metal-only crashes.
+
+    A two-file commit whose `gated_delta.py` half landed byte-identical while all
+    three of its `language.py` hunks were dropped, so the file read as ordinary fork
+    divergence. Both surviving hunks reach `mx.fast.metal_kernel` unconditionally:
+    `_TARGET_VERIFY_GEMV` is built at import time, and
+    `_qwen3_5_ragged_decode_attention` launches its SDPA kernels with no backend
+    check. On a non-Metal backend that is an import-time or decode-time crash rather
+    than the intended fall-through to portable `scaled_dot_product_attention`.
+
+    Not reproducible on Apple Silicon, where `mx.metal.is_available()` is always
+    True — which is exactly why the drop survived. These guards patch the predicate
+    the upstream hunks consult, so they fail against the pre-restore file here.
+    """
+
+    def test_ragged_decode_attention_declines_without_metal(self, monkeypatch):
+        import mlx.core as mx
+
+        from mlx_vlm.models.qwen3_5.language import _qwen3_5_ragged_decode_attention
+
+        queries = mx.zeros((2, 4, 1, 64), dtype=mx.float16)
+        keys = mx.zeros((2, 2, 32, 64), dtype=mx.float16)
+        values = mx.zeros((2, 2, 32, 64), dtype=mx.float16)
+
+        # Shapes chosen to satisfy every other precondition, so the only thing
+        # that can decline the fast path is the backend check.
+        assert (
+            _qwen3_5_ragged_decode_attention(queries, keys, values, [0, 0], 0.125)
+            is not None
+        )
+
+        monkeypatch.setattr(mx.metal, "is_available", lambda: False)
+        assert (
+            _qwen3_5_ragged_decode_attention(queries, keys, values, [0, 0], 0.125)
+            is None
+        )
+
+    def test_use_target_verify_dense_declines_when_kernel_is_none(self, monkeypatch):
+        import mlx.core as mx
+
+        from mlx_vlm.models.qwen3_5 import language as qwen35_language
+
+        linear = nn.Linear(64, 64)
+        x = mx.zeros((1, 4, 64), dtype=mx.float16)
+
+        assert qwen35_language._use_target_verify_dense(linear, x, True) is True
+
+        # What the module global becomes on a non-Metal backend once the
+        # `if mx.metal.is_available() else None` guard is in place.
+        monkeypatch.setattr(qwen35_language, "_TARGET_VERIFY_GEMV", None)
+        assert qwen35_language._use_target_verify_dense(linear, x, True) is False
+
+
+class TestQwen35QuantizedVerifyPredicateIsFactored:
+    """`7fbc7bc9` (#1598) — split `_can_target_verify_quantized`.
+
+    Upstream extracted the weight-only half as `_can_target_verify_quantized_head`
+    so `fused_greedy_decode` could reuse it. The extraction landed and the *rewrite*
+    of the original function was dropped, so this tree kept the pre-split body: two
+    copies of the same predicate, one of which no longer had a reason to exist.
+
+    The two forms are provably equivalent (`x.dtype in (bf16, f16)` +
+    `scales.dtype == x.dtype` + `biases.dtype == x.dtype` is the same constraint as
+    upstream's `scales.dtype in (bf16, f16)` + `biases.dtype == scales.dtype` +
+    `x.dtype == scales.dtype`, and both derive the same `K`), so there is no
+    behavioural repro to write — only the duplication to keep from coming back.
+    """
+
+    def test_predicate_delegates_rather_than_duplicating(self):
+        import inspect
+
+        from mlx_vlm.models.qwen3_5.language import _can_target_verify_quantized
+
+        source = inspect.getsource(_can_target_verify_quantized)
+        assert "_can_target_verify_quantized_head(linear)" in source
+        assert (
+            'linear.mode != "affine"' not in source
+        ), "the pre-split body is back; the head predicate is duplicated again"

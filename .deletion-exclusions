@@ -59,6 +59,19 @@
 # the optimization was inert. Taking upstream's current _fused_greedy_step also
 # lands 6d5603b3 (#1628)'s second half, which b616f889 skipped for want of this
 # very method, and ea2edd68 (#1583)'s _ensure_logits_processor_slots.
+#
+# CORRECTION 2026-08-09 (later, while draining the fork-marker allowlist): "restored"
+# above was one half short, and this note is why nobody looked again. 7fbc7bc9 did not
+# merely ADD _can_target_verify_quantized_head -- it EXTRACTED it out of
+# _can_target_verify_quantized and rewrote that function to call it. Only the
+# extraction landed, so this tree kept the pre-split body and carried the same
+# predicate twice, one copy of which no longer had a caller-side reason to exist. That
+# is trap 6 in the handoff ("a partially-restored commit is unfinished") applied to a
+# commit already recorded as finished: the note named THREE symbols it had verified
+# present and treated their presence as the commit being whole, when what was missing
+# was a rewrite of a FOURTH symbol that was present all along. Presence of a symbol
+# says nothing about whether its body is upstream's. Now converged, and guarded by
+# tests/test_dropped_upstream_guards.py::TestQwen35QuantizedVerifyPredicateIsFactored.
 
 # --- mlx_vlm/server/app.py
 # RESOLVED 2026-08-09. Three entries lived here for _as_plain_dict,

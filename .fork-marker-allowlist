@@ -98,8 +98,33 @@
 #     upstream code to have dropped. Marked; note the `__all__` marker has to sit
 #     INSIDE the list literal — a module-scope hunk is keyed by line, so a marker
 #     above the statement does not cover it.
+#   models/qwen3_5/language.py — 7 sites -> 3 marked regions, and THREE of its four
+#     diverging areas were dropped upstream content rather than fork work, which is the
+#     highest ratio any file in this rollout has produced:
+#       * 16cf6140 (#1423, "Qwen3.5 on CUDA: fix Metal-only crashes") — all THREE of its
+#         language.py hunks, while its gated_delta.py half is byte-identical. So the
+#         `mx.metal.is_available()` guards on `_TARGET_VERIFY_GEMV` and on
+#         `_qwen3_5_ragged_decode_attention` were both gone. Unreproducible on Apple
+#         Silicon by construction, which is why it survived; guarded now by monkeypatching
+#         the predicate the hunks consult.
+#       * 7fbc7bc9 (#1598) split `_can_target_verify_quantized` into a weight-only
+#         `_can_target_verify_quantized_head` plus a thin caller. The extraction landed and
+#         the REWRITE of the original was dropped, so the pre-split body survived as a
+#         second copy of the same predicate. Provably equivalent, so no behavioural repro.
+#       * ea5ad0e4 (#1455) touched 11 model files with the same 4-line empty-MRoPE guard;
+#         qwen3_5 was the ONLY one missing it. The fork then re-fixed the same crash by
+#         hand at a different place in the function (d7eb079c), equivalently — so the
+#         suite was green and upstream's own parametrized test_rope.py passed either way.
+#         Converged to upstream's position; the fork's duplicate is gone.
+#     What actually remains is EpiCache (150a76f9: `_qwen35_scalar_positions` +
+#     `cache.observe`, `make_cache`), suffix decoding (ff0ecc30/de4e502b:
+#     `suffix_verify_kwargs`, `chunked_prefill_policy`'s `"suffix"` arm and
+#     `no_chunked_prefill`) and turboquant KV (a62f7cb8: the verify loop's `bits` guard).
+#     Missing upstream lines went 30 -> 6, and all 6 are the EpiCache/turboquant rewrites.
+#     NB AGENTS.md's note that this file's norm-shift gate was protected fork work was
+#     already known wrong; nothing here depended on it.
 #
-# Current standing (2026-08-10): 8 files / 105 sites, down from 32 files / 175 sites. Every
+# Current standing (2026-08-10): 7 files / 98 sites, down from 32 files / 175 sites. Every
 # diverged file NOT listed here is marked, including
 # server/request_normalization.py — the gen-args union added fork hunks to a file
 # that had been byte-identical to upstream, and this check caught them before the
@@ -128,13 +153,16 @@ mlx_vlm/turboquant.py  # 7 sites / 14 hunks. CORRECTION (2026-08-10): an earlier
 # --- `git diff upstream/main`. Use this to ORDER the work; it decides nothing on its own
 # --- (AGENTS.md's first rule), but a file with few missing lines is cheap to clear and
 # --- a file with many needs each one accounted for before any marker goes in:
-# ---   [common.py 28/848 CLEARED] · qwen3_5/language.py 30/121 · utils.py 32/171
 # ---   openai.py 76/905 · generation.py 92/665 · turboquant.py 118/529
 # ---   dispatch.py 125/377 · test_generate.py 251/297 · apc.py 554/567
 # --- ar.py was 26/233 and is now cleared: all 26 were rewrite artifacts, confirmed by
 # --- equal-count spot checks (speculative_prefill_capture_kwargs 6/6, BatchKVCache 7/7,
 # --- logging.getLogger 1/1) plus fork-only _get_generation_stream (4/0).
+# --- qwen3_5/language.py was 30/121 and is now cleared, but NOT the way ar.py was: the
+# --- identifier-count technique flagged `is_available` 0/2, `backends` 0/1 and `Metal` 1/2,
+# --- and every one of those unequal counts was a real dropped hunk. Equal counts mean
+# --- "rewrite artifact"; UNEQUAL counts are the whole signal, and this file is the case
+# --- that proves it pays to chase them rather than eyeball the diff. Now 6/94.
 mlx_vlm/tests/test_generate.py  # 5 sites / 5 hunks, and the ONLY thing left is method ORDERING. The file was unioned with upstream on 2026-08-10 (1ab442d8): zero definitions missing, zero shared bodies differing, imports unioned. `test_capture_rope_deltas_prefers_prompt_kwargs` was moved back into TestGenerationBatch (upstream's class) on 2026-08-10, closing 2 sites. The residual sites are blank-line/section boundaries that shift because the fork's extra tests are interleaved, and `test_generation_batch_extend_promotes_singleton_kv_cache` sits at a different position inside TestBatchGenerator than upstream's -- BOTH trees have it, so there is nothing to restore. DO NOT chase these with markers: a comment placed on a whitespace probe line changes the alignment and produces a NEW probe line, which is a loop (verified: 10 -> 8 -> 1 -> 2 sites while chasing). Either reorder the fork's methods to upstream's positions, or leave this entry. The 3 informative markers already in the file (the import, TestBatchGenerator's extra method, TestPrefixCacheReuseTrim's reviewed c503fa7b divergence) are kept because they document real facts
-mlx_vlm/models/qwen3_5/language.py  # 7 sites / 18 hunks. AGENTS.md's note that the norm-shift gate here is protected fork work was WRONG (upstream landed the same fix in #1556); treat every site as unreviewed rather than trusting that note
 
 # --- Tests, not yet reviewed at site granularity.

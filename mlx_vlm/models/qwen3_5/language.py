@@ -72,12 +72,13 @@ def _qwen3_5_decode_depthwise_conv(conv_input: mx.array, weight: mx.array):
     return out.astype(conv_input.dtype)[:, None, :]
 
 
-_TARGET_VERIFY_GEMV = mx.fast.metal_kernel(
-    name="qwen3_5_target_verify_gemv",
-    input_names=["x", "weight"],
-    output_names=["out"],
-    header="#include <metal_simdgroup>\nusing namespace metal;\n",
-    source=r"""
+_TARGET_VERIFY_GEMV = (
+    mx.fast.metal_kernel(
+        name="qwen3_5_target_verify_gemv",
+        input_names=["x", "weight"],
+        output_names=["out"],
+        header="#include <metal_simdgroup>\nusing namespace metal;\n",
+        source=r"""
         uint lane = thread_position_in_grid.x;
         uint out_block = thread_position_in_grid.y;
         uint row = thread_position_in_grid.z;
@@ -145,12 +146,16 @@ _TARGET_VERIFY_GEMV = mx.fast.metal_kernel(
             }
         }
     """,
+    )
+    if mx.metal.is_available()
+    else None
 )
 
 
 def _use_target_verify_dense(linear, x: mx.array, target_verify: bool) -> bool:
     return (
-        target_verify
+        _TARGET_VERIFY_GEMV is not None
+        and target_verify
         and x.ndim == 3
         and x.shape[1] > 1
         and isinstance(linear, (nn.Linear, nn.QuantizedLinear))
@@ -503,23 +508,15 @@ def _can_target_verify_quantized_head(linear) -> bool:
 
 def _can_target_verify_quantized(linear, x: mx.array) -> bool:
     if (
-        not isinstance(linear, nn.QuantizedLinear)
+        not _can_target_verify_quantized_head(linear)
         or x.ndim != 3
         or x.shape[1] < 1
-        or linear.bits not in (4, 5)
-        or linear.mode != "affine"
-        or linear.biases is None
-        or x.dtype not in (mx.bfloat16, mx.float16)
-        or linear.scales.dtype != x.dtype
-        or linear.biases.dtype != x.dtype
+        or x.dtype != linear.scales.dtype
     ):
         return False
 
-    _, _, K = x.shape
-    N = linear.weight.shape[0]
-    return (
-        K == linear.weight.shape[1] * 32 // linear.bits and K % 512 == 0 and N % 8 == 0
-    )
+    K = linear.weight.shape[1] * 32 // linear.bits
+    return x.shape[-1] == K
 
 
 def _target_verify_quantized_linear(linear, x: mx.array) -> Optional[mx.array]:
@@ -1341,6 +1338,10 @@ def _qwen3_5_ragged_decode_attention(
     pads: List[int],
     scale: float,
 ) -> Optional[mx.array]:
+    # Metal-only fast path; on other backends (e.g. CUDA) return None so the
+    # caller falls back to portable per-pad-group scaled_dot_product_attention.
+    if not mx.metal.is_available():
+        return None
     if (
         queries.ndim != 4
         or keys.ndim != 4
@@ -1522,6 +1523,10 @@ def _qwen35_scalar_positions(cache, cache_offset, L):
     plain cache ``rope_offset`` is absent so it falls back to ``cache_offset`` and behaviour is
     unchanged. Returns ``(position_ids[3,1,L], kv_len_delta)`` (tiled for MRoPE's 3 sections;
     text positions are identical across sections)."""
+    # Fork: fork-only helper (150a76f9, EpiCache port). Upstream has no rope_offset
+    # notion, so it inlines these four lines in Qwen3_5Attention.__call__'s scalar
+    # branch (7267aff2's `else`). Extracted here only so the EpiCache absolute-index
+    # rule lives in one place; for a plain cache this is upstream's arithmetic exactly.
     rope_offset = cache_offset
     if cache is not None:
         ro = getattr(cache, "rope_offset", cache_offset)
@@ -1610,9 +1615,11 @@ class Qwen3_5Attention(nn.Module):
             else:
                 if isinstance(cache_offset, mx.array):
                     cache_offset = int(cache_offset.item())
-                # EpiCache: RoPE the query/new-keys at the TRUE absolute index (rope_offset),
-                # not the shrunk physical offset, so post-eviction kept keys + query share a
-                # RoPE frame; mask/kv-length still use the physical offset. No-op for plain caches.
+                # Fork: EpiCache (150a76f9) — RoPE the query/new-keys at the TRUE
+                # absolute index (rope_offset), not the shrunk physical offset, so
+                # post-eviction kept keys + query share a RoPE frame; mask/kv-length
+                # still use the physical offset. Upstream's four inline lines are
+                # `_qwen35_scalar_positions`, which is a no-op change for plain caches.
                 position_ids, _kv_delta = _qwen35_scalar_positions(
                     cache, cache_offset, L
                 )
@@ -1658,11 +1665,12 @@ class Qwen3_5Attention(nn.Module):
         else:
             output = None
 
-        # The manual per-position verify loop slices keys/values directly, which only
-        # works for plain (non-quantized) caches. Quantized caches (turboquant /
-        # BatchQuantizedKVCache) return a non-subscriptable _QuantizedStateProxy from
-        # update_and_fetch, so fall through to the standard SDPA path below (which
-        # consumes the cache and handles dequant) — same result up to FP.
+        # Fork: `not hasattr(cache, "bits")` added by a62f7cb8. The manual per-position
+        # verify loop slices keys/values directly, which only works for plain
+        # (non-quantized) caches. The fork's turboquant / BatchQuantizedKVCache return a
+        # non-subscriptable _QuantizedStateProxy from update_and_fetch, so fall through
+        # to the standard SDPA path below (which consumes the cache and handles dequant)
+        # — same result up to FP. Upstream has no such cache on this path, hence no guard.
         if output is None and target_verify and L > 1 and not hasattr(cache, "bits"):
             prefix_len = keys.shape[-2] - L
             output = mx.concatenate(
@@ -1687,10 +1695,11 @@ class Qwen3_5Attention(nn.Module):
             output = scaled_dot_product_attention(
                 queries, keys, values, cache=cache, scale=self.scale, mask=mask
             )
-        # EpiCache: record SnapKV-style attention-mass so the eviction the generation loop runs
-        # after this prefill chunk keeps the most-attended middle keys (not just key-norm). Fires
-        # only when this full-attn cache is over budget; no-op for plain caches (no observe attr)
-        # and during decode (offset back <= budget post-evict). Uses the post-RoPE queries.
+        # Fork: EpiCache (150a76f9), pure addition — record SnapKV-style attention-mass so
+        # the eviction the generation loop runs after this prefill chunk keeps the
+        # most-attended middle keys (not just key-norm). Fires only when this full-attn
+        # cache is over budget; no-op for plain caches (no observe attr) and during decode
+        # (offset back <= budget post-evict). Uses the post-RoPE queries.
         if (
             cache is not None
             and getattr(cache, "observe", None) is not None
@@ -2156,6 +2165,8 @@ class LanguageModel(nn.Module):
         ``capture_set`` empty, so no hidden states are captured — same idiom as
         ``speculative_verify_logits``/``speculative_verify_hidden``.
         """
+        # Fork: fork-only hook (ff0ecc30, de4e502b). Upstream has no SuffixDecoding
+        # drafter at all, so there is no upstream counterpart to diverge from.
         return {"capture_layer_ids": []}
 
     def chunked_prefill_policy(
@@ -2184,6 +2195,12 @@ class LanguageModel(nn.Module):
         """
         del input_ids, inputs_embeds, prompt_cache
         prefill_kwargs = prefill_kwargs or {}
+        # Fork: the docstring above and the next four lines are fork additions
+        # (de4e502b). `no_chunked_prefill` is the fork's per-model opt-out, and the
+        # `"suffix"` arm exists only because upstream has no suffix drafter — without it
+        # a drafter-free proposer would take upstream's `draft_model is None` fallback
+        # and disable chunking, giving a dense [N, N] mask that OOMs at long context.
+        # Every other arm below is upstream's, byte-identical.
         if getattr(self, "no_chunked_prefill", False):
             return False
         if draft_model is None:
@@ -2513,14 +2530,6 @@ class LanguageModel(nn.Module):
                     for token, keep in zip(input_ids.tolist(), row_mask)
                     if keep == 1
                 ]
-                if not input_tokens:
-                    # Fully masked row (e.g. an inactive/padding-only batch slot):
-                    # no real tokens to place. position_ids for this row keeps the
-                    # all-ones placeholder set at init above; skip straight to the
-                    # next row instead of falling through into an empty-array
-                    # concatenate/max below.
-                    mrope_position_deltas.append(0)
-                    continue
                 image_nums, video_nums = 0, 0
                 vision_tokens = [
                     input_tokens[idx + 1]
@@ -2608,6 +2617,10 @@ class LanguageModel(nn.Module):
                     t_index = mx.broadcast_to(t_index, (3, text_len))
 
                     llm_pos_ids_list.append(t_index + st_idx)
+
+                if not llm_pos_ids_list:
+                    mrope_position_deltas.append(0)
+                    continue
 
                 llm_positions = mx.concatenate(llm_pos_ids_list, axis=1).reshape(3, -1)
                 compact_max_position = llm_positions.max()
@@ -2954,9 +2967,12 @@ class LanguageModel(nn.Module):
         return self.model.layers
 
     def make_cache(self):
-        # EpiCache (opt-in via MLX_EPICACHE_BUDGET>0): budget-bound ONLY the full-attention
-        # KVCache layers (the ones whose KV grows with context). The linear GatedDeltaNet
-        # layers carry a bounded ArraysCache (SSM state) and must NOT be wrapped. Mirrors
+        # Fork: EpiCache (150a76f9). Upstream is the one-line comprehension
+        # `[ArraysCache(size=2) if l.is_linear else KVCache() for l in self.layers]`;
+        # with MLX_EPICACHE_BUDGET unset (budget == 0) this loop builds exactly that.
+        # Opt-in via MLX_EPICACHE_BUDGET>0: budget-bound ONLY the full-attention KVCache
+        # layers (the ones whose KV grows with context). The linear GatedDeltaNet layers
+        # carry a bounded ArraysCache (SSM state) and must NOT be wrapped. Mirrors
         # gemma4's make_cache integration; eviction is triggered per prefill chunk by the
         # generation loop (generate/ar.py, model-agnostic evict_to_budget hook).
         import os
