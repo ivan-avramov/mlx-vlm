@@ -172,6 +172,20 @@ def mock_processor():
     return MockProcessor()
 
 
+def test_batch_generator_apc_media_token_ids_handles_text_only_model(mock_processor):
+    model = SimpleNamespace(
+        language_model=MockLanguageModel(),
+        make_cache=lambda: [KVCache()],
+    )
+    generator = ar_module.BatchGenerator(
+        model,
+        mock_processor,
+        apc_manager=apc_module.APCManager(num_blocks=1),
+    )
+
+    assert generator._apc_media_token_ids() == set()
+
+
 # ============================================================================
 # Tests for Dataclasses
 # ============================================================================
@@ -766,6 +780,48 @@ class TestBatchGenerator:
         second = batch.next()
         assert [r.token for r in second] == [3]
 
+    def test_generation_batch_thinking_budget_does_not_sync_next_token(self):
+        class FixedLogitModel:
+            def __call__(self, input_ids, cache=None, **kwargs):
+                token_scores = mx.array([0.0, 10.0, 0.0, 0.0])
+                logits = mx.broadcast_to(
+                    token_scores, (input_ids.shape[0], input_ids.shape[1], 4)
+                )
+                return MagicMock(logits=logits)
+
+        class ForceAfterFirst:
+            def __init__(self):
+                self.forced_token_id = None
+
+            def __call__(self, token):
+                self.forced_token_id = 3 if token == 5 else None
+
+            def pop_forced_token_id(self):
+                forced_token_id = self.forced_token_id
+                self.forced_token_id = None
+                return forced_token_id
+
+        batch = GenerationBatch(
+            model=FixedLogitModel(),
+            uids=[0],
+            inputs=mx.array([5], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+            stop_criteria=lambda token: False,
+            max_tokens=[2],
+            thinking_budget_criteria=[ForceAfterFirst()],
+        )
+
+        original_eval = mx.eval
+        with patch.object(generate_module.mx, "eval", wraps=original_eval) as mock_eval:
+            first = batch.next()
+
+        assert [r.token for r in first] == [5]
+        # GenerationBatch._step synchronizes the current token once. Budget
+        # handling must not add a second synchronization for the next token.
+        assert mock_eval.call_count == 1
+        assert [r.token for r in batch.next()] == [3]
+
     def test_generation_batch_uses_fused_greedy_decode_without_logprobs(self):
         class FastArgmaxModel:
             def __init__(self):
@@ -913,138 +969,6 @@ class TestBatchGenerator:
         assert [r.token for r in first] == [5, 6, 7]
         assert seen_contexts == [[30, 7]]
 
-    def test_generation_batch_extend_promotes_singleton_kv_cache(self):
-        def make_kv_cache(value):
-            c = KVCache()
-            keys = mx.full((1, 2, 3, 4), value, dtype=mx.float32)
-            values = mx.full((1, 2, 3, 4), value + 1, dtype=mx.float32)
-            c.update_and_fetch(keys, values)
-            return c
-
-        sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
-        stop_criteria = lambda token: False
-        first = GenerationBatch(
-            model=MagicMock(),
-            uids=[0],
-            inputs=mx.array([5], dtype=mx.int32),
-            prompt_cache=[make_kv_cache(1.0)],
-            sampler=sampler,
-            stop_criteria=stop_criteria,
-            max_tokens=[2],
-        )
-        second = GenerationBatch(
-            model=MagicMock(),
-            uids=[1],
-            inputs=mx.array([6], dtype=mx.int32),
-            prompt_cache=[make_kv_cache(3.0)],
-            sampler=sampler,
-            stop_criteria=stop_criteria,
-            max_tokens=[2],
-        )
-
-        first.extend(second)
-
-        assert isinstance(first.prompt_cache[0], BatchKVCache)
-        assert first.prompt_cache[0].left_padding.tolist() == [0, 0]
-        assert first.prompt_cache[0].keys.shape[0] == 2
-        assert first._next_tokens.tolist() == [5, 6]
-
-    def test_batch_generator_empty_generation_batch_does_not_seed_flat_processors(
-        self, mock_model, mock_processor
-    ):
-        """Regression: BatchGenerator must not seed its empty internal
-        GenerationBatch with the flat broadcast logits_processors list.
-
-        The empty batch starts with zero uids; per-uid lists are appended
-        via extend() as sequences merge in from PromptProcessingBatch.
-        Seeding the empty batch with a flat list mixes flat callables and
-        per-uid lists, and `_step` then crashes with
-        ``TypeError: 'function' object is not iterable`` when it tries to
-        iterate ``self.logits_processors[i]`` and finds a bare callable.
-        """
-        rep_penalty = lambda tokens, logits: logits  # noqa: E731
-
-        gen = BatchGenerator(
-            model=mock_model.language_model,
-            processor=mock_processor,
-            max_tokens=50,
-            logits_processors=[rep_penalty],
-        )
-        # The empty inner batch must start with no per-uid entries —
-        # NOT the broadcast flat list.
-        assert gen._generation_batch.logits_processors == []
-        # And the broadcast list is preserved on the outer BatchGenerator
-        # so insert() can replicate it per-uid when callers don't supply
-        # an explicit list.
-        assert gen.logits_processors == [rep_penalty]
-
-    def test_remove_from_unprocessed(self, mock_model, mock_processor):
-        gen = BatchGenerator(
-            model=mock_model.language_model,
-            processor=mock_processor,
-            max_tokens=50,
-        )
-        uids = gen.insert([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
-        assert len(gen.unprocessed_prompts) == 3
-
-        assert gen.remove(uids[1]) is True
-        assert len(gen.unprocessed_prompts) == 2
-        remaining_uids = [seq[0] for seq in gen.unprocessed_prompts]
-        assert uids[1] not in remaining_uids
-        assert uids[0] in remaining_uids
-        assert uids[2] in remaining_uids
-
-    def test_remove_missing_uid_returns_false(self, mock_model, mock_processor):
-        gen = BatchGenerator(
-            model=mock_model.language_model,
-            processor=mock_processor,
-            max_tokens=50,
-        )
-        gen.insert([[1, 2, 3]])
-        assert gen.remove(9999) is False
-
-    def test_generation_batch_thinking_budget_does_not_sync_next_token(self):
-        class FixedLogitModel:
-            def __call__(self, input_ids, cache=None, **kwargs):
-                token_scores = mx.array([0.0, 10.0, 0.0, 0.0])
-                logits = mx.broadcast_to(
-                    token_scores, (input_ids.shape[0], input_ids.shape[1], 4)
-                )
-                return MagicMock(logits=logits)
-
-        class ForceAfterFirst:
-            def __init__(self):
-                self.forced_token_id = None
-
-            def __call__(self, token):
-                self.forced_token_id = 3 if token == 5 else None
-
-            def pop_forced_token_id(self):
-                forced_token_id = self.forced_token_id
-                self.forced_token_id = None
-                return forced_token_id
-
-        batch = GenerationBatch(
-            model=FixedLogitModel(),
-            uids=[0],
-            inputs=mx.array([5], dtype=mx.int32),
-            prompt_cache=[],
-            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
-            stop_criteria=lambda token: False,
-            max_tokens=[2],
-            thinking_budget_criteria=[ForceAfterFirst()],
-        )
-
-        original_eval = mx.eval
-        with patch.object(generate_module.mx, "eval", wraps=original_eval) as mock_eval:
-            first = batch.next()
-
-        assert [r.token for r in first] == [5]
-        # GenerationBatch._step synchronizes the current token once. Budget
-        # handling must not add a second synchronization for the next token.
-        assert mock_eval.call_count == 1
-        assert [r.token for r in batch.next()] == [3]
-
     def test_generation_batch_extend_expands_compact_processor_state(self):
         sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
         stop_criteria = lambda token: False
@@ -1110,6 +1034,96 @@ class TestBatchGenerator:
         assert finished_structured.logits_processors == []
         finished_structured.filter([1])
         assert finished_structured.uids == [1]
+
+    def test_generation_batch_extend_promotes_singleton_kv_cache(self):
+        def make_kv_cache(value):
+            c = KVCache()
+            keys = mx.full((1, 2, 3, 4), value, dtype=mx.float32)
+            values = mx.full((1, 2, 3, 4), value + 1, dtype=mx.float32)
+            c.update_and_fetch(keys, values)
+            return c
+
+        sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
+        stop_criteria = lambda token: False
+        first = GenerationBatch(
+            model=MagicMock(),
+            uids=[0],
+            inputs=mx.array([5], dtype=mx.int32),
+            prompt_cache=[make_kv_cache(1.0)],
+            sampler=sampler,
+            stop_criteria=stop_criteria,
+            max_tokens=[2],
+        )
+        second = GenerationBatch(
+            model=MagicMock(),
+            uids=[1],
+            inputs=mx.array([6], dtype=mx.int32),
+            prompt_cache=[make_kv_cache(3.0)],
+            sampler=sampler,
+            stop_criteria=stop_criteria,
+            max_tokens=[2],
+        )
+
+        first.extend(second)
+
+        assert isinstance(first.prompt_cache[0], BatchKVCache)
+        assert first.prompt_cache[0].left_padding.tolist() == [0, 0]
+        assert first.prompt_cache[0].keys.shape[0] == 2
+        assert first._next_tokens.tolist() == [5, 6]
+
+    def test_remove_from_unprocessed(self, mock_model, mock_processor):
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            max_tokens=50,
+        )
+        uids = gen.insert([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
+        assert len(gen.unprocessed_prompts) == 3
+
+        assert gen.remove(uids[1]) is True
+        assert len(gen.unprocessed_prompts) == 2
+        remaining_uids = [seq[0] for seq in gen.unprocessed_prompts]
+        assert uids[1] not in remaining_uids
+        assert uids[0] in remaining_uids
+        assert uids[2] in remaining_uids
+
+    def test_remove_missing_uid_returns_false(self, mock_model, mock_processor):
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            max_tokens=50,
+        )
+        gen.insert([[1, 2, 3]])
+        assert gen.remove(9999) is False
+
+    def test_batch_generator_empty_generation_batch_does_not_seed_flat_processors(
+        self, mock_model, mock_processor
+    ):
+        """Regression: BatchGenerator must not seed its empty internal
+        GenerationBatch with the flat broadcast logits_processors list.
+
+        The empty batch starts with zero uids; per-uid lists are appended
+        via extend() as sequences merge in from PromptProcessingBatch.
+        Seeding the empty batch with a flat list mixes flat callables and
+        per-uid lists, and `_step` then crashes with
+        ``TypeError: 'function' object is not iterable`` when it tries to
+        iterate ``self.logits_processors[i]`` and finds a bare callable.
+        """
+        rep_penalty = lambda tokens, logits: logits  # noqa: E731
+
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            max_tokens=50,
+            logits_processors=[rep_penalty],
+        )
+        # The empty inner batch must start with no per-uid entries —
+        # NOT the broadcast flat list.
+        assert gen._generation_batch.logits_processors == []
+        # And the broadcast list is preserved on the outer BatchGenerator
+        # so insert() can replicate it per-uid when callers don't supply
+        # an explicit list.
+        assert gen.logits_processors == [rep_penalty]
 
 
 # ============================================================================
@@ -1812,6 +1826,52 @@ class TestSamplerArgs:
         )
 
 
+def test_generate_step_schedules_final_prefill_async():
+    model = MagicMock()
+    model.language_model.return_value = MagicMock(
+        logits=mx.zeros((1, 1, 4)),
+        cross_attention_states=None,
+        encoder_outputs=None,
+    )
+
+    embedding_output = MagicMock()
+    embedding_output.inputs_embeds = mx.zeros((1, 1, 4))
+    embedding_output.to_dict.return_value = {}
+    model.get_input_embeddings.return_value = embedding_output
+
+    events = []
+    original_async_eval = mx.async_eval
+    original_eval = mx.eval
+
+    def record_async_eval(*args):
+        events.append("async")
+        return original_async_eval(*args)
+
+    def record_eval(*args):
+        events.append("sync")
+        return original_eval(*args)
+
+    with (
+        patch.object(generate_module.cache, "make_prompt_cache", return_value=[]),
+        patch.object(generate_module, "make_logits_processors", return_value=[]),
+        patch.object(
+            generate_module, "make_sampler", return_value=lambda _: mx.array([0])
+        ),
+        patch.object(generate_module.mx, "async_eval", side_effect=record_async_eval),
+        patch.object(generate_module.mx, "eval", side_effect=record_eval),
+    ):
+        gen = generate_module.generate_step(
+            input_ids=mx.array([[1]], dtype=mx.int32),
+            model=model,
+            pixel_values=None,
+            mask=None,
+            max_tokens=1,
+        )
+        next(gen)
+
+    assert events[0] == "async"
+
+
 @pytest.mark.parametrize(("verbose", "disabled"), [(False, True), (True, False)])
 def test_generate_step_prefill_tqdm_respects_verbose(verbose, disabled):
     pbar = MagicMock()
@@ -1965,6 +2025,24 @@ def test_stream_generate_forwards_verbose_to_generate_step():
         )
 
     assert captured["verbose"] is True
+
+
+def test_public_generation_annotations_match_runtime_results():
+    hints = typing.get_type_hints(dispatch_module.stream_generate)
+
+    assert hints["return"] == typing.Generator[GenerationResult, None, None]
+    assert type(None) in typing.get_args(hints["image"])
+    assert type(None) in typing.get_args(hints["audio"])
+    assert type(None) in typing.get_args(hints["video"])
+
+
+def test_batch_generate_optional_input_annotations_match_defaults():
+    hints = typing.get_type_hints(ar_module.batch_generate)
+
+    assert type(None) in typing.get_args(hints["images"])
+    assert type(None) in typing.get_args(hints["audios"])
+    assert type(None) in typing.get_args(hints["prompts"])
+    assert hints["return"] is BatchResponse
 
 
 def test_normalize_resize_shape_expands_single_value():
@@ -2711,81 +2789,3 @@ class TestBatchTurboQuantizedKVStart:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
-
-
-def test_batch_generate_optional_input_annotations_match_defaults():
-    hints = typing.get_type_hints(ar_module.batch_generate)
-
-    assert type(None) in typing.get_args(hints["images"])
-    assert type(None) in typing.get_args(hints["audios"])
-    assert type(None) in typing.get_args(hints["prompts"])
-    assert hints["return"] is BatchResponse
-
-
-def test_batch_generator_apc_media_token_ids_handles_text_only_model(mock_processor):
-    model = SimpleNamespace(
-        language_model=MockLanguageModel(),
-        make_cache=lambda: [KVCache()],
-    )
-    generator = ar_module.BatchGenerator(
-        model,
-        mock_processor,
-        apc_manager=apc_module.APCManager(num_blocks=1),
-    )
-
-    assert generator._apc_media_token_ids() == set()
-
-
-def test_generate_step_schedules_final_prefill_async():
-    model = MagicMock()
-    model.language_model.return_value = MagicMock(
-        logits=mx.zeros((1, 1, 4)),
-        cross_attention_states=None,
-        encoder_outputs=None,
-    )
-
-    embedding_output = MagicMock()
-    embedding_output.inputs_embeds = mx.zeros((1, 1, 4))
-    embedding_output.to_dict.return_value = {}
-    model.get_input_embeddings.return_value = embedding_output
-
-    events = []
-    original_async_eval = mx.async_eval
-    original_eval = mx.eval
-
-    def record_async_eval(*args):
-        events.append("async")
-        return original_async_eval(*args)
-
-    def record_eval(*args):
-        events.append("sync")
-        return original_eval(*args)
-
-    with (
-        patch.object(generate_module.cache, "make_prompt_cache", return_value=[]),
-        patch.object(generate_module, "make_logits_processors", return_value=[]),
-        patch.object(
-            generate_module, "make_sampler", return_value=lambda _: mx.array([0])
-        ),
-        patch.object(generate_module.mx, "async_eval", side_effect=record_async_eval),
-        patch.object(generate_module.mx, "eval", side_effect=record_eval),
-    ):
-        gen = generate_module.generate_step(
-            input_ids=mx.array([[1]], dtype=mx.int32),
-            model=model,
-            pixel_values=None,
-            mask=None,
-            max_tokens=1,
-        )
-        next(gen)
-
-    assert events[0] == "async"
-
-
-def test_public_generation_annotations_match_runtime_results():
-    hints = typing.get_type_hints(dispatch_module.stream_generate)
-
-    assert hints["return"] == typing.Generator[GenerationResult, None, None]
-    assert type(None) in typing.get_args(hints["image"])
-    assert type(None) in typing.get_args(hints["audio"])
-    assert type(None) in typing.get_args(hints["video"])
