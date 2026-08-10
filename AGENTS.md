@@ -46,6 +46,7 @@ python dev/check_body_divergence.py     # no divergence that is only ALIGNMENT
 python dev/check_upstream_registries.py # no registry entry / re-export / field dropped
 python dev/check_body_divergence.py --summary   # then size what conflicted
 python dev/check_body_divergence.py --sweep     # then re-review the markers
+python dev/find_untested_fork_code.py   # fork-only code no test mentions (non-gating)
 cd mlx_vlm/ && pytest ./tests --ignore=tests/test_smoke.py
 ```
 
@@ -63,9 +64,9 @@ commit that mostly removes code (`29b6c00b`) shows only its insertions and
 closed while still listed**, because attribution is by line content — the exclusion
 baselines, not the commit count, are the progress signal.
 
-**Run all eight checks after every merge — this is not optional.** Seven of them gate
-(they exit non-zero and CI runs them); `find_dropped_hunks.py` is a lead generator
-and does not. When a merge
+**Run all nine checks after every merge — this is not optional.** Seven of them gate
+(they exit non-zero and CI runs them); `find_dropped_hunks.py` and
+`find_untested_fork_code.py` are lead generators and do not. When a merge
 resolution drops content from a commit that upstream already merged, that commit
 is still an ancestor of `main`, so git records the content as *deliberately
 deleted* and no later merge re-offers it. There is no conflict and no warning.
@@ -458,6 +459,39 @@ script collects only `def`/`class` names. The fields are present today, so they 
 restored, but not by the check that claimed them, and the claim made a whole category
 look covered while nothing covered it.
 
+### The seventh direction: who protects the FORK's own code?
+
+Every direction above compares against `upstream/main`. That means **fork-only code is
+invisible to all seven gating checks by construction** — no upstream copy to diff, no
+upstream symbol to miss, no upstream hunk to drop, no marker to demand. The whole
+apparatus protects the upstream content this fork carries. Nothing protected the fork's
+own ~800 commits.
+
+`dev/find_untested_fork_code.py` is the lead generator for that, and it earned its place
+on the first run: the fork's legacy `/v1/completions` endpoint — `completions_endpoint`
+(409 lines), five schemas, four helpers, with both `/completions` and `/v1/completions`
+as live registered routes — had **zero test references.** Writing the tests it lacked
+found a real user-visible bug immediately (a stop sequence split across token boundaries
+had its prefix streamed to the client; `b75c18b7`).
+
+```bash
+python dev/find_untested_fork_code.py          # the untested ones, ~19s
+python dev/find_untested_fork_code.py --all    # every fork-only definition + counts
+```
+
+**It does not gate, and should not.** Two reasons, the first being the same argument
+that kept `.body-divergence-exclusions` from becoming a ledger: an exclusions file would
+need ~18 written reasons for things that are mostly fine (a three-line predicate
+exercised through its caller does not need an entry), which produces ~18 unreviewed
+ones. And unlike every other check here, a hit is not a correctness claim — a dropped
+upstream hunk is *wrong*, untested fork code is *risk*, and risk gets ranked and worked
+down rather than gated.
+
+**Read the columns asymmetrically.** It counts textual references, not coverage. A zero
+in `tests` is a real signal worth acting on; a non-zero is **not** evidence of coverage
+(it may be an unrelated mention), and a zero may still be exercised through a caller. Do
+a real coverage run on anything it flags before concluding.
+
 ## The one rule that matters most
 
 **Never conclude anything about a divergence from a `git diff --numstat` line
@@ -506,7 +540,7 @@ positives. Every hit still needs `git log -S` and a read.
 cd mlx_vlm/ && pytest -s ./tests --ignore=tests/test_smoke.py
 ```
 
-The suite is **green: 2817 passed, 5 skipped, 0 failed.** Keep it that way. (This
+The suite is **green: 2880 passed, 5 skipped, 0 failed.** Keep it that way. (This
 line goes stale on every restore that adds a guard — trust the run, not the number.)
 
 **Compare failing test IDs, not counts.** A change that fixes one test and breaks
