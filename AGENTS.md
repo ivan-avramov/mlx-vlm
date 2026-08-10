@@ -120,6 +120,26 @@ found `gemma4_assistant/masks.py` — recorded in this very file as a deliberate
 divergence — to be half of a dropped commit; see the `[correction]` under
 "Deliberate divergences".
 
+**Before working an allowlist entry, run the AST body diff in "the fifth direction"
+below.** A file's site and hunk counts measure alignment, so a *reordered* file looks
+like the biggest job on the list and is the smallest. Marking is the fallback; the
+better exit is usually CONVERGE.
+
+Two known limits of this check, both hit for real:
+
+- **A pure-deletion hunk cannot carry a marker.** When upstream defines a top-level
+  symbol we legitimately do not have, the diff attributes that deletion to whatever
+  line of ours sits at the seam — usually a blank one — and there is no enclosing
+  definition to annotate and no whitespace to converge. `generate/dispatch.py`
+  (`_cache_fully_retained`, `_prefix_cache_trim_amount`) and `server/generation.py`
+  (`_check_configured_context_budget`) are both stuck this way even when every real
+  site is marked. Teaching the check to accept a deletion-only hunk whose absent
+  symbols are already in `.symbol-exclusions` would fix both. Until then, say so in
+  the allowlist reason rather than leaving it looking unreviewed.
+- **Such a hunk looks exactly like a whitespace probe and is not one.** Run
+  `git diff -U0` on it before concluding either way — a real probe is fixable by
+  converging the ordering, this is not.
+
 ### The fourth direction: is the thing that exists actually reachable?
 
 The three questions above are all about *code*. This one is about *wiring*, and it
@@ -160,6 +180,84 @@ appears in `docs/upstream-gaps.md` next to several fixed items; this check turns
 from a habit into a gate. When something looks unused, ask whether upstream calls
 it before concluding it is fork scaffolding.
 
+### The fifth direction: is this divergence CONTENT, or only ALIGNMENT?
+
+The four questions above are all about *what exists where*. None of them, and none of
+the five gating scripts, can tell you the one thing you need before sizing a diverged
+file: **how much of it actually differs.** A file whose definitions have merely been
+*reordered* reports as maximally diverged by every line-based measure, and there is no
+check that says otherwise.
+
+**Do this before reading a diff, before sizing a file, before scheduling the work.** It
+is ~25 lines and takes a second:
+
+```python
+# .venv/bin/python - <<'PY'    (set P)
+import subprocess, ast, difflib
+R = "/Users/ia87221/ws/mlx-vlm"; P = "mlx_vlm/server/openai.py"
+up = subprocess.run(["git","-C",R,"show",f"upstream/main:{P}"],
+                    capture_output=True, text=True).stdout
+ours = open(f"{R}/{P}").read()
+def parse(src):
+    t = ast.parse(src); L = src.splitlines(); d = {}; mods = []
+    for n in t.body:
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            s = min([n.lineno] + [x.lineno for x in n.decorator_list])
+            d[n.name] = "\n".join(L[s-1:n.end_lineno])
+        else:
+            mods.append("\n".join(L[n.lineno-1:n.end_lineno]))
+    return d, mods
+U, UM = parse(up); O, OM = parse(ours)
+sh = sorted(set(U) & set(O))
+print(f"shared={len(sh)} identical={sum(U[n]==O[n] for n in sh)} "
+      f"ours-only={sorted(set(O)-set(U))} up-only={sorted(set(U)-set(O))}")
+print(f"module stmts: up={len(UM)} ours={len(OM)} identical={UM==OM}")
+for n in sh:
+    if U[n] == O[n]: continue
+    ch = [x for x in difflib.unified_diff(U[n].splitlines(), O[n].splitlines(),
+          lineterm="", n=0) if x[:1] in "+-" and not x.startswith(("---","+++"))]
+    print(f"  DIFF {n:48s} up={len(U[n].splitlines()):4d} "
+          f"ours={len(O[n].splitlines()):4d} changed={len(ch)}")
+PY
+```
+
+Three results so far, and the first one is why this section exists:
+
+- **`apc.py`** — the largest `.fork-marker-allowlist` entry for weeks (36 sites, 75
+  hunks, 554 missing upstream lines), described in this file's own notes and in the
+  handoff as "a rewrite rather than a set of hunks". **76 shared definitions, 74 with
+  byte-identical bodies, 23/23 module statements identical.** The entire delta was four
+  block moves left over from the fork's own cluster-by-cluster port. Real fork content:
+  two fork-only helpers and two call sites.
+- **`turboquant.py`** — 96 shared, **91 identical**. Reduced "118 missing lines, mostly
+  fork rewrite" to five functions, one of which held a dropped hunk that three prior
+  passes had missed because all three read `find_dropped_hunks.py` instead of diffing.
+- **`tests/test_generate.py`** — 49 shared, **47 identical**, and the residual was
+  method ordering. Converged 5 sites to 0.
+
+**The exit this unlocks is the one `.fork-marker-allowlist` calls CONVERGE**, and it is
+`docs/handoff-2026-08-10.md` §2f's test-file method applied to library files: take
+upstream's file as the base, re-apply the fork content, mark it. `apc.py` went from 554
+missing lines to 2. Verify the rebuild lost nothing by AST-diffing **before against
+after** — same definition count, zero lost, zero new, module statements identical, only
+the intended texts changed. For a *test* file also compare `pytest --collect-only`
+counts on both sides; that is the only thing that catches a shadowed definition.
+
+Two caveats, both paid for:
+
+- **Comments are not AST nodes.** A node-based reorder will land a relocated definition
+  on the wrong side of a `# ===` banner. Check banner positions by eye afterwards.
+- **`ours >= upstream` occurrence counts mean "rewrite"; `ours < upstream` is the only
+  signal worth chasing.** That is the cheaper identifier-count technique in the handoff,
+  and it is strictly weaker than this one: it answers "is this symbol present in both?",
+  not "is this body upstream's?". Use it on whatever the AST diff flags, not instead.
+
+**This is also the general form of the rule below.** "Never conclude from a
+`--numstat` line count" was being obeyed to the letter while the same mistake was made
+with "missing lines", "sites" and "hunks" — every wrong claim in the handoff's history
+has been a number or a framing derived from a line count. Line counts measure
+alignment. AST-diffing bodies measures content.
+
 When resolving conflicts, prefer a **union** over picking a side. Both sides add
 to shared lists (`__all__`, lazy-import tuples, skip-lists, registries); taking
 one side drops the other's contribution and usually only fails at runtime.
@@ -175,6 +273,13 @@ count.** That measure cannot distinguish three situations that need opposite
 responses: content we dropped (restore), fork work (keep), and code upstream
 itself later replaced (delete). Six wrong calls have been made this way; they are
 listed at the end of `docs/upstream-gaps.md`.
+
+**`--numstat` is only the most obvious form.** "Missing lines", "sites" and "hunks"
+are the same measure wearing different hats, and reading them as a proxy for *how
+much differs* is how `apc.py` was mis-sized by two orders of magnitude — see "the
+fifth direction" above, and run that AST comparison before you size anything. A
+fourth situation this rule cannot distinguish, added because it cost a cycle: **a
+file whose definitions were merely reordered.**
 
 Establish provenance first, every time:
 
@@ -208,7 +313,8 @@ positives. Every hit still needs `git log -S` and a read.
 cd mlx_vlm/ && pytest -s ./tests --ignore=tests/test_smoke.py
 ```
 
-The suite is **green: 2380 passed, 5 skipped, 0 failed.** Keep it that way.
+The suite is **green: 2685 passed, 5 skipped, 0 failed.** Keep it that way. (This
+line goes stale on every restore that adds a guard — trust the run, not the number.)
 
 **Compare failing test IDs, not counts.** A change that fixes one test and breaks
 another shows the same total:
