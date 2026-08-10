@@ -99,7 +99,7 @@
 #     INSIDE the list literal — a module-scope hunk is keyed by line, so a marker
 #     above the statement does not cover it.
 #
-# Current standing (2026-08-10): 9 files / 113 sites, down from 32 files / 175 sites. Every
+# Current standing (2026-08-10): 8 files / 105 sites, down from 32 files / 175 sites. Every
 # diverged file NOT listed here is marked, including
 # server/request_normalization.py — the gen-args union added fork hunks to a file
 # that had been byte-identical to upstream, and this check caught them before the
@@ -128,13 +128,12 @@ mlx_vlm/turboquant.py  # 7 sites / 14 hunks. CORRECTION (2026-08-10): an earlier
 # --- `git diff upstream/main`. Use this to ORDER the work; it decides nothing on its own
 # --- (AGENTS.md's first rule), but a file with few missing lines is cheap to clear and
 # --- a file with many needs each one accounted for before any marker goes in:
-# ---   common.py 28/848 · qwen3_5/language.py 30/121 · utils.py 32/171
+# ---   [common.py 28/848 CLEARED] · qwen3_5/language.py 30/121 · utils.py 32/171
 # ---   openai.py 76/905 · generation.py 92/665 · turboquant.py 118/529
 # ---   dispatch.py 125/377 · test_generate.py 251/297 · apc.py 554/567
 # --- ar.py was 26/233 and is now cleared: all 26 were rewrite artifacts, confirmed by
 # --- equal-count spot checks (speculative_prefill_capture_kwargs 6/6, BatchKVCache 7/7,
 # --- logging.getLogger 1/1) plus fork-only _get_generation_stream (4/0).
-mlx_vlm/generate/common.py  # 8 sites / 22 hunks. Fork-authored module (the 5e9b9503 generation-engine port) that upstream also has, so both sides edit it; the 2026-08-09 merge added four upstream params to maybe_quantize_kv_cache. Not reviewed. common.py:628's start_position branch is the evidence for c503fa7b being a reviewed divergence (handoff §4) — read that before touching it
 mlx_vlm/tests/test_generate.py  # 5 sites / 5 hunks, and the ONLY thing left is method ORDERING. The file was unioned with upstream on 2026-08-10 (1ab442d8): zero definitions missing, zero shared bodies differing, imports unioned. `test_capture_rope_deltas_prefers_prompt_kwargs` was moved back into TestGenerationBatch (upstream's class) on 2026-08-10, closing 2 sites. The residual sites are blank-line/section boundaries that shift because the fork's extra tests are interleaved, and `test_generation_batch_extend_promotes_singleton_kv_cache` sits at a different position inside TestBatchGenerator than upstream's -- BOTH trees have it, so there is nothing to restore. DO NOT chase these with markers: a comment placed on a whitespace probe line changes the alignment and produces a NEW probe line, which is a loop (verified: 10 -> 8 -> 1 -> 2 sites while chasing). Either reorder the fork's methods to upstream's positions, or leave this entry. The 3 informative markers already in the file (the import, TestBatchGenerator's extra method, TestPrefixCacheReuseTrim's reviewed c503fa7b divergence) are kept because they document real facts
 mlx_vlm/models/qwen3_5/language.py  # 7 sites / 18 hunks. AGENTS.md's note that the norm-shift gate here is protected fork work was WRONG (upstream landed the same fix in #1556); treat every site as unreviewed rather than trusting that note
 

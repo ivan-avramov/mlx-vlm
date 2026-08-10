@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import contextlib
-import logging
+import logging  # Fork: this module logs; upstream's copy does not
 import os
 import threading as _threading
 from dataclasses import dataclass
@@ -13,9 +13,13 @@ from mlx.utils import tree_reduce
 
 from ..kv_quant import from_legacy as kv_quant_from_legacy
 from ..models import cache
-from ..models.cache import PreallocKVCache, PreallocQuantizedKVCache
+from ..models.cache import (  # Fork: prealloc caches are fork-only
+    PreallocKVCache,
+    PreallocQuantizedKVCache,
+)
 from ..turboquant import HybridQuantKVCache, TurboQuantKVCache, turboquant_enabled
 
+# Fork: namespaceable logger so an embedding host can route our records.
 _LOG_NAME = os.environ.get("MLX_VLM_LOG_NAME", "mlx_vlm")
 logger = logging.getLogger(f"{_LOG_NAME}.generate")
 
@@ -25,7 +29,7 @@ DEFAULT_QUANTIZED_KV_START = 5000
 
 
 # ---------------------------------------------------------------------------
-# Lazy per-thread generation stream.
+# Fork: lazy per-thread generation stream.
 #
 # Upstream used a single module-level ``mx.new_thread_local_stream`` singleton.
 # That breaks when generation runs on worker threads (asyncio executors,
@@ -294,6 +298,10 @@ def maybe_quantize_kv_cache(
     kv_key_scheme: Optional[str] = None,
     kv_value_scheme: Optional[str] = None,
 ):
+    # Fork: upstream quantizes any cache exposing `to_quantized` past
+    # quantized_kv_start. This fork additionally skips the last layer (sensitive to
+    # quantization in deep models), honours the TurboQuant split key/value bit widths,
+    # and threads kv_prealloc_tokens through (7de8f7f1).
     if kv_bits is None:
         return
 
@@ -443,6 +451,8 @@ def maybe_preallocate_kv_cache(prompt_cache, kv_prealloc_tokens):
 
 
 @contextlib.contextmanager
+# Fork: identical logic to upstream's; the [WARNING] print is a logger.warning with
+# the same message, and the docstring gains the async-eval note.
 def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
     """Temporarily set the wired memory limit for generation.
 
@@ -483,6 +493,10 @@ def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
 
 @dataclass
 class GenerationResult:
+    # Fork: upstream's fields plus the diffusion/speculative telemetry the fork's
+    # streaming surfaces report (diffusion_block_complete, is_draft, cached_tokens,
+    # token_count, emitted_at).
+
     text: str = ""
     token: Optional[int] = None
     logprobs: Optional[List[float]] = None
@@ -513,6 +527,11 @@ class GenerationResult:
 
 
 class PromptCacheState:
+    # Fork: upstream stores token_ids + cache and nothing else. This fork adds the
+    # snapshot ring (mid-prefill anchors for rotating/SWA caches), the asymmetric
+    # rendering flag for templates that strip prior thinking, and DeltaNet state
+    # capture — all to make multi-turn prefix reuse safe on non-plain-KV caches.
+
     """Holds KV cache and token history across conversation turns.
 
     Pass this to stream_generate via the ``prompt_cache_state`` kwarg to
