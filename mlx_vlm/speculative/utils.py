@@ -34,9 +34,13 @@ from .mtp import (
     _speculative_walk_batch_deferred_greedy,
     _speculative_walk_deferred_greedy,
 )
-from .suffix_decoding import run_suffix_decoding_rounds
+from .suffix_decoding import (  # Fork: drafter-free suffix decoding (863441c9)
+    run_suffix_decoding_rounds,
+)
 
 __all__ = [
+    # Fork: this list carries the suffix-decoding names (863441c9) alongside
+    # upstream's; the module is otherwise upstream's re-export surface.
     "_MTPVerifyResult",
     "_dflash_block_total",
     "_dflash_committed_hidden_segments",
@@ -75,6 +79,9 @@ def format_speculative_stats(draft_model: nn.Module) -> Optional[str]:
 
 
 def get_speculative_rounds_batch(draft_kind: str):
+    # Fork: dispatches draft_kind == "suffix" to the fork's drafter-free
+    # n-gram / prompt-lookup speculation (863441c9), which upstream does not
+    # have at all. Every other branch is upstream's, unchanged.
     if draft_kind == "eagle3":
         return _eagle3_rounds_batch
     if draft_kind == "mtp":
@@ -145,6 +152,9 @@ def run_speculative_server_rounds(
     prompt_tokens: Optional[mx.array] = None,
     row_ids: Optional[List[int]] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
+    # Fork: dispatches draft_kind == "suffix" to the fork's drafter-free
+    # n-gram / prompt-lookup speculation (863441c9), which upstream does not
+    # have at all. Every other branch is upstream's, unchanged.
     batch_size = int(first_bonus.shape[0]) if first_bonus.ndim > 0 else 1
 
     if draft_kind == "suffix":
@@ -267,6 +277,9 @@ def run_speculative_rounds(
     prompt_token_ids: Optional[List[int]] = None,
     thinking_budget_criteria: Optional[Any] = None,
 ) -> Generator[Tuple[Any, mx.array], None, None]:
+    # Fork: dispatches draft_kind == "suffix" to the fork's drafter-free
+    # n-gram / prompt-lookup speculation (863441c9), which upstream does not
+    # have at all. Every other branch is upstream's, unchanged.
     B = input_ids.shape[0]
 
     if draft_kind == "suffix":

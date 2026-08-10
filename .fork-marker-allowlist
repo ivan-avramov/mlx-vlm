@@ -56,36 +56,54 @@
 #     definitions in 3371 lines; the single shared test that differed did so by
 #     4b15cc5's deliberate one-ULP bound, now marked. 11 .symbol-exclusions retired.
 #
-# Current standing (2026-08-09): 19 files, down from 32. Every
+# RESOLVED 2026-08-10, removed from this list:
+#   server/schemas.py — 1 site. `ChatStreamChunk` is upstream's field-for-field
+#     (including cfcc36d9's GenerationTimings/StreamingTimings union); the only
+#     deviation is the fork's `to_sse_json()` (a19e900f, fork-authored, absent from
+#     upstream), which omits `timings` when unset because OpenWebUI's stream parser
+#     dies on an explicit null. Marked.
+#   speculative/utils.py — 5 sites, all one feature: `draft_kind == "suffix"`
+#     dispatch to the fork's drafter-free n-gram speculation (863441c9), which
+#     upstream does not have at all. 61+/0- means pure additions, so there was no
+#     upstream code to have dropped. Marked; note the `__all__` marker has to sit
+#     INSIDE the list literal — a module-scope hunk is keyed by line, so a marker
+#     above the statement does not cover it.
+#
+# Current standing (2026-08-10): 17 files, down from 32. Every
 # diverged file NOT listed here is marked, including
 # server/request_normalization.py — the gen-args union added fork hunks to a file
 # that had been byte-identical to upstream, and this check caught them before the
 # commit landed, which is the workflow working as intended.
+#
+# SITE COUNTS BELOW ARE FROM `--summary` AND ARE NOW ACCURATE. They were not:
+# every count in this file was stale (apc.py said 100 sites against a real 36,
+# schemas.py said 10 against a real 1). `--summary` could not check them because it
+# deleted allowlisted paths before building its table — fixed 2026-08-10, so it now
+# prints a second, ranked table of exactly these files. Re-run it rather than
+# trusting a number here; that is the same discipline the handoff's §1 uses.
 
 # --- Heavy fork rewrites. AGENTS.md names these as the false-positive-prone
 # --- files; site-by-site provenance is the bulk of the remaining work.
-mlx_vlm/apc.py  # LEADS. 100 sites, the largest single block. A rewrite, not a set of hunks: 361 -U0 hunks collapse into 4 default-context regions. .deletion-exclusions already records _merge_arrays_cache_entries as the stale half of dropped 8422ece8 (#1638), whose server/app.py and dispatch.py halves were restored on 2026-08-09 -- but NOT its generate/ar.py half: ar.py:2479 still uses tenant_scoped_hash instead of semantic_extra_hash, a live APC cache-collision bug on the continuous-batching path. LEADS is CORRECT; resolve that first (handoff 2a-1)
-mlx_vlm/server/generation.py  # LEADS. Carries the fork's ResponseGenerator + GPU worker rewrite AND the dropped half of cfcc36d9 (#1634, generation logging — 7 .symbol-exclusions entries), plus sampler commits 36331ea7/b739dfa4/67ca1f05. Do not mark until those are resolved. 29b6c00b (#1508, diffusion unification) is RESOLVED as of 2026-08-10 — its 3 .deletion-exclusions entries are retired and the whole diffusion lane is now byte-identical to 29b6c00b's, so do not re-derive the family-routing branch from this file's divergence
-mlx_vlm/generate/ar.py  # LEADS. 13 sites. find_dropped_hunks reports e029e2b3, 36331ea7, 6d5603b3 (#1628 second half), b739dfa4, 67ca1f05 here; .deletion-exclusions records _greedy_argmax_step as the stale side of dropped 7fbc7bc9 (#1598)
-mlx_vlm/generate/dispatch.py  # LEADS. 11 sites. f044f36a reported missing. Two .symbol-exclusions entries here are reviewed deliberate divergences (_cache_fully_retained, _prefix_cache_trim_amount, superseded by the fork's snapshot ring) — those two are ready to mark; the rest are not reviewed
-mlx_vlm/server/openai.py  # LEADS. 19 sites. 6a8cdff6 (#1411 reasoning_content alias) and f044f36a reported missing
-mlx_vlm/tests/test_server.py  # LEADS. 19 sites and 124 fork-only definitions. Holds 31 of the "unreviewed" .symbol-exclusions entries plus one .deletion-exclusions entry (the stale half of dropped 24f6f590, #1370)
+mlx_vlm/apc.py  # 36 sites / 75 hunks — still the largest block, and now APPROACHABLE: its LEADS blocker is gone. 8422ece8 (#1638) is fully resolved as of 2026-08-10 — the ar.py half (semantic_extra_hash, the media-blind APC key) and the dispatch.py half (commit_prefix_blocks) both landed in 68ac2dc1, and .deletion-exclusions no longer records anything here. A rewrite rather than a set of hunks: 361 -U0 hunks collapse into 4 default-context regions, so expect to reason per region
+mlx_vlm/server/generation.py  # 14 sites / 21 hunks. Carries the fork's ResponseGenerator + GPU worker rewrite. LEADS is CLEARED as of 2026-08-10: cfcc36d9 (#1634 generation logging) restored in 682043f5 with all 8 of its .symbol-exclusions entries retired, 29b6c00b (#1508 diffusion unification) in d3a55800, and the sampler commits 36331ea7/b739dfa4/67ca1f05 in a47e7860. The diffusion lane and all five _log_* helpers are now byte-identical to upstream, so do NOT re-derive them from this file's divergence — what remains is genuine fork rewrite
+mlx_vlm/generate/ar.py  # 8 sites / 44 hunks. LEADS is CLEARED: 7fbc7bc9 (#1598) landed in a47e7860, 6d5603b3 (#1628's second half) with it, 8422ece8's ar.py half in 68ac2dc1, and 6a1704e6's ar.py half (the thinking-budget decode synchronization) in 1ab442d8. Only 2 .symbol-exclusions entries remain repo-wide for this file
+mlx_vlm/generate/dispatch.py  # 8 sites / 26 hunks. LEADS is CLEARED: f044f36a's dispatch half landed earlier and its generation.py half via d3a55800; a30180a6's signatures in 68ac2dc1. The two .symbol-exclusions entries here (_cache_fully_retained, _prefix_cache_trim_amount) are REVIEWED deliberate divergences superseded by the fork's snapshot ring — those two are ready to mark
+mlx_vlm/server/openai.py  # 18 sites / 49 hunks. LEADS mostly cleared: f044f36a resolved, cfcc36d9's openai half (the StreamingTimings plumbing) in 682043f5, f3bc6e81 (#1412, the finalizer cache clear) and 84ebae6e (#1641) in 4bd99ca1. 6a8cdff6 (#1411) is also resolved. Still reported here: 4d468e8575 (#1492) and b3d2380d1d (#1266), a few lines each — resolve before marking. NOTE the fork rewrote the streaming chat-completions thinking machinery around THINKING_FORMATS while /v1/responses uses upstream's ThinkingStreamState; 08723a3f unioned their marker sets, so treat those two paths as one decision, not two
+mlx_vlm/tests/test_server.py  # 6 sites / 7 hunks, down from 19, and 123 fork-only definitions. UNIONED with upstream on 2026-08-10 (4bd99ca1): zero definitions missing, imports fully unioned, and its .symbol-exclusions entries went 31 -> 0. The remaining sites are fork endpoints upstream does not have
 
 # --- Server surfaces, not yet reviewed at site granularity.
-mlx_vlm/server/app.py  # LEADS. 14 sites; e7a0f0f0, 21aeb8a5, 3de5bada reported missing. Three .deletion-exclusions entries here (_as_plain_dict, _request_field_or_default, _model_config_field_or_default) are duplicates of server/request_normalization.py and retire with the gen-args union
-mlx_vlm/server/__init__.py  # 15 sites, all module scope: this file is a re-export surface (lazy import tuples and __all__), so each divergence is one name in a list. Union-resolved by hand at every merge; a marker per name would be noise, and the right convention for a re-export list has not been decided
-mlx_vlm/server/schemas.py  # LEADS. 10 sites; 6a8cdff6 (#1411) reports 10 lines missing here, 91% of its hunk — likely most of this file's divergence IS the dropped commit
-mlx_vlm/server/responses_state.py  # 7 sites, not reviewed. Also defines a second copy of _as_plain_dict (see server/app.py above)
-mlx_vlm/server/cli.py  # 6 sites / 24 hunks, not reviewed. Mostly argparse blocks, so the natural unit is one marker per fork flag group
+mlx_vlm/server/app.py  # 7 sites / 15 hunks. LEADS is CLEARED: e7a0f0f0/21aeb8a5/3de5bada no longer report, the three .deletion-exclusions entries retired with the gen-args union, and 7bf4f7ea (#1402, the preload-reload bug) landed in 4bd99ca1
+mlx_vlm/server/__init__.py  # 7 sites / 13 hunks, all module scope: a re-export surface (lazy import tuples and __all__), so each divergence is one name in a list. Union-resolved by hand at every merge. The convention question is now ANSWERED by speculative/utils.py: put one marker INSIDE the list literal covering the fork names, since a module-scope hunk is keyed by line and a marker above the statement does not cover it
+mlx_vlm/server/responses_state.py  # 5 sites / 7 hunks, not reviewed. The duplicate _as_plain_dict noted here before is gone (retired with the gen-args union). 08723a3f added the _CONTENT_MARKERS strip to _step_thinking_state — that is fork wiring for the fork's streaming chat path and is ready to mark
+mlx_vlm/server/cli.py  # 6 sites / 22 hunks, not reviewed. Mostly argparse blocks, so the natural unit is one marker per fork flag group. cfcc36d9's --log-progress-interval landed in 682043f5 and is upstream's, not fork — do not mark it
 
 # --- Library modules, not yet reviewed at site granularity.
-mlx_vlm/utils.py  # LEADS. 14 sites; 9afc59ce (Inkling Small) and c1821e93 (safetensors index selection) reported missing. .deletion-exclusions records normalize_audio_features as the stale half of dropped b93707d8
-mlx_vlm/generate/common.py  # 8 sites. Fork-authored module (the 5e9b9503 generation-engine port) that upstream also has, so both sides edit it; the 2026-08-09 merge added four upstream params to maybe_quantize_kv_cache. Not reviewed
-mlx_vlm/turboquant.py  # LEADS. 8 sites; 1171888e (#1447) and e3906673 (#1433) reported missing. The 2026-08-09 merge marked one hunk (_ensure_codecs' kv_quant_mode); the other seven are not reviewed
-mlx_vlm/generate/__init__.py  # 5 sites, re-export surface — same open question as server/__init__.py
-mlx_vlm/models/qwen3_5/language.py  # 10 sites. AGENTS.md's note that the norm-shift gate here is protected fork work was WRONG (upstream landed the same fix in #1556); treat every site as unreviewed rather than trusting that note
-mlx_vlm/models/gemma4/language.py  # 5 sites, not reviewed
-mlx_vlm/speculative/utils.py  # 5 sites, not reviewed
+mlx_vlm/utils.py  # 13 sites / 26 hunks. LEADS is CLEARED: 9afc59ce and c1821e93 no longer report, b93707d8's normalize_audio_features stays recorded in .deletion-exclusions, and 63965655/0ae7f5e0 (the StoppingCriteria list aliasing) landed in 68ac2dc1
+mlx_vlm/generate/common.py  # 8 sites / 22 hunks. Fork-authored module (the 5e9b9503 generation-engine port) that upstream also has, so both sides edit it; the 2026-08-09 merge added four upstream params to maybe_quantize_kv_cache. Not reviewed. common.py:628's start_position branch is the evidence for c503fa7b being a reviewed divergence (handoff §4) — read that before touching it
+mlx_vlm/turboquant.py  # 7 sites / 14 hunks. LEADS: 1171888e (#1447) and e3906673 (#1433) still report, but handoff §4 closes BOTH by review — 1171888e's zero_row_tail is byte-identical to upstream's live copy (upstream defines it twice and the report flags the shadowed dead one) and e3906673's remainder contradicts the fork's measured decode-only split. So this is markable now; the 2026-08-09 merge already marked _ensure_codecs
+mlx_vlm/generate/__init__.py  # 4 sites / 7 hunks, re-export surface — see server/__init__.py for the now-settled convention
+mlx_vlm/models/qwen3_5/language.py  # 7 sites / 18 hunks. AGENTS.md's note that the norm-shift gate here is protected fork work was WRONG (upstream landed the same fix in #1556); treat every site as unreviewed rather than trusting that note
+mlx_vlm/models/gemma4/language.py  # 5 sites / 10 hunks, not reviewed
 
 # --- Tests, not yet reviewed at site granularity.
-mlx_vlm/tests/test_generate.py  # LEADS. 10 sites; e029e2b3 reports 6 lines missing. Holds 22 "unreviewed" .symbol-exclusions entries
+mlx_vlm/tests/test_generate.py  # 10 sites / 13 hunks. UNIONED with upstream on 2026-08-10 (1ab442d8): 7 tests restored, and zero shared bodies differ. Its 9 remaining .symbol-exclusions entries are the REVIEWED c503fa7b divergence (TestPrefixCacheReuseTrim), now carrying the real reason instead of 'unreviewed'. The sites are the fork's 9 replacement tests

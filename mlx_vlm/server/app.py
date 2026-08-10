@@ -554,7 +554,7 @@ def get_cached_model(
 
     # If this kind has a different model cached, clear only that cache group.
     if cached_cache:
-        print(f"New {cache_group} model request, clearing existing cache...")
+        logger.info("New %s model requested; clearing its existing cache.", cache_group)
         _unload_model_cache_group(cache_group)
 
     if load_as_edit:
@@ -563,7 +563,7 @@ def get_cached_model(
                 status_code=400,
                 detail="Adapters are not supported for image edit models.",
             )
-        print(f"Loading image edit model from: {model_path}")
+        logger.info("Loading image edit model: %s", model_path)
         try:
             model = load_image_edit_model(model_path)
         except ValueError as e:
@@ -597,7 +597,7 @@ def get_cached_model(
                 status_code=400,
                 detail="Adapters are not supported for image generation models.",
             )
-        print(f"Loading image generation model from: {model_path}")
+        logger.info("Loading image generation model: %s", model_path)
         try:
             model = load_image_generation_model(model_path)
         except ValueError as e:
@@ -631,7 +631,7 @@ def get_cached_model(
                 status_code=400,
                 detail="Adapters are not supported for audio models.",
             )
-        print(f"Loading audio model from: {model_path}")
+        logger.info("Loading audio model: %s", model_path)
         try:
             model = _server_package_attr("load_audio_model", load_audio_model)(
                 model_path
@@ -800,7 +800,7 @@ def unload_model_sync():
             runtime.audio_queue, "is_worker_thread", lambda: False
         )
         if not is_audio_worker():
-            print("Stopping AudioRequestQueue...")
+            logger.info("Stopping audio request queue.")
             runtime.audio_queue.stop_and_join()
             runtime.audio_queue = None
             unloaded_any = True
@@ -811,7 +811,7 @@ def unload_model_sync():
 
     # Stop the ResponseGenerator if running
     if runtime.response_generator is not None:
-        print("Stopping ResponseGenerator...")
+        logger.info("Stopping response generator.")
         runtime.response_generator.stop_and_join()
         runtime.response_generator = None
 
@@ -831,7 +831,7 @@ def unload_model_sync():
     gc.collect()
     mx.clear_cache()
     if unloaded_any:
-        print("Model caches cleared.")
+        logger.info("Model caches cleared.")
     return unloaded_any
 
 

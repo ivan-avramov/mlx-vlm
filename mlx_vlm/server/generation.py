@@ -4,7 +4,6 @@ import json
 import logging
 import os
 import time
-import traceback
 from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass, field
@@ -2211,8 +2210,7 @@ class ResponseGenerator:
         except Exception as e:
             self._load_error = e
             self._ready.set()
-            print(f"Error loading model in generation thread: {e}")
-            traceback.print_exc()
+            logger.exception("Error loading model in generation thread: %s", e)
             return
 
         self._ready.set()
@@ -2855,8 +2853,7 @@ class ResponseGenerator:
                         rqueues[uid].put(None)
 
             except Exception as e:
-                print(f"Error in speculative generation thread: {e}")
-                traceback.print_exc()
+                logger.exception("Error in speculative generation thread: %s", e)
                 error_queues = {id(rqueue): rqueue for rqueue in rqueues.values()}
                 error_queues.update(
                     {id(request.rqueue): request.rqueue for request in pending}

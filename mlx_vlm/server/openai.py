@@ -7,7 +7,6 @@ import logging
 import random
 import re
 import time
-import traceback
 import uuid
 from collections import OrderedDict
 from datetime import datetime
@@ -977,7 +976,7 @@ async def images_generations_endpoint(request: Request):
             stream=False,
             error=str(e),
         )
-        traceback.print_exc()
+        logger.exception("Image generation failed: %s", e)
         mx.clear_cache()
         gc.collect()
         raise HTTPException(status_code=500, detail=f"Image generation failed: {e}")
@@ -1102,7 +1101,7 @@ async def images_edits_endpoint(request: Request):
             stream=False,
             error=str(e),
         )
-        traceback.print_exc()
+        logger.exception("Image edit failed: %s", e)
         mx.clear_cache()
         gc.collect()
         raise HTTPException(status_code=500, detail=f"Image edit failed: {e}")
@@ -1721,8 +1720,7 @@ async def responses_endpoint(request: Request):
                             error=str(e),
                         )
                         metrics_finalized = True
-                    print(f"Error during stream generation: {e}")
-                    traceback.print_exc()
+                    logger.exception("Responses stream generation failed: %s", e)
                     error_data = json.dumps({"error": str(e)})
                     yield f"data: {error_data}\n\n"
 
@@ -1916,8 +1914,7 @@ async def responses_endpoint(request: Request):
                     stream=False,
                     error=str(e),
                 )
-                print(f"Error during generation: {e}")
-                traceback.print_exc()
+                logger.exception("Responses generation failed: %s", e)
                 mx.clear_cache()
                 gc.collect()
                 raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
@@ -1925,8 +1922,7 @@ async def responses_endpoint(request: Request):
     except HTTPException as http_exc:
         raise http_exc
     except Exception as e:
-        print(f"Unexpected error in /responses endpoint: {e}")
-        traceback.print_exc()
+        logger.exception("Unexpected error in /responses endpoint: %s", e)
         mx.clear_cache()
         gc.collect()
         raise HTTPException(
@@ -2464,8 +2460,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             error=str(e),
                         )
                         metrics_finalized = True
-                    print(f"Error during stream generation: {e}")
-                    traceback.print_exc()
+                    logger.exception("Chat completion stream generation failed: %s", e)
                     error_data = json.dumps({"error": str(e)})
                     yield f"data: {error_data}\n\n"
 
@@ -2751,8 +2746,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     stream=False,
                     error=str(e),
                 )
-                print(f"Error during generation: {e}")
-                traceback.print_exc()
+                logger.exception("Chat completion generation failed: %s", e)
                 mx.clear_cache()
                 gc.collect()
                 raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
@@ -2762,8 +2756,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
         raise http_exc
     except Exception as e:
         # Catch unexpected errors
-        print(f"Unexpected error in /generate endpoint: {e}")
-        traceback.print_exc()
+        logger.exception("Unexpected error in /chat/completions endpoint: %s", e)
         mx.clear_cache()
         gc.collect()
         raise HTTPException(
@@ -3005,8 +2998,7 @@ async def completions_endpoint(request: Request):
                             error=str(e),
                         )
                         metrics_finalized = True
-                    print(f"Error during completion stream generation: {e}")
-                    traceback.print_exc()
+                    logger.exception("Completion stream generation failed: %s", e)
                     error_data = json.dumps({"error": str(e)})
                     yield f"data: {error_data}\n\n"
                 finally:
@@ -3167,8 +3159,7 @@ async def completions_endpoint(request: Request):
                 stream=False,
                 error=str(e),
             )
-            print(f"Error during completion generation: {e}")
-            traceback.print_exc()
+            logger.exception("Completion generation failed: %s", e)
             mx.clear_cache()
             gc.collect()
             raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
@@ -3176,8 +3167,7 @@ async def completions_endpoint(request: Request):
     except HTTPException as http_exc:
         raise http_exc
     except Exception as e:
-        print(f"Unexpected error in /completions endpoint: {e}")
-        traceback.print_exc()
+        logger.exception("Unexpected error in /completions endpoint: %s", e)
         mx.clear_cache()
         gc.collect()
         raise HTTPException(

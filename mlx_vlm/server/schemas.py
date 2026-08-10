@@ -898,6 +898,11 @@ class ChatStreamChoice(BaseModel):
 
 
 class ChatStreamChunk(BaseModel):
+    # Fork: adds `to_sse_json()` (a19e900f). Every field here is upstream's,
+    # including the GenerationTimings/StreamingTimings union that cfcc36d9
+    # (#1634) introduced; the serializer is the only deviation, and it exists
+    # because OpenWebUI's stream parser dies on an explicit `timings: null`.
+    # See the method's own docstring.
     id: str = ""
     object: str = "chat.completion.chunk"
     created: int = 0

@@ -258,11 +258,16 @@ def main() -> int:
 
     # Now suppress the files the allowlist covers, recording which entries did
     # real work so the rest can be reported as stale.
+    # Allowlisted files are suppressed from the GATE, but their site counts are
+    # kept so --summary can rank the rollout. Discarding them here is what made
+    # --summary structurally unable to show the only files that still need work.
+    allowed_sites: dict = {}
     for path in list(uncovered):
         for glob, _reason in allowlist:
             if fnmatch.fnmatch(path, glob):
                 used.add(glob)
                 allowed_files.append(path)
+                allowed_sites[path] = uncovered[path]
                 del uncovered[path]
                 break
 
@@ -288,6 +293,22 @@ def main() -> int:
                 f"\n  {sum(len(s) for s in uncovered.values()):>5} "
                 f"{sum(sum(s.values()) for s in uncovered.values()):>6}  TOTAL "
                 f"across {len(uncovered)} file(s)"
+            )
+
+        # The rollout schedule. These are the files the gate currently excuses, so
+        # they are the only ones with work left — ranking them is the whole point of
+        # --summary, and it used to be unable to see them at all.
+        if allowed_sites:
+            print("\nAllowlisted files — the rollout, ranked (worst first):")
+            print(f"  {'sites':>5} {'hunks':>6}  path")
+            for path, sites in sorted(
+                allowed_sites.items(), key=lambda kv: -len(kv[1])
+            ):
+                print(f"  {len(sites):>5} {sum(sites.values()):>6}  {path}")
+            print(
+                f"\n  {sum(len(s) for s in allowed_sites.values()):>5} "
+                f"{sum(sum(s.values()) for s in allowed_sites.values()):>6}  TOTAL "
+                f"across {len(allowed_sites)} allowlisted file(s)"
             )
 
     if stale:
