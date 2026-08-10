@@ -423,8 +423,9 @@ nothing was deleted (deletions), the hunk sits in a file whose fork sites are ma
 
 `dev/check_upstream_registries.py` is that check, and **the gap it closes was
 measured, not assumed.** Deleting `models/gemma4/__init__.py`'s
-`Gemma4VideoProcessor` re-export — a real historical loss in this fork — leaves **all
-2817 tests passing and all five other audits green.** Only this one reports it.
+`Gemma4VideoProcessor` re-export — a real historical loss in this fork — left **the
+entire suite passing (2817 tests at the time) and all five other audits green.**
+Only this one reports it.
 
 Four shapes, each of which has cost a real loss here:
 
