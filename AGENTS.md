@@ -268,7 +268,20 @@ git show upstream/main:<path> | grep -c 'Generation cancelled: request=%s'
 grep -c 'Generation cancelled: request=%s' <path>
 ```
 
-Do that for every logging commit. Counting the *helpers* is not enough — a guard in
+**[update 2026-08-10] The fifth direction now covers this, for the common case.**
+`check_body_divergence.py --file`'s `gone` list is line-content based, so a dropped log
+line *inside a shared definition* appears in it verbatim. Verified by deleting exactly
+`cfcc36d9`'s cancellation log line from `server/generation.py`: `ResponseGenerator`
+went gone=16 -> 18 and the report named
+`"Generation cancelled: request=%s generated_tokens=%d",` outright, while parity,
+symbols, deletions, fork-markers and registries all stayed green. So "nothing above can
+see it" was true when written and is now false — run `--sweep` after a logging commit
+and the literals show up on their own.
+
+Two limits keep the hand-count worth knowing. `gone` only sees content inside a
+definition **both trees define**, so a log line at module scope or in a fork-only
+function is still invisible to it; and it is per-file, so a line the fork moved to
+another module reads as present. Counting the *helpers* is not enough either — a guard in
 `test_dropped_upstream_guards.py` was already comparing `self._log_*(` call counts
 against upstream and passed throughout, because both survivors were direct
 `logger.info(...)` calls in otherwise byte-identical blocks.
