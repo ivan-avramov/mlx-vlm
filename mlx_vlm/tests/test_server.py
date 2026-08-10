@@ -4641,9 +4641,32 @@ def test_metrics_endpoint_reports_empty_state(client, monkeypatch):
     assert payload["server"]["apc"] == {"enabled": False}
 
 
-# Fork: placement only — this and the next test are upstream's, byte-identical in
-# body, but sit here rather than at upstream's line because the fork's extra
-# endpoints shift everything around them. Nothing to converge.
+def test_metrics_store_logs_request_lifecycle(caplog):
+    caplog.set_level(logging.INFO, logger="mlx_vlm.server")
+    metrics = server.ServerMetricsStore()
+    metrics.begin_request(endpoint="/chat/completions", model="demo", stream=True)
+    metrics.record_success(
+        {
+            "endpoint": "/chat/completions",
+            "model": "demo",
+            "stream": True,
+            "backend": "continuous_batching",
+            "prompt_tokens": 10,
+            "completion_tokens": 4,
+            "generated_tokens": 4,
+            "request_elapsed_s": 0.5,
+            "decode_elapsed_s": 0.1,
+            "prefill_tok_s": 100.0,
+            "decode_tok_s": 40.0,
+            "finish_reason": "stop",
+        }
+    )
+
+    assert "Request started: endpoint=/chat/completions model=demo" in caplog.text
+    assert "Request completed: endpoint=/chat/completions model=demo" in caplog.text
+    assert "prefill=100.0 tok/s decode=40.0 tok/s" in caplog.text
+
+
 def test_metrics_endpoint_records_chat_completion_metrics(client, monkeypatch):
     monkeypatch.setattr(server.runtime, "metrics", server.ServerMetricsStore())
     monkeypatch.setattr(server.runtime, "apc_manager", None)
@@ -4727,32 +4750,6 @@ def test_metrics_endpoint_records_chat_completion_metrics(client, monkeypatch):
 
 
 # ── Continuous batching / ResponseGenerator tests ─────────────────────
-def test_metrics_store_logs_request_lifecycle(caplog):
-    # Fork: placement only — upstream's test, byte-identical body, restored here
-    # rather than at upstream's line (cfcc36d9's test half). Nothing to converge.
-    caplog.set_level(logging.INFO, logger="mlx_vlm.server")
-    metrics = server.ServerMetricsStore()
-    metrics.begin_request(endpoint="/chat/completions", model="demo", stream=True)
-    metrics.record_success(
-        {
-            "endpoint": "/chat/completions",
-            "model": "demo",
-            "stream": True,
-            "backend": "continuous_batching",
-            "prompt_tokens": 10,
-            "completion_tokens": 4,
-            "generated_tokens": 4,
-            "request_elapsed_s": 0.5,
-            "decode_elapsed_s": 0.1,
-            "prefill_tok_s": 100.0,
-            "decode_tok_s": 40.0,
-            "finish_reason": "stop",
-        }
-    )
-
-    assert "Request started: endpoint=/chat/completions model=demo" in caplog.text
-    assert "Request completed: endpoint=/chat/completions model=demo" in caplog.text
-    assert "prefill=100.0 tok/s decode=40.0 tok/s" in caplog.text
 
 
 class TestResponseGenerator:

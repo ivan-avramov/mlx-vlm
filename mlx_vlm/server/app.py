@@ -223,13 +223,6 @@ async def _preflight_stream_context_budget(
         raise HTTPException(status_code=400, detail=str(e))
 
 
-# Fork: placement only — body is byte-identical to upstream's; the fork's extra
-# helpers above shift its line number.
-def _extract_response_format_schema(request):
-    """Retain the package-level compatibility alias for schema extraction."""
-    return _request_normalization._extract_response_format_schema(request)
-
-
 def _build_structured_logits_processors(request, processor):
     return _request_normalization._build_structured_logits_processors(
         request,
@@ -239,6 +232,11 @@ def _build_structured_logits_processors(request, processor):
             build_json_schema_logits_processor,
         ),
     )
+
+
+def _extract_response_format_schema(request):
+    """Retain the package-level compatibility alias for schema extraction."""
+    return _request_normalization._extract_response_format_schema(request)
 
 
 # Fork: the registry fallback below (see the marker inside the function).
