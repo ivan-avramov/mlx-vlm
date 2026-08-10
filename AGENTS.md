@@ -183,14 +183,21 @@ makes the site invisible to every later audit. The four:
   inspection; the same mistake around the `qwen3_5` norm-shift gate hid a live `+2.0`
   double-shift bug.
 
-The check for it is `dev/check_body_divergence.py --file <path>`'s **`absent`**
-column, which lists the upstream lines missing from each differing body. A marker
-saying the fork ADDED something that appears in that list is false — we did not add
-what upstream already has. Use `absent`, not a plain diff: a rewritten body reports
+The check for it is `dev/check_body_divergence.py --file <path>`'s **`gone`**
+column, which lists the upstream lines missing from our whole copy of the file. A
+marker saying the fork ADDED something that appears in that list is false — we did not
+add what upstream already has. Use `gone`, not a plain diff: a rewritten body reports
 every reordered line as changed, so a real omission hides in the noise. Then
-`git log -S` the distinctive lines, because `absent > 0` means *either* a fork
+`git log -S` the distinctive lines, because `gone > 0` means *either* a fork
 replacement *or* content a resolution dropped, and nothing distinguishes those
 mechanically.
+
+Note what `gone = 0` does and does not prove. It means every upstream line is
+*somewhere* in our file, so a marker claiming upstream LACKS something cannot be
+supported by absence — but a marker can still be false the other way, by claiming the
+fork authored something both trees have. That is exactly `0670f556`, whose
+`# Skip the last layer` comment was present in *upstream's* body and absent from
+neither. Only reading the two bodies settles that.
 
 **So: review a marker whenever you touch its file, and never write one from the
 diff alone.**
@@ -300,10 +307,15 @@ delta, on purpose: `tests/test_server.py` reads +2185/-262 and scores 33;
 distrusted. A file with `content=0` is a pure reordering — converge it rather than
 reading its diff.
 
-`--file` also prints, per differing definition, an **`absent`** count and the
-upstream lines missing from our body. That is the column a `# Fork:` marker's claim
-gets checked against — see "a marker is unverified prose" above; it is what caught
-`0670f556`.
+`--file` also prints, per differing definition, two counts: **`absent`** (upstream
+lines missing from our *body*) and **`gone`** (missing from the whole *file*), and
+lists the `gone` ones. **Read `gone`.** `absent` alone cannot tell *moved* from
+*lost* — `turboquant.py`'s rewritten kernel reports absent=66 / gone=2, because the
+fork kept upstream's body as an ours-only `_legacy` sibling, so reading the first
+number as content loss overstates it 33x. That is AGENTS.md's central rule one level
+down: a measure that conflates two situations needing opposite responses.
+`gone` is the column a `# Fork:` marker's claim gets checked against — see "a marker
+is unverified prose" above; it is what caught `0670f556`.
 
 It **gates only on alignment masquerading as content**, which is a much narrower
 claim than the report makes: a whole file whose divergence is zero content, a
@@ -422,7 +434,7 @@ positives. Every hit still needs `git log -S` and a read.
 cd mlx_vlm/ && pytest -s ./tests --ignore=tests/test_smoke.py
 ```
 
-The suite is **green: 2755 passed, 5 skipped, 0 failed.** Keep it that way. (This
+The suite is **green: 2763 passed, 5 skipped, 0 failed.** Keep it that way. (This
 line goes stale on every restore that adds a guard — trust the run, not the number.)
 
 **Compare failing test IDs, not counts.** A change that fixes one test and breaks

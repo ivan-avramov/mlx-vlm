@@ -192,6 +192,10 @@ class FileComparison:
             normalise(s) for s in up_mods
         ) == Counter(normalise(s) for s in our_mods)
 
+        # Every content line anywhere in our copy, so `absent_from_file` can tell
+        # "we do not have this" from "we have it in a different definition".
+        self._our_file_lines = Counter(_content_lines(our_source))
+
     def absent_upstream_lines(self, name: str) -> list[tuple[int, str]]:
         """[(count, line)] upstream has in `name`'s body that our copy does not.
 
@@ -225,6 +229,31 @@ class FileComparison:
             _content_lines(self.our_defs[name])
         )
         return [(count, line) for line, count in missing.items()]
+
+    def absent_from_file(self, name: str) -> list[tuple[int, str]]:
+        """`absent_upstream_lines(name)` minus anything present elsewhere in our file.
+
+        THIS is the count that means "we do not have this content"; the per-definition
+        one means "not in this definition", which is a different and much noisier
+        claim. `turboquant.py::_fused_mse_decode_2pass_1_kernel` reports 66 absent
+        lines and 2 file-absent: the fork rewrote the kernel and kept upstream's whole
+        body as an ours-only `_fused_mse_decode_2pass_1_kernel_legacy` sibling, so 64
+        of the 66 never left the file. Reading the first number as content loss
+        overstates it by 33x.
+
+        That is the same error AGENTS.md's central rule is about, one level down — a
+        measure that cannot distinguish "moved" from "gone". So the report prints both,
+        and only this list is worth reading first.
+
+        A non-empty result still needs `git log -S`: it says the lines are not in our
+        copy of this file, not that a resolution dropped them. They may equally live in
+        another module the fork split them into, which no per-file view can see.
+        """
+        return [
+            (count, line)
+            for count, line in self.absent_upstream_lines(name)
+            if self._our_file_lines[line] == 0
+        ]
 
     @property
     def content_score(self) -> int:
@@ -364,25 +393,37 @@ def report_one_file(cmp: FileComparison) -> None:
             if l[:1] in "+-" and not l.startswith(("---", "+++"))
         ]
         absent = cmp.absent_upstream_lines(name)
+        gone = cmp.absent_from_file(name)
+        n_absent = sum(c for c, _ in absent)
+        n_gone = sum(c for c, _ in gone)
         tag = "ALIGN" if name in cmp.alignment_only else "DIFF "
         print(
             f"  {tag} {name:48s} up={len(up.splitlines()):4d} "
             f"ours={len(ours.splitlines()):4d} changed={len(changed)} "
-            f"absent={sum(c for c, _ in absent)}"
+            f"absent={n_absent} gone={n_gone}"
         )
-        # `absent` is the marker-review column, not decoration: it is what a `# Fork:`
+        # `gone` is the marker-review column, not decoration: it is what a `# Fork:`
         # comment's claim can actually be checked against. `changed` cannot do that
         # job -- a rewritten body reports every reordered line, so a real omission
-        # hides in the noise.
-        for count, line in absent:
-            print(f"          upstream-only x{count}  {line[:100]}")
+        # hides in the noise. Only `gone` is listed; `absent - gone` is content that
+        # merely moved within the file, which is the loud false positive here.
+        for count, line in gone:
+            print(f"          not in our file x{count}  {line[:100]}")
+        if n_absent > n_gone:
+            print(
+                f"          ({n_absent - n_gone} more absent from this definition but "
+                "present elsewhere in the file — moved, not lost)"
+            )
 
     if cmp.content_differing:
         print(
-            "\n  `absent` = upstream lines missing from OUR body. absent=0 means our "
-            "body is a strict\n  superset. absent>0 is a fork replacement OR content a "
-            "resolution dropped, and nothing\n  here tells those apart — run "
-            "`git log -S` on the distinctive lines.\n"
+            "\n  `absent` = upstream lines missing from our BODY. `gone` = missing from "
+            "the whole FILE,\n  and gone is the one to read: absent alone cannot tell "
+            "moved from lost, which overstated\n  turboquant's rewritten kernel by 33x. "
+            "gone=0 means we have every upstream line somewhere.\n"
+            "  gone>0 is a fork replacement OR content a resolution dropped, and "
+            "nothing here tells\n  those apart — run `git log -S` on the distinctive "
+            "lines.\n"
             "  Check each differing definition's `# Fork:` marker against this list. "
             "A marker saying\n  the fork ADDED something that appears above is false: "
             "we did not add what upstream has."

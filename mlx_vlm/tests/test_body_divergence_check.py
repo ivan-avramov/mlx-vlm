@@ -397,3 +397,151 @@ class TestAbsentUpstreamLines:
 
     def test_content_lines_helper(self, cbd):
         assert cbd._content_lines("a\n\n   b   \n\t\n c\n") == ["a", "b", "c"]
+
+
+class TestAbsentFromFile:
+    """The second tier, and the one worth reading. `absent` cannot tell moved from lost.
+
+    `turboquant.py::_fused_mse_decode_2pass_1_kernel` reports 66 absent lines and 2
+    file-absent: the fork rewrote the kernel and kept upstream's whole body as an
+    ours-only `_fused_mse_decode_2pass_1_kernel_legacy` sibling, so 64 of the 66 never
+    left the file. Reading the per-definition number as content loss overstates it by
+    33x — the same "a measure that cannot distinguish two situations needing opposite
+    responses" error AGENTS.md's central rule is about, one level down.
+    """
+
+    UP_TWO = """\
+def alpha(x):
+    return helper(x) + 1
+
+
+def beta(y):
+    return y
+"""
+
+    def test_content_moved_to_another_definition_is_not_gone(self, cbd):
+        ours = """\
+def alpha(x):
+    return rewritten(x)
+
+
+def alpha_legacy(x):
+    return helper(x) + 1
+
+
+def beta(y):
+    return y
+"""
+        cmp = _cmp(cbd, self.UP_TWO, ours)
+        assert cmp.absent_upstream_lines("alpha") == [(1, "return helper(x) + 1")]
+        assert cmp.absent_from_file("alpha") == []
+
+    def test_content_moved_to_another_SHARED_definition_is_not_gone(self, cbd):
+        """The mover need not be an ours-only helper — a shared sibling counts too.
+
+        The moved text must match exactly, which is worth noting: `helper(y)` is not
+        `helper(x)`, so a "move" that also renames a variable still reports. That is
+        correct but it is why AGENTS.md records two commits whose entire residue was a
+        local variable rename — expect that shape and read it as a rename.
+        """
+        ours = """\
+def alpha(x):
+    return rewritten(x)
+
+
+def beta(y):
+    return helper(x) + 1
+"""
+        cmp = _cmp(cbd, self.UP_TWO, ours)
+        assert cmp.absent_upstream_lines("alpha")
+        assert cmp.absent_from_file("alpha") == []
+
+    def test_a_move_that_renames_a_variable_still_reports(self, cbd):
+        """The flip side of the above, made explicit so the looseness is bounded."""
+        ours = """\
+def alpha(x):
+    return rewritten(x)
+
+
+def beta(y):
+    return helper(y) + 1
+"""
+        cmp = _cmp(cbd, self.UP_TWO, ours)
+        assert cmp.absent_from_file("alpha") == [(1, "return helper(x) + 1")]
+
+    def test_genuinely_missing_content_is_still_reported(self, cbd):
+        """The tier must not swallow the signal it exists to sharpen."""
+        ours = self.UP_TWO.replace("    return helper(x) + 1", "    return 0")
+        cmp = _cmp(cbd, self.UP_TWO, ours)
+        assert cmp.absent_from_file("alpha") == [(1, "return helper(x) + 1")]
+
+    def test_it_is_a_subset_of_the_per_definition_view(self, cbd):
+        """A structural invariant: the tier can only ever narrow, never add."""
+        ours = self.UP_TWO.replace("    return helper(x) + 1", "    return 0")
+        cmp = _cmp(cbd, self.UP_TWO, ours)
+        assert set(cmp.absent_from_file("alpha")) <= set(
+            cmp.absent_upstream_lines("alpha")
+        )
+
+    def test_module_level_code_counts_as_the_file(self, cbd):
+        """A line hoisted OUT of a definition to module scope has not left the file.
+
+        Comparison is against the whole source text, not against the definitions the
+        AST walk collected, precisely so a hoist to module scope does not read as a
+        loss. `generate/common.py` has 21 module statements against upstream's 14, so
+        this is not a hypothetical shape.
+        """
+        up = """\
+def alpha(x):
+    LIMIT = compute(8)
+    return LIMIT
+
+
+def beta(y):
+    return y
+"""
+        ours = """\
+LIMIT = compute(8)
+
+
+def alpha(x):
+    return LIMIT
+
+
+def beta(y):
+    return y
+"""
+        cmp = _cmp(cbd, up, ours)
+        assert cmp.absent_upstream_lines("alpha") == [(1, "LIMIT = compute(8)")]
+        assert cmp.absent_from_file("alpha") == []
+
+    def test_an_unshared_name_reports_nothing(self, cbd):
+        cmp = _cmp(cbd, self.UP_TWO, self.UP_TWO)
+        assert cmp.absent_from_file("nope") == []
+
+    def test_the_real_turboquant_kernel_case(self, cbd):
+        """Ties the tier to the file that motivated it, the way
+        `test_fork_marker_check.py` ties case 4 to its `.symbol-exclusions` entries.
+
+        If the fork ever drops the `_legacy` sibling this fails, which is correct — the
+        64 lines would then genuinely be gone and the count should say so.
+        """
+        import subprocess
+
+        root = Path(__file__).resolve().parents[2]
+        path = "mlx_vlm/turboquant.py"
+        up = subprocess.run(
+            ["git", "-C", str(root), "show", f"upstream/main:{path}"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        ours = (root / path).read_text()
+        cmp = cbd.FileComparison(path, up, ours)
+        name = "_fused_mse_decode_2pass_1_kernel"
+
+        assert f"{name}_legacy" in cmp.ours_only
+        per_def = sum(c for c, _ in cmp.absent_upstream_lines(name))
+        file_wide = sum(c for c, _ in cmp.absent_from_file(name))
+        assert per_def > 50, per_def
+        assert file_wide < 5, file_wide
