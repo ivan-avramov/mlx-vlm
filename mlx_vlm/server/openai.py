@@ -94,6 +94,7 @@ from .schemas import (
     ResponseOutputItemDoneEvent,
     ResponseOutputTextDeltaEvent,
     ResponseOutputTextDoneEvent,
+    StreamingTimings,
     UsageStats,
 )
 from .session_manager import (  # noqa: F401
@@ -596,11 +597,13 @@ def _final_chat_chunk(
     request_id: str,
     model: str,
     finish_reason: str,
+    predicted_per_second: Optional[float] = None,
 ) -> ChatStreamChunk:
     return ChatStreamChunk(
         id=request_id,
         created=int(time.time()),
         model=model,
+        timings=StreamingTimings(predicted_per_second=predicted_per_second),
         choices=[
             ChatStreamChoice(
                 finish_reason=finish_reason,
@@ -1472,6 +1475,7 @@ async def responses_endpoint(request: Request):
                             output_tokens += getattr(token, "token_count", 1)
                             raw_delta = token.text
                             full_text += raw_delta
+                            chunk_rate = metrics.record_chunk(token)
                             thinking_delta = thinking_state.feed(raw_delta)
                             if thinking_delta.reasoning:
                                 streamed_reasoning += thinking_delta.reasoning
@@ -1484,20 +1488,20 @@ async def responses_endpoint(request: Request):
                                         "output_index": 0,
                                         "content_index": 0,
                                         "delta": thinking_delta.reasoning,
+                                        "timings": {"predicted_per_second": chunk_rate},
                                     },
                                 )
                             delta = thinking_delta.content
                             in_tool_call, delta = suppress_tool_call_content(
                                 full_text, in_tool_call, tc_start, delta
                             )
-                            metrics.record_chunk(token)
                             usage_stats = {
                                 "input_tokens": ctx.prompt_tokens,
                                 "output_tokens": output_tokens,
                             }
 
                             if delta:
-                                yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
+                                yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta, timings=StreamingTimings(predicted_per_second=chunk_rate)).model_dump_json()}\n\n"
                                 await asyncio.sleep(0.01)
 
                             if token.finish_reason:
@@ -1522,6 +1526,7 @@ async def responses_endpoint(request: Request):
 
                             raw_delta = chunk.text
                             full_text += raw_delta
+                            chunk_rate = metrics.record_chunk(chunk)
                             thinking_delta = thinking_state.feed(raw_delta)
                             if thinking_delta.reasoning:
                                 streamed_reasoning += thinking_delta.reasoning
@@ -1534,13 +1539,13 @@ async def responses_endpoint(request: Request):
                                         "output_index": 0,
                                         "content_index": 0,
                                         "delta": thinking_delta.reasoning,
+                                        "timings": {"predicted_per_second": chunk_rate},
                                     },
                                 )
                             delta = thinking_delta.content
                             in_tool_call, delta = suppress_tool_call_content(
                                 full_text, in_tool_call, tc_start, delta
                             )
-                            metrics.record_chunk(chunk)
                             chunk_finish = getattr(chunk, "finish_reason", None)
                             if chunk_finish is not None:
                                 finish_reason = chunk_finish
@@ -1550,7 +1555,7 @@ async def responses_endpoint(request: Request):
                             }
 
                             if delta:
-                                yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta).model_dump_json()}\n\n"
+                                yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=delta, timings=StreamingTimings(predicted_per_second=chunk_rate)).model_dump_json()}\n\n"
                                 await asyncio.sleep(0.01)
 
                     output_items, clean_text, _, output_finish_reason = (
@@ -1587,7 +1592,7 @@ async def responses_endpoint(request: Request):
                         )
 
                     # Send response.output_text.done event (to match the openai pipeline)
-                    yield f"event: response.output_text.done\ndata: {ResponseOutputTextDoneEvent(type='response.output_text.done', item_id=message_id, output_index=0, content_index=0, text=clean_text).model_dump_json()}\n\n"
+                    yield f"event: response.output_text.done\ndata: {ResponseOutputTextDoneEvent(type='response.output_text.done', item_id=message_id, output_index=0, content_index=0, text=clean_text, timings=StreamingTimings(predicted_per_second=metrics.rate)).model_dump_json()}\n\n"
 
                     # Send response.content_part.done event (to match the openai pipeline)
                     final_content_part = ContentPartOutputText(
@@ -2207,7 +2212,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                 break
                             output_tokens += getattr(token, "token_count", 1)
                             full_output += token.text
-                            metrics.record_chunk(token)
+                            chunk_rate = metrics.record_chunk(token)
 
                             # Detect thinking boundaries. The helper appends
                             # the token to `accumulated` internally — callers
@@ -2267,6 +2272,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                     created=int(time.time()),
                                     model=request.model,
                                     choices=choices,
+                                    timings=StreamingTimings(
+                                        predicted_per_second=chunk_rate
+                                    ),
                                 )
 
                                 yield f"data: {chunk_data.to_sse_json()}\n\n"
@@ -2297,6 +2305,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                     created=int(time.time()),
                                     model=request.model,
                                     choices=choices,
+                                    timings=StreamingTimings(
+                                        predicted_per_second=metrics.rate
+                                    ),
                                 )
                                 yield f"data: {chunk_data.to_sse_json()}\n\n"
                         if not terminal_emitted:
@@ -2305,6 +2316,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                 request_id,
                                 request.model,
                                 finish_reason,
+                                metrics.rate,
                             )
                             yield f"data: {chunk_data.to_sse_json()}\n\n"
                         if emit_usage:
@@ -2345,7 +2357,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             output_text += chunk.text
                             stream_prompt_tokens = chunk.prompt_tokens
                             output_tokens = chunk.generation_tokens
-                            metrics.record_chunk(chunk)
+                            chunk_rate = metrics.record_chunk(chunk)
                             chunk_finish = getattr(chunk, "finish_reason", None)
                             if chunk_finish is not None:
                                 finish_reason = chunk_finish
@@ -2366,6 +2378,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                     created=int(time.time()),
                                     model=request.model,
                                     choices=choices,
+                                    timings=StreamingTimings(
+                                        predicted_per_second=chunk_rate
+                                    ),
                                 )
 
                                 yield f"data: {chunk_data.to_sse_json()}\n\n"
@@ -2376,6 +2391,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             request_id,
                             request.model,
                             finish_reason,
+                            metrics.rate,
                         )
                         yield f"data: {chunk_data.to_sse_json()}\n\n"
                         if emit_usage:

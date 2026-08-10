@@ -1067,3 +1067,145 @@ class TestStreamingThinkingMarkerUnion:
         assert reasoning == "North reasoning."
         assert content == "North answer."
         assert in_thinking is False
+
+
+class TestServerGenerationLogging:
+    """`cfcc36d9` — improve server generation logging (#1634).
+
+    The largest single dropped commit in this fork (~375 lines / 9 files). Two of its
+    pieces had already landed and were inert, which is the part worth remembering:
+    `GenerationMetrics.record_chunk` and its `rate` property were byte-identical to
+    upstream, computing an instantaneous decode rate that **nothing read** — the
+    `schemas.py` half that surfaces it in streaming responses was the dropped part.
+    A value computed and discarded is the same shape as a helper with no call site,
+    and neither audit can see it.
+    """
+
+    def test_progress_interval_is_configurable_and_fails_safe(self):
+        import os
+
+        from mlx_vlm.server.generation import (
+            DEFAULT_LOG_PROGRESS_INTERVAL,
+            get_log_progress_interval,
+        )
+
+        previous = os.environ.get("MLX_VLM_LOG_PROGRESS_INTERVAL")
+        try:
+            os.environ["MLX_VLM_LOG_PROGRESS_INTERVAL"] = "25"
+            assert get_log_progress_interval() == 25
+            # 0 disables periodic decode progress and must survive the max(0, ...).
+            os.environ["MLX_VLM_LOG_PROGRESS_INTERVAL"] = "0"
+            assert get_log_progress_interval() == 0
+            # A bad value must not take the server down on the first request.
+            os.environ["MLX_VLM_LOG_PROGRESS_INTERVAL"] = "not-a-number"
+            assert get_log_progress_interval() == DEFAULT_LOG_PROGRESS_INTERVAL
+        finally:
+            if previous is None:
+                os.environ.pop("MLX_VLM_LOG_PROGRESS_INTERVAL", None)
+            else:
+                os.environ["MLX_VLM_LOG_PROGRESS_INTERVAL"] = previous
+
+    def test_cli_flag_reaches_the_getter(self):
+        """`--log-progress-interval` is only wired through an env var.
+
+        The flag, the export and the getter live in three files, so any one of them
+        going missing leaves a flag that parses and does nothing — the same shape as
+        the sampler modes that were accepted and discarded.
+        """
+        import inspect
+
+        from mlx_vlm.server import cli
+
+        source = inspect.getsource(cli.main)
+        assert "--log-progress-interval" in source
+        assert 'os.environ["MLX_VLM_LOG_PROGRESS_INTERVAL"]' in source
+
+    def test_instantaneous_rate_is_exposed_to_streaming_clients(self):
+        """`GenerationMetrics.rate` existed and no schema read it.
+
+        `StreamingTimings` plus `GenerationTimings.from_metrics` preferring
+        `metrics.rate` are what make the computed value observable. Without them the
+        rate is calculated per chunk and thrown away on every streaming request.
+        """
+        from mlx_vlm.server.schemas import (
+            ChatStreamChunk,
+            GenerationTimings,
+            ResponseOutputTextDeltaEvent,
+            ResponseOutputTextDoneEvent,
+            StreamingTimings,
+        )
+
+        assert StreamingTimings(predicted_per_second=4.0).predicted_per_second == 4.0
+        for model in (ResponseOutputTextDeltaEvent, ResponseOutputTextDoneEvent):
+            assert "timings" in model.model_fields
+
+        # ChatStreamChunk must accept BOTH shapes: the terminal chunk carries full
+        # GenerationTimings, the per-token chunks carry StreamingTimings.
+        chunk = ChatStreamChunk(timings=StreamingTimings(predicted_per_second=1.5))
+        assert chunk.timings.predicted_per_second == 1.5
+
+        class _Metrics:
+            rate = 7.5
+            generation_tps = 1.0
+            token_times = []
+            cached_tokens = 0
+            peak_memory = 0.0
+            prompt_tps = None
+
+        timings = GenerationTimings.from_metrics(_Metrics(), 4, 2)
+        assert (
+            timings.predicted_per_second == 7.5
+        ), "from_metrics must prefer the instantaneous rate over generation_tps"
+
+    def test_every_logging_helper_is_called_as_often_as_upstream(self):
+        """A *second* dropped call site is invisible to `check_dead_helpers.py`.
+
+        That check is per-symbol, so one caller satisfies it forever. It is how
+        `8422ece8` read as closed twice while `commit_prefix_blocks` and
+        `apc_lookup_plan` still had a missing call site each. These five helpers are
+        wired into the fork's own rewritten GPU worker loops (`_run`, `_step`,
+        `_run_speculative`, `_run_diffusion`), so they are exactly the shape that
+        goes missing in a resolution — count them against upstream directly.
+        """
+        import re
+        import subprocess
+
+        helpers = (
+            "_log_prefill_started",
+            "_log_prefill_progress",
+            "_log_prefill_completed",
+            "_log_decode_progress",
+            "_request_log_id",
+        )
+        ours = open(_generation_path()).read()
+        upstream = subprocess.run(
+            ["git", "show", "upstream/main:mlx_vlm/server/generation.py"],
+            capture_output=True,
+            text=True,
+            cwd=_repo_root(),
+        ).stdout
+        if not upstream:
+            import pytest
+
+            pytest.skip("upstream/main not fetched")
+
+        for helper in helpers:
+            pattern = re.compile(rf"self\.{helper}\(")
+            mine = len(pattern.findall(ours))
+            theirs = len(pattern.findall(upstream))
+            assert mine == theirs, (
+                f"{helper}: {mine} call site(s) here vs {theirs} upstream — "
+                "a dropped call site the per-symbol check cannot see"
+            )
+
+
+def _repo_root() -> str:
+    import pathlib
+
+    return str(pathlib.Path(__file__).resolve().parents[2])
+
+
+def _generation_path() -> str:
+    import pathlib
+
+    return str(pathlib.Path(__file__).resolve().parents[1] / "server" / "generation.py")

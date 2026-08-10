@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 import uuid
@@ -10,6 +11,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import HTTPException
 
 from ..prompt_utils import THINKING_FORMATS, ThinkingFormat, detect_thinking_format
+
+logger = logging.getLogger("mlx_vlm.server")
 
 RESPONSE_STORE_LIMIT = int(os.environ.get("MLX_VLM_RESPONSE_STORE_LIMIT", "1024"))
 _CONTENT_MARKERS = ("<|START_TEXT|>", "<|END_TEXT|>")
@@ -283,7 +286,7 @@ def process_tool_calls(model_output: str, tool_module, tools):
                             },
                         )
                 except Exception:
-                    print(f"Invalid tool call: {call}")
+                    logger.warning("Invalid tool call: %s", call)
     return dict(calls=called_tools, remaining_text=remaining)
 
 

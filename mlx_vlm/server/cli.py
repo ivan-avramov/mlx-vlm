@@ -14,6 +14,7 @@ from ..generate import (
 from ..snapshot import DEFAULT_RING_SIZE
 from .generation import (
     DEFAULT_ENABLE_THINKING,
+    get_log_progress_interval,
     get_server_generation_defaults,
     get_server_max_tokens,
     get_server_thinking_budget,
@@ -205,6 +206,15 @@ def main():
         type=int,
         default=DEFAULT_PREFILL_STEP_SIZE,
         help="Tokens per prefill step (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--log-progress-interval",
+        type=int,
+        default=get_log_progress_interval(),
+        help=(
+            "Decoded tokens between progress log messages; 0 disables periodic "
+            "decode progress (default: %(default)s)."
+        ),
     )
     parser.add_argument(
         "--max-tokens",
@@ -567,6 +577,7 @@ def main():
         os.environ["MLX_VLM_MAX_NUM_SEQS"] = str(args.max_num_seqs)
     if args.prefill_step_size:
         os.environ["PREFILL_STEP_SIZE"] = str(args.prefill_step_size)
+    os.environ["MLX_VLM_LOG_PROGRESS_INTERVAL"] = str(args.log_progress_interval)
     os.environ["MLX_VLM_MAX_TOKENS"] = str(args.max_tokens)
     os.environ["MLX_VLM_ENABLE_THINKING"] = "1" if args.enable_thinking else "0"
     if args.thinking_budget is not None:

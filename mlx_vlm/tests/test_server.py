@@ -3113,12 +3113,27 @@ def test_chat_completions_streaming_emits_timings_on_finish(client, monkeypatch)
         for line in response.text.splitlines()
         if line.startswith("data: ") and line != "data: [DONE]"
     ]
-    timed_chunks = [chunk for chunk in chunks if chunk.get("timings") is not None]
-    assert len(timed_chunks) == 1
-    timed_chunk = timed_chunks[0]
+    timed_chunk = next(chunk for chunk in chunks if chunk.get("usage") is not None)
     assert timed_chunk["choices"] == []
     assert timed_chunk["timings"]["cache_n"] == 2
     assert timed_chunk["usage"]["prompt_tokens_details"]["cached_tokens"] == 2
+    token_chunks = [
+        chunk
+        for chunk in chunks
+        if chunk["choices"] and chunk["choices"][0]["delta"].get("content") is not None
+    ]
+    assert token_chunks[0]["timings"]["predicted_per_second"] is None
+    assert token_chunks[1]["timings"]["predicted_per_second"] > 0
+    terminal_chunk = next(
+        chunk
+        for chunk in chunks
+        if chunk["choices"] and chunk["choices"][0]["finish_reason"] == "stop"
+    )
+    assert terminal_chunk["timings"]["predicted_per_second"] > 0
+    assert (
+        timed_chunk["timings"]["predicted_per_second"]
+        == terminal_chunk["timings"]["predicted_per_second"]
+    )
 
 
 def test_chat_completions_streaming_tool_calls_emit_usage_chunk(client, monkeypatch):
@@ -4472,6 +4487,30 @@ def test_metrics_endpoint_records_chat_completion_metrics(client, monkeypatch):
 
 
 # ── Continuous batching / ResponseGenerator tests ─────────────────────
+def test_metrics_store_logs_request_lifecycle(caplog):
+    caplog.set_level(logging.INFO, logger="mlx_vlm.server")
+    metrics = server.ServerMetricsStore()
+    metrics.begin_request(endpoint="/chat/completions", model="demo", stream=True)
+    metrics.record_success(
+        {
+            "endpoint": "/chat/completions",
+            "model": "demo",
+            "stream": True,
+            "backend": "continuous_batching",
+            "prompt_tokens": 10,
+            "completion_tokens": 4,
+            "generated_tokens": 4,
+            "request_elapsed_s": 0.5,
+            "decode_elapsed_s": 0.1,
+            "prefill_tok_s": 100.0,
+            "decode_tok_s": 40.0,
+            "finish_reason": "stop",
+        }
+    )
+
+    assert "Request started: endpoint=/chat/completions model=demo" in caplog.text
+    assert "Request completed: endpoint=/chat/completions model=demo" in caplog.text
+    assert "prefill=100.0 tok/s decode=40.0 tok/s" in caplog.text
 
 
 class TestResponseGenerator:
@@ -4570,8 +4609,10 @@ class TestResponseGenerator:
 
         handled = []
         gen._collect_pending_requests = collect_pending_requests
-        gen._generate_diffusion = lambda uid, rq, raw, args, cancelled: handled.append(
-            (uid, raw, args)
+        gen._generate_diffusion = (
+            lambda uid, rq, raw, args, cancelled, log_state=None: handled.append(
+                (uid, raw, args)
+            )
         )
 
         gen._run_diffusion()
@@ -6559,6 +6600,134 @@ class TestResponseGenerator:
         assert args.enable_thinking is False
         assert args.reasoning is False
         assert args.reasoning_effort == "high"
+
+    def test_log_progress_interval_is_configurable(self, monkeypatch):
+        monkeypatch.delenv("MLX_VLM_LOG_PROGRESS_INTERVAL", raising=False)
+        assert server.get_log_progress_interval() == 10
+
+        monkeypatch.setenv("MLX_VLM_LOG_PROGRESS_INTERVAL", "7")
+        assert server.get_log_progress_interval() == 7
+
+        monkeypatch.setenv("MLX_VLM_LOG_PROGRESS_INTERVAL", "-1")
+        assert server.get_log_progress_interval() == 0
+
+    def test_debug_decode_logging_adds_token_details(self, monkeypatch, caplog):
+        monkeypatch.setenv("MLX_VLM_LOG_PROGRESS_INTERVAL", "2")
+        caplog.set_level(logging.DEBUG, logger="mlx_vlm.server")
+        info = {
+            "request_id": "req-1",
+            "queued_at": time.perf_counter() - 0.1,
+            "generated_tokens": 0,
+            "decode_started_at": None,
+        }
+
+        for token_number in range(1, 4):
+            server.ResponseGenerator._log_decode_progress(
+                1,
+                info,
+                token=token_number,
+                text=str(token_number),
+                finish_reason="stop" if token_number == 3 else None,
+            )
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert any(
+            "Decode progress: request=req-1 generated_tokens=1" in m
+            and "token_number=1 token_id=1 text='1'" in m
+            for m in messages
+        )
+        assert not any("Token streamed:" in m for m in messages)
+        assert any("Decode started: request=req-1" in m for m in messages)
+        assert any(
+            "Decode completed: request=req-1 generated_tokens=3" in m for m in messages
+        )
+
+    def test_info_decode_logging_uses_interval_without_token_details(
+        self, monkeypatch, caplog
+    ):
+        monkeypatch.setenv("MLX_VLM_LOG_PROGRESS_INTERVAL", "2")
+        caplog.set_level(logging.INFO, logger="mlx_vlm.server")
+        info = {
+            "request_id": "req-1",
+            "queued_at": time.perf_counter(),
+            "generated_tokens": 0,
+            "decode_started_at": None,
+        }
+
+        for token_number in range(1, 3):
+            server.ResponseGenerator._log_decode_progress(
+                1,
+                info,
+                token=token_number,
+                text=str(token_number),
+                finish_reason=None,
+            )
+
+        progress = [
+            record.getMessage()
+            for record in caplog.records
+            if record.getMessage().startswith("Decode progress:")
+        ]
+        assert len(progress) == 1
+        assert "generated_tokens=2" in progress[0]
+        assert "token_number=" not in progress[0]
+        assert "token_id=" not in progress[0]
+        assert "text=" not in progress[0]
+
+    def test_decode_logging_uses_one_rate_field(self, monkeypatch, caplog):
+        times = iter([10.0, 10.25])
+        monkeypatch.setattr(server_generation.time, "perf_counter", lambda: next(times))
+        caplog.set_level(logging.DEBUG, logger="mlx_vlm.server")
+        info = {
+            "request_id": "req-1",
+            "queued_at": 9.0,
+            "generated_tokens": 0,
+            "decode_started_at": None,
+            "last_token_at": None,
+        }
+
+        for token_number in range(1, 3):
+            server.ResponseGenerator._log_decode_progress(
+                1,
+                info,
+                token=token_number,
+                text=str(token_number),
+                finish_reason="stop" if token_number == 2 else None,
+            )
+
+        progress = [
+            record.getMessage()
+            for record in caplog.records
+            if record.getMessage().startswith("Decode progress:")
+        ]
+        assert "rate=n/a" in progress[0]
+        assert "rate=4.0 tok/s" in progress[1]
+        assert not any("token_rate=" in message for message in progress)
+        completed = next(
+            record.getMessage()
+            for record in caplog.records
+            if record.getMessage().startswith("Decode completed:")
+        )
+        assert "rate=4.0 tok/s" in completed
+        assert "token_rate=" not in completed
+
+    def test_chunked_prefill_logging_reports_partial_progress(self, caplog):
+        caplog.set_level(logging.INFO, logger="mlx_vlm.server")
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        prompt_batch = SimpleNamespace(
+            _processed_prompt_columns=2,
+            _inputs_embeds=mx.zeros((1, 4, 8)),
+            uids=[1],
+            _suffix_lens=[6],
+            _cached_tokens_per_row=[0],
+            _left_padding_per_row=[0],
+            _right_pad_per_row=None,
+        )
+        active = {1: {"request_id": "req-1", "prefill_processed": -1}}
+
+        gen._log_prefill_progress(SimpleNamespace(_prompt_batch=prompt_batch), active)
+
+        assert "Prefill progress: request=req-1 tokens=2/6 (33.3%)" in caplog.text
 
 
 class TestSplitThinking:

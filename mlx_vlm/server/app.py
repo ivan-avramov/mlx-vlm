@@ -458,14 +458,16 @@ def _unload_model_cache_group(cache_group: str) -> bool:
     if not cache:
         return False
 
-    print(
-        f"Unloading {cache_group} model: {cache.get('model_path')}, "
-        f"Adapter: {cache.get('adapter_path')}"
+    logger.info(
+        "Unloading %s model: %s (adapter=%s)",
+        cache_group,
+        cache.get("model_path"),
+        cache.get("adapter_path"),
     )
 
     response_generator = cache.get("response_generator")
     if response_generator is not None:
-        print("Stopping ResponseGenerator...")
+        logger.info("Stopping response generator.")
         response_generator.stop_and_join()
         if runtime.response_generator is response_generator:
             runtime.response_generator = None
@@ -543,7 +545,7 @@ def get_cached_model(
         if cache_group == "text_generation":
             runtime.response_generator = cached_cache.get("response_generator")
             runtime.apc_manager = cached_cache.get("apc_manager")
-        print(f"Using cached model: {model_path}, Adapter: {adapter_path}")
+        logger.debug("Using cached model: %s (adapter=%s)", model_path, adapter_path)
         return (
             cached_cache["model"],
             cached_cache["processor"],

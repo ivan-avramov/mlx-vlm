@@ -467,9 +467,11 @@ class GenerationTimings(BaseModel):
         prompt_tokens: int,
         output_tokens: int,
     ) -> "GenerationTimings":
-        generation_tps = metrics.generation_tps or cls._derive_gen_tps(
-            metrics.token_times
-        )
+        generation_tps = getattr(metrics, "rate", None)
+        if generation_tps is None:
+            generation_tps = metrics.generation_tps or cls._derive_gen_tps(
+                metrics.token_times
+            )
         cached_tokens = metrics.cached_tokens
         prompt_n = max(0, int(prompt_tokens) - int(cached_tokens))
         prompt_s = prompt_tokens / metrics.prompt_tps if metrics.prompt_tps else 0.0
@@ -495,6 +497,12 @@ class GenerationTimings(BaseModel):
             draft_n=getattr(metrics, "draft_n", None),
             draft_n_accepted=getattr(metrics, "draft_n_accepted", None),
         )
+
+
+class StreamingTimings(BaseModel):
+    """Timing data available while a response is still streaming."""
+
+    predicted_per_second: Optional[float] = None
 
 
 class OpenAIErrorObject(BaseModel):
@@ -608,6 +616,7 @@ class ResponseOutputTextDeltaEvent(BaseStreamEvent):
     output_index: int
     content_index: int
     delta: str
+    timings: StreamingTimings
 
 
 class ResponseOutputTextDoneEvent(BaseStreamEvent):
@@ -616,6 +625,7 @@ class ResponseOutputTextDoneEvent(BaseStreamEvent):
     output_index: int
     content_index: int
     text: str
+    timings: StreamingTimings
 
 
 class ResponseContentPartDoneEvent(BaseStreamEvent):
@@ -894,7 +904,7 @@ class ChatStreamChunk(BaseModel):
     model: str = ""
     choices: List[ChatStreamChoice] = []
     usage: Optional[UsageStats] = None
-    timings: Optional[GenerationTimings] = None
+    timings: Optional[Union[GenerationTimings, StreamingTimings]] = None
 
     def to_sse_json(self) -> str:
         """Serialize for SSE. Omits the llama.cpp-style `timings` extension
