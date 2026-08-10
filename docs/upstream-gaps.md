@@ -525,13 +525,15 @@ restored and `vision.py` stale, the tests fail `TypeError: VisionModel.__call__(
 takes 2 positional arguments but 3 were given`. Landing the pair together is
 still the rule.
 
-## The dropped-hunk report has bottomed out — 19 commits, all closed by review
+## The dropped-hunk report has bottomed out — 18 commits, all closed by review
 
 **Settled 2026-08-10, and this is the section to read before re-investigating any
 `find_dropped_hunks.py` hit.** The wide pass
-(`--min-lines 1 --min-share 0.05 --max-commits 400`) went 72 -> 43 -> 24 -> **19**
-commits. Those 19 will keep appearing forever, and that is correct: **every one of
-them now has an established disposition, and none is missing content.** The report
+(`--min-lines 1 --min-share 0.05 --max-commits 400`) went 72 -> 43 -> 24 -> 19 ->
+**18** commits. Those 18 will keep appearing forever, and that is correct: **every one
+of them now has an established disposition, and none is missing content.** The 19th,
+`b590c747`, is the only entry ever to LEAVE the report, and it took converging a file
+to byte-identical to do it — see its bullet below. The report
 attributes by line CONTENT, so a reviewed supersession, a rewrite, or even a local
 variable rename reads identically to a dropped hunk.
 
@@ -558,10 +560,20 @@ markers, which name the commit:
 * **`a492e47d`** (6) — `generate/common.py`'s inline uniform-quant path, replaced
   deliberately. Its `apc.py` line is a content-attribution artifact: all 12 of the
   lines it added there are present.
-* **`b590c747`** (8) — fork work (`f0d50c90`, ours, four days before upstream's own
-  fix), marked at `qwen3_5_moe.py:59`. **Reclassify rather than close:** the only
-  difference is probing `gate_proj` vs `up_proj`, equivalent for any real SwiGLU
-  checkpoint, so it is a convergence candidate carrying a permanent conflict site.
+* **`b590c747`** (8) — **RETIRED from the report entirely by `6be3f881` (2026-08-10),
+  the only entry ever to leave this list.** It was recorded here as fork work
+  (`f0d50c90`, ours, four days before upstream's own fix) differing only in probing
+  `gate_proj` where upstream probes `up_proj`. That equivalence was then *confirmed*
+  rather than assumed: upstream's `sanitize` was extracted from `upstream/main` and
+  both were run over every expert-key layout. Identical output for all three
+  projections present, for no expert keys, and for the fused `gate_up_proj` tensor;
+  both `KeyError` for gate+up-without-down. The two probes are **exact mirror
+  images** on the only cases where they differ, and both of those are non-layouts (an
+  expert with no gate projection is not SwiGLU; with no up projection it is not a
+  gated MLP). So the fork's version bought nothing and cost a permanent conflict
+  site. `qwen3_5_moe.py` is now byte-identical to upstream, and since `b590c747` is a
+  single-file commit whose entire content is that branch, it stops being reported.
+  The knowledge lives in the fork-only `tests/test_qwen3_5_moe_sanitize.py`.
 
 Closed because upstream's own copy is the defect:
 
