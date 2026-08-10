@@ -42,6 +42,7 @@ from .responses_state import (  # Fork: _CONTENT_MARKERS is fork-only (08723a3f'
     _CONTENT_MARKERS,
     ThinkingStreamState,
     _normalize_response_input,
+    _partial_tag_start_pos,
     _response_chain_items,
     _response_items_to_chat,
     _response_output_items_from_text,
@@ -2967,8 +2968,25 @@ async def completions_endpoint(request: Request):
                             emitted = truncated
                             finish_reason = "stop"
                         else:
-                            delta = full_output[len(emitted) :]
-                            emitted = full_output
+                            # Fork: hold back a trailing PARTIAL stop sequence. A
+                            # `_truncate_at_stop` check alone only fires once the whole
+                            # sequence is in `full_output`, by which point its leading
+                            # bytes have already been streamed as earlier tokens —
+                            # `stop="END"` arriving as "EN" + "D" emitted "EN" to the
+                            # client and then withheld nothing, because by the time the
+                            # match existed the delta was empty. Same failure the
+                            # thinking-marker code above documents, same helper.
+                            # `max()` because `emitted` must never shrink: a partial
+                            # can start before bytes already sent, and those cannot be
+                            # unstreamed.
+                            safe_end = len(full_output)
+                            partial_at = _partial_tag_start_pos(
+                                full_output, tuple(stop_sequences)
+                            )
+                            if partial_at is not None:
+                                safe_end = max(len(emitted), partial_at)
+                            delta = full_output[len(emitted) : safe_end]
+                            emitted = full_output[:safe_end]
 
                         if delta:
                             chunk = CompletionStreamChunk(
@@ -2984,6 +3002,22 @@ async def completions_endpoint(request: Request):
                         if getattr(token, "finish_reason", None):
                             finish_reason = token.finish_reason
                             break
+
+                    # Fork: flush whatever the partial-stop hold-back above is still
+                    # sitting on. A generation ending in "EN" with stop="END" never
+                    # completes the sequence, so those bytes are real output — without
+                    # this they are silently dropped, which is a worse bug than the
+                    # leak the hold-back fixes.
+                    if not stop_hit and len(emitted) < len(full_output):
+                        tail = full_output[len(emitted) :]
+                        emitted = full_output
+                        chunk = CompletionStreamChunk(
+                            id=request_id,
+                            created=created,
+                            model=completion_request.model,
+                            choices=[CompletionStreamChoice(text=tail, index=0)],
+                        )
+                        yield f"data: {chunk.to_sse_json()}\n\n"
 
                     finish_reason = finish_reason or "stop"
                     yield (

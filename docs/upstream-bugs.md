@@ -15,7 +15,7 @@ defect, and to explain the one divergence we carry *because* upstream is wrong
   task; it was never asked for and nothing else in `AGENTS.md`, `upstream-gaps.md` or
   `memory.md` ever proposed it. Don't re-propose it.
 * **These are not to be patched locally either.** A local fix to upstream code is a
-  new permanent conflict site, and for items 1-3 our copy is byte-identical to
+  new permanent conflict site, and for items 1-3 and 5 our copy is byte-identical to
   upstream's — which is the state worth keeping. Item 4 is the exception and is
   already diverged deliberately; its marker and guard say so.
 
@@ -173,3 +173,81 @@ vacuous if mlx ever implements it.
 
 The fix upstream is one line: the same `isinstance` guard its other two branches
 already use.
+
+## 5. Anthropic streaming leaks the stop sequence; non-streaming does not
+
+`mlx_vlm/server/anthropic.py`'s streaming path emits every text delta verbatim and
+applies `_apply_stop_sequences` only at the very end, **discarding the truncated
+text**:
+
+```python
+stop_sequence = None
+if not parsed_tool_calls:
+    _, stop_sequence = _apply_stop_sequences(      # line 782 — note the `_,`
+        text_output, request.stop_sequences
+    )
+```
+
+Only the matched sequence name survives, for `message_delta.stop_reason`. The
+non-streaming path at line 953 keeps both halves and does truncate:
+
+```python
+response_text, stop_sequence = _apply_stop_sequences(
+    response_text, request.stop_sequences
+)
+```
+
+So the same request returns different text depending on `stream`. Demonstrated against
+this tree with `stop_sequences: ["END"]` and a generation of `"keep" + "END" + "drop"`:
+
+| | text | stop_reason | stop_sequence |
+|---|---|---|---|
+| non-streaming | `'keep'` | `stop_sequence` | `END` |
+| streaming | `'keepENDdrop'` | `stop_sequence` | `END` |
+
+The streaming client is told a stop sequence fired *and* handed the sequence plus
+everything after it. `stop_sequences` exists precisely to prevent that.
+
+**This fork carries `anthropic.py` byte-identical to upstream** — `check_body_divergence.py
+--file` reports 21 of 21 shared bodies identical and 28 of 28 module statements
+identical — and `git log -S` puts the block in upstream's #1203. So it is not patched
+here, per this file's header: a local fix would turn a perfectly aligned file into a
+permanent conflict site.
+
+Reproduce (drives the real endpoint through `TestClient`):
+
+```python
+import json
+from types import SimpleNamespace
+from unittest.mock import patch
+from fastapi.testclient import TestClient
+import mlx_vlm.server as server
+import mlx_vlm.server.anthropic as anth
+from mlx_vlm.generate import GenerationResult
+
+BODY = {"model": "demo", "max_tokens": 32, "stop_sequences": ["END"],
+        "messages": [{"role": "user", "content": "hi"}]}
+fake = lambda: (SimpleNamespace(), SimpleNamespace(), SimpleNamespace(model_type="qwen2_vl"))
+toks = [GenerationResult(text=t, prompt_tokens=5, generation_tokens=1,
+                         finish_reason=("stop" if t == "drop" else None))
+        for t in ["keep", "END", "drop"]]
+
+with TestClient(server.app) as c:
+    server.runtime.response_generator = None
+    with (patch.object(anth, "get_cached_model", return_value=fake()),
+          patch.object(anth, "apply_chat_template", return_value="p"),
+          patch.object(anth, "stream_generate", side_effect=lambda **k: iter(toks))):
+        r = c.post("/v1/messages", json={**BODY, "stream": True})
+    print("".join(json.loads(l[6:])["delta"]["text"]
+                  for l in r.text.splitlines()
+                  if l.startswith("data: ")
+                  and json.loads(l[6:]).get("type") == "content_block_delta"))
+    # keepENDdrop  — expected: keep
+```
+
+The fix upstream is to truncate the accumulated text before emitting each delta and
+hold back a trailing *partial* sequence, which is what
+`responses_state._partial_tag_start_pos` already does for thinking markers. **The
+fork's own `/v1/completions` endpoint had the partial half of this same bug** — see
+the `# Fork:` comment on its streaming stop hold-back and
+`tests/test_completions_endpoint.py`.
