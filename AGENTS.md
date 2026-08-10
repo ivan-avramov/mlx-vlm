@@ -6,6 +6,59 @@ MLX-VLM is a Python package for inference and fine-tuning of Vision Language
 Models and Omni (audio/video) models on Apple Silicon using MLX. 50+ model
 architectures via a plugin-based model system.
 
+## Starting a session: verify the tree before believing anything
+
+Takes ~6 minutes and it has repeatedly been worth it. Every number in this file goes
+stale eventually; the tree does not lie.
+
+```bash
+cd /Users/ia87221/ws/mlx-vlm
+git status --short                                           # expect clean
+git rev-parse origin/main                                    # expect == HEAD
+git fetch upstream && git log --oneline HEAD..upstream/main   # MUST be empty; merge if not
+
+(cd mlx_vlm && ../.venv/bin/python -m pytest -q ./tests --ignore=tests/test_smoke.py)
+
+.venv/bin/python dev/check_upstream_parity.py
+.venv/bin/python dev/check_upstream_symbols.py
+.venv/bin/python dev/check_upstream_deletions.py     # ~70s
+.venv/bin/python dev/check_dead_helpers.py
+.venv/bin/python dev/check_fork_markers.py
+.venv/bin/python dev/check_body_divergence.py        # ~3s
+.venv/bin/python dev/check_upstream_registries.py    # ~13s
+
+grep -cE '^mlx_vlm' .symbol-exclusions .deletion-exclusions .fork-marker-allowlist \
+    .dead-helper-exclusions .body-divergence-exclusions .registry-exclusions
+# expect 14, 0, 0, 0, 0, 5 — see "Exclusion baselines" below
+grep -cE '^mlx_vlm.*# baseline: pre-existing divergence, unreviewed' .symbol-exclusions
+# expect 0 — every remaining exclusion carries a real reason
+```
+
+The pytest `cd` **must** be in a subshell as written. After any bare `cd mlx_vlm`,
+`.venv/bin/python` is *not found* — come back to the repo root.
+
+### Exclusion baselines
+
+Seven gating audits, each with its own reviewed baseline. **These are the progress
+signal, not any report's count.**
+
+| file | baseline | meaning |
+|---|---|---|
+| `.symbol-exclusions` | **14** | upstream symbols we deliberately lack; zero unreviewed |
+| `.deletion-exclusions` | **0** | upstream deletions we deliberately kept |
+| `.fork-marker-allowlist` | **0** | files not yet under the `# Fork:` convention |
+| `.dead-helper-exclusions` | **0** | upstream-called helpers unreachable here |
+| `.body-divergence-exclusions` | **0** | misalignments claimed deliberate |
+| `.registry-exclusions` | **5** | re-exports the fork replaced, all reviewed |
+
+An empty file is **not** a reason to delete it — each keeps its header and RESOLVED
+notes, and the next merge that adds a fork hunk to a shared file will need an entry.
+
+Two non-gating lead generators, which are read rather than gated on:
+`find_dropped_hunks.py` (**18** commits, all closed by review — see `upstream-gaps.md`,
+"the dropped-hunk report has bottomed out"; that count will never reach zero) and
+`find_untested_fork_code.py` (**10**, all confirmed executed by a coverage run).
+
 ## Fork & branches
 
 A fork of Blaizzy/mlx-vlm. `main` is the only branch and carries local work on
@@ -389,6 +442,17 @@ instead of above `class TestResponseGenerator` where upstream has it — a previ
 node-based move had landed on the wrong side of it. After acting on a RELOCATED
 finding, check banners by eye.
 
+**Two shapes to expect when reading `gone`, both from real passes:**
+
+- **A textual `gone` cannot see a BEHAVIOURAL superset.**
+  `server/app.py::_count_thinking_tag_tokens` reads gone=7 and its "strict superset"
+  marker holds — upstream's accumulator (`count = 4` / `elif … count = 2` /
+  `return count`) versus our early returns is the same function. Read the bodies before
+  concluding a marker is false.
+- **A big `gone` is not a big problem.** `tests/test_generate.py::TestPrefixCacheReuseTrim`
+  reads gone=60, the largest single number in the sweep, and every line is the body of
+  one of 9 already-reviewed `.symbol-exclusions` methods.
+
 **A third caveat, and the reason this check gates rather than merely reports:
 `# Fork: placement only` is a lie waiting to be written.** All three markers in this
 tree that said it were false — two claimed "byte-identical body ... Nothing to
@@ -487,6 +551,13 @@ exercised through its caller does not need an entry), which produces ~18 unrevie
 ones. And unlike every other check here, a hit is not a correctness claim — a dropped
 upstream hunk is *wrong*, untested fork code is *risk*, and risk gets ranked and worked
 down rather than gated.
+
+**The method that worked, and it is the point.** Read the code for its contract, write
+the tests that pin it, and let the failures find the bug. Of five items worked this way,
+two were bugs (`/v1/completions`' partial stop sequence, gpt-oss's mangled first word)
+and three were not — and *saying so* is the deliverable, not a reason to manufacture a
+fix. But: **do not write tests that assert current behaviour without deciding it is
+correct first.** That is how the suite came to certify #1402's cache-key bug.
 
 **Read the columns asymmetrically.** It counts textual references, not coverage. A zero
 in `tests` is a real signal worth acting on; a non-zero is **not** evidence of coverage
@@ -778,6 +849,17 @@ fallback and by two test files.
   with online softmax and `mx.eval` between K-tiles, so peak memory is ~O(chunk)
   rather than O(context). Upstream dequantizes the whole state. This is the only
   reason `base.py` is not byte-identical to upstream.
+- **`models/qwen3_5_moe/qwen3_5_moe.py` is byte-identical to upstream ON PURPOSE**
+  (`6be3f881`). The fork had its own unfused-expert probe keyed on `gate_proj` where
+  upstream keys on `up_proj`; the two were shown identical on every layout that can
+  exist and exact mirror images on the two that cannot (an expert with no gate
+  projection is not SwiGLU; with no up projection it is not a gated MLP). Do not
+  reintroduce the fork probe. `tests/test_qwen3_5_moe_sanitize.py` is fork-only and is
+  now the sole carrier of that knowledge, with
+  `test_a_partial_expert_layout_raises` there to stop it coming back.
+- **`utils.py`'s remaining 12 missing upstream lines** are the fork's `print`/`logging`
+  → module-logger conversions (`2f5e01dd`) plus one comment inside the same converted
+  block. Not a gap.
 - **`qwen3_5{,_moe}` MoE `sanitize()`'s expert-fusion branch** handles an unfused
   expert layout. Note the *norm-shift gate* in those files is **no longer a
   divergence** — it is byte-identical to upstream, which landed the same fix in
@@ -858,9 +940,18 @@ expected and the reformat is still correct.
 
 ## Traps — every one of these cost a real cycle
 
-Collected from `docs/handoff-2026-08-10.md` when that file was retired (2026-08-10,
-its §2 empty). Ordered
-roughly by how often they bite.
+Collected from the retired handoff files (`handoff-2026-08-10.md`, then
+`handoff-2026-08-11.md`), each deleted per its own "delete this when §2 is empty"
+instruction once its task list was drained. Ordered roughly by how often they bite.
+
+**There is no handoff file now, deliberately.** Both were task lists, and a task list
+holding no tasks is the document most likely to go stale next — the last one needed four
+separate correction commits for numbers that restated themselves, including three
+consecutive revisions of a single unpushed-commit count. Standing work lives in this
+file as rules ("merge weekly", "re-run the sweep after each merge"); state lives in the
+tree and is verified by the cold-start section at the top; history lives in `memory.md`
+and `docs/upstream-gaps.md`. If a future session needs to hand off *tasks*, write a new
+one and delete it on the same trigger.
 
 **Environment and tooling**
 
