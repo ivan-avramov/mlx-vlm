@@ -18,7 +18,7 @@ from tqdm import tqdm
 from .. import apc as _apc
 from ..kv_quant import from_legacy as kv_quant_from_legacy
 from ..models import cache
-from ..models.epicache import EpiCacheKVCache
+from ..models.epicache import EpiCacheKVCache  # Fork: EpiCache is fork-only
 from ..prompt_utils import apply_chat_template
 from ..sample_utils import make_logits_processors, make_sampler, top_p_sampling
 from ..speculative.utils import (
@@ -30,7 +30,7 @@ from ..speculative.utils import (
 )
 from ..turboquant import BatchTurboQuantKVCache, turboquant_enabled
 from ..utils import group_images_by_shape, prepare_inputs, should_add_special_tokens
-from .common import (
+from .common import (  # Fork: the 5e9b9503 engine port's own helpers
     DEFAULT_KV_GROUP_SIZE,
     DEFAULT_KV_QUANT_SCHEME,
     DEFAULT_QUANTIZED_KV_START,
@@ -48,6 +48,8 @@ from .common import (
 )
 from .types import GenerateKwargs, ProcessorLike, Unpack
 
+# Fork: the logger name is namespaceable via MLX_VLM_LOG_NAME so an embedding host
+# can route our records; upstream hard-codes "mlx_vlm.generate".
 logger = logging.getLogger(f"{os.environ.get('MLX_VLM_LOG_NAME', 'mlx_vlm')}.generate")
 
 DEFAULT_MAX_TOKENS = 2048
@@ -156,6 +158,9 @@ def normalize_resize_shape(values):
     return (values[0], values[0]) if len(values) == 1 else tuple(values)
 
 
+# Fork: suffix decoding is grammar-blind, so structured output falls back to plain
+# decode rather than letting the drafter propose tokens the grammar will reject
+# (863441c9). Upstream has no suffix drafter.
 def _suffix_structured_fallback(draft_kind, logits_processors, processors=None) -> bool:
     """Whether to skip speculation and decode plainly for this request.
 
@@ -292,6 +297,11 @@ def generate_step(
         Generator[Tuple[mx.array, mx.array], None, None]: A generator producing
           one token and a vector of log probabilities.
     """
+    # Fork: upstream's decode loop plus the fork's KV pre-allocation
+    # (kv_prealloc_tokens), EpiCache eviction hooks, the suffix drafter, APC
+    # block/exact modes and the snapshot ring. The lazy `_get_generation_stream()`
+    # replaces upstream's eager `generation_stream` so importing the package does
+    # not create a Metal stream. Upstream's own branches are unchanged.
 
     serialize_kv_quantization = kwargs.pop("serialize_kv_quantization", False)
     quantize_cache_fn = functools.partial(
@@ -924,6 +934,10 @@ def _make_cache(
     - ``"uniform"`` → ``BatchQuantizedKVCache`` (``mx.quantize``)
     - ``"turboquant"`` or fractional *kv_bits* → ``BatchTurboQuantKVCache``
     """
+    # Fork: same isinstance ladder as upstream, extended with the prealloc cache
+    # variants, the TurboQuant split-bits schemes and EpiCache wrapping. Every
+    # `cache.BatchKVCache(...)` upstream builds is still built here — the calls
+    # differ only by the extra prealloc/quant kwargs threaded in.
     _batch_policy = kv_quant_from_legacy(
         kv_bits,
         kv_quant_scheme,
@@ -1770,6 +1784,9 @@ class PromptProcessingBatch:
     a GenerationBatch when prompt processing is complete.
     """
 
+    # Fork: chunked multi-row prefill with right-padding, APC warm-row admission and
+    # the snapshot ring. Upstream's class prefills a single padded batch.
+
     def __init__(
         self,
         model: nn.Module,
@@ -2365,6 +2382,10 @@ class BatchGenerator:
     - prompt_responses contains completed prompt-batch timing stats
     - generation_responses is a list of GenerationBatch.Response objects
     """
+
+    # Fork: continuous batching with APC (block + exact modes), the suffix drafter,
+    # EpiCache eviction per prefill chunk and the KeepAlive heartbeat for the
+    # cached-request path. See the marked methods inside for the specifics.
 
     def __init__(
         self,
