@@ -123,8 +123,48 @@
 #     Missing upstream lines went 30 -> 6, and all 6 are the EpiCache/turboquant rewrites.
 #     NB AGENTS.md's note that this file's norm-shift gate was protected fork work was
 #     already known wrong; nothing here depended on it.
+#   apc.py — CONVERGED, not marked, and the reason is the most reusable thing in this
+#     file. It was the largest entry here for weeks (36 sites / 75 hunks, 554 missing
+#     upstream lines against 567 added) and every description of it — this file's own
+#     entry, the handoff's §2g — called it "a rewrite rather than a set of hunks" and
+#     budgeted it accordingly. It was not a rewrite. It was a REORDERING.
 #
-# Current standing (2026-08-10): 7 files / 98 sites, down from 32 files / 175 sites. Every
+#     What settled it in one step: AST-compare the two files def by def. Of 76 shared
+#     top-level definitions, **74 had byte-identical bodies**, all 23 module-level
+#     statements were identical, and the whole 554-line delta was four block moves left
+#     over from the fork's own cluster-by-cluster port (0f359e53). The genuine fork
+#     content was FOUR things: `_kv_prealloc_floor` + `_resolve_turn_capacity`
+#     (fork-only, 739f7ff1 / 3c8bf750) and two `min_capacity_tokens=max(...,
+#     _kv_prealloc_floor())` call sites in APCManager. Two further "divergences" were
+#     artifacts: `resident_bytes`/`_resident_bytes_locked` sat at a different position
+#     inside APCManager, and `_clone_layer_major_kv_cache_for_apc` had an ABSOLUTE
+#     `from mlx_vlm.models.cache import KVCache` where upstream is relative — the only
+#     absolute mlx_vlm import in the file, left by 9065b024, i.e. the same
+#     conversion-artifact shape as the masks.py non-divergence above.
+#
+#     So the exit was §2f's test-file method applied to a library file: take upstream's
+#     file as the base, re-apply the fork content, mark it. `git diff upstream/main --
+#     mlx_vlm/apc.py` is now THREE hunks, all marked. RESTORED on the way in, both from
+#     3de5bada (#1566), whose other three files had all landed: the
+#     `apc_trace("store", ...)` call site (see below) and `_env_truthy("APC_DISK_TRACE")`.
+#
+#     THE LESSON: before sizing a big diverged file, AST-diff the definition bodies.
+#     "554 missing lines" and "36 sites" measure alignment, not content, and for a
+#     reordered file they measure it wrongly by two orders of magnitude. Do this for
+#     turboquant.py (118/529) and dispatch.py (125/377) before budgeting either.
+#
+#     The store trace also deserves its own note, because it beat all six audits at
+#     once and is the cleanest "helper landed, call site dropped" in the tree: parity
+#     and symbols saw `apc_trace` present, deletions saw nothing removed, fork-markers
+#     had apc.py allowlisted, and `check_dead_helpers.py` is PER-SYMBOL — `apc_trace`
+#     has two other callers, so it read as reachable. And #1566's own restored test
+#     calls `apc_trace("store", ...)` DIRECTLY rather than driving `store_exact_cache`,
+#     so it passed throughout. With APC_TRACE=1 the store event simply never logged,
+#     against a README that promises it. Guard:
+#     test_dropped_upstream_guards.py::TestApcStoreEmitsItsTrace.
+#
+# Current standing (2026-08-10): 6 files / 61 sites / 127 hunks, down from 32 files /
+# 175 sites. Re-run `--summary`; do not trust this line either. Every
 # diverged file NOT listed here is marked, including
 # server/request_normalization.py — the gen-args union added fork hunks to a file
 # that had been byte-identical to upstream, and this check caught them before the
@@ -139,7 +179,6 @@
 
 # --- Heavy fork rewrites. AGENTS.md names these as the false-positive-prone
 # --- files; site-by-site provenance is the bulk of the remaining work.
-mlx_vlm/apc.py  # 36 sites / 75 hunks — still the largest block, and now APPROACHABLE: its LEADS blocker is gone. 8422ece8 (#1638) is fully resolved as of 2026-08-10 — the ar.py half (semantic_extra_hash, the media-blind APC key) and the dispatch.py half (commit_prefix_blocks) both landed in 68ac2dc1, and .deletion-exclusions no longer records anything here. A rewrite rather than a set of hunks: 361 -U0 hunks collapse into 4 default-context regions, so expect to reason per region
 mlx_vlm/server/generation.py  # 14 sites / 21 hunks. Carries the fork's ResponseGenerator + GPU worker rewrite. LEADS is CLEARED as of 2026-08-10: cfcc36d9 (#1634 generation logging) restored in 682043f5 with all 8 of its .symbol-exclusions entries retired, 29b6c00b (#1508 diffusion unification) in d3a55800, and the sampler commits 36331ea7/b739dfa4/67ca1f05 in a47e7860. The diffusion lane and all five _log_* helpers are now byte-identical to upstream, so do NOT re-derive them from this file's divergence — what remains is genuine fork rewrite
 mlx_vlm/generate/dispatch.py  # 8 sites / 26 hunks. LEADS is CLEARED: f044f36a's dispatch half landed earlier and its generation.py half via d3a55800; a30180a6's signatures in 68ac2dc1. The two .symbol-exclusions entries here (_cache_fully_retained, _prefix_cache_trim_amount) are REVIEWED deliberate divergences superseded by the fork's snapshot ring — those two are ready to mark
 mlx_vlm/server/openai.py  # 18 sites / 49 hunks. LEADS mostly cleared: f044f36a resolved, cfcc36d9's openai half (the StreamingTimings plumbing) in 682043f5, f3bc6e81 (#1412, the finalizer cache clear) and 84ebae6e (#1641) in 4bd99ca1. 6a8cdff6 (#1411) is also resolved. Still reported here: 4d468e8575 (#1492) and b3d2380d1d (#1266), a few lines each — resolve before marking. NOTE the fork rewrote the streaming chat-completions thinking machinery around THINKING_FORMATS while /v1/responses uses upstream's ThinkingStreamState; 08723a3f unioned their marker sets, so treat those two paths as one decision, not two
@@ -155,8 +194,10 @@ mlx_vlm/turboquant.py  # 7 sites / 14 hunks. CORRECTION (2026-08-10): an earlier
 # --- a file with many needs each one accounted for before any marker goes in:
 # ---   [common.py 28/848 CLEARED] · [qwen3_5/language.py 30/121 CLEARED, now 6/94]
 # ---   [utils.py 32/171 REVIEWED, now 19/159, one named blocker]
+# ---   [apc.py 554/567 CONVERGED, now 2/35 -- it was a REORDERING, not a rewrite;
+# ---    AST-diff bodies before sizing any file here, see its RESOLVED note above]
 # ---   openai.py 76/905 · generation.py 92/665 · turboquant.py 118/529
-# ---   dispatch.py 125/377 · test_generate.py 251/297 · apc.py 554/567
+# ---   dispatch.py 125/377 · test_generate.py 251/297
 # --- ar.py was 26/233 and is now cleared: all 26 were rewrite artifacts, confirmed by
 # --- equal-count spot checks (speculative_prefill_capture_kwargs 6/6, BatchKVCache 7/7,
 # --- logging.getLogger 1/1) plus fork-only _get_generation_stream (4/0).

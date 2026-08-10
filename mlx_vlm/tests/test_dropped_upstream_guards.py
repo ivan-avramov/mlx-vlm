@@ -1531,3 +1531,65 @@ class TestSubmoduleSanitizeGuardsOnMissingConfigs:
             "self.talker.sanitize",
         ):
             assert submodule in source, f"{submodule} is no longer reached"
+
+
+class TestApcStoreEmitsItsTrace:
+    """`3de5bada` (#1566) — `APC_TRACE` store event, dropped from `apc.py`.
+
+    The purest instance of "helper landed, call site dropped" in the tree, and it
+    beat all six audits at once. `apc_trace` is present (parity, symbols), nothing
+    was deleted (deletions), `apc.py` is allowlisted (fork markers), and
+    `check_dead_helpers.py` is per-symbol — `apc_trace` has two other callers
+    (`reject`, `self_check`), so it reads as reachable while the `store` call site
+    is gone. Every other file of #1566 landed: `tests/test_apc_observability.py`
+    byte-identical, `server/app.py`'s self-check wiring, and the README row
+    promising "greppable store/reject/self-check log lines".
+
+    And the restored upstream test does not catch it, which is the point:
+    `test_trace_emits_logger_info_when_enabled` calls `apc_trace("store", ...)`
+    **directly**, so it exercises the helper rather than the site. Its sibling
+    `test_reject_records_emit_trace` drives `store_exact_cache` end to end — for
+    the reject path only. This guard is the missing success-path half.
+    """
+
+    def test_successful_exact_store_logs_the_store_event(self, monkeypatch, caplog):
+        import logging
+
+        import mlx.core as mx
+
+        from mlx_vlm.apc import APCManager
+        from mlx_vlm.models.cache import KVCache
+
+        monkeypatch.setenv("APC_TRACE", "1")
+
+        cache = KVCache()
+        cache.keys = mx.ones((1, 1, 4, 2))
+        cache.values = mx.ones((1, 1, 4, 2))
+        cache.offset = 4
+        manager = APCManager(num_blocks=4, block_size=4)
+
+        with caplog.at_level(logging.INFO, logger="mlx_vlm.apc"):
+            assert manager.store_exact_cache([1, 2, 3, 4], [cache]) is True
+
+        messages = [r.message for r in caplog.records]
+        assert any(
+            "APC_TRACE store" in m for m in messages
+        ), f"store succeeded but emitted no trace; got {messages}"
+        assert any("mode=exact" in m for m in messages)
+        assert any("token_len=4" in m for m in messages)
+        assert any("layers=1" in m for m in messages)
+
+    def test_disk_trace_flag_goes_through_the_shared_helper(self):
+        """`_env_truthy("APC_DISK_TRACE")` — #1566's other dropped `apc.py` site.
+
+        The helper landed and this call site kept the pre-refactor inline
+        `os.environ.get(...).lower() in (...)`. Equivalent, so the guard is
+        structural: it keeps the two flags reading the same predicate.
+        """
+        import inspect
+
+        import mlx_vlm.apc as apc
+
+        source = inspect.getsource(apc.DiskBlockStore.load_layer_major_prefix)
+        assert '_env_truthy("APC_DISK_TRACE")' in source
+        assert 'os.environ.get("APC_DISK_TRACE"' not in source
