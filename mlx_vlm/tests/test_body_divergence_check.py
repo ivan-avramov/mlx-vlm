@@ -545,3 +545,67 @@ def beta(y):
         file_wide = sum(c for c, _ in cmp.absent_from_file(name))
         assert per_def > 50, per_def
         assert file_wide < 5, file_wide
+
+
+class TestSweep:
+    """`--sweep` is the marker-review worklist. Its only job is to rank correctly.
+
+    A report cannot be "more permissive" the way a gate can, so the risk here is
+    different: ranking by the wrong number sends the reader to the wrong definition
+    first. That already happened once — ranking by `absent` put a rewritten Metal
+    kernel on top with 64 of its 66 lines sitting in an ours-only sibling.
+    """
+
+    def _comparisons(self, cbd):
+        superset = cbd.FileComparison(
+            "a.py",
+            "def f(x):\n    return x\n",
+            "def f(x):\n    log(x)\n    return x\n",
+        )
+        small_gone = cbd.FileComparison(
+            "b.py",
+            "def g(x):\n    return helper(x)\n",
+            "def g(x):\n    return other(x)\n",
+        )
+        big_absent_no_gone = cbd.FileComparison(
+            "c.py",
+            "def h(x):\n    a = 1\n    b = 2\n    c = 3\n    return a\n",
+            "def h(x):\n    return rebuilt(x)\n\n\ndef h_legacy(x):\n"
+            "    a = 1\n    b = 2\n    c = 3\n    return a\n",
+        )
+        return superset, small_gone, big_absent_no_gone
+
+    def test_it_ranks_by_gone_not_absent(self, cbd, capsys):
+        """The regression this mode was rewritten for."""
+        _, small_gone, big_absent_no_gone = self._comparisons(cbd)
+        assert sum(c for c, _ in big_absent_no_gone.absent_upstream_lines("h")) > sum(
+            c for c, _ in small_gone.absent_upstream_lines("g")
+        )
+        assert big_absent_no_gone.absent_from_file("h") == []
+
+        cbd.report_sweep([big_absent_no_gone, small_gone])
+        out = capsys.readouterr().out
+        # ".py::" rather than "::" — the column header is `path::definition`.
+        listed = [l for l in out.splitlines() if ".py::" in l]
+        assert listed, out
+        assert "b.py::g" in listed[0], listed
+
+    def test_strict_supersets_are_counted_but_not_listed(self, cbd, capsys):
+        """22 of the tree's 61 are pure fork addition; listing them is noise, and
+        omitting them silently would misreport coverage. So: counted, not listed."""
+        superset, small_gone, _ = self._comparisons(cbd)
+        cbd.report_sweep([superset, small_gone])
+        out = capsys.readouterr().out
+        assert "a.py::f" not in out
+        assert "b.py::g" in out
+        assert "2 content-differing shared definition(s)" in out
+        assert "The other 1 are strict supersets" in out
+
+    def test_it_survives_a_tree_with_nothing_to_report(self, cbd, capsys):
+        identical = cbd.FileComparison(
+            "a.py", "def f(x):\n    return x\n", "def f(x):\n    return x\n"
+        )
+        cbd.report_sweep([identical])
+        out = capsys.readouterr().out
+        assert "0 content-differing" in out
+        assert "::" not in out.split("path::definition")[-1]

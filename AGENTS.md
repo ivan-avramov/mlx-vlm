@@ -296,8 +296,9 @@ in this file until 2026-08-10, which meant it only ran when someone remembered.
 work.** It takes ~3s over the whole tree:
 
 ```bash
-python dev/check_body_divergence.py --summary        # rank files by CONTENT
-python dev/check_body_divergence.py --file <path>    # per-definition report + `absent`
+python dev/check_body_divergence.py --summary        # rank FILES by CONTENT
+python dev/check_body_divergence.py --sweep          # rank DEFINITIONS by `gone`
+python dev/check_body_divergence.py --file <path>    # per-definition report
 python dev/check_body_divergence.py                  # the gate
 ```
 
@@ -316,6 +317,15 @@ number as content loss overstates it 33x. That is AGENTS.md's central rule one l
 down: a measure that conflates two situations needing opposite responses.
 `gone` is the column a `# Fork:` marker's claim gets checked against — see "a marker
 is unverified prose" above; it is what caught `0670f556`.
+
+**`--sweep` ranks every content-differing definition in the tree by `gone`.** That is
+the marker-review worklist: 61 definitions differ, 22 are strict supersets (pure fork
+addition, nothing upstream lost) and 39 have upstream lines we do not have. It is
+regenerated on demand rather than stored, deliberately — a per-definition ledger of
+reviewed entries would be ~50 rows nobody had looked at, which is the
+"baseline: pre-existing divergence, unreviewed" anti-pattern `.symbol-exclusions` took
+months to drain. The conclusion belongs in the marker or a `docs/` note, not in a
+list.
 
 It **gates only on alignment masquerading as content**, which is a much narrower
 claim than the report makes: a whole file whose divergence is zero content, a
@@ -434,7 +444,7 @@ positives. Every hit still needs `git log -S` and a read.
 cd mlx_vlm/ && pytest -s ./tests --ignore=tests/test_smoke.py
 ```
 
-The suite is **green: 2763 passed, 5 skipped, 0 failed.** Keep it that way. (This
+The suite is **green: 2766 passed, 5 skipped, 0 failed.** Keep it that way. (This
 line goes stale on every restore that adds a guard — trust the run, not the number.)
 
 **Compare failing test IDs, not counts.** A change that fixes one test and breaks

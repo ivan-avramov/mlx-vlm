@@ -430,6 +430,51 @@ def report_one_file(cmp: FileComparison) -> None:
         )
 
 
+def report_sweep(comparisons: list[FileComparison]) -> None:
+    """Every content-differing definition in the tree, ranked by `gone`.
+
+    The marker-review worklist, and deliberately a *report* rather than a ledger. A
+    per-definition file of reviewed entries was considered and rejected: it would have
+    meant ~50 rows nobody had looked at, which is the "baseline: pre-existing
+    divergence, unreviewed" anti-pattern `.symbol-exclusions` took months to drain. So
+    what gets recorded is the conclusion, in the marker or in a `docs/` note — and this
+    view is regenerated on demand instead of stored.
+
+    Ranked by `gone` because that is the only number here that means content we do not
+    have; ranking by `absent` put a rewritten Metal kernel on top with 64 of its 66
+    lines sitting in an ours-only sibling.
+    """
+    rows = []
+    for cmp in comparisons:
+        for name in cmp.content_differing:
+            gone = sum(c for c, _ in cmp.absent_from_file(name))
+            absent = sum(c for c, _ in cmp.absent_upstream_lines(name))
+            rows.append((gone, absent, cmp.path, name))
+    rows.sort(reverse=True)
+
+    total_defs = sum(len(c.content_differing) for c in comparisons)
+    with_gone = [r for r in rows if r[0]]
+    print(
+        f"{total_defs} content-differing shared definition(s) across "
+        f"{len(comparisons)} file(s).\n"
+        f"{len(with_gone)} have upstream lines missing from our copy of their file "
+        f"({sum(r[0] for r in with_gone)} lines total).\n"
+        f"The other {total_defs - len(with_gone)} are strict supersets — pure fork "
+        "addition, nothing upstream lost."
+    )
+    print(f"\n  {'gone':>5} {'absent':>6}  path::definition")
+    for gone, absent, path, name in rows:
+        if not gone:
+            continue
+        print(f"  {gone:>5} {absent:>6}  {path}::{name}")
+    print(
+        "\n  Run --file on the top entries and read each one's `# Fork:` marker against "
+        "the\n  listed lines. gone>0 is NOT a defect — it is a fork replacement or "
+        "dropped content,\n  and only `git log -S` tells them apart. A marker claiming "
+        "the fork ADDED something\n  that appears in the list is false."
+    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--upstream-ref", default="upstream/main")
@@ -443,6 +488,12 @@ def main() -> int:
         "--file",
         metavar="PATH",
         help="print the full per-definition report for one path and exit",
+    )
+    ap.add_argument(
+        "--sweep",
+        action="store_true",
+        help="rank every content-differing definition in the tree by `gone`; the "
+        "marker-review worklist. Use --file on whatever it puts on top",
     )
     args = ap.parse_args()
     ref = args.upstream_ref
@@ -470,6 +521,10 @@ def main() -> int:
             unparseable.append(path)
             continue
         comparisons.append(cmp)
+
+    if args.sweep:
+        report_sweep(comparisons)
+        return 0
 
     findings: list[tuple[str, str, str]] = []  # (path, symbol, why)
     excused = 0
