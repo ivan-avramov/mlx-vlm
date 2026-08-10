@@ -223,7 +223,7 @@
 #     against a README that promises it. Guard:
 #     test_dropped_upstream_guards.py::TestApcStoreEmitsItsTrace.
 #
-# Current standing (2026-08-09): 4 files / 49 sites / 108 hunks, down from 32 files /
+# Current standing (2026-08-09): 4 files / 42 sites / 83 hunks, down from 32 files /
 # 175 sites. Re-run `--summary`; do not trust this line either. Every
 # diverged file NOT listed here is marked, including
 # server/request_normalization.py — the gen-args union added fork hunks to a file
@@ -240,7 +240,6 @@
 # --- Heavy fork rewrites. AGENTS.md names these as the false-positive-prone
 # --- files; site-by-site provenance is the bulk of the remaining work.
 mlx_vlm/server/generation.py  # 14 sites / 21 hunks. Carries the fork's ResponseGenerator + GPU worker rewrite. LEADS is CLEARED as of 2026-08-10: cfcc36d9 (#1634 generation logging) restored in 682043f5 with all 8 of its .symbol-exclusions entries retired, 29b6c00b (#1508 diffusion unification) in d3a55800, and the sampler commits 36331ea7/b739dfa4/67ca1f05 in a47e7860. The diffusion lane and all five _log_* helpers are now byte-identical to upstream, so do NOT re-derive them from this file's divergence — what remains is genuine fork rewrite
-mlx_vlm/generate/dispatch.py  # 8 sites / 26 hunks. LEADS is CLEARED: f044f36a's dispatch half landed earlier and its generation.py half via d3a55800; a30180a6's signatures in 68ac2dc1. The two .symbol-exclusions entries here (_cache_fully_retained, _prefix_cache_trim_amount) are REVIEWED deliberate divergences superseded by the fork's snapshot ring — those two are ready to mark
 mlx_vlm/server/openai.py  # 18 sites / 49 hunks. LEADS mostly cleared: f044f36a resolved, cfcc36d9's openai half (the StreamingTimings plumbing) in 682043f5, f3bc6e81 (#1412, the finalizer cache clear) and 84ebae6e (#1641) in 4bd99ca1. 6a8cdff6 (#1411) is also resolved. Still reported here: 4d468e8575 (#1492) and b3d2380d1d (#1266), a few lines each — resolve before marking. NOTE the fork rewrote the streaming chat-completions thinking machinery around THINKING_FORMATS while /v1/responses uses upstream's ThinkingStreamState; 08723a3f unioned their marker sets, so treat those two paths as one decision, not two
 
 # --- Server surfaces, not yet reviewed at site granularity.
@@ -258,7 +257,7 @@ mlx_vlm/utils.py  # REVIEWED site-by-site 2026-08-09; ONE named blocker, not a g
 # ---   openai.py 76/905 · generation.py 92/665
 # ---   [turboquant.py 118/529 CLEARED: 91 of 96 bodies byte-identical; the AST-body
 # ---    method found #1433 where three earlier report-based passes had not]
-# ---   dispatch.py 125/377
+# ---   [dispatch.py 125/377 FULLY MARKED, 8 sites -> 1 unmarkable deletion-only hunk]
 # ---   [test_generate.py 251/297 CONVERGED by reordering, now 70/116; all 70 are
 # ---    TestPrefixCacheReuseTrim's 9 REVIEWED .symbol-exclusions methods]
 # --- ar.py was 26/233 and is now cleared: all 26 were rewrite artifacts, confirmed by
@@ -271,3 +270,11 @@ mlx_vlm/utils.py  # REVIEWED site-by-site 2026-08-09; ONE named blocker, not a g
 # --- that proves it pays to chase them rather than eyeball the diff. Now 6/94.
 
 # --- Tests, not yet reviewed at site granularity.
+
+# --- Blocked by a TOOL limitation, not by unreviewed content. Both files below are
+# --- fully marked; each keeps its entry only because of a pure-DELETION hunk that
+# --- `check_fork_markers.py` cannot attribute to any definition (see the note in
+# --- dispatch.py's reason). Teaching the check to consult `.symbol-exclusions` for
+# --- deletion-only hunks would drain both immediately, and is the cheapest remaining
+# --- tooling win in this rollout.
+mlx_vlm/generate/dispatch.py  # FULLY MARKED 2026-08-09, 8 sites -> 1, and the 1 is not markable. All four real sites carry `# Fork:` markers: the .common snapshot-ring import, `parse_arguments` (+23/-0, the "suffix" draft kind), `main` (+17/-0, the SuffixDecodingProposer arm) and `stream_generate` (a 405->647 rewrite whose 80 absent upstream lines are accounted for per site in the marker: upstream's `_prefix_cache_trim_amount` gate, a REVIEWED .symbol-exclusions divergence superseded by the snapshot ring, and its `thinking_start_token_id in input_ids` gate, deliberately replaced by `prompt_is_inside_thinking` because Gemma 4's markers are not single tokens). THE RESIDUAL SITE is a DELETION-ONLY hunk: upstream lines 635-673 define `_cache_fully_retained` and `_prefix_cache_trim_amount`, both legitimately absent here and both in .symbol-exclusions, and the check keys that deletion to our line 673 -- a blank line. There is no definition to put a marker inside, and both trees have identical whitespace there, so nothing can be converged either. Verified: this is NOT the trap-9 whitespace probe it looks like

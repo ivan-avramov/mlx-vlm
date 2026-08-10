@@ -2,7 +2,7 @@ import argparse
 import codecs
 import json
 import logging
-import os
+import os  # Fork: MLX_VLM_LOG_NAME override on the logger below (5e9b9503)
 import time
 from collections.abc import Sequence
 from typing import Any, Dict, Generator, List, Optional, Tuple, Union
@@ -12,9 +12,9 @@ import mlx.nn as nn
 from transformers import PreTrainedTokenizer
 
 from .. import apc as _apc
-from ..kv_quant import from_legacy as kv_quant_from_legacy
+from ..kv_quant import from_legacy as kv_quant_from_legacy  # Fork: kv-quant config
 from ..models import cache
-from ..prompt_utils import (
+from ..prompt_utils import (  # Fork: all but apply_chat_template are fork-only (1c3f1e50, 7e3477b0) — the THINKING_FORMATS registry
     apply_chat_template,
     cached_special_token_encode,
     detect_thinking_format,
@@ -29,7 +29,7 @@ from ..utils import (
     prepare_inputs,
     should_add_special_tokens,
 )
-from .common import (
+from .common import (  # Fork: the snapshot-ring helpers (_capture/_restore_*, _rotating_rewind_safe, _has_non_trimmable) and _get_generation_stream are fork-only; they replace upstream's _prefix_cache_trim_amount/_cache_fully_retained
     DEFAULT_KV_GROUP_SIZE,
     DEFAULT_KV_QUANT_SCHEME,
     DEFAULT_QUANTIZED_KV_START,
@@ -55,6 +55,8 @@ from .image import (
 )
 from .video_generation import DEFAULT_VIDEO_STEPS, run_video_generation_cli
 
+# Fork: MLX_VLM_LOG_NAME (5e9b9503) so an embedding host can re-root the logger
+# tree; upstream hardcodes "mlx_vlm.generate". Same name when the var is unset.
 logger = logging.getLogger(f"{os.environ.get('MLX_VLM_LOG_NAME', 'mlx_vlm')}.generate")
 
 DEFAULT_MODEL_PATH = "mlx-community/nanoLLaVA-1.5-8bit"
@@ -79,6 +81,11 @@ DEFAULT_DIFFUSION_MAX_DENOISING_STEPS = 48
 
 
 def parse_arguments():
+    # Fork: PURE ADDITIONS to upstream's parser — 23 added lines, 0 removed. The
+    # "suffix" choice on --draft-kind plus --suffix-min-match and --draft-cooldown
+    # (863441c9, drafter-free n-gram speculation, which upstream does not have), and
+    # the --draft-block-size help text extended to describe its meaning for that
+    # kind. Every other flag here is upstream's, byte-identical.
     parser = argparse.ArgumentParser(
         description="Generate text, an image, or a video with a supported model."
     )
@@ -695,6 +702,33 @@ def stream_generate(
         Generator[GenerationResult]: A generator producing GenerationResult objects
           containing the generated text, tokens, and statistics.
     """
+    # Fork: a rewrite of upstream's body (405 -> 647 lines). 80 upstream lines are
+    # absent and ALL of them are accounted for, per site, in two groups:
+    #
+    #  1. Upstream's prefix-reuse gate — `_prefix_cache_trim_amount(kv_cache,
+    #     prefix_len)` plus its `n_drop` trim loop. Both symbols are REVIEWED
+    #     .symbol-exclusions entries: this fork gates rewinds with
+    #     `_rotating_rewind_safe` + the snapshot ring instead (c503fa7b, mlx-vlm
+    #     #1715), and running both would give two different notions of when a
+    #     rewind is safe. This is also why the audit reports a permanent
+    #     whitespace probe near `from .ar import generate_step`: upstream's two
+    #     absent functions sit right above it, so the differ pairs the blank lines
+    #     differently. Both trees have identical blanks there; there is nothing to
+    #     converge, which is why this file keeps its allowlist entry.
+    #  2. Upstream's `enable_thinking` gate —
+    #     `thinking_start_token_id in input_ids`. DELIBERATELY replaced by
+    #     `prompt_is_inside_thinking(decoded_prompt)` + `detect_thinking_format`
+    #     (1c3f1e50): for families like Gemma 4 the hardcoded <think>/</think>
+    #     defaults are not real tokens, so upstream's id-in-prompt check forced
+    #     enable_thinking False and the forced closer would have been a bare ">".
+    #     The replacement is a strict superset — see the comment at the
+    #     `thinking_budget` block below and prompt_utils.THINKING_FORMATS.
+    #
+    # Everything else upstream does here is still done: the vision-feature cache,
+    # the APC media-safe-prefix helpers (`multimodal_token_ids_from_config`,
+    # `media_safe_prefix_min`, `prefix_leaves_text_only_suffix`,
+    # `prefix_contains_media_tokens`) and `prompt_cache_state.update` all appear
+    # here at >= upstream's count.
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
     verbose = kwargs.pop("verbose", False)
 
@@ -1440,6 +1474,10 @@ def generate(
 
 
 def main():
+    # Fork: PURE ADDITIONS — 17 added lines, 0 removed: the `elif args.draft_kind
+    # == "suffix"` arm that builds a SuffixDecodingProposer and passes it as
+    # `draft_model`, so upstream's existing dispatch fires with no weights and no
+    # extra memory (863441c9). Everything else in this function is upstream's.
     args = parse_arguments()
 
     if getattr(args, "output_modality", "text") == "image":
