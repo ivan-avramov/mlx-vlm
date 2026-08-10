@@ -1825,9 +1825,7 @@ class TestResponsesInputTokensNormalizesInstructions:
         helper also keeps this guard honest if upstream changes the normalization —
         it tracks the helper instead of a hard-coded expectation.
         """
-        from mlx_vlm.server.openai import (
-            _normalize_response_instruction_messages,
-        )
+        from mlx_vlm.server.openai import _normalize_response_instruction_messages
 
         counted = self._captured_messages(
             client, monkeypatch, "/responses/input_tokens"
@@ -1955,3 +1953,76 @@ class TestOmniAudioFeaturesComeFromTheProcessor:
         for stale in ("is_qwen3_omni_moe", "is_lossy_audio", "audio_feature_lengths"):
             assert stale not in source, f"pre-#1498 audio branch is back: {stale}"
         assert not hasattr(utils, "normalize_audio_features")
+
+
+class TestUniformKvQuantSkipsRotatingCaches:
+    """Not a dropped hunk — the inverse. `a492e47d`'s uniform path, kept on purpose.
+
+    `generate/common.py::maybe_quantize_kv_cache`'s final (uniform, non-TurboQuant)
+    loop is the one branch this fork rewrote rather than took, and it had no test.
+    Upstream gates on `hasattr(c, "to_quantized")`. `RotatingKVCache` **has** that
+    method — it raises `NotImplementedError("RotatingKVCache Quantization NYI")` — so
+    upstream raises for any sliding-window model run with `--kv-bits` on a scheme that
+    is neither hybrid nor TurboQuant. Recorded as `docs/upstream-bugs.md` item 4.
+
+    That makes this the shape AGENTS.md warns about in the other direction: a
+    divergence with no coverage reads as unexplained fork drift, and the next reader
+    to "converge" it reintroduces a crash. The guard is the explanation.
+    """
+
+    @staticmethod
+    def _rotating_cache_with_content():
+        import mlx.core as mx
+
+        from mlx_vlm.models import cache
+
+        entry = cache.RotatingKVCache(max_size=32, keep=4)
+        entry.update_and_fetch(mx.zeros((1, 2, 8, 4)), mx.zeros((1, 2, 8, 4)))
+        return entry
+
+    def test_the_method_upstream_gates_on_still_raises(self):
+        """Pins the premise, so this guard cannot silently become vacuous.
+
+        If mlx ever implements rotating-cache quantization, `hasattr` stops being the
+        wrong test, the fork's skip becomes dead weight, and this assertion is what
+        says so instead of the guard passing for the wrong reason.
+        """
+        from mlx_vlm.models import cache
+
+        entry = self._rotating_cache_with_content()
+        assert hasattr(entry, "to_quantized")
+        with pytest.raises(NotImplementedError):
+            entry.to_quantized(group_size=64, bits=4)
+        assert isinstance(entry, cache.RotatingKVCache)
+
+    def test_a_rotating_cache_survives_uniform_quantization(self):
+        from mlx_vlm.generate.common import maybe_quantize_kv_cache
+        from mlx_vlm.models import cache
+
+        prompt_cache = [self._rotating_cache_with_content()]
+
+        maybe_quantize_kv_cache(
+            prompt_cache, quantized_kv_start=0, kv_group_size=64, kv_bits=4
+        )
+
+        assert isinstance(prompt_cache[0], cache.RotatingKVCache)
+
+    def test_a_plain_cache_alongside_it_is_still_quantized(self):
+        """The skip must be surgical: guarding the rotating layer must not disable
+        quantization for the layers that can be quantized, which a `return` instead of
+        a `continue` would do."""
+        import mlx.core as mx
+
+        from mlx_vlm.generate.common import maybe_quantize_kv_cache
+        from mlx_vlm.models import cache
+
+        plain = cache.KVCache()
+        plain.update_and_fetch(mx.zeros((1, 2, 8, 64)), mx.zeros((1, 2, 8, 64)))
+        prompt_cache = [self._rotating_cache_with_content(), plain]
+
+        maybe_quantize_kv_cache(
+            prompt_cache, quantized_kv_start=0, kv_group_size=64, kv_bits=4
+        )
+
+        assert isinstance(prompt_cache[0], cache.RotatingKVCache)
+        assert isinstance(prompt_cache[1], cache.QuantizedKVCache)

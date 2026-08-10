@@ -298,10 +298,23 @@ def maybe_quantize_kv_cache(
     kv_key_scheme: Optional[str] = None,
     kv_value_scheme: Optional[str] = None,
 ):
-    # Fork: upstream quantizes any cache exposing `to_quantized` past
-    # quantized_kv_start. This fork additionally skips the last layer (sensitive to
-    # quantization in deep models), honours the TurboQuant split key/value bit widths,
-    # and threads kv_prealloc_tokens through (7de8f7f1).
+    # Fork: the hybrid and TurboQuant branches below are upstream's, including the
+    # last-layer skip and its comment (#909) and the split key/value bit widths — an
+    # earlier version of this marker claimed both as fork work and was wrong on both.
+    # What actually diverges:
+    #   * three extra parameters — max_kv_size, kv_prealloc_tokens (7de8f7f1) and
+    #     serialize_kv_quantization;
+    #   * the TurboQuant branch also accepts SimpleKVCache / ChunkedKVCache and reads
+    #     `offset` via getattr, so a cache without one is treated as empty;
+    #   * both quantizing loops can mx.eval each layer as it converts
+    #     (serialize_kv_quantization), so MLX does not build one fp32 graph across all
+    #     layers and spike multi-GB;
+    #   * the uniform path skips RotatingKVCache. That is not a refinement — upstream
+    #     gates on `hasattr(c, "to_quantized")`, RotatingKVCache HAS that method, and
+    #     it raises NotImplementedError("RotatingKVCache Quantization NYI"). So
+    #     upstream raises for any SWA model run with --kv-bits on a non-TurboQuant
+    #     scheme; see docs/upstream-bugs.md item 4 and the guard in
+    #     tests/test_dropped_upstream_guards.py.
     if kv_bits is None:
         return
 

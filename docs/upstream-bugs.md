@@ -6,22 +6,24 @@ resolving a merge or draining an audit, and each is reproducible against
 
 **This file is bookkeeping, and that is the whole of its purpose.** Its job is to
 stop each of these being re-investigated as a fork problem every time it surfaces in
-an audit, and to record which `.symbol-exclusions` entries exist *because* upstream
-has a defect. Two consequences, both deliberate:
+an audit, to record which `.symbol-exclusions` entries exist *because* upstream has a
+defect, and to explain the one divergence we carry *because* upstream is wrong
+(item 4). Two consequences, both deliberate:
 
 * **These are not to be filed with upstream.** Engaging upstream's issue tracker is
   out of scope for this fork (decided 2026-08-10). An earlier handoff invented that
   task; it was never asked for and nothing else in `AGENTS.md`, `upstream-gaps.md` or
   `memory.md` ever proposed it. Don't re-propose it.
 * **These are not to be patched locally either.** A local fix to upstream code is a
-  new permanent conflict site, and for two of the three our copy is byte-identical to
-  upstream's — which is the state worth keeping.
+  new permanent conflict site, and for items 1-3 our copy is byte-identical to
+  upstream's — which is the state worth keeping. Item 4 is the exception and is
+  already diverged deliberately; its marker and guard say so.
 
 So the correct action on every entry below is: read it, understand why our tree looks
 the way it does, and move on.
 
 Line numbers are `upstream/main` at base `ffd7aeff` unless stated. Verified
-2026-08-10; none of the three had been filed by anyone else as of that date
+2026-08-10; none had been filed by anyone else as of that date
 (`gh search issues --repo Blaizzy/mlx-vlm`), which is recorded only because it
 confirms they are genuinely unreported rather than known-and-wontfix.
 
@@ -111,3 +113,63 @@ Confirmed identical in this fork (our `anthropic.py:489` is byte-identical to
 upstream's), so `gen_args.skip_special_tokens = False` does nothing in **both**
 trees. Recorded as `docs/upstream-gaps.md` item 9(b) and deliberately not patched
 here.
+
+## 4. Uniform KV quantization raises on any sliding-window model
+
+`mlx_vlm/generate/common.py::maybe_quantize_kv_cache`'s final loop — the uniform,
+non-hybrid, non-TurboQuant path — is:
+
+```python
+for index, layer_cache in enumerate(prompt_cache):
+    if (
+        hasattr(layer_cache, "to_quantized")
+        and layer_cache.offset >= quantized_kv_start
+    ):
+        prompt_cache[index] = layer_cache.to_quantized(...)
+```
+
+`hasattr(..., "to_quantized")` is the wrong gate. `RotatingKVCache` **has** that
+method, and it is a stub:
+
+```python
+def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
+    raise NotImplementedError("RotatingKVCache Quantization NYI")
+```
+
+So the call is made and raises. Every other branch of the same function guards
+`RotatingKVCache` explicitly (`if isinstance(entry, cache.RotatingKVCache): return
+entry` in both `hybridize` and `quantize_entry`) — only the uniform path does not,
+which is what makes this look like an oversight rather than a design choice.
+
+Reachable for any sliding-window model (Gemma-family SWA layers produce a
+`RotatingKVCache`) run with `--kv-bits` set on the default `uniform` scheme.
+Reproduced directly against upstream's function:
+
+```python
+import ast, subprocess, textwrap
+import mlx.core as mx
+from mlx_vlm.generate import common as ourmod
+from mlx_vlm.models import cache
+
+src = subprocess.run(["git", "show", "upstream/main:mlx_vlm/generate/common.py"],
+                     capture_output=True, text=True).stdout
+tree, lines = ast.parse(src), src.splitlines()
+fn = next(textwrap.dedent("\n".join(lines[n.lineno - 1:n.end_lineno]))
+          for n in tree.body if getattr(n, "name", "") == "maybe_quantize_kv_cache")
+ns = dict(vars(ourmod)); exec(fn, ns)
+
+entry = cache.RotatingKVCache(max_size=32, keep=4)
+entry.update_and_fetch(mx.zeros((1, 2, 8, 4)), mx.zeros((1, 2, 8, 4)))
+ns["maybe_quantize_kv_cache"]([entry], quantized_kv_start=0, kv_group_size=64, kv_bits=4)
+# NotImplementedError: RotatingKVCache Quantization NYI
+```
+
+**This fork already does not have the bug**, and that is the one entry here where our
+divergence is load-bearing rather than incidental: our uniform loop skips
+`RotatingKVCache` with a `continue`. It had no test until 2026-08-10 — see
+`TestUniformKvQuantSkipsRotatingCaches` in `tests/test_dropped_upstream_guards.py`,
+which also pins the premise (that `to_quantized` still raises), so it cannot become
+vacuous if mlx ever implements it.
+
+The fix upstream is one line: the same `isinstance` guard its other two branches
+already use.
