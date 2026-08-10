@@ -124,6 +124,11 @@ def definition_bodies(source: str) -> tuple[dict[str, str], list[str]]:
     return defs, module_stmts
 
 
+def _content_lines(text: str) -> list[str]:
+    """Stripped, non-blank lines. The unit `absent_upstream_lines` compares."""
+    return [l.strip() for l in text.splitlines() if l.strip()]
+
+
 def normalise(text: str) -> str:
     """Strip blank lines and trailing whitespace -- and nothing else.
 
@@ -186,6 +191,40 @@ class FileComparison:
         self.module_stmts_same_multiset = Counter(
             normalise(s) for s in up_mods
         ) == Counter(normalise(s) for s in our_mods)
+
+    def absent_upstream_lines(self, name: str) -> list[tuple[int, str]]:
+        """[(count, line)] upstream has in `name`'s body that our copy does not.
+
+        Multiset difference over stripped, non-blank lines, so a line upstream uses
+        twice and we use once still shows. Comments are included deliberately: one of
+        the ten dropped hunks found during the fork-marker rollout was a comment.
+
+        THIS IS THE MARKER-REVIEW TOOL, and it is why it exists rather than a plain
+        diff. `check_fork_markers.py` proves a `# Fork:` comment is PRESENT; nothing
+        proves it is TRUE, and four markers in this tree have turned out to be false
+        (`3105b598`, `0670f556`). A marker claims "upstream does X, we do Y instead" —
+        so the question that checks it is "what does upstream's body have that ours
+        does not", and a plain diff answers a different, noisier question because a
+        rewritten body reports every reordered line as a change.
+
+        Read the result in two directions:
+
+          absent == 0  -- our body is a strict superset. The divergence is pure
+                          addition, so no marker claiming upstream LACKS something
+                          can be wrong, but one claiming upstream lacks something we
+                          both have still can be (that is how `0670f556` happened).
+          absent  > 0  -- either a fork replacement or content a resolution dropped,
+                          and NOTHING here can tell those apart. Run `git log -S` on
+                          the distinctive lines. If a construct shows up as absent and
+                          the marker says the fork ADDED it, the marker is wrong: we
+                          did not add what upstream already has.
+        """
+        if name not in self.shared:
+            return []
+        missing = Counter(_content_lines(self.up_defs[name])) - Counter(
+            _content_lines(self.our_defs[name])
+        )
+        return [(count, line) for line, count in missing.items()]
 
     @property
     def content_score(self) -> int:
@@ -324,10 +363,29 @@ def report_one_file(cmp: FileComparison) -> None:
             )
             if l[:1] in "+-" and not l.startswith(("---", "+++"))
         ]
+        absent = cmp.absent_upstream_lines(name)
         tag = "ALIGN" if name in cmp.alignment_only else "DIFF "
         print(
             f"  {tag} {name:48s} up={len(up.splitlines()):4d} "
-            f"ours={len(ours.splitlines()):4d} changed={len(changed)}"
+            f"ours={len(ours.splitlines()):4d} changed={len(changed)} "
+            f"absent={sum(c for c, _ in absent)}"
+        )
+        # `absent` is the marker-review column, not decoration: it is what a `# Fork:`
+        # comment's claim can actually be checked against. `changed` cannot do that
+        # job -- a rewritten body reports every reordered line, so a real omission
+        # hides in the noise.
+        for count, line in absent:
+            print(f"          upstream-only x{count}  {line[:100]}")
+
+    if cmp.content_differing:
+        print(
+            "\n  `absent` = upstream lines missing from OUR body. absent=0 means our "
+            "body is a strict\n  superset. absent>0 is a fork replacement OR content a "
+            "resolution dropped, and nothing\n  here tells those apart — run "
+            "`git log -S` on the distinctive lines.\n"
+            "  Check each differing definition's `# Fork:` marker against this list. "
+            "A marker saying\n  the fork ADDED something that appears above is false: "
+            "we did not add what upstream has."
         )
 
 

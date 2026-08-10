@@ -310,3 +310,90 @@ class TestExclusionsFileParsing:
         require editing this test and saying why.
         """
         assert cbd.load_exclusions() == []
+
+
+class TestAbsentUpstreamLines:
+    """The marker-review view. Its job is to be readable, not to be a proof.
+
+    `check_fork_markers.py` proves a `# Fork:` comment exists; nothing proves it is
+    true, and four in this tree were not (`3105b598`, `0670f556`). This is the column a
+    reviewer checks a marker's claim against, so the tests here are about it reporting
+    the right *set* — a marker review that silently omits a line is a marker review
+    that passes a false marker.
+    """
+
+    def test_a_strict_superset_reports_nothing(self, cbd):
+        """absent=0 is the common case for fork work: we added, we did not replace.
+
+        Note that editing an existing line is a replacement, not an addition — a
+        trailing `# noqa` on `return x + 1` makes `absent` report the original. That is
+        correct and is the next test.
+        """
+        ours = UP.replace("    return x + 1", "    log(x)\n    return x + 1")
+        cmp = _cmp(cbd, UP, ours)
+        assert cmp.absent_upstream_lines("alpha") == []
+
+    def test_a_replaced_line_is_reported(self, cbd):
+        cmp = _cmp(cbd, UP, UP.replace("return x + 1", "return x + 42"))
+        assert cmp.absent_upstream_lines("alpha") == [(1, "return x + 1")]
+
+    def test_a_dropped_comment_is_reported(self, cbd):
+        """One of the ten dropped hunks the marker rollout found was a comment.
+
+        This is the case that caught `0670f556`: upstream's explanatory comment showed
+        as upstream-only, which is what proved the construct it describes is upstream's
+        and not the fork's, contradicting the marker.
+        """
+        up = "def alpha(x):\n    # clamp, see #909\n    return x\n"
+        ours = "def alpha(x):\n    return x\n"
+        cmp = _cmp(cbd, up, ours)
+        assert cmp.absent_upstream_lines("alpha") == [(1, "# clamp, see #909")]
+
+    def test_it_counts_multiplicity(self, cbd):
+        """Upstream calling something twice where we call it once is a dropped site.
+
+        AGENTS.md's "count the call sites" rule in miniature — `eda1ec4f` changed the
+        same line in two endpoints and only one landed.
+        """
+        up = "def alpha(x):\n    f(x)\n    f(x)\n    return x\n"
+        ours = "def alpha(x):\n    f(x)\n    return x\n"
+        cmp = _cmp(cbd, up, ours)
+        assert cmp.absent_upstream_lines("alpha") == [(1, "f(x)")]
+
+    def test_blank_lines_are_not_reported(self, cbd):
+        """Otherwise every reflowed body drowns the real omissions in whitespace."""
+        up = "def alpha(x):\n\n\n    return x\n"
+        ours = "def alpha(x):\n    return x\n"
+        cmp = _cmp(cbd, up, ours)
+        assert cmp.absent_upstream_lines("alpha") == []
+
+    def test_reindented_lines_are_not_reported_and_that_is_deliberate(self, cbd):
+        """A known, chosen looseness — the one place this view is permissive.
+
+        A fork that wraps upstream's code in a new `if` re-indents all of it, and
+        reporting every line as absent would make the view useless for exactly the
+        bodies it matters most for. So comparison is on stripped text.
+
+        This does NOT weaken the alignment gate: `normalise` (which decides
+        ALIGNMENT findings) leaves leading whitespace alone, because in Python an
+        indent change is a semantic change. Two different questions, two different
+        normalisations — asserted together here so neither drifts into the other.
+        """
+        up = "def alpha(x):\n    return x\n"
+        ours = "def alpha(x):\n    if y:\n        return x\n"
+        cmp = _cmp(cbd, up, ours)
+        assert cmp.absent_upstream_lines("alpha") == []
+        assert cbd.normalise(up) != cbd.normalise(ours)
+
+    def test_our_own_additions_are_never_reported(self, cbd):
+        """One direction only. The other direction is what `# Fork:` markers are for."""
+        cmp = _cmp(cbd, UP, UP.replace("return x + 1", "return x + 1\n    extra()"))
+        assert cmp.absent_upstream_lines("alpha") == []
+
+    def test_an_unshared_name_reports_nothing(self, cbd):
+        cmp = _cmp(cbd, UP, UP + "\n\ndef fork_helper():\n    pass\n")
+        assert cmp.absent_upstream_lines("fork_helper") == []
+        assert cmp.absent_upstream_lines("never_defined_anywhere") == []
+
+    def test_content_lines_helper(self, cbd):
+        assert cbd._content_lines("a\n\n   b   \n\t\n c\n") == ["a", "b", "c"]

@@ -168,6 +168,33 @@ gating script needs one, because a bug that makes one of these checks **more
 permissive** fails nothing, still prints OK, and silently stops reporting dropped
 content. Extend them rather than replacing them.
 
+**A marker is unverified prose, and four of them have been false.** This is the
+convention's structural weakness and worth stating plainly: `check_fork_markers.py`
+proves a `# Fork:` comment is **present**; nothing proves it is **true**. A false
+marker is worse than a missing one, because a missing one reports and a false one
+makes the site invisible to every later audit. The four:
+
+- three `# Fork: placement only ... Nothing to converge` claims on definitions that
+  were byte-identical to upstream and merely *out of order* (`3105b598`);
+- `maybe_quantize_kv_cache`'s claim that the fork "additionally skips the last layer"
+  and "honours the TurboQuant split key/value bit widths" — upstream's own hybrid and
+  TurboQuant branches do both, with upstream's own comment (`0670f556`). That one
+  overstated fork ownership of shared code, which is the shape that *deters*
+  inspection; the same mistake around the `qwen3_5` norm-shift gate hid a live `+2.0`
+  double-shift bug.
+
+The check for it is `dev/check_body_divergence.py --file <path>`'s **`absent`**
+column, which lists the upstream lines missing from each differing body. A marker
+saying the fork ADDED something that appears in that list is false — we did not add
+what upstream already has. Use `absent`, not a plain diff: a rewritten body reports
+every reordered line as changed, so a real omission hides in the noise. Then
+`git log -S` the distinctive lines, because `absent > 0` means *either* a fork
+replacement *or* content a resolution dropped, and nothing distinguishes those
+mechanically.
+
+**So: review a marker whenever you touch its file, and never write one from the
+diff alone.**
+
 ### The fourth direction: is the thing that exists actually reachable?
 
 The three questions above are all about *code*. This one is about *wiring*, and it
@@ -263,7 +290,7 @@ work.** It takes ~3s over the whole tree:
 
 ```bash
 python dev/check_body_divergence.py --summary        # rank files by CONTENT
-python dev/check_body_divergence.py --file <path>    # per-definition report
+python dev/check_body_divergence.py --file <path>    # per-definition report + `absent`
 python dev/check_body_divergence.py                  # the gate
 ```
 
@@ -272,6 +299,11 @@ delta, on purpose: `tests/test_server.py` reads +2185/-262 and scores 33;
 `turboquant.py` reads +539/-102 and scores 9. The line column is there to be
 distrusted. A file with `content=0` is a pure reordering — converge it rather than
 reading its diff.
+
+`--file` also prints, per differing definition, an **`absent`** count and the
+upstream lines missing from our body. That is the column a `# Fork:` marker's claim
+gets checked against — see "a marker is unverified prose" above; it is what caught
+`0670f556`.
 
 It **gates only on alignment masquerading as content**, which is a much narrower
 claim than the report makes: a whole file whose divergence is zero content, a
@@ -390,7 +422,7 @@ positives. Every hit still needs `git log -S` and a read.
 cd mlx_vlm/ && pytest -s ./tests --ignore=tests/test_smoke.py
 ```
 
-The suite is **green: 2742 passed, 5 skipped, 0 failed.** Keep it that way. (This
+The suite is **green: 2755 passed, 5 skipped, 0 failed.** Keep it that way. (This
 line goes stale on every restore that adds a guard — trust the run, not the number.)
 
 **Compare failing test IDs, not counts.** A change that fixes one test and breaks
