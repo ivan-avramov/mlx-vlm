@@ -24,7 +24,7 @@ from mlx_vlm.generate import (
     _prime_cached_prefix_rope_state,
 )
 from mlx_vlm.generate import ar as ar_module
-from mlx_vlm.generate import common as common_module
+from mlx_vlm.generate import common as common_module  # Fork: the engine port
 from mlx_vlm.generate import dispatch as dispatch_module
 from mlx_vlm.generate import normalize_resize_shape
 from mlx_vlm.models.cache import (
@@ -441,6 +441,16 @@ class TestGenerationBatch:
             [7],
         ]
 
+    def test_capture_rope_deltas_prefers_prompt_kwargs(self):
+        from mlx_vlm.generate import PromptProcessingBatch
+
+        captured = PromptProcessingBatch._capture_rope_deltas_from_prompt_kwargs(
+            {"rope_deltas": mx.array([[5], [7]], dtype=mx.int32)},
+            SimpleNamespace(_rope_deltas=mx.array([[99], [99]], dtype=mx.int32)),
+            2,
+        )
+        assert captured.tolist() == [[5], [7]]
+
 
 # ============================================================================
 # Tests for Helper Functions
@@ -499,6 +509,8 @@ class TestLeftPadPrompts:
 
 
 class TestBatchGenerator:
+    # Fork: adds test_batch_generator_empty_generation_batch_does_not_seed_flat_processors;
+    # the rest of the class is upstream's.
     """Tests for BatchGenerator class."""
 
     def test_initialization(self, mock_model, mock_processor):
@@ -1224,16 +1236,6 @@ class TestBatchGenerate:
         assert rows[1]["position_ids"].shape == (3, 1, seq_len)
         assert rows[0]["position_ids"].tolist() == position_ids[:, :1, :].tolist()
         assert rows[1]["position_ids"].tolist() == position_ids[:, 1:2, :].tolist()
-
-    def test_capture_rope_deltas_prefers_prompt_kwargs(self):
-        from mlx_vlm.generate import PromptProcessingBatch
-
-        captured = PromptProcessingBatch._capture_rope_deltas_from_prompt_kwargs(
-            {"rope_deltas": mx.array([[5], [7]], dtype=mx.int32)},
-            SimpleNamespace(_rope_deltas=mx.array([[99], [99]], dtype=mx.int32)),
-            2,
-        )
-        assert captured.tolist() == [[5], [7]]
 
     @patch.object(ar_module, "_generate_batch")
     @patch("mlx_vlm.utils.process_image")
@@ -2321,6 +2323,11 @@ def test_cached_prefix_rope_failure_falls_back_to_cold(caplog):
 
 
 class TestPrefixCacheReuseTrim:
+    # Fork: REVIEWED divergence (handoff §4, c503fa7b). Upstream's 9 methods here test
+    # _prefix_cache_trim_amount/_cache_fully_retained; this fork gates rewind with
+    # _rotating_rewind_safe + a snapshot ring, so its own 9 replacements test that
+    # instead — see the docstring below and mlx-vlm #1715. Deliberately NOT converged;
+    # the 9 .symbol-exclusions entries carry the same reason.
     """Prompt-cache prefix reuse must respect each cache's own retention.
 
     Fork counterpart of upstream's ``TestPrefixCacheReuseTrim``. Upstream gates

@@ -51,7 +51,7 @@ from .audio import (
     audio_transcriptions_endpoint,
     audio_translations_endpoint,
 )
-from .generation import (
+from .generation import (  # Fork: adds the fork's KV/session/APC getters
     CACHED_PATH_HEARTBEAT_INTERVAL_SECS,
     DEFAULT_ENABLE_THINKING,
     DEFAULT_LOG_PROGRESS_INTERVAL,
@@ -96,7 +96,7 @@ from .generation import (
     make_streaming_detokenizer,
     run_speculative_server_rounds,
 )
-from .openai import (
+from .openai import (  # Fork: adds the fork's thinking-format helpers
     _PREFILL_FLAG_CACHE,
     _all_thinking_openers,
     _compute_prefill_flag,
@@ -114,7 +114,7 @@ from .openai import (
     responses_input_tokens_endpoint,
     responses_retrieve_endpoint,
 )
-from .responses_state import (
+from .responses_state import (  # Fork: adds the THINKING_FORMATS helpers; Fork: _step_thinking_state is fork-only
     RESPONSE_STORE_LIMIT,
     StoredResponse,
     ThinkingStreamDelta,
@@ -128,7 +128,7 @@ from .responses_state import (
     _split_thinking,
 )
 from .responses_state import _sse_event as _response_sse_event
-from .responses_state import (
+from .responses_state import (  # Fork: adds the THINKING_FORMATS helpers; Fork: _step_thinking_state is fork-only
     _step_thinking_state,
     _store_response,
     process_tool_calls,
@@ -139,7 +139,7 @@ from .responses_state import (
     suppress_tool_call_content,
 )
 from .runtime import ModelCacheRegistry, runtime
-from .schemas import (
+from .schemas import (  # Fork: adds the fork's Completion* legacy-endpoint models
     AnthropicMessageParam,
     AnthropicMessageResponse,
     AnthropicRequest,
@@ -195,7 +195,7 @@ from .schemas import (
     UsageStats,
     VLMRequest,
 )
-from .session_manager import (
+from .session_manager import (  # Fork: the whole session manager is fork-only
     _append_session_assistant_hash,
     _canonical_message,
     _compute_turn_hashes,
@@ -212,8 +212,9 @@ from .session_manager import (
 
 
 def __getattr__(name):
-    # Per-chat session config holders live on session_manager (the tests
-    # mutate them there). Proxy read access so ``mlx_vlm.server.<name>``
+    # Fork: upstream has no __getattr__ here. Per-chat session config holders live
+    # on session_manager (the tests mutate them there). Proxy read access so
+    # ``mlx_vlm.server.<name>``
     # still resolves to the live value; mutation must target
     # ``mlx_vlm.server.session_manager`` directly.
     from . import session_manager as _session_manager
