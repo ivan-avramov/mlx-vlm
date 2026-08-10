@@ -62,6 +62,23 @@
 #     deviation is the fork's `to_sse_json()` (a19e900f, fork-authored, absent from
 #     upstream), which omits `timings` when unset because OpenWebUI's stream parser
 #     dies on an explicit null. Marked.
+#   generate/__init__.py — 4 sites. Re-export surface for the fork's generation-engine
+#     port (5e9b9503) + maybe_preallocate_kv_cache (7de8f7f1), plus a lazy
+#     `generation_stream` so importing the package does not create a Metal stream.
+#     RESTORED first: `"GenerateKwargs"` was missing from __all__ — a30180a6's last
+#     dropped line — and the import was therefore unreferenced, i.e. autoflake bait
+#     (trap 5). Marking that site would have laundered it.
+#   models/gemma4/language.py — 5 sites -> 3 markers, and TWO were dropped upstream
+#     content, not fork work: 64a09079 (#1445)'s `base_mask.shape[-2] != [-1]` guard on
+#     the cached vision-mask overlay, and upstream's comment above
+#     `use_bidirectional_vision`. Both restored, so the file now diverges only by
+#     EpiCache + suffix decoding. Worth knowing: that comment describes
+#     `has_audio_tokens` from 2197a68a, an upstream BRANCH commit that never reached
+#     upstream/main — so it is stray in both trees. Restored verbatim anyway; matching
+#     upstream byte-for-byte is what keeps future merges clean.
+#   server/responses_state.py — 5 sites. Zero upstream lines missing (pure additions),
+#     which is what made marking safe: the THINKING_FORMATS registry integration,
+#     `_CONTENT_MARKERS` stripping, and the ends-with-a-prefix partial-tag scan.
 #   speculative/utils.py — 5 sites, all one feature: `draft_kind == "suffix"`
 #     dispatch to the fork's drafter-free n-gram speculation (863441c9), which
 #     upstream does not have at all. 61+/0- means pure additions, so there was no
@@ -69,7 +86,7 @@
 #     INSIDE the list literal — a module-scope hunk is keyed by line, so a marker
 #     above the statement does not cover it.
 #
-# Current standing (2026-08-10): 17 files, down from 32. Every
+# Current standing (2026-08-10): 14 files / 152 sites, down from 32 files. Every
 # diverged file NOT listed here is marked, including
 # server/request_normalization.py — the gen-args union added fork hunks to a file
 # that had been byte-identical to upstream, and this check caught them before the
@@ -94,16 +111,13 @@ mlx_vlm/tests/test_server.py  # 6 sites / 7 hunks, down from 19, and 123 fork-on
 # --- Server surfaces, not yet reviewed at site granularity.
 mlx_vlm/server/app.py  # 7 sites / 15 hunks. LEADS is CLEARED: e7a0f0f0/21aeb8a5/3de5bada no longer report, the three .deletion-exclusions entries retired with the gen-args union, and 7bf4f7ea (#1402, the preload-reload bug) landed in 4bd99ca1
 mlx_vlm/server/__init__.py  # 7 sites / 13 hunks, all module scope: a re-export surface (lazy import tuples and __all__), so each divergence is one name in a list. Union-resolved by hand at every merge. The convention question is now ANSWERED by speculative/utils.py: put one marker INSIDE the list literal covering the fork names, since a module-scope hunk is keyed by line and a marker above the statement does not cover it
-mlx_vlm/server/responses_state.py  # 5 sites / 7 hunks, not reviewed. The duplicate _as_plain_dict noted here before is gone (retired with the gen-args union). 08723a3f added the _CONTENT_MARKERS strip to _step_thinking_state — that is fork wiring for the fork's streaming chat path and is ready to mark
 mlx_vlm/server/cli.py  # 6 sites / 22 hunks, not reviewed. Mostly argparse blocks, so the natural unit is one marker per fork flag group. cfcc36d9's --log-progress-interval landed in 682043f5 and is upstream's, not fork — do not mark it
 
 # --- Library modules, not yet reviewed at site granularity.
 mlx_vlm/utils.py  # 13 sites / 26 hunks. LEADS is CLEARED: 9afc59ce and c1821e93 no longer report, b93707d8's normalize_audio_features stays recorded in .deletion-exclusions, and 63965655/0ae7f5e0 (the StoppingCriteria list aliasing) landed in 68ac2dc1
 mlx_vlm/generate/common.py  # 8 sites / 22 hunks. Fork-authored module (the 5e9b9503 generation-engine port) that upstream also has, so both sides edit it; the 2026-08-09 merge added four upstream params to maybe_quantize_kv_cache. Not reviewed. common.py:628's start_position branch is the evidence for c503fa7b being a reviewed divergence (handoff §4) — read that before touching it
 mlx_vlm/turboquant.py  # 7 sites / 14 hunks. LEADS: 1171888e (#1447) and e3906673 (#1433) still report, but handoff §4 closes BOTH by review — 1171888e's zero_row_tail is byte-identical to upstream's live copy (upstream defines it twice and the report flags the shadowed dead one) and e3906673's remainder contradicts the fork's measured decode-only split. So this is markable now; the 2026-08-09 merge already marked _ensure_codecs
-mlx_vlm/generate/__init__.py  # 4 sites / 7 hunks, re-export surface — see server/__init__.py for the now-settled convention
 mlx_vlm/models/qwen3_5/language.py  # 7 sites / 18 hunks. AGENTS.md's note that the norm-shift gate here is protected fork work was WRONG (upstream landed the same fix in #1556); treat every site as unreviewed rather than trusting that note
-mlx_vlm/models/gemma4/language.py  # 5 sites / 10 hunks, not reviewed
 
 # --- Tests, not yet reviewed at site granularity.
 mlx_vlm/tests/test_generate.py  # 10 sites / 13 hunks. UNIONED with upstream on 2026-08-10 (1ab442d8): 7 tests restored, and zero shared bodies differ. Its 9 remaining .symbol-exclusions entries are the REVIEWED c503fa7b divergence (TestPrefixCacheReuseTrim), now carrying the real reason instead of 'unreviewed'. The sites are the fork's 9 replacement tests

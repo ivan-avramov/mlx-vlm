@@ -10,7 +10,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import HTTPException
 
-from ..prompt_utils import THINKING_FORMATS, ThinkingFormat, detect_thinking_format
+from ..prompt_utils import (  # Fork: the THINKING_FORMATS registry is fork-only
+    THINKING_FORMATS,
+    ThinkingFormat,
+    detect_thinking_format,
+)
 
 logger = logging.getLogger("mlx_vlm.server")
 
@@ -41,6 +45,12 @@ class ThinkingStreamDelta:
 
 class ThinkingStreamState:
     """Split streamed thinking delimiters from user-visible content."""
+
+    # Fork: upstream's class plus registry-sourced markers.
+    # `_registry_open_close_markers` folds THINKING_FORMATS's family literals in
+    # AHEAD of the always-on defaults so Gemma's pipe-delimited `<|think|>` is not
+    # mis-split by the looser `<think>` pair, and `_CONTENT_MARKERS` strips Cohere's
+    # structural `<|START_TEXT|>` wrapper. The feed/split machine is upstream's.
 
     _DEFAULT_OPEN_CLOSE_MARKERS = (
         ("<|channel>thought", "<channel|>"),
@@ -318,6 +328,8 @@ def _clean_reasoning(reasoning: str, start_marker: str) -> str:
 
 
 def _strip_thinking_quirks(fmt: ThinkingFormat, reasoning: str) -> str:
+    # Fork: per-family cleanup of reasoning text, keyed off the THINKING_FORMATS
+    # registry, which upstream does not have.
     """Apply per-format reasoning-text fixups after opener removal.
 
     gpt-oss leaves a literal "thought" word right after the opener even
@@ -372,6 +384,8 @@ def _split_thinking(
     thinking_end_token: Optional[str] = None,
     starts_in_thinking: bool = False,
 ) -> Tuple[Optional[str], str]:
+    # Fork: dispatches to `_split_thinking_by_format` when a registry family is
+    # detected, falling back to upstream's marker-pair logic otherwise.
     """Split thinking tags from content. Returns (reasoning, content).
 
     When no explicit start/end tokens are supplied, prefer the
@@ -428,6 +442,9 @@ def _split_thinking(
 def _partial_tag_start_pos(
     accumulated: str, partial_buffers: Tuple[str, ...]
 ) -> Optional[int]:
+    # Fork: ENDS-WITH-a-prefix rather than substring containment. A contains check
+    # only fires once `accumulated` is long enough to hold the whole partial, by
+    # which point its bytes have already leaked into delta.content as short tokens.
     """Return the earliest position in ``accumulated`` where a partial
     tag prefix starts, OR None if accumulated does not end with a
     partial-tag prefix.

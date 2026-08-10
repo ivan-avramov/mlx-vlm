@@ -9,7 +9,7 @@ from .ar import (
     generate_step,
 )
 from .cli import main, parse_arguments
-from .common import (
+from .common import (  # Fork: the 5e9b9503 engine port's own helpers
     GenerationResult,
     PromptCacheState,
     _adjust_chunk_for_snapshot_landing,
@@ -77,6 +77,7 @@ __all__ = [
     "BatchGenerator",
     "BatchResponse",
     "BatchStats",
+    "GenerateKwargs",
     "GenerationResult",
     "ImageEditModel",
     "ImageEditRequest",
@@ -113,6 +114,7 @@ __all__ = [
     "load_image_model",
     "load_video_generation_model",
     "main",
+    # Fork: 7de8f7f1's KV pre-allocation entry point.
     "maybe_preallocate_kv_cache",
     "maybe_quantize_kv_cache",
     "parse_arguments",
@@ -124,6 +126,10 @@ __all__ = [
 
 
 def __getattr__(name):
+    # Fork: `common` is in the lazy-import tuple because the fork's generation
+    # engine lives there (5e9b9503); upstream's tuple has no `common`. The
+    # `generation_stream` special case keeps that name working as an attribute
+    # while deferring Metal stream creation to first use.
     import importlib
 
     from . import ar, common, dispatch, image, video_generation
@@ -146,6 +152,10 @@ def __getattr__(name):
 
 
 def __dir__():
+    # Fork: `common` is in the lazy-import tuple because the fork's generation
+    # engine lives there (5e9b9503); upstream's tuple has no `common`. The
+    # `generation_stream` special case keeps that name working as an attribute
+    # while deferring Metal stream creation to first use.
     import importlib
 
     from . import ar, common, dispatch, image, video_generation

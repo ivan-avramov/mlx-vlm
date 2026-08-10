@@ -5,12 +5,16 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn import RMSNorm
 
-from ..base import (
+from ..base import (  # Fork: create_causal_mask comes from ..cache here (9065b024)
     LanguageModelOutput,
     create_attention_mask,
     scaled_dot_product_attention,
 )
-from ..cache import KVCache, RotatingKVCache, create_causal_mask
+from ..cache import (  # Fork: 9065b024 vendored create_causal_mask into ..cache
+    KVCache,
+    RotatingKVCache,
+    create_causal_mask,
+)
 from ..rope_utils import initialize_rope
 from .config import TextConfig
 
@@ -128,6 +132,22 @@ class Experts(nn.Module):
 
 
 class Attention(nn.Module):
+    """Fork: two EpiCache hooks on top of upstream's attention.
+
+    1. The RoPE position prefers ``cache.rope_offset`` when the cache exposes one
+       (``EpiCacheKVCache.rope_offset == evicted + inner.offset``) so kept
+       post-eviction keys and the query share a RoPE frame. Plain caches have no
+       ``rope_offset``, so this falls back to ``.offset`` — behaviour is unchanged
+       with EpiCache off.
+    2. When a budget-bounded cache is over budget it records a SnapKV-style
+       attention-mass score from the chunk's observation window, so eviction keeps
+       the most-attended middle keys rather than going by key-norm alone.
+
+    Everything else here is upstream's.
+    """
+
+    # Fork: EpiCache hooks — see the docstring above.
+
     def __init__(
         self,
         config: TextConfig,
@@ -491,6 +511,8 @@ class Gemma4TextModel(nn.Module):
             return base_mask
         if mm_token_type_ids.shape[1] != base_mask.shape[-1]:
             return base_mask
+        if base_mask.shape[-2] != base_mask.shape[-1]:
+            return base_mask
 
         block_sequence_ids = self._block_sequence_ids_for_mask(mm_token_type_ids)
         q_blocks = mx.expand_dims(block_sequence_ids, -1)
@@ -507,6 +529,8 @@ class Gemma4TextModel(nn.Module):
             and int(mx.sum((mm_token_type_ids == 1) | (mm_token_type_ids == 2)).item())
             > 0
         )
+        # Audio spans are sequential; keep mixed image+audio prompts causal to
+        # avoid the vision block overlay dominating quantized unified models.
         use_bidirectional_vision = (
             getattr(self.config, "use_bidirectional_attention", None) == "vision"
             and mm_token_type_ids is not None
@@ -663,6 +687,20 @@ class Gemma4TextModel(nn.Module):
 
 
 class LanguageModel(nn.Module):
+    """Fork: adds drafter-free suffix-decoding support and opt-in EpiCache.
+
+    ``suffix_verify_kwargs()`` and the ``draft_kind == "suffix"`` chunked-prefill
+    branch belong to the fork's SuffixDecoding drafter (863441c9), which upstream
+    does not have; gemma4 capture is KV-only, so chunked prefill is safe here and
+    avoids the non-chunked full-prompt forward that OOMs at long context.
+    ``make_cache`` wraps ONLY the full-attention layers in ``EpiCacheKVCache`` when
+    ``MLX_EPICACHE_BUDGET > 0`` (sliding-window layers are already
+    RotatingKVCache-bounded). Both are additive: off by default, upstream's
+    behaviour unchanged.
+    """
+
+    # Fork: suffix decoding (863441c9) + opt-in EpiCache — see the docstring above.
+
     supports_logits_to_keep = True
 
     def __init__(self, config: TextConfig):
