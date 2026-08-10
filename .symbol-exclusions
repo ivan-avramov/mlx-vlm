@@ -90,24 +90,15 @@ mlx_vlm/server/generation.py::_sample_top_p_one  # baseline: pre-existing diverg
 # --- mlx_vlm/tests/test_gemma4_tool_parser.py
 
 # --- mlx_vlm/tests/test_generate.py
-mlx_vlm/tests/test_generate.py::_fill  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_generate.py::make_batch  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_generate.py::record_async_eval  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_generate.py::test_batch_generate_optional_input_annotations_match_defaults  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_generate.py::test_batch_generator_apc_media_token_ids_handles_text_only_model  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_generate.py::test_empty_cache_is_reusable  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_generate.py::test_flat_cache_trims_to_prefix  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_generate.py::test_full_prefix_needs_no_trim  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_generate.py::test_generate_step_schedules_final_prefill_async  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_generate.py::test_generation_batch_extend_discards_inactive_stale_processor_state  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_generate.py::test_generation_batch_extend_expands_compact_processor_state  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_generate.py::test_generation_batch_thinking_budget_does_not_sync_next_token  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_generate.py::test_mixed_flat_and_wrapped_rotating_is_not_reusable  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_generate.py::test_public_generation_annotations_match_runtime_results  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_generate.py::test_unwrapped_buffered_rotating_trims  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_generate.py::test_unwrapped_rotating_trims_and_stays_usable  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_generate.py::test_wrapped_buffered_rotating_declined_and_survives_next_step  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/tests/test_generate.py::test_wrapped_rotating_is_not_reusable  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/tests/test_generate.py::_fill  # REVIEWED: c503fa7b's half of TestPrefixCacheReuseTrim. Upstream gates prefix reuse with _prefix_cache_trim_amount/_cache_fully_retained; this fork uses _rotating_rewind_safe + a snapshot ring, so these 9 test the symbols the fork does not have. The fork's own 9 replacements live in the same class (see its docstring and mlx-vlm #1715). Superseded, not missing.
+mlx_vlm/tests/test_generate.py::test_empty_cache_is_reusable  # REVIEWED: c503fa7b's half of TestPrefixCacheReuseTrim. Upstream gates prefix reuse with _prefix_cache_trim_amount/_cache_fully_retained; this fork uses _rotating_rewind_safe + a snapshot ring, so these 9 test the symbols the fork does not have. The fork's own 9 replacements live in the same class (see its docstring and mlx-vlm #1715). Superseded, not missing.
+mlx_vlm/tests/test_generate.py::test_flat_cache_trims_to_prefix  # REVIEWED: c503fa7b's half of TestPrefixCacheReuseTrim. Upstream gates prefix reuse with _prefix_cache_trim_amount/_cache_fully_retained; this fork uses _rotating_rewind_safe + a snapshot ring, so these 9 test the symbols the fork does not have. The fork's own 9 replacements live in the same class (see its docstring and mlx-vlm #1715). Superseded, not missing.
+mlx_vlm/tests/test_generate.py::test_full_prefix_needs_no_trim  # REVIEWED: c503fa7b's half of TestPrefixCacheReuseTrim. Upstream gates prefix reuse with _prefix_cache_trim_amount/_cache_fully_retained; this fork uses _rotating_rewind_safe + a snapshot ring, so these 9 test the symbols the fork does not have. The fork's own 9 replacements live in the same class (see its docstring and mlx-vlm #1715). Superseded, not missing.
+mlx_vlm/tests/test_generate.py::test_mixed_flat_and_wrapped_rotating_is_not_reusable  # REVIEWED: c503fa7b's half of TestPrefixCacheReuseTrim. Upstream gates prefix reuse with _prefix_cache_trim_amount/_cache_fully_retained; this fork uses _rotating_rewind_safe + a snapshot ring, so these 9 test the symbols the fork does not have. The fork's own 9 replacements live in the same class (see its docstring and mlx-vlm #1715). Superseded, not missing.
+mlx_vlm/tests/test_generate.py::test_unwrapped_buffered_rotating_trims  # REVIEWED: c503fa7b's half of TestPrefixCacheReuseTrim. Upstream gates prefix reuse with _prefix_cache_trim_amount/_cache_fully_retained; this fork uses _rotating_rewind_safe + a snapshot ring, so these 9 test the symbols the fork does not have. The fork's own 9 replacements live in the same class (see its docstring and mlx-vlm #1715). Superseded, not missing.
+mlx_vlm/tests/test_generate.py::test_unwrapped_rotating_trims_and_stays_usable  # REVIEWED: c503fa7b's half of TestPrefixCacheReuseTrim. Upstream gates prefix reuse with _prefix_cache_trim_amount/_cache_fully_retained; this fork uses _rotating_rewind_safe + a snapshot ring, so these 9 test the symbols the fork does not have. The fork's own 9 replacements live in the same class (see its docstring and mlx-vlm #1715). Superseded, not missing.
+mlx_vlm/tests/test_generate.py::test_wrapped_buffered_rotating_declined_and_survives_next_step  # REVIEWED: c503fa7b's half of TestPrefixCacheReuseTrim. Upstream gates prefix reuse with _prefix_cache_trim_amount/_cache_fully_retained; this fork uses _rotating_rewind_safe + a snapshot ring, so these 9 test the symbols the fork does not have. The fork's own 9 replacements live in the same class (see its docstring and mlx-vlm #1715). Superseded, not missing.
+mlx_vlm/tests/test_generate.py::test_wrapped_rotating_is_not_reusable  # REVIEWED: c503fa7b's half of TestPrefixCacheReuseTrim. Upstream gates prefix reuse with _prefix_cache_trim_amount/_cache_fully_retained; this fork uses _rotating_rewind_safe + a snapshot ring, so these 9 test the symbols the fork does not have. The fork's own 9 replacements live in the same class (see its docstring and mlx-vlm #1715). Superseded, not missing.
 
 
 # --- mlx_vlm/tests/test_processors.py

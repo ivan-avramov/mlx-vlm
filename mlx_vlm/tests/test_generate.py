@@ -2,6 +2,7 @@
 
 import logging
 import sys
+import typing
 from argparse import Namespace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -989,6 +990,114 @@ class TestBatchGenerator:
         )
         gen.insert([[1, 2, 3]])
         assert gen.remove(9999) is False
+
+    def test_generation_batch_thinking_budget_does_not_sync_next_token(self):
+        class FixedLogitModel:
+            def __call__(self, input_ids, cache=None, **kwargs):
+                token_scores = mx.array([0.0, 10.0, 0.0, 0.0])
+                logits = mx.broadcast_to(
+                    token_scores, (input_ids.shape[0], input_ids.shape[1], 4)
+                )
+                return MagicMock(logits=logits)
+
+        class ForceAfterFirst:
+            def __init__(self):
+                self.forced_token_id = None
+
+            def __call__(self, token):
+                self.forced_token_id = 3 if token == 5 else None
+
+            def pop_forced_token_id(self):
+                forced_token_id = self.forced_token_id
+                self.forced_token_id = None
+                return forced_token_id
+
+        batch = GenerationBatch(
+            model=FixedLogitModel(),
+            uids=[0],
+            inputs=mx.array([5], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+            stop_criteria=lambda token: False,
+            max_tokens=[2],
+            thinking_budget_criteria=[ForceAfterFirst()],
+        )
+
+        original_eval = mx.eval
+        with patch.object(generate_module.mx, "eval", wraps=original_eval) as mock_eval:
+            first = batch.next()
+
+        assert [r.token for r in first] == [5]
+        # GenerationBatch._step synchronizes the current token once. Budget
+        # handling must not add a second synchronization for the next token.
+        assert mock_eval.call_count == 1
+        assert [r.token for r in batch.next()] == [3]
+
+    def test_generation_batch_extend_expands_compact_processor_state(self):
+        sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
+        stop_criteria = lambda token: False
+
+        def make_batch(uid, processor=None):
+            return GenerationBatch(
+                model=object(),
+                uids=[uid],
+                inputs=mx.array([uid + 1], dtype=mx.int32),
+                prompt_cache=[],
+                sampler=sampler,
+                stop_criteria=stop_criteria,
+                max_tokens=[2],
+                token_context=[[30]] if processor is not None else None,
+                logits_processors=[[processor]] if processor is not None else None,
+            )
+
+        first_plain = make_batch(0)
+        second_plain = make_batch(1)
+        structured_processor = lambda tokens, logits: logits
+        structured = make_batch(2, structured_processor)
+
+        first_plain.extend(second_plain)
+        assert first_plain.logits_processors == []
+
+        first_plain.extend(structured)
+
+        assert first_plain.uids == [0, 1, 2]
+        assert first_plain.token_context == [[], [], [30]]
+        assert first_plain.logits_processors == [
+            None,
+            None,
+            [structured_processor],
+        ]
+
+    def test_generation_batch_extend_discards_inactive_stale_processor_state(self):
+        sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
+        stop_criteria = lambda token: False
+        finished_structured = GenerationBatch(
+            model=MagicMock(),
+            uids=[0],
+            inputs=mx.array([5], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=sampler,
+            stop_criteria=stop_criteria,
+            max_tokens=[2],
+            token_context=[[30]],
+            logits_processors=[None],
+        )
+        plain = GenerationBatch(
+            model=MagicMock(),
+            uids=[1],
+            inputs=mx.array([6], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=sampler,
+            stop_criteria=stop_criteria,
+            max_tokens=[2],
+        )
+
+        finished_structured.extend(plain)
+
+        assert finished_structured.token_context == []
+        assert finished_structured.logits_processors == []
+        finished_structured.filter([1])
+        assert finished_structured.uids == [1]
 
 
 # ============================================================================
@@ -2595,3 +2704,81 @@ class TestBatchTurboQuantizedKVStart:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+def test_batch_generate_optional_input_annotations_match_defaults():
+    hints = typing.get_type_hints(ar_module.batch_generate)
+
+    assert type(None) in typing.get_args(hints["images"])
+    assert type(None) in typing.get_args(hints["audios"])
+    assert type(None) in typing.get_args(hints["prompts"])
+    assert hints["return"] is BatchResponse
+
+
+def test_batch_generator_apc_media_token_ids_handles_text_only_model(mock_processor):
+    model = SimpleNamespace(
+        language_model=MockLanguageModel(),
+        make_cache=lambda: [KVCache()],
+    )
+    generator = ar_module.BatchGenerator(
+        model,
+        mock_processor,
+        apc_manager=apc_module.APCManager(num_blocks=1),
+    )
+
+    assert generator._apc_media_token_ids() == set()
+
+
+def test_generate_step_schedules_final_prefill_async():
+    model = MagicMock()
+    model.language_model.return_value = MagicMock(
+        logits=mx.zeros((1, 1, 4)),
+        cross_attention_states=None,
+        encoder_outputs=None,
+    )
+
+    embedding_output = MagicMock()
+    embedding_output.inputs_embeds = mx.zeros((1, 1, 4))
+    embedding_output.to_dict.return_value = {}
+    model.get_input_embeddings.return_value = embedding_output
+
+    events = []
+    original_async_eval = mx.async_eval
+    original_eval = mx.eval
+
+    def record_async_eval(*args):
+        events.append("async")
+        return original_async_eval(*args)
+
+    def record_eval(*args):
+        events.append("sync")
+        return original_eval(*args)
+
+    with (
+        patch.object(generate_module.cache, "make_prompt_cache", return_value=[]),
+        patch.object(generate_module, "make_logits_processors", return_value=[]),
+        patch.object(
+            generate_module, "make_sampler", return_value=lambda _: mx.array([0])
+        ),
+        patch.object(generate_module.mx, "async_eval", side_effect=record_async_eval),
+        patch.object(generate_module.mx, "eval", side_effect=record_eval),
+    ):
+        gen = generate_module.generate_step(
+            input_ids=mx.array([[1]], dtype=mx.int32),
+            model=model,
+            pixel_values=None,
+            mask=None,
+            max_tokens=1,
+        )
+        next(gen)
+
+    assert events[0] == "async"
+
+
+def test_public_generation_annotations_match_runtime_results():
+    hints = typing.get_type_hints(dispatch_module.stream_generate)
+
+    assert hints["return"] == typing.Generator[GenerationResult, None, None]
+    assert type(None) in typing.get_args(hints["image"])
+    assert type(None) in typing.get_args(hints["audio"])
+    assert type(None) in typing.get_args(hints["video"])
