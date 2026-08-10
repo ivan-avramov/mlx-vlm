@@ -123,6 +123,38 @@
 #     Missing upstream lines went 30 -> 6, and all 6 are the EpiCache/turboquant rewrites.
 #     NB AGENTS.md's note that this file's norm-shift gate was protected fork work was
 #     already known wrong; nothing here depended on it.
+#   turboquant.py — 7 sites -> 4 markers + 2 module-level, and the AST-body method
+#     found the one real defect that three earlier passes over this file missed.
+#     91 of 96 shared definitions were byte-identical, so the whole review reduced to
+#     five, and this file's own entry had already been corrected once for reading the
+#     per-commit report instead of a direct diff. RESTORED: e3906673 (#1433, "improved
+#     turbo quant's prefill") is a single-file 8-line commit whose two Metal-kernel
+#     changes landed and whose third did not — it WIDENED
+#     `_TurboQuantMSECodec.quantize`'s fast path from
+#     `vectors.shape[-2] == 1 and self.bits > 0 and self.use_rht` to `self.bits > 0`,
+#     and this tree kept the pre-#1433 narrow gate. So every multi-token call, i.e.
+#     every prefill, fell past BOTH fused-kernel blocks to the slow `_quantize_unit`
+#     path: exactly the prefill the commit title improved. Not a missing hunk — a
+#     narrowing upstream had already removed, which is why nothing read as absent.
+#     All 241 turboquant tests pass either way, because both paths produce a valid
+#     quantization and none asserts which ran. `quantize` is now byte-identical to
+#     upstream; guard: TestTurboQuantPrefillUsesTheFusedKernel.
+#     The other four are genuine fork work, all `git log -S`-confirmed:
+#       * `_fused_mse_decode_2pass_1_kernel` is a fork rewrite (bf7c793a, GQA
+#         tile-reuse). Upstream's kernel is NOT lost — it is
+#         `_fused_mse_decode_2pass_1_kernel_legacy`, byte-identical apart from the
+#         rename and an added docstring, and TurboQuantKVCache branches between the
+#         two at runtime. Keeping it verbatim means a future upstream change to that
+#         kernel conflicts in that function instead of diverging silently.
+#       * `_reserve_state_capacity` is a strict superset (2f5e01dd): upstream's step
+#         arithmetic unchanged, max()'d with a geometric 1.25x plus allocation hooks.
+#       * `TurboQuantKVCache` adds four fork-only tiled-prefill methods (b311af00).
+#       * `BatchTurboQuantKVCache`'s 73 "missing" lines are upstream's SHADOWED DEAD
+#         `zero_row_tail` — upstream defines it twice and the second shadows the
+#         first; ours is byte-identical to the live copy. This is handoff §4's
+#         1171888e note, now confirmed mechanically rather than by spot check.
+#     Also converged: the absolute `from mlx_vlm.models.cache import ...` (9065b024),
+#     the same artifact apc.py had and the third instance of that shape in this file.
 #   apc.py — CONVERGED, not marked, and the reason is the most reusable thing in this
 #     file. It was the largest entry here for weeks (36 sites / 75 hunks, 554 missing
 #     upstream lines against 567 added) and every description of it — this file's own
@@ -163,7 +195,7 @@
 #     against a README that promises it. Guard:
 #     test_dropped_upstream_guards.py::TestApcStoreEmitsItsTrace.
 #
-# Current standing (2026-08-10): 6 files / 61 sites / 127 hunks, down from 32 files /
+# Current standing (2026-08-10): 5 files / 54 sites / 113 hunks, down from 32 files /
 # 175 sites. Re-run `--summary`; do not trust this line either. Every
 # diverged file NOT listed here is marked, including
 # server/request_normalization.py — the gen-args union added fork hunks to a file
@@ -187,7 +219,6 @@ mlx_vlm/server/openai.py  # 18 sites / 49 hunks. LEADS mostly cleared: f044f36a 
 
 # --- Library modules, not yet reviewed at site granularity.
 mlx_vlm/utils.py  # REVIEWED site-by-site 2026-08-09; ONE named blocker, not a general "not yet reviewed". Missing upstream lines 32 -> 19, and of the 19 all but 7 are the fork's print/logging -> module-logger conversions (2f5e01dd, fork-authored, confirmed). RESTORED while reviewing: 1551c71f (#1746 Kimi K3)'s 4-line mxfp4-pack-quantized branch -- 10 of its 11 files had landed, so compressed-tensors checkpoints in that format were loaded as mode "affine" (wrong dequant, no error); b93707d8 (#1498)'s sanitize-block half, which was a hard AttributeError on load_model of minimax_m3; and c90167b3 (#1711)'s 3-line comment above _COMPRESSED_TENSORS_DROP_SUFFIXES. THE BLOCKER: the other half of b93707d8 -- prepare_inputs' qwen3-omni audio special case (is_qwen3_omni_moe / audio_inputs / is_lossy_audio / normalize_audio_features) is #1498's deleted text verbatim, i.e. CONFIRMED-STALE, but no test drives prepare_inputs with audio through that branch so a ~60-line deletion cannot be validated here. Do NOT mark that region -- marking stale content is the laundering this file exists to prevent. Full evidence in .deletion-exclusions under normalize_audio_features
-mlx_vlm/turboquant.py  # 7 sites / 14 hunks. CORRECTION (2026-08-10): an earlier version of this entry said "markable now" because handoff §4 closes its two reported commits (1171888e, e3906673) by review. That was too optimistic and read off the per-commit report rather than a direct diff: `git diff upstream/main` shows 118 upstream lines absent. Spot-checked four of them (_fused_mse_decode_2pass_1_kernel, dequantize_for_apc, _allocate_state_like, prefill_query_block_size) and all exist in BOTH trees, so the bulk is fork REWRITE of the same functions (bf7c793a's GQA tile-reuse, b311af00's flash-style tiled prefill) counted line-wise rather than dropped content. Bulk is not all: confirm the remaining ~114 before marking. The 2026-08-09 merge already marked _ensure_codecs' kv_quant_mode
 # --- TRIAGE (2026-08-10). Missing upstream lines / added lines per file, from a direct
 # --- `git diff upstream/main`. Use this to ORDER the work; it decides nothing on its own
 # --- (AGENTS.md's first rule), but a file with few missing lines is cheap to clear and
@@ -196,7 +227,9 @@ mlx_vlm/turboquant.py  # 7 sites / 14 hunks. CORRECTION (2026-08-10): an earlier
 # ---   [utils.py 32/171 REVIEWED, now 19/159, one named blocker]
 # ---   [apc.py 554/567 CONVERGED, now 2/35 -- it was a REORDERING, not a rewrite;
 # ---    AST-diff bodies before sizing any file here, see its RESOLVED note above]
-# ---   openai.py 76/905 · generation.py 92/665 · turboquant.py 118/529
+# ---   openai.py 76/905 · generation.py 92/665
+# ---   [turboquant.py 118/529 CLEARED: 91 of 96 bodies byte-identical; the AST-body
+# ---    method found #1433 where three earlier report-based passes had not]
 # ---   dispatch.py 125/377 · test_generate.py 251/297
 # --- ar.py was 26/233 and is now cleared: all 26 were rewrite artifacts, confirmed by
 # --- equal-count spot checks (speculative_prefill_capture_kwargs 6/6, BatchKVCache 7/7,

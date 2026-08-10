@@ -1593,3 +1593,63 @@ class TestApcStoreEmitsItsTrace:
         source = inspect.getsource(apc.DiskBlockStore.load_layer_major_prefix)
         assert '_env_truthy("APC_DISK_TRACE")' in source
         assert 'os.environ.get("APC_DISK_TRACE"' not in source
+
+
+class TestTurboQuantPrefillUsesTheFusedKernel:
+    """`e3906673` (#1433, "improved turbo quant's prefill") — its one-line gate.
+
+    A single-file, 8-line commit with three changes; the two Metal-kernel changes
+    landed and the third did not. #1433 WIDENED `_TurboQuantMSECodec.quantize`'s
+    fast path from `vectors.shape[-2] == 1 and self.bits > 0 and self.use_rht` to
+    just `self.bits > 0`, so this tree kept the pre-#1433 narrow gate: anything
+    with more than one token — i.e. every prefill — fell past both fused-kernel
+    blocks to the slow `_quantize_unit` path. That is precisely the prefill the
+    commit title says it improved, and with the gate restored `quantize` is
+    byte-identical to upstream's.
+
+    This is the mirror of the other guards here: not missing content, but a
+    narrowing that upstream had already removed. Nothing failed — all 241
+    turboquant tests pass either way, because both paths produce a valid
+    quantization and none of them asserts which one ran.
+    """
+
+    def _multi_token_vectors(self):
+        import mlx.core as mx
+
+        # dim=64 is a power of two, so use_rht is True and the narrow gate's
+        # `shape[-2] == 1` is the only clause that can reject a prefill.
+        return mx.ones((1, 2, 8, 64), dtype=mx.float32)
+
+    def test_multi_token_quantize_does_not_take_the_slow_path(self, monkeypatch):
+        from mlx_vlm.turboquant import _TurboQuantMSECodec
+
+        codec = _TurboQuantMSECodec(64, 3, seed=0)
+        assert codec.use_rht is True
+
+        calls = []
+        original = codec._quantize_unit
+        monkeypatch.setattr(
+            codec,
+            "_quantize_unit",
+            lambda *a, **k: (calls.append(1), original(*a, **k))[1],
+        )
+
+        state = codec.quantize(self._multi_token_vectors())
+
+        assert not calls, (
+            "multi-token quantize fell through to _quantize_unit; "
+            "the #1433 fast-path gate is narrowed again"
+        )
+        # The fused path must still produce a usable state, shaped per-vector.
+        assert state.norms.shape == (1, 2, 8)
+
+    def test_single_token_quantize_also_uses_it(self):
+        """Both shapes take the fused path, which is what `self.bits > 0` means."""
+        import mlx.core as mx
+
+        from mlx_vlm.turboquant import _TurboQuantMSECodec
+
+        codec = _TurboQuantMSECodec(64, 3, seed=0)
+        state = codec.quantize(mx.ones((1, 2, 1, 64), dtype=mx.float32))
+
+        assert state.norms.shape == (1, 2, 1)
