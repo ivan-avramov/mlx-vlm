@@ -613,9 +613,59 @@ def test_get_cached_model_omitted_adapter_inherits_loaded_adapter(monkeypatch):
     assert server.runtime.model_cache["cache_key"] == (
         "demo-model",
         "adapter-a",
-        "auto",
+        "text_generation",
     )
     assert server.runtime.model_cache["adapter_path"] == "adapter-a"
+
+
+@pytest.mark.parametrize(
+    "load_error",
+    [
+        ValueError("Model type bert not supported."),
+        RuntimeError("Unable to initialize model."),
+    ],
+)
+def test_load_model_resources_returns_load_failure_as_bad_request(
+    monkeypatch, load_error
+):
+    def reject_model(*_args, **_kwargs):
+        raise load_error
+
+    monkeypatch.setattr(server_generation, "load", reject_model)
+
+    with pytest.raises(server.HTTPException) as exc_info:
+        server_generation.load_model_resources(
+            "google-bert/bert-base-multilingual-cased",
+            None,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == f"Failed to load model: {load_error}"
+
+
+def test_unsupported_model_request_does_not_crash_server(client, monkeypatch):
+    def reject_model(*_args, **_kwargs):
+        raise ValueError("Model type bert not supported.")
+
+    monkeypatch.setattr(server_generation, "load", reject_model)
+    monkeypatch.setattr(server._app_module._apc, "from_env", lambda *_, **__: None)
+    monkeypatch.setattr(server.runtime, "model_cache", {})
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+    monkeypatch.setattr(server.runtime, "apc_manager", None)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "google-bert/bert-base-multilingual-cased",
+            "messages": [{"role": "user", "content": "Hello"}],
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "Failed to load model: Model type bert not supported."
+    )
+    assert client.get("/health").status_code == 200
 
 
 def _unstarted_response_generator():
@@ -2209,24 +2259,34 @@ def test_responses_streaming_emits_reasoning_events(client):
 
     assert response.status_code == 200
     events = _sse_events(response.text)
-    reasoning = [
-        data["delta"]
+    reasoning_events = [
+        data
         for event_type, data in events
         if event_type == "response.reasoning_text.delta"
     ]
-    text_deltas = [
-        data["delta"]
+    text_delta_events = [
+        data
         for event_type, data in events
         if event_type == "response.output_text.delta"
     ]
+    done_event = next(
+        data for event_type, data in events if event_type == "response.output_text.done"
+    )
     completed = next(
         data["response"]
         for event_type, data in events
         if event_type == "response.completed"
     )
 
-    assert "".join(reasoning) == "Check briefly."
-    assert "".join(text_deltas) == "Done."
+    assert "".join(event["delta"] for event in reasoning_events) == "Check briefly."
+    assert "".join(event["delta"] for event in text_delta_events) == "Done."
+    assert reasoning_events[0]["timings"]["predicted_per_second"] is None
+    assert reasoning_events[1]["timings"]["predicted_per_second"] > 0
+    assert (
+        text_delta_events[0]["timings"]["predicted_per_second"]
+        == reasoning_events[1]["timings"]["predicted_per_second"]
+    )
+    assert done_event["timings"]["predicted_per_second"] > 0
     assert [item["type"] for item in completed["output"]] == ["reasoning", "message"]
     assert completed["output"][0]["summary"][0]["text"] == "Check briefly."
     assert completed["output_text"] == "Done."
@@ -2357,6 +2417,77 @@ def test_responses_streaming_emits_function_call_arguments_done(client):
     assert done["item_id"].startswith("fc_")
     assert done["name"] == "get_weather"
     assert done["arguments"] == '{"location": "SF"}'
+
+
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        (
+            "/v1/chat/completions",
+            {
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": 4,
+                "stream": True,
+            },
+        ),
+        (
+            "/v1/responses",
+            {
+                "model": "demo",
+                "input": "Hello",
+                "max_output_tokens": 4,
+                "stream": True,
+            },
+        ),
+    ],
+)
+def test_stream_endpoints_do_not_clear_mlx_cache_on_close(
+    client, monkeypatch, path, payload
+):
+    class FakeResponseGenerator:
+        tokenizer = SimpleNamespace(decode=lambda tokens: "")
+
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
+            return None
+
+        def generate(self, prompt, images=None, audio=None, args=None):
+            return server.GenerationContext(uid=1, prompt_tokens=3), iter(
+                [
+                    server.StreamingToken(
+                        text="ok",
+                        token=1,
+                        logprobs=0.0,
+                        finish_reason="stop",
+                    )
+                ]
+            )
+
+    calls = {"clear_cache": 0, "collect": 0}
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+
+    monkeypatch.setattr(server.runtime, "response_generator", FakeResponseGenerator())
+    monkeypatch.setattr(
+        server, "get_cached_model", MagicMock(return_value=(model, processor, config))
+    )
+    monkeypatch.setattr(server, "apply_chat_template", MagicMock(return_value="prompt"))
+    monkeypatch.setattr(
+        server_openai.mx,
+        "clear_cache",
+        lambda: calls.__setitem__("clear_cache", calls["clear_cache"] + 1),
+    )
+    monkeypatch.setattr(
+        server_openai.gc,
+        "collect",
+        lambda: calls.__setitem__("collect", calls["collect"] + 1),
+    )
+
+    response = client.post(path, json=payload)
+
+    assert response.status_code == 200
+    assert calls == {"clear_cache": 0, "collect": 0}
 
 
 @pytest.mark.parametrize(
@@ -2618,7 +2749,7 @@ def test_chat_completions_streaming_splits_gemma_thinking_channel_content(
     ]
 
     assert "".join(delta.get("content") or "" for delta in deltas) == "7 * 8 = 56"
-    assert "".join(delta.get("reasoning") or "" for delta in deltas) == ""
+    assert "".join(delta.get("reasoning_content") or "" for delta in deltas) == ""
     assert "<|channel>" not in response.text
     assert "<channel|>" not in response.text
 
@@ -2678,6 +2809,9 @@ def test_chat_completions_streaming_uses_custom_thinking_markers(client, monkeyp
         if chunk.get("choices") and chunk["choices"][0].get("delta")
     ]
 
+    assert "".join(delta.get("reasoning_content") or "" for delta in deltas) == (
+        "Custom reasoning."
+    )
     assert "".join(delta.get("reasoning") or "" for delta in deltas) == (
         "Custom reasoning."
     )
@@ -2764,6 +2898,105 @@ def test_chat_completions_streaming_uses_prompt_opened_thinking_without_flag(
     assert "<|END_THINKING|>" not in response.text
     assert "<|START_TEXT|>" not in response.text
     assert "<|END_TEXT|>" not in response.text
+
+
+def test_chat_completions_streaming_keeps_plain_output_as_content_when_thinking_enabled(
+    client, monkeypatch
+):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="lfm2_vl")
+
+    class FakeResponseGenerator:
+        tokenizer = SimpleNamespace(decode=lambda tokens: "")
+
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
+            return None
+
+        def generate(self, prompt, images=None, audio=None, args=None):
+            return server.GenerationContext(uid=1, prompt_tokens=8), iter(
+                [
+                    server.StreamingToken(
+                        text="Hello", token=1, logprobs=0.0, finish_reason=None
+                    ),
+                    server.StreamingToken(
+                        text="!", token=2, logprobs=0.0, finish_reason="stop"
+                    ),
+                ]
+            )
+
+    monkeypatch.setattr(server.runtime, "response_generator", FakeResponseGenerator())
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "liquidai/LFM2.5-VL-1.6B",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": True,
+                "enable_thinking": True,
+            },
+        )
+
+    assert response.status_code == 200
+    chunks = [
+        json.loads(line[len("data: ") :])
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    deltas = [
+        chunk["choices"][0]["delta"]
+        for chunk in chunks
+        if chunk.get("choices") and chunk["choices"][0].get("delta")
+    ]
+
+    assert "".join(delta.get("content") or "" for delta in deltas) == "Hello!"
+    assert "".join(delta.get("reasoning_content") or "" for delta in deltas) == ""
+    assert "".join(delta.get("reasoning") or "" for delta in deltas) == ""
+
+
+def test_chat_completions_response_uses_reasoning_content(client):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="custom")
+    result = GenerationResult(
+        text="<analysis>Custom reasoning.</analysis>Custom answer.",
+        prompt_tokens=8,
+        generation_tokens=4,
+        total_tokens=12,
+        prompt_tps=10.0,
+        generation_tps=5.0,
+        peak_memory=0.1,
+    )
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", return_value="prompt"),
+        patch.object(server, "generate", return_value=result),
+    ):
+        response = client.post(
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "enable_thinking": True,
+                "thinking_start_token": "<analysis>",
+                "thinking_end_token": "</analysis>",
+            },
+        )
+
+    assert response.status_code == 200
+    message = response.json()["choices"][0]["message"]
+    assert message["reasoning_content"] == "Custom reasoning."
+    assert message["reasoning"] == "Custom reasoning."
+    assert message["content"] == "Custom answer."
 
 
 @pytest.mark.parametrize(
@@ -4633,6 +4866,11 @@ class TestResponseGenerator:
 
         monkeypatch.setenv("MAX_KV_SIZE", "8")
 
+        # Fork: upstream matches "MAX_KV_SIZE is 8" because its `generate` calls
+        # `_check_configured_context_budget`. This fork calls
+        # `_apply_generation_budget`, which reports the shortfall against
+        # MIN_OUTPUT_TOKENS instead. Different message, same rejection — do not
+        # "converge" this string without converging the budget helper too.
         with pytest.raises(server.PromptTooLongError, match="MIN_OUTPUT_TOKENS"):
             gen.generate("prompt", args=server.GenerationArguments(max_tokens=4))
 
@@ -4697,6 +4935,8 @@ class TestResponseGenerator:
             list(pool.map(generate_one, range(4)))
 
         assert max_active == 1
+        assert len(queued) == 4
+        assert all(request.thinking_budget_criteria is not None for request in queued)
 
     def test_server_runtime_snapshot_reports_effective_context_limit(self, monkeypatch):
         monkeypatch.setenv("MAX_KV_SIZE", "8")
@@ -5655,11 +5895,15 @@ class TestResponseGenerator:
     def test_generate_arguments_to_template_kwargs(self):
         args = server.GenerationArguments(
             enable_thinking=False,
+            reasoning=True,
+            reasoning_effort="high",
             thinking_budget=50,
             thinking_end_token="</think>",
         )
         kw = args.to_template_kwargs()
         assert kw["enable_thinking"] is False
+        assert kw["reasoning"] is True
+        assert kw["reasoning_effort"] == "high"
         assert kw["thinking_budget"] == 50
         assert kw["thinking_end_token"] == "</think>"
 
@@ -6205,11 +6449,11 @@ class TestResponseGenerator:
             assert os.environ["MLX_VLM_THINKING_BUDGET"] == "128"
             assert os.environ["MLX_VLM_THINKING_START_TOKEN"] == "<|START_THINKING|>"
             assert os.environ["MLX_VLM_THINKING_END_TOKEN"] == "<|END_THINKING|>"
-            assert os.environ["MLX_VLM_SERVER_API_KEY"] == "admin-token"
             assert os.environ["MLX_VLM_PRELOAD_MODEL"] == "demo"
             assert os.environ["MLX_VLM_PRELOAD_IMAGE_MODEL"] == "image-demo"
             assert os.environ["MLX_VLM_PRELOAD_TTS_MODEL"] == "tts-demo"
             assert os.environ["MLX_VLM_PRELOAD_STT_MODEL"] == "stt-demo"
+            assert os.environ["MLX_VLM_SERVER_API_KEY"] == "admin-token"
             assert run_calls[0][1]["host"] == "127.0.0.1"
         finally:
             for env_var in (
@@ -6879,6 +7123,28 @@ class TestThinkingStreamState:
         assert (
             server.prompt_has_open_thinking(
                 "prompt<|START_THINKING|>", enable_thinking=False
+            )
+            is True
+        )
+
+    def test_prompt_must_end_with_open_thinking_marker_to_start_in_thinking(self):
+        assert server.prompt_has_open_thinking("prompt", enable_thinking=True) is False
+        assert (
+            server.prompt_has_open_thinking("prompt<think>\n", enable_thinking=True)
+            is True
+        )
+        assert (
+            server.prompt_has_open_thinking(
+                "User: Say <think> literally\nAssistant:", enable_thinking=True
+            )
+            is False
+        )
+        assert (
+            server.prompt_has_open_thinking(
+                "prompt<analysis>",
+                enable_thinking=True,
+                thinking_start_token="<analysis>",
+                thinking_end_token="</analysis>",
             )
             is True
         )

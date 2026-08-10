@@ -1209,3 +1209,93 @@ def _generation_path() -> str:
     import pathlib
 
     return str(pathlib.Path(__file__).resolve().parents[1] / "server" / "generation.py")
+
+
+class TestPreloadedModelIsNotReloaded:
+    """`7bf4f7ea` — fixes #1402: every first request after startup reloads the model.
+
+    Two lines, and the more instructive half is the second: the fork's copy of
+    `test_get_cached_model_omitted_adapter_inherits_loaded_adapter` had been edited to
+    assert the *buggy* cache key (`"auto"` instead of `"text_generation"`), so the
+    suite actively certified the bug. That is trap 8 — "a test can be edited to
+    tolerate its own bug" — and it is why a test-file union has to diff bodies rather
+    than just definition names.
+
+    The mechanism: `lifespan()` preloads with `model_kind="text_generation"`, every
+    `/chat/completions` request uses the default `model_kind="auto"`, and the cache key
+    embeds the *unnormalized* kind while both resolve to the same `text_generation`
+    cache group. So the first real request saw a key mismatch on the single slot,
+    evicted the preloaded model and loaded it again — making `--preload-model` worse
+    than useless (it paid the load cost twice and doubled peak memory transiently).
+    """
+
+    def test_preload_then_default_request_loads_once(self, monkeypatch):
+        from types import SimpleNamespace
+
+        from mlx_vlm import server
+
+        app_module = server._app_module
+        loads = []
+
+        class FakeResponseGenerator:
+            def __init__(self, model_path, adapter_path=None, **kwargs):
+                loads.append((model_path, adapter_path))
+                self.model_path = model_path
+                self.adapter_path = adapter_path
+                self.model = SimpleNamespace()
+                self.processor = SimpleNamespace()
+                self.config = SimpleNamespace(model_type="qwen2_vl")
+
+            def wait_until_ready(self):
+                return self.model, self.processor, self.config
+
+            def stop_and_join(self):
+                pass
+
+        monkeypatch.setattr(app_module, "ResponseGenerator", FakeResponseGenerator)
+        monkeypatch.setattr(app_module._apc, "from_env", lambda *a, **k: None)
+        monkeypatch.setattr(server.runtime, "model_cache", {})
+        monkeypatch.setattr(server.runtime, "response_generator", None)
+        monkeypatch.setattr(server.runtime, "apc_manager", None)
+
+        # Exactly what lifespan() does for --preload-model.
+        server.get_cached_model("demo-model", None, model_kind="text_generation")
+        assert len(loads) == 1
+
+        # Exactly what the first /chat/completions request does (model_kind defaults
+        # to "auto"). It must reuse the preloaded model.
+        server.get_cached_model("demo-model", None)
+        assert (
+            len(loads) == 1
+        ), "preloaded model was reloaded on the first request (mlx-vlm #1402)"
+
+        # And an explicitly-kinded request must land on the same slot too.
+        server.get_cached_model("demo-model", None, model_kind="text_generation")
+        assert len(loads) == 1
+
+
+class TestThinkingBudgetDoesNotSynchronizeDecode:
+    """`6a1704e6` — avoid thinking budget decode synchronization.
+
+    Half-landed in the shape that is hardest to spot: the `utils.py` half is
+    byte-identical to upstream (`ThinkingBudgetCriteria.pop_forced_token_id`, via the
+    `565ca595` rename), and the `ar.py` half was dropped. So `GenerationBatch.next`
+    called the *new* helper while keeping the *old* structure around it —
+    `mx.eval(self._next_tokens)` then `.tolist()` — a full device synchronization on
+    every decode step of every request with a thinking budget. The symbol was present,
+    reachable and unit-tested; only the reason it existed was gone.
+    """
+
+    def test_forced_token_substitution_does_not_materialize_next_tokens(self):
+        import inspect
+
+        from mlx_vlm.generate.ar import GenerationBatch
+
+        source = inspect.getsource(GenerationBatch.next)
+        assert (
+            "mx.eval(self._next_tokens)" not in source
+        ), "forced-token handling synchronizes the decode step again"
+        assert ".tolist()" not in source
+        # The mask-based substitution is what replaces it.
+        assert "mx.where(" in source
+        assert "mx.async_eval(self._next_tokens)" in source
