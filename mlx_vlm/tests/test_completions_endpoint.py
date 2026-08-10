@@ -525,3 +525,294 @@ class TestStreamChunkSerialization:
 
         assert "timings" not in payload
         assert payload["choices"][0]["text"] == "hi"
+
+
+class _FakeCtx:
+    def __init__(self, prompt_tokens=11):
+        self.prompt_tokens = prompt_tokens
+
+
+class _FakeResponseGenerator:
+    """Minimal stand-in for the continuous-batching worker.
+
+    `generate` is called POSITIONALLY on the streaming path and by KEYWORD on the
+    non-streaming one, so it has to accept both — which is itself worth pinning, since a
+    signature change on one call site only would break exactly one of the two.
+    """
+
+    def __init__(self, tokens, prompt_tokens=11):
+        self._tokens = list(tokens)
+        self._ctx = _FakeCtx(prompt_tokens)
+        self.closed = False
+        self.calls = []
+
+    def generate(self, prompt=None, images=None, audio=None, args=None, **kwargs):
+        self.calls.append({"prompt": prompt, "images": images, "audio": audio})
+        return self._ctx, self._iter()
+
+    def validate_context_budget(self, prompt, **kwargs):
+        """The streaming path preflights the context budget through the generator.
+
+        A no-op here, but it has to EXIST: without it the endpoint's outer handler
+        turns the AttributeError into a 500 and the test sees an empty stream rather
+        than a failure at the point of the mistake. That is how the first version of
+        this fake failed, and it is worth the comment because the symptom points
+        nowhere near the cause.
+        """
+        self.validated = prompt
+        return None
+
+    def _iter(self):
+        outer = self
+
+        class _It:
+            def __init__(self):
+                self._i = iter(outer._tokens)
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                return next(self._i)
+
+            def close(self):
+                outer.closed = True
+
+        return _It()
+
+
+def _with_generator(client, body, generator, *, stream=False):
+    with patch.object(server_openai, "get_cached_model", return_value=_fake_model()):
+        with patch.object(server.runtime, "response_generator", generator):
+            return client.post("/v1/completions", json={**body, "stream": stream})
+
+
+class TestResponseGeneratorBackend:
+    """The continuous-batching backend — the endpoint's PRIMARY path in production.
+
+    Added after a real coverage run: measured against this file alone, the
+    `runtime.response_generator is not None` branch was entirely unexecuted. The
+    full-suite run showed it covered, which was an artifact of another module leaving
+    `runtime.response_generator` set — executed by accident, asserted by nobody. That is
+    the sharper form of `fork_coverage_report.py`'s own caveat that "executed is not
+    asserted", and the reason a whole-suite number can flatter a single file.
+    """
+
+    def test_non_streaming_uses_the_generator_and_its_prompt_tokens(self, client):
+        gen = _FakeResponseGenerator([_token("from worker", "stop")], prompt_tokens=11)
+
+        response = _with_generator(client, {"model": "demo", "prompt": "raw"}, gen)
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["choices"][0]["text"] == "from worker"
+        # prompt_tokens comes from the worker's ctx, not from a GenerationResult
+        assert body["usage"]["prompt_tokens"] == 11
+        assert gen.calls[0]["prompt"] == "raw"
+
+    def test_the_prompt_is_still_verbatim_on_this_backend(self, client):
+        """The verbatim contract is the endpoint's reason to exist, and it has to hold
+        on BOTH backends — the earlier test only covered the fallback."""
+        gen = _FakeResponseGenerator([_token("x", "stop")])
+
+        _with_generator(client, {"model": "demo", "prompt": "Once upon a"}, gen)
+
+        assert gen.calls[0]["prompt"] == "Once upon a"
+        assert gen.calls[0]["images"] is None
+        assert gen.calls[0]["audio"] is None
+
+    def test_stop_truncation_applies_on_this_backend_too(self, client):
+        gen = _FakeResponseGenerator([_token("keepENDdrop", "stop")])
+
+        response = _with_generator(
+            client, {"model": "demo", "prompt": "p", "stop": "END"}, gen
+        )
+
+        assert response.json()["choices"][0]["text"] == "keep"
+        assert response.json()["choices"][0]["finish_reason"] == "stop"
+
+    def test_the_token_iterator_is_closed(self, client):
+        """It holds a slot on the GPU worker; leaking it keeps the daemon decoding an
+        orphaned request."""
+        gen = _FakeResponseGenerator([_token("x", "stop")])
+
+        _with_generator(client, {"model": "demo", "prompt": "p"}, gen)
+
+        assert gen.closed is True
+
+    def test_streaming_uses_the_generator(self, client):
+        gen = _FakeResponseGenerator([_token("a"), _token("b", "stop")])
+
+        response = _with_generator(
+            client, {"model": "demo", "prompt": "p"}, gen, stream=True
+        )
+
+        assert response.status_code == 200
+        texts = [c["choices"][0]["text"] for c in _sse_chunks(response) if c["choices"]]
+        assert "".join(texts) == "ab"
+        assert response.text.endswith("data: [DONE]\n\n")
+
+    def test_streaming_reports_the_continuous_batching_backend(self, client):
+        """The metrics envelope's `backend` field distinguishes the two paths; getting
+        it wrong makes production telemetry attribute work to the wrong engine."""
+        gen = _FakeResponseGenerator([_token("a", "stop")])
+        recorded = {}
+
+        with patch.object(
+            server.runtime.metrics,
+            "record_success",
+            side_effect=lambda env: recorded.update(env),
+        ):
+            _with_generator(client, {"model": "demo", "prompt": "p"}, gen, stream=True)
+
+        assert recorded.get("backend") == "continuous_batching"
+
+    def test_streaming_withholds_a_partial_stop_on_this_backend(self, client):
+        """b75c18b7's fix has to hold on both backends — the loop is shared, but the
+        token source is not, and only the fallback was covered."""
+        gen = _FakeResponseGenerator(
+            [_token("keep"), _token("EN"), _token("Ddrop"), _token("z", "stop")]
+        )
+
+        response = _with_generator(
+            client, {"model": "demo", "prompt": "p", "stop": "END"}, gen, stream=True
+        )
+
+        texts = [c["choices"][0]["text"] for c in _sse_chunks(response) if c["choices"]]
+        assert "".join(texts) == "keep"
+
+
+class TestErrorContracts:
+    """Every one of these was an unexecuted `except` block. They are API contracts: the
+    status code a client sees is the whole observable behaviour."""
+
+    def test_a_too_long_prompt_is_a_400_not_a_500(self, client):
+        def boom(**_kwargs):
+            raise server.PromptTooLongError("MAX_KV_SIZE is 8")
+
+        with (
+            patch.object(server_openai, "get_cached_model", return_value=_fake_model()),
+            patch.object(server_openai, "generate", side_effect=boom),
+        ):
+            response = client.post(
+                "/v1/completions", json={"model": "demo", "prompt": "p"}
+            )
+
+        assert response.status_code == 400
+        assert "MAX_KV_SIZE is 8" in response.json()["detail"]
+
+    def test_an_unexpected_generation_failure_is_a_500(self, client):
+        def boom(**_kwargs):
+            raise RuntimeError("metal exploded")
+
+        with (
+            patch.object(server_openai, "get_cached_model", return_value=_fake_model()),
+            patch.object(server_openai, "generate", side_effect=boom),
+        ):
+            response = client.post(
+                "/v1/completions", json={"model": "demo", "prompt": "p"}
+            )
+
+        assert response.status_code == 500
+        assert "Generation failed" in response.json()["detail"]
+
+    def test_a_bad_sampling_parameter_is_a_400(self, client):
+        """`_build_gen_args` validates sampling params; its failure is the client's
+        fault and must not read as a server error."""
+
+        def boom(*_args, **_kwargs):
+            raise ValueError("top_p must be in [0, 1]")
+
+        with (
+            patch.object(server_openai, "get_cached_model", return_value=_fake_model()),
+            patch.object(server_openai, "_build_gen_args", side_effect=boom),
+        ):
+            response = client.post(
+                "/v1/completions", json={"model": "demo", "prompt": "p"}
+            )
+
+        assert response.status_code == 400
+        assert "top_p" in response.json()["detail"]
+
+    def test_a_streaming_failure_is_reported_in_band(self, client):
+        """SSE headers are already sent, so a mid-stream failure cannot change the
+        status code — it has to arrive as a data frame or the client hangs."""
+
+        def boom(**_kwargs):
+            raise RuntimeError("decode blew up")
+
+        with (
+            patch.object(server_openai, "get_cached_model", return_value=_fake_model()),
+            patch.object(server_openai, "stream_generate", side_effect=boom),
+        ):
+            response = client.post(
+                "/v1/completions",
+                json={"model": "demo", "prompt": "p", "stream": True},
+            )
+
+        assert response.status_code == 200
+        errors = [c for c in _sse_chunks(response) if "error" in c]
+        assert errors and "decode blew up" in errors[0]["error"]
+
+
+class TestTokenAccounting:
+    """The two token shapes the stream loop must count differently.
+
+    `openai.py`'s own comment: *"GenerationResult.generation_tokens is cumulative;
+    StreamingToken lacks it and is counted per-token."* Getting that backwards
+    double-counts or under-counts `usage.completion_tokens` on every streamed request —
+    silently, since neither shape raises.
+
+    Both branches were unexecuted by this file until now; the `GenerationResult` one is
+    what every other test here happens to use.
+    """
+
+    def test_a_cumulative_generation_tokens_is_taken_as_is(self, client):
+        """`GenerationResult.generation_tokens` is a running total, so the last value
+        wins — summing them would multiply the count."""
+        tokens = [
+            GenerationResult(text="a", prompt_tokens=7, generation_tokens=1),
+            GenerationResult(
+                text="b", prompt_tokens=7, generation_tokens=2, finish_reason="stop"
+            ),
+        ]
+
+        response = _stream(client, {"model": "demo", "prompt": "p"}, tokens)
+
+        usage = [c for c in _sse_chunks(response) if c.get("usage")][0]["usage"]
+        assert usage["completion_tokens"] == 2
+
+    def test_a_streaming_token_is_accumulated_per_token(self, client):
+        """`StreamingToken` has `token_count` but no `generation_tokens`, so the loop
+        must ADD rather than assign. Two tokens of 3 is 6, not 3."""
+        tokens = [
+            server.StreamingToken(text="a", token=1, logprobs=0.0, finish_reason=None),
+            server.StreamingToken(
+                text="b", token=2, logprobs=0.0, finish_reason="stop"
+            ),
+        ]
+        for tok in tokens:
+            tok.token_count = 3
+
+        response = _stream(client, {"model": "demo", "prompt": "p"}, tokens)
+
+        usage = [c for c in _sse_chunks(response) if c.get("usage")][0]["usage"]
+        assert usage["completion_tokens"] == 6
+
+    def test_an_exhausted_iterator_without_a_finish_reason_terminates(self, client):
+        """The `token is None` break — normal exhaustion. Every other streaming test
+        here ends on an explicit `finish_reason`, so this exit was never taken, and a
+        stream that cannot end on exhaustion hangs the client."""
+        tokens = [_token("a"), _token("b")]  # no finish_reason anywhere
+
+        response = _stream(client, {"model": "demo", "prompt": "p"}, tokens)
+
+        assert response.text.endswith("data: [DONE]\n\n")
+        texts = [c["choices"][0]["text"] for c in _sse_chunks(response) if c["choices"]]
+        assert "".join(texts) == "ab"
+        finals = [
+            c
+            for c in _sse_chunks(response)
+            if c["choices"] and c["choices"][0]["finish_reason"]
+        ]
+        assert finals[0]["choices"][0]["finish_reason"] == "stop"
