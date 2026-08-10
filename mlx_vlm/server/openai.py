@@ -8,7 +8,7 @@ import random
 import re
 import time
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict  # Fork: _PREFILL_FLAG_CACHE LRU below
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -23,7 +23,7 @@ from ..generate.edit_image import ImageEditRequest as CoreImageEditRequest
 from ..generate.edit_image import edit_image
 from ..generate.image import ImageGenerationRequest as CoreImageGenerationRequest
 from ..generate.image import generate_image, parse_size
-from ..prompt_utils import (
+from ..prompt_utils import (  # Fork: THINKING_FORMATS / detect_thinking_format / get_cache_alignment_kwargs are fork-only (1c3f1e50)
     THINKING_FORMATS,
     apply_chat_template,
     detect_thinking_format,
@@ -31,14 +31,14 @@ from ..prompt_utils import (
     get_cache_alignment_kwargs,
 )
 from ..tool_parsers import _infer_tool_parser_from_processor, load_tool_module
-from ..utils import prepare_inputs, sanitize_strict_json
+from ..utils import prepare_inputs, sanitize_strict_json  # Fork: sanitize_strict_json
 from .generation import (
     GenerationMetrics,
     PromptTooLongError,
     _build_metrics_envelope,
     _count_prompt_tokens,
 )
-from .responses_state import (
+from .responses_state import (  # Fork: _CONTENT_MARKERS is fork-only (08723a3f's marker-set union); Fork: _step_thinking_state is fork-only — the positional opener scan that replaces upstream's ThinkingStreamState.feed on the streaming chat path
     _CONTENT_MARKERS,
     ThinkingStreamState,
     _normalize_response_input,
@@ -48,7 +48,7 @@ from .responses_state import (
     _response_tool_registry,
 )
 from .responses_state import _sse_event as _response_sse_event
-from .responses_state import (
+from .responses_state import (  # Fork: _CONTENT_MARKERS is fork-only (08723a3f's marker-set union); Fork: _step_thinking_state is fork-only — the positional opener scan that replaces upstream's ThinkingStreamState.feed on the streaming chat path
     _step_thinking_state,
     _store_response,
     process_tool_calls,
@@ -58,7 +58,7 @@ from .responses_state import (
     suppress_tool_call_content,
 )
 from .runtime import runtime
-from .schemas import (
+from .schemas import (  # Fork: adds the /v1/completions response models and ChatStreamChunk.to_sse_json's callers
     ChatChoice,
     ChatLogprobs,
     ChatMessage,
@@ -96,7 +96,7 @@ from .schemas import (
     StreamingTimings,
     UsageStats,
 )
-from .session_manager import (  # noqa: F401
+from .session_manager import (  # noqa: F401  # Fork: fork-only session store
     _append_session_assistant_hash,
     _resolve_session,
 )
@@ -294,6 +294,13 @@ def _looks_like_audio_reference(value: str) -> bool:
     )
 
 
+# Fork: this whole block of helpers is fork-only (_all_thinking_openers,
+# _has_prefilled_opener, _is_prompt_inside_thinking, _is_template_thinking_asymmetric,
+# _resolve_streaming_thinking_format, _union_thinking_format, _compute_prefill_flag,
+# _strip_assistant_thinking). Upstream has no THINKING_FORMATS registry, so it has
+# nothing equivalent; 08723a3f unioned the fork's positional opener scan with
+# upstream's complete marker set, so treat this and ThinkingStreamState as ONE
+# decision rather than two competing machines.
 # --- Thinking prefill / asymmetry detection -------------------------------
 #
 # Used to seed the streaming SSE state machine and to mark a session's
@@ -548,6 +555,31 @@ def _adapter_path_or_inherit(request):
     )
 
 
+def _normalize_response_instruction_messages(
+    chat_messages: List[dict],
+    instructions: Optional[str],
+) -> Optional[str]:
+    instruction_parts = [instructions] if instructions else []
+    conversation = []
+
+    for message in chat_messages:
+        if message.get("role") in ("system", "developer"):
+            content = message.get("content")
+            if content:
+                instruction_parts.append(str(content))
+        else:
+            conversation.append(message)
+
+    normalized_instructions = "\n\n".join(instruction_parts) or None
+    if normalized_instructions:
+        conversation.insert(
+            0,
+            {"role": "system", "content": normalized_instructions},
+        )
+    chat_messages[:] = conversation
+    return normalized_instructions
+
+
 def _decode_input_audio_data(input_audio: InputAudio):
     data = input_audio["data"]
     if not isinstance(data, str):
@@ -630,6 +662,8 @@ def _chat_usage_chunk(
 
 
 def _normalize_stop_sequences(stop) -> List[str]:
+    # Fork: fork-only, used by the fork's /v1/completions endpoint and its
+    # _truncate_at_stop companion. Upstream has no stop-sequence handling here.
     """Coerce the OpenAI ``stop`` field (str | list[str] | None) to a list."""
     if stop is None:
         return []
@@ -696,6 +730,8 @@ def _completion_usage_chunk(
 
 
 def register_routes(app, deps):
+    # Fork: registers the fork-only /v1/completions route and threads the extra
+    # globals its handler needs. Upstream's registrations are unchanged.
     global _INHERIT_ADAPTER
     global get_cached_model, _build_gen_args, _read_tenant_id
     global _preflight_stream_context_budget, _split_thinking
@@ -1117,10 +1153,10 @@ async def responses_input_tokens_endpoint(request: Request):
             + current_input_items
         )
         chat_messages, images = _response_items_to_chat(prompt_items)
-        if openai_request.instructions:
-            chat_messages.insert(
-                0, {"role": "system", "content": openai_request.instructions}
-            )
+        _normalize_response_instruction_messages(
+            chat_messages,
+            openai_request.instructions,
+        )
         _ensure_effective_input(chat_messages, images=images)
 
         model, processor, config = get_cached_model(
@@ -1206,32 +1242,11 @@ async def responses_input_items_endpoint(response_id: str):
     }
 
 
-def _normalize_response_instruction_messages(
-    chat_messages: List[dict],
-    instructions: Optional[str],
-) -> Optional[str]:
-    instruction_parts = [instructions] if instructions else []
-    conversation = []
-
-    for message in chat_messages:
-        if message.get("role") in ("system", "developer"):
-            content = message.get("content")
-            if content:
-                instruction_parts.append(str(content))
-        else:
-            conversation.append(message)
-
-    normalized_instructions = "\n\n".join(instruction_parts) or None
-    if normalized_instructions:
-        conversation.insert(
-            0,
-            {"role": "system", "content": normalized_instructions},
-        )
-    chat_messages[:] = conversation
-    return normalized_instructions
-
-
 async def responses_endpoint(request: Request):
+    # Fork: 6 upstream lines absent, all accounted for — upstream's
+    # `prompt_has_open_thinking` + raw thinking_start/end_token use is replaced by
+    # `_is_prompt_inside_thinking` / `_resolve_streaming_thinking_format` from the
+    # THINKING_FORMATS block above. Everything else is upstream's.
     """
     OpenAI-compatible endpoint for generating text based on a prompt and optional images.
 
@@ -1931,6 +1946,18 @@ async def responses_endpoint(request: Request):
 
 
 async def chat_completions_endpoint(request: ChatRequest, http_request: Request):
+    # Fork: the largest rewrite in this file (753 -> 832 lines). Its 38 absent
+    # upstream lines are two substitutions, not losses:
+    #  1. `chunk.model_dump_json(...)` -> `chunk.to_sse_json()` (a19e900f), which
+    #     omits `timings` when unset because OpenWebUI's SSE parser dies on an
+    #     explicit null. Accounts for all 7 of them.
+    #  2. upstream's `ThinkingStreamState.feed` on the streaming path ->
+    #     `_step_thinking_state(..., thinking_format)`, the fork's positional
+    #     opener scan. /v1/responses still uses ThinkingStreamState; 08723a3f
+    #     unioned their marker sets, so the two are one decision.
+    # The video plumbing (4d468e85 / #1492) and the per-token thinking split
+    # (b3d2380d / #1266) are both fully landed here — do not re-derive them from
+    # this function's divergence.
     """
     Generate text based on a prompt and optional images.
     Prompt must be a list of chat messages, including system, user, and assistant messages.
@@ -2764,6 +2791,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
         )
 
 
+# Fork: everything from here to the end of the file is the fork-only legacy
+# /v1/completions (text) endpoint and its helpers (b49708d9). Upstream serves no
+# such route.
 async def completions_endpoint(request: Request):
     """Legacy OpenAI text-completions endpoint (``/v1/completions``).
 

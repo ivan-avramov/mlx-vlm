@@ -155,6 +155,40 @@
 #         1171888e note, now confirmed mechanically rather than by spot check.
 #     Also converged: the absolute `from mlx_vlm.models.cache import ...` (9065b024),
 #     the same artifact apc.py had and the third instance of that shape in this file.
+#   server/openai.py — 16 sites -> 0. RESTORED one dropped hunk that is the cleanest
+#     "helper landed, ONE OF TWO call sites dropped" instance found yet: eda1ec4f
+#     (#1716, "Fix Responses instructions for Qwen templates") replaced the same
+#     `chat_messages.insert(0, {"role": "system", ...})` in BOTH /v1/responses and
+#     /v1/responses/input_tokens with a call to the new
+#     _normalize_response_instruction_messages, which coalesces `instructions` plus
+#     every system/developer message into ONE leading system message and drops the
+#     originals. The helper landed, responses_endpoint's call site landed,
+#     responses_input_tokens_endpoint's did not. So the endpoint whose entire contract
+#     is to report the token count of the prompt /v1/responses builds was counting a
+#     differently-shaped list — instructions duplicated as a second system message and
+#     `developer` roles left in place, which is exactly what #1716's title says breaks
+#     Qwen templates.
+#     TWO reasons nothing caught it, both worth carrying forward: check_dead_helpers.py
+#     is per-symbol so the surviving caller made the helper read as reachable; and
+#     #1716's own two tests DID land and DO pass, because both exercise /v1/responses.
+#     **A restored upstream test that covers the call site which survived is worse than
+#     no test — it makes the commit look closed.** When a commit changes N call sites,
+#     count them (`git grep -c`) instead of trusting its tests.
+#     Also CONVERGED a relocation: _normalize_response_instruction_messages was
+#     byte-identical to upstream but sat ~900 lines further down, which produced a
+#     deletion hunk AND an addition hunk (2 of the 16 sites). Moving it to upstream's
+#     position closed both — the same reorder-not-rewrite finding as apc.py, in a file
+#     that is otherwise a genuine rewrite.
+#     27 of 31 shared definitions were byte-identical. The 4 that differ:
+#     chat_completions_endpoint (753 -> 832; its 38 absent lines are exactly two
+#     substitutions — `model_dump_json` -> the fork's `to_sse_json`, 7 of them, and
+#     ThinkingStreamState.feed -> _step_thinking_state), responses_endpoint (6 lines,
+#     same thinking substitution), responses_input_tokens_endpoint (now fixed) and
+#     register_routes (the /v1/completions route). 13 ours-only definitions, almost all
+#     the fork-only /v1/completions endpoint and the THINKING_FORMATS prefill helpers.
+#     Confirmed fully landed and NOT to be re-derived from this file's divergence:
+#     4d468e8575 (#1492) video plumbing and b3d2380d1d (#1266) per-token thinking split,
+#     both of which the allowlist previously listed as open leads here.
 #   server/generation.py — 13 sites -> 0, and BOTH of its "unreviewed"
 #     .symbol-exclusions entries are now reviewed, which is what actually unblocked it:
 #       * `_check_configured_context_budget` — deliberately removed by fork commit
@@ -250,7 +284,7 @@
 #     against a README that promises it. Guard:
 #     test_dropped_upstream_guards.py::TestApcStoreEmitsItsTrace.
 #
-# Current standing (2026-08-10): 2 files / 28 sites / 62 hunks, down from 32 files /
+# Current standing (2026-08-10): 1 file / 12 sites / 21 hunks, down from 32 files /
 # 175 sites. Re-run `--summary`; do not trust this line either. Every
 # diverged file NOT listed here is marked, including
 # server/request_normalization.py — the gen-args union added fork hunks to a file
@@ -266,7 +300,6 @@
 
 # --- Heavy fork rewrites. AGENTS.md names these as the false-positive-prone
 # --- files; site-by-site provenance is the bulk of the remaining work.
-mlx_vlm/server/openai.py  # 18 sites / 49 hunks. LEADS mostly cleared: f044f36a resolved, cfcc36d9's openai half (the StreamingTimings plumbing) in 682043f5, f3bc6e81 (#1412, the finalizer cache clear) and 84ebae6e (#1641) in 4bd99ca1. 6a8cdff6 (#1411) is also resolved. Still reported here: 4d468e8575 (#1492) and b3d2380d1d (#1266), a few lines each — resolve before marking. NOTE the fork rewrote the streaming chat-completions thinking machinery around THINKING_FORMATS while /v1/responses uses upstream's ThinkingStreamState; 08723a3f unioned their marker sets, so treat those two paths as one decision, not two
 
 # --- Server surfaces, not yet reviewed at site granularity.
 
@@ -280,7 +313,8 @@ mlx_vlm/utils.py  # REVIEWED site-by-site 2026-08-09; ONE named blocker, not a g
 # ---   [utils.py 32/171 REVIEWED, now 19/159, one named blocker]
 # ---   [apc.py 554/567 CONVERGED, now 2/35 -- it was a REORDERING, not a rewrite;
 # ---    AST-diff bodies before sizing any file here, see its RESOLVED note above]
-# ---   openai.py 76/905
+# ---   [openai.py 76/905 CLEARED: 27 of 31 bodies byte-identical; one dropped call
+# ---    site (#1716) and one byte-identical function that had merely MOVED]
 # ---   [generation.py 92/665 CLEARED: 43 of 47 bodies byte-identical; both its
 # ---    "unreviewed" .symbol-exclusions entries reviewed; cfcc36d9 took a THIRD pass]
 # ---   [turboquant.py 118/529 CLEARED: 91 of 96 bodies byte-identical; the AST-body

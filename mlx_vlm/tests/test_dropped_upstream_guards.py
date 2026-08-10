@@ -14,6 +14,7 @@ Each guard names the upstream commit whose content it protects.
 """
 
 import mlx.nn as nn
+import pytest
 
 from mlx_vlm.generate import ar
 from mlx_vlm.utils import skip_multimodal_module
@@ -1701,3 +1702,141 @@ class TestTurboQuantPrefillUsesTheFusedKernel:
         state = codec.quantize(mx.ones((1, 2, 1, 64), dtype=mx.float32))
 
         assert state.norms.shape == (1, 2, 1)
+
+
+class TestResponsesInputTokensNormalizesInstructions:
+    """`eda1ec4f` (#1716) — "Fix Responses instructions for Qwen templates".
+
+    A two-file commit that replaced the same pre-existing
+    `chat_messages.insert(0, {"role": "system", ...})` in BOTH `/v1/responses` and
+    `/v1/responses/input_tokens` with a call to the new
+    `_normalize_response_instruction_messages`, which coalesces `instructions` plus
+    every system/developer message into one leading system message and drops the
+    originals. The helper landed, `responses_endpoint`'s call site landed, and
+    `responses_input_tokens_endpoint`'s did not — it kept the pre-#1716 insert.
+
+    Why nothing caught it, which is the reusable part:
+
+    * `check_dead_helpers.py` is per-symbol, so the one surviving caller made the
+      helper read as reachable — the same blind spot that hid two `8422ece8` call
+      sites and `apc_trace("store", ...)`.
+    * #1716's own two tests landed and pass, because both exercise
+      `/v1/responses`. **A restored upstream test covering the call site that
+      SURVIVED is worse than no test: it makes the commit look closed.** When a
+      commit changes N call sites, count them (`git grep -c`) rather than trusting
+      its tests.
+
+    The consequence is a plain contradiction between two endpoints whose entire
+    contract is to agree: `/v1/responses/input_tokens` exists to report the token
+    count of the prompt `/v1/responses` would build, and it was counting a
+    differently-shaped message list — instructions duplicated as a second system
+    message and `developer`-role messages left in place, which is exactly what
+    #1716's title says breaks Qwen templates.
+    """
+
+    @pytest.fixture
+    def client(self):
+        """Local fixture — `test_server.py`'s is not visible from this file.
+
+        Defined here rather than promoted to `conftest.py` on purpose: this file is
+        fork-only and `conftest.py` is shared with restored upstream tests, which are
+        kept byte-identical so future merges apply.
+        """
+        from fastapi.testclient import TestClient
+
+        import mlx_vlm.server as server
+
+        with TestClient(server.app) as test_client:
+            yield test_client
+
+    def _captured_messages(self, client, monkeypatch, path):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        import mlx.core as mx
+
+        import mlx_vlm.server as server
+
+        seen = {}
+
+        def fake_apply_chat_template(processor, config, messages, **kwargs):
+            seen["messages"] = [dict(m) for m in messages]
+            return "prompt"
+
+        monkeypatch.setattr(
+            server.runtime,
+            "response_generator",
+            SimpleNamespace(
+                _cpu_preprocess=MagicMock(
+                    return_value={"input_ids": mx.array([[1, 2, 3]], dtype=mx.int32)}
+                )
+            ),
+        )
+        monkeypatch.setattr(
+            server,
+            "get_cached_model",
+            MagicMock(
+                return_value=(
+                    SimpleNamespace(),
+                    SimpleNamespace(),
+                    SimpleNamespace(model_type="qwen2_vl"),
+                )
+            ),
+        )
+        monkeypatch.setattr(server, "apply_chat_template", fake_apply_chat_template)
+
+        response = client.post(
+            path,
+            json={
+                "model": "demo",
+                "instructions": "Be terse.",
+                "input": [
+                    {"role": "developer", "content": "Prefer bullet points."},
+                    {"role": "user", "content": "Hello"},
+                ],
+            },
+        )
+        assert response.status_code == 200, response.text
+        return seen["messages"]
+
+    def test_developer_message_and_instructions_are_coalesced(
+        self, client, monkeypatch
+    ):
+        messages = self._captured_messages(
+            client, monkeypatch, "/responses/input_tokens"
+        )
+
+        systems = [m for m in messages if m.get("role") == "system"]
+        assert len(systems) == 1, f"expected one coalesced system message: {messages}"
+        assert "Be terse." in systems[0]["content"]
+        assert "Prefer bullet points." in systems[0]["content"]
+        # The originals must be GONE, not merely preceded by a new one. A leftover
+        # `developer` role is what breaks the Qwen template #1716 was fixing.
+        assert not [m for m in messages if m.get("role") == "developer"]
+        assert messages[0] is systems[0] or messages[0] == systems[0]
+
+    def test_it_matches_what_the_shared_normalizer_produces(self, client, monkeypatch):
+        """The endpoint must agree with the helper `/v1/responses` calls.
+
+        Comparing against `_normalize_response_instruction_messages` rather than
+        against a live `/v1/responses` request is deliberate: driving that endpoint
+        needs a whole generation mocked, and the contract under test is the message
+        SHAPE, which is exactly what the helper defines. Asserting equality with the
+        helper also keeps this guard honest if upstream changes the normalization —
+        it tracks the helper instead of a hard-coded expectation.
+        """
+        from mlx_vlm.server.openai import (
+            _normalize_response_instruction_messages,
+        )
+
+        counted = self._captured_messages(
+            client, monkeypatch, "/responses/input_tokens"
+        )
+
+        expected = [
+            {"role": "developer", "content": "Prefer bullet points."},
+            {"role": "user", "content": "Hello"},
+        ]
+        _normalize_response_instruction_messages(expected, "Be terse.")
+
+        assert counted == expected

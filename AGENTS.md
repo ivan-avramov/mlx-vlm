@@ -188,6 +188,18 @@ appears in `docs/upstream-gaps.md` next to several fixed items; this check turns
 from a habit into a gate. When something looks unused, ask whether upstream calls
 it before concluding it is fork scaffolding.
 
+**A restored upstream test that covers the call site which SURVIVED is worse than no
+test — it makes the commit look closed.** `eda1ec4f` (#1716) changed the same line in
+two endpoints; one landed, one did not, and both of the commit's own tests landed and
+passed because both exercise the endpoint that got the fix. The result was
+`/v1/responses/input_tokens` reporting the token count of a differently-shaped prompt
+than `/v1/responses` actually builds — the one thing that endpoint exists not to do.
+So when a commit touches N call sites, **count them** rather than trusting its tests:
+
+```bash
+git grep -c '<helper>(' upstream/main -- '*.py'   # then the same here
+```
+
 **A log line is the same shape with no handle at all.** It has no caller, no symbol
 and no test, so nothing above can see it — and a commit whose content is mostly
 logging is therefore the hardest kind to restore completely. `cfcc36d9` (#1634) took
