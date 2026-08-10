@@ -40,6 +40,7 @@ from .generation import (
     _count_prompt_tokens,
 )
 from .responses_state import (
+    _CONTENT_MARKERS,
     ThinkingStreamState,
     _normalize_response_input,
     _response_chain_items,
@@ -363,7 +364,11 @@ def _has_prefilled_opener(processor, template_kwargs: dict) -> bool:
     return flag
 
 
-def _is_prompt_inside_thinking(formatted_prompt: str) -> bool:
+def _is_prompt_inside_thinking(
+    formatted_prompt: str,
+    thinking_start_token: Optional[str] = None,
+    thinking_end_token: Optional[str] = None,
+) -> bool:
     """Return True if generation will start *inside* an unclosed thinking
     block.
 
@@ -374,21 +379,37 @@ def _is_prompt_inside_thinking(formatted_prompt: str) -> bool:
     the closer arrives. Captures both tail-prefilled openers (unsloth Qwen
     ``<think>\\n``) and global openers (Gemma 4 ``<|think|>`` in the system
     block when enable_thinking=True).
+
+    Fork: the *positional* logic is ours (an opener anywhere in the prompt, not
+    just at the tail as upstream's ``prompt_has_open_thinking`` requires), but the
+    *marker set* is ThinkingStreamState's rather than ``THINKING_FORMATS`` alone.
+    That is a union, and it is load-bearing: the registry has no Cohere family, so
+    a ``<|START_THINKING|>`` prompt scanned against the registry alone found no
+    opener and read as closed — the streaming chat-completions path then never
+    seeded ``in_thinking`` and emitted empty ``reasoning_content`` for every
+    Cohere-style model, and for any marker supplied via ``--thinking-start-token``
+    or per request. ``_build_open_close_markers`` is registry + defaults +
+    explicitly configured tokens, which is exactly the set the output-side state
+    machine will later match against, so prompt-side and output-side detection
+    can no longer disagree.
     """
+    if not isinstance(formatted_prompt, str):
+        return False
+    markers = ThinkingStreamState._build_open_close_markers(
+        thinking_start_token, thinking_end_token
+    )
     last_opener = -1
-    for fmt in THINKING_FORMATS:
-        for op in fmt.openers:
-            idx = formatted_prompt.rfind(op)
-            if idx > last_opener:
-                last_opener = idx
+    for opener, _ in markers:
+        idx = formatted_prompt.rfind(opener)
+        if idx > last_opener:
+            last_opener = idx
     if last_opener < 0:
         return False
     last_closer = -1
-    for fmt in THINKING_FORMATS:
-        for cl in fmt.closers:
-            idx = formatted_prompt.rfind(cl)
-            if idx > last_closer:
-                last_closer = idx
+    for _, closer in markers:
+        idx = formatted_prompt.rfind(closer)
+        if idx > last_closer:
+            last_closer = idx
     return last_closer < last_opener
 
 
@@ -425,6 +446,38 @@ def _union_thinking_format(
             if pb not in partials:
                 partials.append(pb)
         tag_token_count = max(tag_token_count, fmt.tag_token_count)
+    # The docstring above promises the always-on defaults of ThinkingStreamState,
+    # and for a long time only the registry was folded in. The two sets are not the
+    # same: ThinkingStreamState carries a Cohere pair
+    # (``<|START_THINKING|>``/``<|END_THINKING|>``) that THINKING_FORMATS has no
+    # family for. The result was that streaming chat completions for Cohere-style
+    # models emitted the raw closer and the whole reply stayed classified as
+    # reasoning_content, while the non-streaming path — which goes through
+    # ThinkingStreamState's own marker set — split it correctly.
+    #
+    # Markers need their partial prefixes too, or a tag split across tokens leaks:
+    # `<|END_THINKING|>` arriving as `<|END_THINK` + `ING|>` is emitted verbatim and
+    # the closer can then never match. `_partial_tag_start_pos` tries every prefix
+    # length of each entry, so one entry per marker suffices — minus the final
+    # character, which is the convention the registry families already use so that a
+    # *complete* tag matches as a closer instead of being held as a partial.
+    for opener, closer in ThinkingStreamState._build_open_close_markers(
+        thinking_start_token, thinking_end_token
+    ):
+        if opener not in openers:
+            openers.append(opener)
+        if closer not in closers:
+            closers.append(closer)
+        for marker in (opener, closer):
+            partial = marker[:-1]
+            if len(partial) > 1 and partial not in partials:
+                partials.append(partial)
+    # Same treatment for the structural content markers `_step_thinking_state`
+    # strips, so a split `<|START_TEXT|>` is held rather than leaked mid-strip.
+    for marker in _CONTENT_MARKERS:
+        partial = marker[:-1]
+        if len(partial) > 1 and partial not in partials:
+            partials.append(partial)
     return _TF(
         name="union",
         openers=tuple(openers),
@@ -2048,7 +2101,11 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
         )
         thinking_prefilled = _has_prefilled_opener(
             processor, template_kwargs
-        ) or _is_prompt_inside_thinking(formatted_prompt)
+        ) or _is_prompt_inside_thinking(
+            formatted_prompt,
+            gen_args.thinking_start_token,
+            gen_args.thinking_end_token,
+        )
 
         # Mark the session's cache as asymmetric so stream_generate can anchor
         # the cache at end-of-user on multi-turn thinking conversations.

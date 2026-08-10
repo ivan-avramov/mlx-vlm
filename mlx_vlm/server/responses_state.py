@@ -557,7 +557,13 @@ def _step_thinking_state(
         break
 
     delta_reasoning = "".join(reasoning_parts) if reasoning_parts else None
-    delta_content = "".join(content_parts) if content_parts else None
+    # Cohere wraps its visible answer in <|START_TEXT|>...<|END_TEXT|>. These are
+    # structural, never content: ThinkingStreamState strips them unconditionally on
+    # the /v1/responses path, and this state machine — the fork's streaming
+    # chat-completions equivalent — did not, so the raw markers reached
+    # delta.content. Strip after joining so a marker split across tokens is handled
+    # too (the union format buffers their prefixes).
+    delta_content = _strip_content_markers("".join(content_parts)) or None
     return in_thinking, accumulated, delta_reasoning, delta_content
 
 

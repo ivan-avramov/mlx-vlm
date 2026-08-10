@@ -975,3 +975,95 @@ class TestModelLoadFailureIsABadRequest:
         source = inspect.getsource(server_generation)
         assert 'status_code=400, detail=f"Failed to load model' in source
         assert 'status_code=500, detail=f"Failed to load model' not in source
+
+
+class TestReasoningProtocolFields:
+    """`221fe0b3` — fix streaming reasoning protocol compatibility (#1644).
+
+    The commit's generation.py and responses_state.py halves had landed; the
+    schemas.py half had not. As with the diffusion knobs, `FlexibleBaseModel`'s
+    `extra="allow"` meant the fields still *reached* GenerationArguments —
+    `_request_field_is_set` reads `model_fields_set`, which includes extras — so
+    upstream's own tests for this pass either way. Only the declaration was lost,
+    and with it OpenAPI visibility and `reasoning_effort`'s str coercion.
+    """
+
+    def test_reasoning_fields_are_declared_on_both_request_models(self):
+        from mlx_vlm.server.schemas import OpenAIRequest, VLMRequest
+
+        for model in (OpenAIRequest, VLMRequest):
+            properties = model.model_json_schema()["properties"]
+            for field in ("reasoning", "reasoning_effort"):
+                assert field in properties, f"{model.__name__}.{field} undeclared"
+
+
+class TestStreamingThinkingMarkerUnion:
+    """`221fe0b3`'s streaming half, and a fork gap it exposed.
+
+    The fork rewrote the streaming chat-completions thinking machinery around the
+    `THINKING_FORMATS` registry (`_is_prompt_inside_thinking` +
+    `_step_thinking_state`), while `/v1/responses` and the non-streaming chat path
+    go through upstream's `ThinkingStreamState`. Those two marker sets are not the
+    same — `ThinkingStreamState` carries a Cohere pair the registry has no family
+    for — so restoring #1644's own test surfaced three layers of the same gap on
+    the streaming chat path only:
+
+      1. the prompt-side opener was not recognised, so `in_thinking` was never
+         seeded and `reasoning_content` came back empty;
+      2. the closer was not in the union format, so once seeded the *entire* reply
+         stayed classified as reasoning;
+      3. the closer's partial prefixes were absent, so `<|END_THINKING|>` split
+         across two tokens leaked verbatim and could never match.
+
+    Fixed as a union (the fork's positional scan x upstream's complete marker set),
+    not by picking a side: the fork's structural check finds openers anywhere in the
+    prompt, which upstream's `endswith` cannot, and that is load-bearing for Gemma 4's
+    global opener.
+    """
+
+    def test_prompt_side_detection_covers_non_registry_markers(self):
+        from mlx_vlm.server.openai import _is_prompt_inside_thinking
+
+        assert _is_prompt_inside_thinking("prompt<|START_THINKING|>") is True
+        assert (
+            _is_prompt_inside_thinking("p<|START_THINKING|>x<|END_THINKING|>") is False
+        )
+        # Explicitly configured markers must work too (--thinking-start-token).
+        assert _is_prompt_inside_thinking("p<<GO>>", "<<GO>>", "<<STOP>>") is True
+        # The fork's positional generality must survive: opener not at the tail.
+        assert _is_prompt_inside_thinking("a<|think|>b") is True
+        assert _is_prompt_inside_thinking("plain") is False
+
+    def test_union_format_carries_markers_and_their_partials(self):
+        from mlx_vlm.server.openai import _union_thinking_format
+
+        fmt = _union_thinking_format()
+        assert "<|START_THINKING|>" in fmt.openers
+        assert "<|END_THINKING|>" in fmt.closers
+        # Registry families must still be present — this is a union, not a swap.
+        assert "<think>" in fmt.openers and "</think>" in fmt.closers
+        assert "<|END_THINKING|" in fmt.partial_buffers
+
+    def test_split_closer_and_content_markers_do_not_leak(self):
+        """The end-to-end shape: a closer split across tokens, then Cohere's
+        structural content wrapper, which the fork's path never stripped."""
+        from mlx_vlm.server.openai import _resolve_streaming_thinking_format
+        from mlx_vlm.server.responses_state import _step_thinking_state
+
+        fmt = _resolve_streaming_thinking_format("prompt<|START_THINKING|>")
+        in_thinking, accumulated = True, ""
+        reasoning, content = "", ""
+        for token in (
+            "North reasoning.",
+            "<|END_THINK",
+            "ING|><|START_TEXT|>North answer.<|END_TEXT|>",
+        ):
+            in_thinking, accumulated, delta_r, delta_c = _step_thinking_state(
+                token, in_thinking, accumulated, fmt
+            )
+            reasoning += delta_r or ""
+            content += delta_c or ""
+
+        assert reasoning == "North reasoning."
+        assert content == "North answer."
+        assert in_thinking is False
