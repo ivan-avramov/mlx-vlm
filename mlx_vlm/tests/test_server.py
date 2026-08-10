@@ -425,6 +425,8 @@ def test_positioned_target_sampler_is_batch_grouping_invariant():
 
 
 def test_positioned_target_sampler_honors_top_k():
+    # Fork: _PositionedTargetSampler is fork-only (the seeded, position-keyed
+    # sampler); upstream has no equivalent to test.
     # top_k=1 collapses each row to its argmax token, regardless of the
     # position-keyed RNG -> draws are deterministic and equal to argmax.
     sampler = server_generation._PositionedTargetSampler(
@@ -3537,7 +3539,9 @@ def test_chat_completions_endpoint_forwards_video_content(client):
 
 
 # ---------------------------------------------------------------------------
-# Legacy OpenAI text-completions endpoint (/v1/completions)
+# Fork: legacy OpenAI text-completions endpoint (/v1/completions). Upstream has
+# no CompletionRequest/CompletionResponse at all, so every test below this banner
+# is fork-only.
 # ---------------------------------------------------------------------------
 
 
@@ -4637,6 +4641,9 @@ def test_metrics_endpoint_reports_empty_state(client, monkeypatch):
     assert payload["server"]["apc"] == {"enabled": False}
 
 
+# Fork: placement only — this and the next test are upstream's, byte-identical in
+# body, but sit here rather than at upstream's line because the fork's extra
+# endpoints shift everything around them. Nothing to converge.
 def test_metrics_endpoint_records_chat_completion_metrics(client, monkeypatch):
     monkeypatch.setattr(server.runtime, "metrics", server.ServerMetricsStore())
     monkeypatch.setattr(server.runtime, "apc_manager", None)
@@ -4721,6 +4728,8 @@ def test_metrics_endpoint_records_chat_completion_metrics(client, monkeypatch):
 
 # ── Continuous batching / ResponseGenerator tests ─────────────────────
 def test_metrics_store_logs_request_lifecycle(caplog):
+    # Fork: placement only — upstream's test, byte-identical body, restored here
+    # rather than at upstream's line (cfcc36d9's test half). Nothing to converge.
     caplog.set_level(logging.INFO, logger="mlx_vlm.server")
     metrics = server.ServerMetricsStore()
     metrics.begin_request(endpoint="/chat/completions", model="demo", stream=True)
@@ -7052,6 +7061,9 @@ class TestSplitThinking:
 
 
 class TestThinkingStreamState:
+    # Fork: upstream's class plus tests for the THINKING_FORMATS registry paths
+    # (`_registry_open_close_markers`, the Gemma pipe-delimited ordering) that only
+    # this fork has.
     """Tests for streaming thinking tag parsing."""
 
     @pytest.mark.parametrize("enable_thinking", [False, True])
@@ -7294,7 +7306,8 @@ class TestCountThinkingTagTokens:
 
 
 # ============================================================================
-# Fork-ported test classes (server-port adaptation, 2026-06-06)
+# Fork: fork-ported test classes (server-port adaptation, 2026-06-06). Everything
+# below this banner is fork content; upstream's file ends before it.
 # ============================================================================
 # Patch-target remaps: TOKEN_QUEUE_TIMEOUT_SECS / CACHED_PATH_HEARTBEAT_INTERVAL_SECS
 # moved to mlx_vlm.server.generation (patched via the server_generation alias).

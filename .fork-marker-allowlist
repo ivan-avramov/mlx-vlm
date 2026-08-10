@@ -76,6 +76,19 @@
 #     `has_audio_tokens` from 2197a68a, an upstream BRANCH commit that never reached
 #     upstream/main — so it is stray in both trees. Restored verbatim anyway; matching
 #     upstream byte-for-byte is what keeps future merges clean.
+#   tests/test_server.py — 6 sites. Two were PLACEMENT only (upstream tests with
+#     byte-identical bodies sitting at fork-shifted line numbers); the rest are the
+#     fork's /v1/completions endpoint tests, its position-keyed sampler test, and the
+#     THINKING_FORMATS additions to TestThinkingStreamState.
+#   server/cli.py — 6 sites. ~17 fork flag groups in one parser, so one marker on
+#     `main()` covers them; the rest are fork imports. NB --log-progress-interval is
+#     upstream's (cfcc36d9), not fork — the marker says so.
+#   server/app.py — 7 sites. All fork, and two are strict supersets worth naming:
+#     `_count_thinking_tag_tokens` preserves upstream's hard-coded accounting exactly
+#     and adds a registry fallback, and `unload_model_sync` additionally STOPS the
+#     generator thread and clears APC / vision / session caches, each of which pins
+#     the unloaded weights' allocations. `_extract_response_format_schema` is
+#     byte-identical — placement only.
 #   server/responses_state.py — 5 sites. Zero upstream lines missing (pure additions),
 #     which is what made marking safe: the THINKING_FORMATS registry integration,
 #     `_CONTENT_MARKERS` stripping, and the ends-with-a-prefix partial-tag scan.
@@ -86,7 +99,7 @@
 #     INSIDE the list literal — a module-scope hunk is keyed by line, so a marker
 #     above the statement does not cover it.
 #
-# Current standing (2026-08-10): 14 files / 152 sites, down from 32 files. Every
+# Current standing (2026-08-10): 11 files / 133 sites, down from 32 files. Every
 # diverged file NOT listed here is marked, including
 # server/request_normalization.py — the gen-args union added fork hunks to a file
 # that had been byte-identical to upstream, and this check caught them before the
@@ -106,12 +119,9 @@ mlx_vlm/server/generation.py  # 14 sites / 21 hunks. Carries the fork's Response
 mlx_vlm/generate/ar.py  # 8 sites / 44 hunks. LEADS is CLEARED: 7fbc7bc9 (#1598) landed in a47e7860, 6d5603b3 (#1628's second half) with it, 8422ece8's ar.py half in 68ac2dc1, and 6a1704e6's ar.py half (the thinking-budget decode synchronization) in 1ab442d8. Only 2 .symbol-exclusions entries remain repo-wide for this file
 mlx_vlm/generate/dispatch.py  # 8 sites / 26 hunks. LEADS is CLEARED: f044f36a's dispatch half landed earlier and its generation.py half via d3a55800; a30180a6's signatures in 68ac2dc1. The two .symbol-exclusions entries here (_cache_fully_retained, _prefix_cache_trim_amount) are REVIEWED deliberate divergences superseded by the fork's snapshot ring — those two are ready to mark
 mlx_vlm/server/openai.py  # 18 sites / 49 hunks. LEADS mostly cleared: f044f36a resolved, cfcc36d9's openai half (the StreamingTimings plumbing) in 682043f5, f3bc6e81 (#1412, the finalizer cache clear) and 84ebae6e (#1641) in 4bd99ca1. 6a8cdff6 (#1411) is also resolved. Still reported here: 4d468e8575 (#1492) and b3d2380d1d (#1266), a few lines each — resolve before marking. NOTE the fork rewrote the streaming chat-completions thinking machinery around THINKING_FORMATS while /v1/responses uses upstream's ThinkingStreamState; 08723a3f unioned their marker sets, so treat those two paths as one decision, not two
-mlx_vlm/tests/test_server.py  # 6 sites / 7 hunks, down from 19, and 123 fork-only definitions. UNIONED with upstream on 2026-08-10 (4bd99ca1): zero definitions missing, imports fully unioned, and its .symbol-exclusions entries went 31 -> 0. The remaining sites are fork endpoints upstream does not have
 
 # --- Server surfaces, not yet reviewed at site granularity.
-mlx_vlm/server/app.py  # 7 sites / 15 hunks. LEADS is CLEARED: e7a0f0f0/21aeb8a5/3de5bada no longer report, the three .deletion-exclusions entries retired with the gen-args union, and 7bf4f7ea (#1402, the preload-reload bug) landed in 4bd99ca1
 mlx_vlm/server/__init__.py  # 7 sites / 13 hunks, all module scope: a re-export surface (lazy import tuples and __all__), so each divergence is one name in a list. Union-resolved by hand at every merge. The convention question is now ANSWERED by speculative/utils.py: put one marker INSIDE the list literal covering the fork names, since a module-scope hunk is keyed by line and a marker above the statement does not cover it
-mlx_vlm/server/cli.py  # 6 sites / 22 hunks, not reviewed. Mostly argparse blocks, so the natural unit is one marker per fork flag group. cfcc36d9's --log-progress-interval landed in 682043f5 and is upstream's, not fork — do not mark it
 
 # --- Library modules, not yet reviewed at site granularity.
 mlx_vlm/utils.py  # 13 sites / 26 hunks. LEADS is CLEARED: 9afc59ce and c1821e93 no longer report, b93707d8's normalize_audio_features stays recorded in .deletion-exclusions, and 63965655/0ae7f5e0 (the StoppingCriteria list aliasing) landed in 68ac2dc1

@@ -19,7 +19,9 @@ from huggingface_hub.errors import CacheNotFound, RepositoryNotFoundError
 from .. import apc as _apc
 from ..generate.edit_image import load_image_edit_model
 from ..generate.image import is_image_generation_model, load_image_generation_model
-from ..prompt_utils import detect_thinking_format as _detect_thinking_format
+from ..prompt_utils import (
+    detect_thinking_format as _detect_thinking_format,  # Fork: THINKING_FORMATS registry
+)
 from ..structured import build_json_schema_logits_processor
 from ..tool_parsers import _infer_tool_parser_from_processor
 from ..version import __version__
@@ -47,7 +49,7 @@ from .openai import register_routes as register_openai_routes
 from .responses_state import _split_thinking as _split_thinking_text
 from .runtime import ModelCacheRegistry, runtime
 from .schemas import ChatLogprobContent, ModelsResponse, TopLogprob
-from .session_manager import clear_session_caches
+from .session_manager import clear_session_caches  # Fork: per-chat session cache
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
@@ -221,6 +223,8 @@ async def _preflight_stream_context_budget(
         raise HTTPException(status_code=400, detail=str(e))
 
 
+# Fork: placement only — body is byte-identical to upstream's; the fork's extra
+# helpers above shift its line number.
 def _extract_response_format_schema(request):
     """Retain the package-level compatibility alias for schema extraction."""
     return _request_normalization._extract_response_format_schema(request)
@@ -237,6 +241,7 @@ def _build_structured_logits_processors(request, processor):
     )
 
 
+# Fork: the registry fallback below (see the marker inside the function).
 def _count_thinking_tag_tokens(
     text: str,
     thinking_start_token: Optional[str] = None,
@@ -250,6 +255,11 @@ def _count_thinking_tag_tokens(
     their per-family ``tag_token_count`` — and only when both an opener and a
     closer are present (partial / mid-thinking output isn't debited the closer).
     """
+    # Fork: a strict superset of upstream's. The hard-coded channeled/generic-think
+    # accounting is preserved exactly; a THINKING_FORMATS registry fallback is added for
+    # families upstream does not enumerate (Gemma's pipe-delimited <|think|>), debited
+    # only when BOTH an opener and a closer are present so mid-thinking output is not
+    # charged for a closer it has not emitted.
     if (
         thinking_start_token
         and thinking_end_token
@@ -509,6 +519,11 @@ def get_cached_model(
     Factory function to get or load the appropriate model resources from cache or by loading.
     Also creates/updates the ResponseGenerator for continuous batching.
     """
+    # Fork: upstream's loader plus the fork's extra model kinds and wiring —
+    # image_edit / image_generation / audio_tts / audio_stt / embedding cache groups,
+    # the APC manager, the vision cache and the ResponseGenerator lifecycle. Purely
+    # additive: the text_generation path is upstream's, including 7bf4f7ea's
+    # `model_kind == "auto"` normalization in the cache key.
     load_as_edit = model_kind == "image_edit"
     load_as_audio = _audio_model_kind(model_kind)
     load_as_embedding = model_kind == "embedding"
@@ -794,6 +809,10 @@ def get_cached_model(
 
 # Synchronous unload function for internal use
 def unload_model_sync():
+    # Fork: upstream resets `runtime.response_generator`/`apc_manager` to None and stops
+    # there. The fork must also STOP the generator thread, clear APC blocks, clear the
+    # vision cache and drop per-chat PromptCacheState sessions — each of those holds KV /
+    # DeltaNet references that would otherwise pin the unloaded weights' allocations.
     unloaded_any = False
     if runtime.audio_queue is not None:
         is_audio_worker = getattr(

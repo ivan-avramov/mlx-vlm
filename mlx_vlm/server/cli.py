@@ -1,7 +1,7 @@
 import argparse
 import logging
 import os
-import sys
+import sys  # Fork: used by the fork's fail-loud config validation
 
 import uvicorn
 
@@ -11,8 +11,8 @@ from ..generate import (
     DEFAULT_PREFILL_STEP_SIZE,
     DEFAULT_QUANTIZED_KV_START,
 )
-from ..snapshot import DEFAULT_RING_SIZE
-from .generation import (
+from ..snapshot import DEFAULT_RING_SIZE  # Fork: the snapshot ring is fork-only
+from .generation import (  # Fork: generation_defaults + thinking getters are fork
     DEFAULT_ENABLE_THINKING,
     get_log_progress_interval,
     get_server_generation_defaults,
@@ -21,12 +21,13 @@ from .generation import (
     get_server_thinking_end_token,
     get_server_thinking_start_token,
 )
-from .session_manager import _env_choice, _env_int
+from .session_manager import _env_choice, _env_int  # Fork: session manager is fork
 from .session_manager import configure as _configure_session_manager
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
 
+# Fork: the log name is overridable so an embedding host can namespace our logger.
 _LOG_NAME = os.environ.get("MLX_VLM_LOG_NAME", "mlx_vlm")
 logger = logging.getLogger(f"{_LOG_NAME}.server")
 
@@ -141,6 +142,12 @@ def validate_kv_prealloc_tokens(kv_prealloc_tokens, max_kv_size):
 
 
 def main():
+    # Fork: this parser carries ~17 fork flag groups on top of upstream's —
+    # KV-quant split schemes and --kv-prealloc-tokens, the snapshot ring, session
+    # management, APC, EpiCache, the suffix drafter, registry generation_defaults,
+    # MLX memory limits, and the extra preload targets (image/TTS/STT). Upstream's
+    # own flags are unchanged; --log-progress-interval below is upstream's
+    # (cfcc36d9) and is NOT fork work.
     parser = argparse.ArgumentParser(description="MLX VLM Http Server.")
     parser.add_argument(
         "--host",
