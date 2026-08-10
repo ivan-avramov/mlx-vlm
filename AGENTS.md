@@ -489,8 +489,30 @@ down rather than gated.
 
 **Read the columns asymmetrically.** It counts textual references, not coverage. A zero
 in `tests` is a real signal worth acting on; a non-zero is **not** evidence of coverage
-(it may be an unrelated mention), and a zero may still be exercised through a caller. Do
-a real coverage run on anything it flags before concluding.
+(it may be an unrelated mention), and a zero may still be exercised through a caller.
+
+**`dev/fork_coverage_report.py` is the confirmation step**, and it is what settles those
+dismissals rather than arguing them:
+
+```bash
+uv pip install --python .venv/bin/python coverage
+cd mlx_vlm && ../.venv/bin/python -m coverage run \
+    --source=/Users/ia87221/ws/mlx-vlm/mlx_vlm --data-file=/tmp/cov.data \
+    -m pytest -q ./tests --ignore=tests/test_smoke.py
+.venv/bin/python dev/fork_coverage_report.py --data-file=/tmp/cov.data [--all]
+```
+
+Per-definition, not per-file: `server/openai.py` is mostly upstream code and the fork's
+dozen definitions vanish in its total. First run: **95 definitions, 1467 statements,
+92.2% covered, ZERO entirely uncovered** — every one of the 12 "no test mentions"
+dismissals confirmed. The two partial ones worth closing were `_trim_cache` (30/58, the
+whole `[B, L, H, D]` layout path) and `/v1/completions`' ResponseGenerator backend.
+
+**Measure the file alone, not just the suite.** `completions_endpoint`'s second backend
+read as *covered* in the whole-suite run and *missed* when only its own test file ran —
+another module had left `runtime.response_generator` set, so the branch was executed by
+accident and asserted by nobody. A whole-suite number flatters an individual file; when a
+definition matters, re-run coverage over its own test file.
 
 ## The one rule that matters most
 
@@ -540,7 +562,7 @@ positives. Every hit still needs `git log -S` and a read.
 cd mlx_vlm/ && pytest -s ./tests --ignore=tests/test_smoke.py
 ```
 
-The suite is **green: 2955 passed, 5 skipped, 0 failed.** Keep it that way. (This
+The suite is **green: 3001 passed, 5 skipped, 0 failed.** Keep it that way. (This
 line goes stale on every restore that adds a guard — trust the run, not the number.)
 
 **Compare failing test IDs, not counts.** A change that fixes one test and breaks
