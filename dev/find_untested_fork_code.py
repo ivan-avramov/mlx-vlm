@@ -51,6 +51,10 @@ own file or used nowhere -- and "used nowhere" in fork-only code is the shape
 `check_dead_helpers.py` deliberately does not report (a fork-only helper nothing calls
 yet is our business, one upstream calls is a dropped hunk).
 
+Reads the git **index** (`git ls-files`), like the seven gating audits. That means a
+brand-new test file is invisible until it is `git add`ed -- write the tests, stage them,
+then re-run, or the count will not move and it looks like the tests did not help.
+
 Usage:
     python dev/find_untested_fork_code.py [--upstream-ref upstream/main] [--all]
 """

@@ -338,8 +338,13 @@ def _strip_thinking_quirks(fmt: ThinkingFormat, reasoning: str) -> str:
     """
     cleaned = reasoning.strip()
     if fmt.name == "gpt-oss":
-        if cleaned.startswith("thought"):
-            cleaned = cleaned[len("thought") :].lstrip()
+        # Word-boundary anchored, NOT `startswith("thought")`. A bare prefix test
+        # mangles any reasoning whose first word merely begins with "thought":
+        # "thoughts about the problem" became "s about the problem" and
+        # "thoughtful analysis" became "ful analysis". `\b` does not match between
+        # "thought" and "s" (both word characters), so only the standalone leftover
+        # token the tokenization actually produces is removed.
+        cleaned = re.sub(r"^thought\b\s*", "", cleaned, count=1)
     return cleaned
 
 
