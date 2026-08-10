@@ -1380,3 +1380,154 @@ class TestQwen35QuantizedVerifyPredicateIsFactored:
         assert (
             'linear.mode != "affine"' not in source
         ), "the pre-split body is back; the head predicate is duplicated again"
+
+
+class TestCompressedTensorsMxfp4FormatIsHonored:
+    """`1551c71f` (#1746, "Add Kimi K3") — its 4-line `utils.py` hunk.
+
+    Ten of that commit's eleven files landed (the whole `models/kimi_k3/` package
+    and the `prompt_utils.py` format entry), so nothing looked missing. The dropped
+    hunk is the one that reads `quantization_config["format"]`: without it every
+    `quant_method: compressed-tensors` checkpoint is loaded as
+    `mode: "affine"`, including the `mxfp4-pack-quantized` ones the commit added
+    support for. `nn.quantize` then dequantizes mxfp4-packed weights with the
+    affine formula — wrong numbers, no error, no failing test.
+    """
+
+    def _load_with_format(self, fmt):
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        import mlx.nn as mlx_nn
+
+        from mlx_vlm.utils import load_model
+
+        class FakeConfig:
+            @classmethod
+            def from_dict(cls, config):
+                return cls()
+
+        class FakeModel(mlx_nn.Module):
+            def __init__(self, config):
+                super().__init__()
+                self.config = config
+                self.language_model = mlx_nn.Linear(2, 2, bias=False)
+
+            def load_weights(self, weights, strict=True):
+                self.loaded_weights = weights
+
+        quantization_config = {"quant_method": "compressed-tensors"}
+        if fmt is not None:
+            quantization_config["format"] = fmt
+
+        with (
+            patch(
+                "mlx_vlm.utils.load_config",
+                return_value={
+                    "model_type": "kimi_k3",
+                    "quantization_config": quantization_config,
+                },
+            ),
+            patch(
+                "mlx_vlm.utils.glob.glob",
+                return_value=["/tmp/model/model.safetensors"],
+            ),
+            patch("mlx_vlm.utils._load_safetensors", return_value={}),
+            patch(
+                "mlx_vlm.utils.get_model_and_args",
+                return_value=(
+                    SimpleNamespace(ModelConfig=FakeConfig, Model=FakeModel),
+                    "kimi_k3",
+                ),
+            ),
+            patch("mlx_vlm.utils.nn.quantize") as quantize,
+        ):
+            load_model(Path("/tmp/model"), lazy=True)
+
+        return quantize.call_args.kwargs
+
+    def test_mxfp4_packed_format_selects_mxfp4_mode(self):
+        kwargs = self._load_with_format("mxfp4-pack-quantized")
+
+        assert kwargs["mode"] == "mxfp4"
+        assert kwargs["bits"] == 4
+        assert kwargs["group_size"] == 32
+
+    def test_other_formats_still_select_affine(self):
+        """The `else` arm — so the guard cannot pass by hard-coding mxfp4."""
+        assert self._load_with_format("int4-pack-quantized")["mode"] == "affine"
+        assert self._load_with_format(None)["mode"] == "affine"
+
+
+class TestSubmoduleSanitizeGuardsOnMissingConfigs:
+    """`b93707d8` (#1498) — the `hasattr(model_config, "<x>_config")` guards.
+
+    #1498 replaced a `hasattr(model, "thinker")` special case in `load_model` with
+    three guarded `if hasattr(model_config, ...)` blocks, having moved the six-way
+    thinker sanitize chain into `qwen3_omni_moe.Model.sanitize`. That model-side
+    half landed byte-identical; the `utils.py` half did not, so this tree kept the
+    pre-#1498 shape — which reaches `model_config.text_config` unguarded.
+
+    `minimax_m3` (a real top-level `model_type`: TEXT_ONLY in `prompt_utils.py`,
+    with its own tool parser) exports `LanguageModel` but its `ModelConfig` has no
+    `text_config`, so `load_model` raised
+    `AttributeError: 'ModelConfig' object has no attribute 'text_config'` and the
+    model could not be loaded at all. Upstream's guard skips the block instead.
+    Nothing failed here because `test_minimax_m3.py` builds the config and model
+    directly and never goes through `load_model`.
+    """
+
+    def test_text_only_minimax_m3_loads_without_a_text_config(self):
+        from pathlib import Path
+        from unittest.mock import patch
+
+        import mlx_vlm.models.minimax_m3 as minimax_m3
+        from mlx_vlm.utils import load_model
+
+        assert hasattr(minimax_m3, "LanguageModel")
+        config = minimax_m3.ModelConfig.from_dict({"model_type": "minimax_m3"})
+        # The precondition the guard exists for; if this ever becomes True the
+        # guard stops being load-bearing and this test stops proving anything.
+        assert not hasattr(config, "text_config")
+
+        with (
+            patch(
+                "mlx_vlm.utils.load_config",
+                return_value={"model_type": "minimax_m3"},
+            ),
+            patch(
+                "mlx_vlm.utils.glob.glob",
+                return_value=["/tmp/model/model.safetensors"],
+            ),
+            patch("mlx_vlm.utils._load_safetensors", return_value={}),
+            patch(
+                "mlx_vlm.utils.get_model_and_args",
+                return_value=(minimax_m3, "minimax_m3"),
+            ),
+        ):
+            model = load_model(Path("/tmp/model"), lazy=True, strict=False)
+
+        assert model is not None
+
+    def test_omni_still_sanitizes_every_submodule(self):
+        """The thinker chain must live on the model, not in `load_model`.
+
+        Removing `load_model`'s `thinker` branch is only safe because #1498's other
+        half put the same six passes in `Model.sanitize`, which the unconditional
+        `sanitize_weights(model, weights)` above reaches.
+        """
+        import inspect
+
+        import mlx_vlm.models.qwen3_omni_moe as qwen3_omni_moe
+
+        source = inspect.getsource(qwen3_omni_moe.Model.sanitize)
+        for submodule in (
+            "self.thinker.sanitize",
+            "self.thinker.vision_tower.sanitize",
+            "self.thinker.audio_tower.sanitize",
+            "self.thinker.language_model.sanitize",
+            "self.code2wav.sanitize",
+            "self.talker.sanitize",
+        ):
+            assert submodule in source, f"{submodule} is no longer reached"

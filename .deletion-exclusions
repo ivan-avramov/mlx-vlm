@@ -142,4 +142,37 @@
 # needs `git log -S` on the symbol, not just a plausible nearby commit.
 
 # --- mlx_vlm/utils.py
-mlx_vlm/utils.py::normalize_audio_features  # stale half of dropped b93707d8 "Always sanitize loaded weights and simplify audio preprocessing"; upstream folded it into the sanitize path
+mlx_vlm/utils.py::normalize_audio_features  # CONFIRMED-STALE, restore of the surrounding region still OPEN -- see the note below
+#
+# 2026-08-09, while draining the fork-marker allowlist: the one-line reason above was
+# right about the classification and wrong about the scope, and "upstream folded it into
+# the sanitize path" conflated two independent halves of b93707d8 (#1498, "Always
+# sanitize loaded weights and simplify audio preprocessing"). The commit did TWO things
+# to utils.py, and this tree had reverted both:
+#
+#   (a) load_model's sanitize block. #1498 deleted the `hasattr(model, "thinker")`
+#       special case and added three `if hasattr(model_config, "<x>_config")` guards,
+#       having moved the six-way thinker chain into qwen3_omni_moe.Model.sanitize. That
+#       model-side half landed BYTE-IDENTICAL, so our copy both double-sanitized omni
+#       AND reached `model_config.text_config` unguarded. FIXED 2026-08-09: that was a
+#       hard `AttributeError` on every `load_model` of minimax_m3, which is a real
+#       top-level model_type (TEXT_ONLY in prompt_utils, its own tool parser) whose
+#       ModelConfig has no `text_config`. The model could not be loaded at all.
+#
+#   (b) prepare_inputs' audio block. #1498 deleted the qwen3-omni special case
+#       (`is_qwen3_omni_moe`, `audio_inputs`, `audio_feature_lengths`, `is_lossy_audio`
+#       and this symbol) in favour of letting the processor do the feature extraction --
+#       `process_inputs_with_fallback(..., audio=audio, ...)` returns `input_features` /
+#       `feature_attention_mask`, the generic copy loop forwards them, and
+#       qwen3_omni_moe/thinker.py:55 derives `audio_feature_lengths` when it is None.
+#       Our copy is #1498's deleted text verbatim apart from one `print` -> `logger`.
+#       STILL OPEN, deliberately: removing ~60 lines changes qwen3-omni audio
+#       preprocessing and NOTHING in the suite drives prepare_inputs with audio through
+#       that branch (checked: no test in tests/ passes `audio=` to prepare_inputs), so
+#       it cannot be validated here without a real qwen3-omni checkpoint. Marking it
+#       `# Fork:` would launder it, so mlx_vlm/utils.py stays on
+#       .fork-marker-allowlist with this as its single named blocker.
+#
+# The reusable part: a "stale half" entry should name the WHOLE region and say which
+# sub-parts are resolved, because a per-symbol entry makes a multi-region revert look
+# like a one-symbol one. This entry hid a load-time crash for as long as it existed.

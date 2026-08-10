@@ -262,6 +262,9 @@ def _transform_compressed_tensors_int4_weights(
     return new_weights, {"group_size": group_size, "bits": bits, "mode": "affine"}
 
 
+# Compressed-tensors auxiliary tensors with no MLX consumer. They carry
+# activation / kv-cache / shape metadata; left in place they reach
+# ``model.load_weights(strict=True)`` as unexpected keys and abort startup.
 _COMPRESSED_TENSORS_DROP_SUFFIXES = (
     ".weight_shape",
     ".weight_global_scale",  # folded into ``.scales`` alongside ``.weight_packed``
@@ -721,23 +724,18 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     # Sanitize weights
     weights = sanitize_weights(model, weights)
 
-    if hasattr(model, "thinker") and hasattr(model.thinker, "sanitize"):
-        weights = sanitize_weights(model.thinker, weights)
-        weights = sanitize_weights(model.thinker.vision_tower, weights)
-        weights = sanitize_weights(model.thinker.audio_tower, weights)
-        weights = sanitize_weights(model.thinker.language_model, weights)
-        weights = sanitize_weights(model.code2wav, weights)
-        weights = sanitize_weights(model.talker, weights)
-    else:
-        if hasattr(model_class, "VisionModel"):
+    if hasattr(model_class, "VisionModel"):
+        if hasattr(model_config, "vision_config"):
             weights = sanitize_weights(
                 model_class.VisionModel, weights, model_config.vision_config
             )
-        if hasattr(model_class, "LanguageModel"):
+    if hasattr(model_class, "LanguageModel"):
+        if hasattr(model_config, "text_config"):
             weights = sanitize_weights(
                 model_class.LanguageModel, weights, model_config.text_config
             )
-        if hasattr(model_class, "AudioModel"):
+    if hasattr(model_class, "AudioModel"):
+        if hasattr(model_config, "audio_config"):
             weights = sanitize_weights(
                 model_class.AudioModel, weights, model_config.audio_config
             )
@@ -767,7 +765,10 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             quant_method = quantization_config.get("quant_method")
             quantization = None
             if quant_method == "compressed-tensors":
-                quantization = {"group_size": 32, "bits": 4, "mode": "affine"}
+                if quantization_config.get("format") == "mxfp4-pack-quantized":
+                    quantization = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+                else:
+                    quantization = {"group_size": 32, "bits": 4, "mode": "affine"}
             elif quant_method == "mxfp4":
                 quantization = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
             elif quant_method == "fp8" and config.get("model_type") == "deepseek_v4":
