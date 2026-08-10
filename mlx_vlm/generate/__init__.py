@@ -127,17 +127,19 @@ __all__ = [
 
 def __getattr__(name):
     # Fork: `common` is in the lazy-import tuple because the fork's generation
-    # engine lives there (5e9b9503); upstream's tuple has no `common`. The
-    # `generation_stream` special case keeps that name working as an attribute
-    # while deferring Metal stream creation to first use.
+    # engine lives there (5e9b9503); upstream's tuple has no `common`. That is the
+    # whole divergence — `generation_stream` needs no special case here, because
+    # `common` has its own module `__getattr__` resolving it to the calling thread's
+    # stream, so the `hasattr(common, name)` probe below already finds it. There used
+    # to be an explicit branch above that probe; it was redundant, and its comment
+    # credited it with keeping the name working. Deleting it changes nothing —
+    # `tests/test_model_registry.py` pins the real mechanism.
     import importlib
 
     from . import ar, common, dispatch, image, video_generation
 
     edit_image_module = importlib.import_module("mlx_vlm.generate.edit_image")
 
-    if name == "generation_stream":
-        return common._get_generation_stream()
     if hasattr(common, name):
         return getattr(common, name)
     if hasattr(dispatch, name):
@@ -153,9 +155,7 @@ def __getattr__(name):
 
 def __dir__():
     # Fork: `common` is in the lazy-import tuple because the fork's generation
-    # engine lives there (5e9b9503); upstream's tuple has no `common`. The
-    # `generation_stream` special case keeps that name working as an attribute
-    # while deferring Metal stream creation to first use.
+    # engine lives there (5e9b9503); upstream's tuple has no `common`.
     import importlib
 
     from . import ar, common, dispatch, image, video_generation
