@@ -375,7 +375,7 @@ positives. Every hit still needs `git log -S` and a read.
 cd mlx_vlm/ && pytest -s ./tests --ignore=tests/test_smoke.py
 ```
 
-The suite is **green: 2685 passed, 5 skipped, 0 failed.** Keep it that way. (This
+The suite is **green: 2709 passed, 5 skipped, 0 failed.** Keep it that way. (This
 line goes stale on every restore that adds a guard — trust the run, not the number.)
 
 **Compare failing test IDs, not counts.** A change that fixes one test and breaks

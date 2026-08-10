@@ -131,6 +131,6 @@ mlx_vlm/tests/test_generate.py::test_wrapped_rotating_is_not_reusable  # REVIEWE
 # --- mlx_vlm/trainer/sft_trainer.py
 
 # --- mlx_vlm/turboquant.py
-mlx_vlm/turboquant.py::_z  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/turboquant.py::_z  # REVIEWED 2026-08-10: not missing content — `_z` is the nested helper inside upstream's SHADOWED DEAD `zero_row_tail`. Upstream defines `zero_row_tail` TWICE in BatchTurboQuantKVCache (the `_map_state`/`_z` version at 6230, then a `_zero_state_row_tail` version at 6271 that shadows it), so its first copy and everything nested in it is unreachable upstream too. Ours is byte-identical to the LIVE copy, so `_z` has nothing to be nested in. Same shape as the doubly-defined TestLagunaProcessor; both are upstream bugs worth reporting. This was the last "unreviewed" entry in this file
 
 # --- mlx_vlm/utils.py
