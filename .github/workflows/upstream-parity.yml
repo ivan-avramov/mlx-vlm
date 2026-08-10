@@ -67,3 +67,11 @@ jobs:
       # instances were found by hand in one session before this existed.
       - name: Check no upstream-called helper is unreachable here
         run: python dev/check_dead_helpers.py --upstream-ref upstream/main
+
+      # The fifth direction, and the only measurement rather than a presence test:
+      # is a file's divergence CONTENT, or only ALIGNMENT? Every wrong sizing call
+      # in docs/upstream-gaps.md was a number derived from a line count, which
+      # cannot tell a rewrite from a reordering. Gates only on the three findings
+      # that are alignment masquerading as content, all mechanically fixable.
+      - name: Check no divergence is alignment-only
+        run: python dev/check_body_divergence.py --upstream-ref upstream/main

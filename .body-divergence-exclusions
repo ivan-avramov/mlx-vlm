@@ -1,0 +1,51 @@
+# Baseline for dev/check_body_divergence.py — the alignment-vs-content audit.
+#
+# Format: `path_glob::symbol_glob  # reason`. Every entry MUST carry a reason; the
+# script refuses to run otherwise. Use `<file>` as the symbol for a whole-file
+# finding — it is not a legal Python identifier, so it cannot collide with a real
+# name, and `path::*` still covers it.
+#
+# What this audit catches: divergence from upstream/main that is ALIGNMENT rather
+# than CONTENT. That distinction is the one no line-based measure can make, and
+# every wrong sizing call in docs/upstream-gaps.md was a number derived from a line
+# count. `apc.py` read as 554 missing lines / 36 fork-marker sites / 75 hunks and
+# was four block moves: 74 of its 76 shared definition bodies were byte-identical.
+#
+# Three findings, all mechanically fixable with no archaeology — which is what
+# makes gating on them honest, and why this file is expected to stay near-empty:
+#
+#   <file>      the file differs from upstream but NOTHING in it does. Converge it.
+#   ALIGNMENT   a shared definition whose bodies differ only in blank lines or
+#               trailing whitespace. Converge the definition.
+#   RELOCATED   a shared definition whose body is byte-identical to upstream's but
+#               which sits outside upstream's definition order. Move it back.
+#
+# An entry here is therefore a claim that a MISALIGNMENT is deliberate, which is a
+# high bar: it means upstream's ordering or whitespace is actively wrong for this
+# fork. The far more likely answers are "converge it" and "it is content, so it
+# belongs to check_fork_markers.py instead".
+#
+# THE TRAP, same one as .fork-marker-allowlist: do not excuse a finding by asserting
+# it is deliberate. Three `# Fork: placement only` markers in this tree said exactly
+# that — "byte-identical body ... Nothing to converge" — and all three were false;
+# `git log -S` showed only upstream's own commits behind both sides of both pairs.
+# See 3105b598.
+#
+# What this audit deliberately does NOT gate on: "every differing body must be
+# reviewed". check_fork_markers.py already requires a `# Fork:` marker on each
+# diverging site, and a second per-definition ledger would only add ~50 entries
+# nobody had looked at — recreating the "baseline: pre-existing divergence,
+# unreviewed" anti-pattern .symbol-exclusions took months to drain. Content
+# divergence needs a human reading `--summary` and picking the next file.
+#
+# Validated to fire before being trusted: the two relocations it reported on first
+# run (server/app.py::_extract_response_format_schema and
+# tests/test_server.py::test_metrics_endpoint_records_chat_completion_metrics) were
+# both real, and converging them took the count to zero. Reverting either commit
+# makes it report again. Runs in ~3s.
+#
+# RESOLVED 2026-08-10, converged rather than excused (3105b598):
+#   mlx_vlm/server/app.py::_extract_response_format_schema        — reordered
+#   mlx_vlm/tests/test_server.py::test_metrics_endpoint_records_chat_completion_metrics
+#
+# Baseline: EMPTY. Keep it that way — every finding here has a mechanical fix.

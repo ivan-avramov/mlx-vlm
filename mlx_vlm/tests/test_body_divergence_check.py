@@ -1,0 +1,312 @@
+"""Tests for `dev/check_body_divergence.py`'s alignment-vs-content rules.
+
+A fork-only file, and the second test of any `dev/` audit script after
+`test_fork_marker_check.py`. Same reason that one exists: the audits are the safety
+net for every merge, so a bug that makes one MORE PERMISSIVE is the worst shape of
+bug available here — nothing fails, the check still prints OK, and divergence stops
+being reported. `docs/upstream-gaps.md` is what happens with no check at all; a check
+that lies is worse.
+
+For this script "more permissive" has a specific meaning: calling a real CONTENT
+difference mere ALIGNMENT. That is the direction most of these tests guard. Two
+normalisations look harmless and are not — indentation (semantic in Python) and
+comments (one of the ten dropped hunks the marker rollout found was a comment) — so
+`normalise` must leave both alone, and several tests say so out loud.
+
+The other direction, calling alignment "content", only produces noise. It is still
+tested, because a noisy gate gets switched off.
+"""
+
+import importlib.util
+from pathlib import Path
+
+import pytest
+
+_DEV = Path(__file__).resolve().parents[2] / "dev" / "check_body_divergence.py"
+
+
+def _load():
+    spec = importlib.util.spec_from_file_location("_cbd_under_test", _DEV)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture(scope="module")
+def cbd():
+    assert _DEV.is_file(), f"missing {_DEV}"
+    return _load()
+
+
+def _cmp(cbd, upstream, ours, path="mlx_vlm/x.py"):
+    return cbd.FileComparison(path, upstream, ours)
+
+
+UP = """\
+import os
+
+
+def alpha(x):
+    return x + 1
+
+
+def beta(y):
+    return y * 2
+"""
+
+
+class TestNormalise:
+    """The normalisation is the only place a content difference can be lost."""
+
+    def test_blank_lines_and_trailing_space_are_alignment(self, cbd):
+        assert cbd.normalise("def f():\n    return 1\n") == cbd.normalise(
+            "def f():   \n\n    return 1\n\n"
+        )
+
+    def test_indentation_is_content_not_alignment(self, cbd):
+        """In Python an indent change moves a statement between blocks.
+
+        Stripping leading whitespace would make a real behavioural difference read
+        as alignment and be silently converged away — the single most dangerous
+        over-normalisation available to this script.
+        """
+        a = "def f():\n    if x:\n        return 1\n    return 2\n"
+        b = "def f():\n    if x:\n        return 1\n        return 2\n"
+        assert cbd.normalise(a) != cbd.normalise(b)
+
+    def test_comments_are_content_not_alignment(self, cbd):
+        """A dropped comment is a dropped hunk.
+
+        One of the ten found while marking was exactly a comment, and it had no
+        failing test and no audit hit. Normalising comments away here would put
+        that shape back out of reach.
+        """
+        a = "def f():\n    # explains the clamp\n    return 1\n"
+        b = "def f():\n    return 1\n"
+        assert cbd.normalise(a) != cbd.normalise(b)
+
+    def test_a_real_statement_change_is_content(self, cbd):
+        assert cbd.normalise("def f():\n    return 1\n") != cbd.normalise(
+            "def f():\n    return 2\n"
+        )
+
+
+class TestRelocatedDefinitions:
+    def test_same_order_reports_nothing(self, cbd):
+        assert cbd.relocated_definitions(["a", "b", "c"], ["a", "b", "c"]) == []
+
+    def test_a_single_swap_is_reported(self, cbd):
+        moved = cbd.relocated_definitions(["a", "b", "c"], ["a", "c", "b"])
+        assert len(moved) == 1
+        assert moved[0] in {"b", "c"}
+
+    def test_an_inserted_fork_only_helper_does_not_cascade(self, cbd):
+        """This is what makes the signal quiet enough to gate on.
+
+        Comparing raw positions would call every definition after an insertion
+        "moved". Dropping one-sided names first and taking the longest common
+        subsequence of what remains reports the 2 real relocations in this tree
+        rather than hundreds.
+        """
+        assert cbd.relocated_definitions(["a", "b", "c"], ["a", "fork", "b", "c"]) == []
+
+    def test_a_removed_upstream_symbol_does_not_cascade(self, cbd):
+        assert cbd.relocated_definitions(["a", "gone", "b"], ["a", "b"]) == []
+
+    def test_empty_inputs(self, cbd):
+        assert cbd.relocated_definitions([], []) == []
+        assert cbd.relocated_definitions(["a"], []) == []
+
+
+class TestDefinitionBodies:
+    def test_a_syntax_error_propagates(self, cbd):
+        """Fail loud. A file this script cannot parse is a file it is not checking.
+
+        `main` turns this into a fatal error listing the paths, rather than skipping
+        them — an audit that quietly covers less than it claims is the bug this whole
+        test file exists to prevent.
+        """
+        with pytest.raises(SyntaxError):
+            cbd.definition_bodies("def f(:\n")
+
+    def test_decorators_are_part_of_the_body(self, cbd):
+        """A decorator change IS a body change.
+
+        `@pytest.mark.parametrize` data lives entirely in the decorator, so excluding
+        it would make a rewritten test case look byte-identical.
+        """
+        defs, _ = cbd.definition_bodies("@deco(1)\ndef f():\n    pass\n")
+        assert "@deco(1)" in defs["f"]
+
+    def test_module_statements_are_separated_from_definitions(self, cbd):
+        defs, mods = cbd.definition_bodies("import os\n\n\ndef f():\n    pass\n")
+        assert list(defs) == ["f"]
+        assert mods == ["import os"]
+
+
+class TestFileComparison:
+    def test_a_pure_reorder_is_alignment_only(self, cbd):
+        ours = """\
+import os
+
+
+def beta(y):
+    return y * 2
+
+
+def alpha(x):
+    return x + 1
+"""
+        cmp = _cmp(cbd, UP, ours)
+        assert cmp.content_score == 0
+        assert cmp.alignment_only_file is True
+        assert [k for k, _ in cmp.findings()] == [cbd.FILE_SYMBOL, "beta"]
+
+    def test_an_ours_only_definition_is_content(self, cbd):
+        cmp = _cmp(cbd, UP, UP + "\n\ndef fork_helper():\n    pass\n")
+        assert cmp.ours_only == ["fork_helper"]
+        assert cmp.content_score == 1
+        assert cmp.alignment_only_file is False
+
+    def test_an_up_only_definition_is_content(self, cbd):
+        ours = UP.replace("def beta(y):\n    return y * 2\n", "")
+        cmp = _cmp(cbd, UP, ours)
+        assert cmp.up_only == ["beta"]
+        assert cmp.alignment_only_file is False
+
+    def test_a_changed_body_is_content(self, cbd):
+        cmp = _cmp(cbd, UP, UP.replace("return x + 1", "return x + 42"))
+        assert cmp.content_differing == ["alpha"]
+        assert cmp.alignment_only == []
+        assert cmp.alignment_only_file is False
+
+    def test_a_blank_line_only_change_is_reported_as_alignment(self, cbd):
+        """And it names the definition as well as the file.
+
+        A blank-line-only change leaves content_score at 0, so the whole-file
+        finding fires too. Both are wanted: `<file>` says converge the file, the
+        per-definition finding says which part of it to look at.
+        """
+        cmp = _cmp(cbd, UP, UP.replace("def alpha(x):\n", "def alpha(x):\n\n"))
+        assert cmp.alignment_only == ["alpha"]
+        assert cmp.content_differing == []
+        assert [name for name, _why in cmp.findings()] == [cbd.FILE_SYMBOL, "alpha"]
+
+    def test_a_new_module_statement_is_content(self, cbd):
+        cmp = _cmp(cbd, UP, "import sys\n" + UP)
+        assert cmp.module_stmts_same_multiset is False
+        assert cmp.content_score == 1
+        assert cmp.alignment_only_file is False
+
+    def test_reordered_module_statements_are_not_content(self, cbd):
+        up = "import os\nimport sys\n\n\ndef alpha(x):\n    return x\n"
+        ours = "import sys\nimport os\n\n\ndef alpha(x):\n    return x\n"
+        cmp = _cmp(cbd, up, ours)
+        assert cmp.module_stmts_ordered_equal is False
+        assert cmp.module_stmts_same_multiset is True
+        assert cmp.content_score == 0
+
+    def test_a_definition_that_moved_AND_changed_is_content_not_relocation(self, cbd):
+        """Relocation is only claimed for a byte-identical body.
+
+        Otherwise a rewritten function that also moved would be reported as "just
+        out of place", inviting someone to move it back and call the file converged
+        while its real content divergence went unexamined. That is the permissive
+        direction, so it gets its own test.
+        """
+        ours = """\
+import os
+
+
+def beta(y):
+    return y * 2
+
+
+def alpha(x):
+    return x + 999
+"""
+        cmp = _cmp(cbd, UP, ours)
+        assert cmp.content_differing == ["alpha"]
+        assert "alpha" not in cmp.relocated
+        assert cmp.alignment_only_file is False
+
+
+class TestExclusionMatching:
+    def test_an_empty_list_excuses_nothing(self, cbd):
+        """Fail closed."""
+        assert cbd.matching_exclusion("mlx_vlm/x.py", "alpha", []) is None
+
+    def test_an_exact_match(self, cbd):
+        rules = [("mlx_vlm/x.py", "alpha", "why")]
+        assert cbd.matching_exclusion("mlx_vlm/x.py", "alpha", rules) == (
+            "mlx_vlm/x.py",
+            "alpha",
+        )
+
+    def test_it_does_not_leak_across_files(self, cbd):
+        rules = [("mlx_vlm/x.py", "alpha", "why")]
+        assert cbd.matching_exclusion("mlx_vlm/y.py", "alpha", rules) is None
+
+    def test_it_does_not_leak_across_symbols(self, cbd):
+        rules = [("mlx_vlm/x.py", "alpha", "why")]
+        assert cbd.matching_exclusion("mlx_vlm/x.py", "beta", rules) is None
+
+    def test_a_path_glob(self, cbd):
+        rules = [("mlx_vlm/server/*.py", "alpha", "why")]
+        assert cbd.matching_exclusion("mlx_vlm/server/app.py", "alpha", rules)
+        assert cbd.matching_exclusion("mlx_vlm/apc.py", "alpha", rules) is None
+
+    def test_the_file_pseudo_symbol(self, cbd):
+        """`<file>` names the whole-file finding, and `path::*` must still cover it."""
+        by_name = [("mlx_vlm/x.py", cbd.FILE_SYMBOL, "why")]
+        assert cbd.matching_exclusion("mlx_vlm/x.py", cbd.FILE_SYMBOL, by_name)
+        by_star = [("mlx_vlm/x.py", "*", "why")]
+        assert cbd.matching_exclusion("mlx_vlm/x.py", cbd.FILE_SYMBOL, by_star)
+
+    def test_a_real_symbol_entry_does_not_excuse_the_whole_file(self, cbd):
+        """Excusing one definition must not excuse the file-level finding.
+
+        The file-level finding says the ENTIRE diff is alignment; a per-definition
+        reason cannot support that claim.
+        """
+        rules = [("mlx_vlm/x.py", "alpha", "why")]
+        assert cbd.matching_exclusion("mlx_vlm/x.py", cbd.FILE_SYMBOL, rules) is None
+
+    def test_the_file_pseudo_symbol_is_not_a_legal_identifier(self, cbd):
+        """Which is what stops it colliding with a real definition name."""
+        assert not cbd.FILE_SYMBOL.isidentifier()
+
+
+class TestExclusionsFileParsing:
+    def test_a_line_without_a_reason_is_fatal(self, cbd, tmp_path, monkeypatch):
+        path = tmp_path / ".body-divergence-exclusions"
+        path.write_text("mlx_vlm/x.py::alpha\n")
+        monkeypatch.setattr(cbd, "EXCLUSIONS_FILE", path)
+        with pytest.raises(SystemExit):
+            cbd.load_exclusions()
+
+    def test_a_malformed_rule_is_fatal(self, cbd, tmp_path, monkeypatch):
+        path = tmp_path / ".body-divergence-exclusions"
+        path.write_text("mlx_vlm/x.py  # no double colon\n")
+        monkeypatch.setattr(cbd, "EXCLUSIONS_FILE", path)
+        with pytest.raises(SystemExit):
+            cbd.load_exclusions()
+
+    def test_comments_and_blank_lines_are_skipped(self, cbd, tmp_path, monkeypatch):
+        path = tmp_path / ".body-divergence-exclusions"
+        path.write_text("# header\n\nmlx_vlm/x.py::alpha  # a real reason\n")
+        monkeypatch.setattr(cbd, "EXCLUSIONS_FILE", path)
+        assert cbd.load_exclusions() == [("mlx_vlm/x.py", "alpha", "a real reason")]
+
+    def test_a_missing_file_reads_as_empty(self, cbd, tmp_path, monkeypatch):
+        monkeypatch.setattr(cbd, "EXCLUSIONS_FILE", tmp_path / "absent")
+        assert cbd.load_exclusions() == []
+
+    def test_the_repo_baseline_is_empty(self, cbd):
+        """Pins the baseline, the way the other audits' baselines are pinned.
+
+        Every finding this script reports has a mechanical fix, so a non-empty
+        baseline means someone claimed a misalignment was deliberate. That should
+        require editing this test and saying why.
+        """
+        assert cbd.load_exclusions() == []

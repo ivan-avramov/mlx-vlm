@@ -42,6 +42,8 @@ python dev/find_dropped_hunks.py --min-lines 1 --min-share 0.05 \
 python dev/check_upstream_deletions.py  # no upstream DELETION silently reverted
 python dev/check_fork_markers.py        # every fork hunk in a shared file is marked
 python dev/check_dead_helpers.py        # no upstream-called helper left unreachable
+python dev/check_body_divergence.py     # no divergence that is only ALIGNMENT
+python dev/check_body_divergence.py --summary   # then size what conflicted
 cd mlx_vlm/ && pytest ./tests --ignore=tests/test_smoke.py
 ```
 
@@ -59,7 +61,9 @@ commit that mostly removes code (`29b6c00b`) shows only its insertions and
 closed while still listed**, because attribution is by line content — the exclusion
 baselines, not the commit count, are the progress signal.
 
-**Run all six checks after every merge — this is not optional.** When a merge
+**Run all seven checks after every merge — this is not optional.** Six of them gate
+(they exit non-zero and CI runs them); `find_dropped_hunks.py` is a lead generator
+and does not. When a merge
 resolution drops content from a commit that upstream already merged, that commit
 is still an ancestor of `main`, so git records the content as *deliberately
 deleted* and no later merge re-offers it. There is no conflict and no warning.
@@ -135,8 +139,8 @@ found `gemma4_assistant/masks.py` — recorded in this very file as a deliberate
 divergence — to be half of a dropped commit; see the `[correction]` under
 "Deliberate divergences".
 
-**Before working an allowlist entry, run the AST body diff in "the fifth direction"
-below.** A file's site and hunk counts measure alignment, so a *reordered* file looks
+**Before working an allowlist entry, run `dev/check_body_divergence.py --file <path>`
+("the fifth direction" below).** A file's site and hunk counts measure alignment, so a *reordered* file looks
 like the biggest job on the list and is the smallest. Marking is the fallback; the
 better exit is usually CONVERGE.
 
@@ -158,10 +162,11 @@ covered on each run so the coverage stays auditable. Two things to know:
   first attempt that left `server/generation.py` stuck on a deleted *method*
   (`_sample_top_p_one`) whose class is present and marked.
 
-`mlx_vlm/tests/test_fork_marker_check.py` pins that narrowness, and is the only test
-of any `dev/` audit. Worth extending rather than replacing: a bug that makes one of
-these checks **more permissive** fails nothing, still prints OK, and silently stops
-reporting dropped content.
+`mlx_vlm/tests/test_fork_marker_check.py` pins that narrowness. It and
+`test_body_divergence_check.py` are the only tests of any `dev/` audit; every new
+gating script needs one, because a bug that makes one of these checks **more
+permissive** fails nothing, still prints OK, and silently stops reporting dropped
+content. Extend them rather than replacing them.
 
 ### The fourth direction: is the thing that exists actually reachable?
 
@@ -244,46 +249,40 @@ trusted, and the file could not be signed off while they read "unreviewed".
 
 ### The fifth direction: is this divergence CONTENT, or only ALIGNMENT?
 
-The four questions above are all about *what exists where*. None of them, and none of
-the five gating scripts, can tell you the one thing you need before sizing a diverged
-file: **how much of it actually differs.** A file whose definitions have merely been
-*reordered* reports as maximally diverged by every line-based measure, and there is no
-check that says otherwise.
+The four questions above are all about *what exists where*. None of them, and no
+line-based measure, can tell you the one thing you need before sizing a diverged file:
+**how much of it actually differs.** A file whose definitions have merely been
+*reordered* reports as maximally diverged by `--numstat`, by "missing lines", by
+"sites" and by "hunks" alike — those are all the same measure wearing different hats.
 
-**Do this before reading a diff, before sizing a file, before scheduling the work.** It
-is ~25 lines and takes a second:
+`dev/check_body_divergence.py` is that check. It was prose plus a copy-paste snippet
+in this file until 2026-08-10, which meant it only ran when someone remembered.
 
-```python
-# .venv/bin/python - <<'PY'    (set P)
-import subprocess, ast, difflib
-R = "/Users/ia87221/ws/mlx-vlm"; P = "mlx_vlm/server/openai.py"
-up = subprocess.run(["git","-C",R,"show",f"upstream/main:{P}"],
-                    capture_output=True, text=True).stdout
-ours = open(f"{R}/{P}").read()
-def parse(src):
-    t = ast.parse(src); L = src.splitlines(); d = {}; mods = []
-    for n in t.body:
-        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            s = min([n.lineno] + [x.lineno for x in n.decorator_list])
-            d[n.name] = "\n".join(L[s-1:n.end_lineno])
-        else:
-            mods.append("\n".join(L[n.lineno-1:n.end_lineno]))
-    return d, mods
-U, UM = parse(up); O, OM = parse(ours)
-sh = sorted(set(U) & set(O))
-print(f"shared={len(sh)} identical={sum(U[n]==O[n] for n in sh)} "
-      f"ours-only={sorted(set(O)-set(U))} up-only={sorted(set(U)-set(O))}")
-print(f"module stmts: up={len(UM)} ours={len(OM)} identical={UM==OM}")
-for n in sh:
-    if U[n] == O[n]: continue
-    ch = [x for x in difflib.unified_diff(U[n].splitlines(), O[n].splitlines(),
-          lineterm="", n=0) if x[:1] in "+-" and not x.startswith(("---","+++"))]
-    print(f"  DIFF {n:48s} up={len(U[n].splitlines()):4d} "
-          f"ours={len(O[n].splitlines()):4d} changed={len(ch)}")
-PY
+**Run `--summary` before reading a diff, before sizing a file, before scheduling the
+work.** It takes ~3s over the whole tree:
+
+```bash
+python dev/check_body_divergence.py --summary        # rank files by CONTENT
+python dev/check_body_divergence.py --file <path>    # per-definition report
+python dev/check_body_divergence.py                  # the gate
 ```
 
-Three results so far, and the first one is why this section exists:
+`--summary` prints each file's `content` score next to the same file's `--numstat`
+delta, on purpose: `tests/test_server.py` reads +2185/-262 and scores 33;
+`turboquant.py` reads +539/-102 and scores 9. The line column is there to be
+distrusted. A file with `content=0` is a pure reordering — converge it rather than
+reading its diff.
+
+It **gates only on alignment masquerading as content**, which is a much narrower
+claim than the report makes: a whole file whose divergence is zero content, a
+definition whose bodies differ only in blank lines or trailing whitespace, and a
+definition byte-identical to upstream's sitting outside upstream's order. All three
+have mechanical fixes, so `.body-divergence-exclusions` should stay empty. It
+deliberately does **not** demand a per-definition review ledger — `check_fork_markers.py`
+already covers each diverging site, and a second list would just add ~50 unreviewed
+entries.
+
+Three results from the snippet era, and the first one is why this section exists:
 
 - **`apc.py`** — the largest `.fork-marker-allowlist` entry for weeks (36 sites, 75
   hunks, 554 missing upstream lines), described in this file's own notes and in the
@@ -314,6 +313,21 @@ Two caveats, both paid for:
   and it is strictly weaker than this one: it answers "is this symbol present in both?",
   not "is this body upstream's?". Use it on whatever the AST diff flags, not instead.
 
+The first caveat was observed live by the script itself. `tests/test_server.py` had
+`# ── Continuous batching / ResponseGenerator tests ──` sitting above a metrics test
+instead of above `class TestResponseGenerator` where upstream has it — a previous
+node-based move had landed on the wrong side of it. After acting on a RELOCATED
+finding, check banners by eye.
+
+**A third caveat, and the reason this check gates rather than merely reports:
+`# Fork: placement only` is a lie waiting to be written.** All three markers in this
+tree that said it were false — two claimed "byte-identical body ... Nothing to
+converge" about definitions that were simply in the wrong order, and one blamed a
+"line number shift" for an ordering swap. `git log -S` showed only upstream's own
+commits behind every side of both pairs. A marker is what makes a site invisible to
+every later audit, so *placement* is exactly the wrong thing to excuse with one; the
+gate now refuses it. See `3105b598`.
+
 **This is also the general form of the rule below.** "Never conclude from a
 `--numstat` line count" was being obeyed to the letter while the same mistake was made
 with "missing lines", "sites" and "hunks" — every wrong claim in the handoff's history
@@ -339,7 +353,8 @@ listed at the end of `docs/upstream-gaps.md`.
 **`--numstat` is only the most obvious form.** "Missing lines", "sites" and "hunks"
 are the same measure wearing different hats, and reading them as a proxy for *how
 much differs* is how `apc.py` was mis-sized by two orders of magnitude — see "the
-fifth direction" above, and run that AST comparison before you size anything. A
+fifth direction" above, and run `dev/check_body_divergence.py --summary` before you
+size anything. A
 fourth situation this rule cannot distinguish, added because it cost a cycle: **a
 file whose definitions were merely reordered.**
 
@@ -375,7 +390,7 @@ positives. Every hit still needs `git log -S` and a read.
 cd mlx_vlm/ && pytest -s ./tests --ignore=tests/test_smoke.py
 ```
 
-The suite is **green: 2709 passed, 5 skipped, 0 failed.** Keep it that way. (This
+The suite is **green: 2742 passed, 5 skipped, 0 failed.** Keep it that way. (This
 line goes stale on every restore that adds a guard — trust the run, not the number.)
 
 **Compare failing test IDs, not counts.** A change that fixes one test and breaks
@@ -618,7 +633,7 @@ fallback and by two test files.
   file had failures). Because it is PR-only, pushes straight to `main` are never
   style-checked — which is how style drift went unnoticed.
 - `upstream-parity.yml` — runs on pushes to `main` as well as PRs, since this fork
-  is usually committed to directly. Runs the five gating audit scripts.
+  is usually committed to directly. Runs the six gating audit scripts.
 
 ## Key dependencies
 
@@ -639,7 +654,8 @@ Four for four on `test_utils.py`, `test_trainer_utils.py`,
 1. AST-compare definition names both ways. **`only_ours` empty does NOT mean
    checkout-safe** — `test_utils.py` had zero fork-only definitions and real fork
    content in *bodies*.
-2. Diff the **bodies** of shared definitions (see "the fifth direction"). Ours-only
+2. Diff the **bodies** of shared definitions: `dev/check_body_divergence.py --file
+   <path>` (see "the fifth direction"). Ours-only
    content is either a fork adaptation (keep, mark `# Fork:`) or a weakened assertion
    (take upstream's). **These look identical in a diff**; `memory.md`'s change log is
    what distinguishes them.
@@ -647,7 +663,8 @@ Four for four on `test_utils.py`, `test_trainer_utils.py`,
    definitions below a `# Fork additions below this line` banner.
 4. Union the import block, and mark fork-only imports **inline** (`# Fork:` on the
    line) — a standalone comment gets hoisted by isort.
-5. Re-run `check_upstream_symbols.py` + `check_fork_markers.py` and prune what stops
+5. Re-run `check_upstream_symbols.py`, `check_fork_markers.py` and
+   `check_body_divergence.py`, and prune what stops
    being excused, **in the same commit**.
 
 Step 2 is the step that pays. In `test_server.py`, 10 of 232 shared bodies differed and
@@ -721,16 +738,18 @@ roughly by how often they bite.
 10. **A line-count delta measures ALIGNMENT, not CONTENT.** The general form of the
     rule above. `apc.py` read as 554 missing lines / 36 sites / 75 hunks and was a
     reordering. Two commits' entire reported residue turned out to be a **local
-    variable rename**. AST-diff the bodies.
+    variable rename**. Run `dev/check_body_divergence.py --summary`.
 11. **The per-commit dropped-hunk report does not tell you how much of a file
     diverges.** It ranks commits it can attribute. Deciding a file was "markable" from
     it produced the wrong call on `turboquant.py` twice. Use a direct
-    `git diff upstream/main -- <path>` for that question, and the AST body diff to
-    classify what it shows.
+    `git diff upstream/main -- <path>` for that question, and
+    `dev/check_body_divergence.py --file <path>` to classify what it shows.
 12. **A marker on a whitespace probe line creates a new probe line.** Chasing them in
     `test_generate.py` went 10 -> 8 -> 1 -> 2 sites. **Converge the ordering instead** —
     that took it to 0. And check `git diff -U0` before assuming a residual site IS a
     probe: a deletion-only hunk looks identical and is not fixable that way.
+    `check_body_divergence.py` now refuses `# Fork: placement only` outright: all three
+    markers in this tree that claimed it were false.
 
 **Proof**
 
