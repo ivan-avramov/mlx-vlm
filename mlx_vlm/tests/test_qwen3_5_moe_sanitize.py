@@ -10,7 +10,7 @@ sanitize only reads self.config.text_config.{num_hidden_layers, num_experts,
 tie_word_embeddings}, so we duck-type `self` and call the method unbound — no need
 to instantiate the (heavy) full multimodal Model.
 
-This file is fork-only, and after 4a54a2be it is the *only* thing carrying the fork's
+This file is fork-only, and after 6be3f881 it is the *only* thing carrying the fork's
 knowledge about these two layouts: `qwen3_5_moe.py` itself is now byte-identical to
 upstream. The fork had its own unfused branch (`f0d50c90`) four days before upstream's
 `b590c747` (#1472) added an equivalent one; the fork's differed only in probing
