@@ -155,6 +155,26 @@
 #         1171888e note, now confirmed mechanically rather than by spot check.
 #     Also converged: the absolute `from mlx_vlm.models.cache import ...` (9065b024),
 #     the same artifact apc.py had and the third instance of that shape in this file.
+#   utils.py — 12 sites -> 0, THE LAST ENTRY, and it closed on a decision rather than a
+#     discovery. Its three dropped hunks were restored in c5454e71 (see below); what kept
+#     it listed for a session was b93707d8 (#1498)'s OTHER half — prepare_inputs'
+#     qwen3-omni audio special case, CONFIRMED-STALE (upstream's deleted text verbatim,
+#     no fork commit ever touched it, its model-side half landed byte-identical) but with
+#     zero test coverage, since nothing in tests/ passed `audio=` to prepare_inputs.
+#     DELETED 2026-08-10 on an explicit decision. The coverage that was missing is now
+#     written: TestOmniAudioFeaturesComeFromTheProcessor asserts the contract the
+#     simplified path depends on — the processor receives audio ARRAYS and whatever it
+#     returns is forwarded — plus a tripwire against the branch reappearing, which
+#     matters because a future merge re-offering pre-#1498 content produces NO conflict
+#     (its deleting commit is already an ancestor of main).
+#     Missing upstream lines 32 -> 12, and all 12 are the fork's print/logging ->
+#     module-logger conversions (2f5e01dd, confirmed fork-authored), so every marker in
+#     this file names that plus whatever else its function carries.
+#     Worth keeping: holding this open for a session with the evidence written down was
+#     the right move, not a stall. Marking it would have laundered stale code into a
+#     documented feature; deleting it blind would have been an unvalidated behaviour
+#     change. Writing down what was known and what could not be known LOCALLY is what
+#     turned it into a one-line decision later.
 #   server/openai.py — 16 sites -> 0. RESTORED one dropped hunk that is the cleanest
 #     "helper landed, ONE OF TWO call sites dropped" instance found yet: eda1ec4f
 #     (#1716, "Fix Responses instructions for Qwen templates") replaced the same
@@ -284,8 +304,25 @@
 #     against a README that promises it. Guard:
 #     test_dropped_upstream_guards.py::TestApcStoreEmitsItsTrace.
 #
-# Current standing (2026-08-10): 1 file / 12 sites / 21 hunks, down from 32 files /
-# 175 sites. Re-run `--summary`; do not trust this line either. Every
+# ============================================================================
+# EMPTY as of 2026-08-10. The rollout is COMPLETE: 0 files, down from 32 files /
+# 175 sites. Every diverged file this fork carries is now either byte-identical to
+# upstream or carries a `# Fork:` marker saying what deviates and why.
+#
+# KEEP THIS FILE AND ITS HEADER. It is a rollout schedule, and the schedule being
+# empty is the steady state to maintain, not a reason to delete the mechanism — the
+# next merge that adds a fork hunk to a shared file will need an entry, exactly as
+# server/request_normalization.py did. The RESOLVED notes below are the record of how
+# each file was settled and are the reason a future reader can trust the markers
+# rather than re-deriving them.
+#
+# Two coverage rules are now doing work that no marker can, and both are visible in
+# every `--summary` run rather than silent:
+#   * check_fork_markers.py case 4 — a deletion-only hunk whose removed def/class
+#     names are ALL excused in .symbol-exclusions. Three symbols across two files.
+#   * the fork-boundary banner in models/cache.py and the test-file banners.
+# ============================================================================
+# Every
 # diverged file NOT listed here is marked, including
 # server/request_normalization.py — the gen-args union added fork hunks to a file
 # that had been byte-identical to upstream, and this check caught them before the
@@ -304,7 +341,6 @@
 # --- Server surfaces, not yet reviewed at site granularity.
 
 # --- Library modules, not yet reviewed at site granularity.
-mlx_vlm/utils.py  # REVIEWED site-by-site 2026-08-09; ONE named blocker, not a general "not yet reviewed". Missing upstream lines 32 -> 19, and of the 19 all but 7 are the fork's print/logging -> module-logger conversions (2f5e01dd, fork-authored, confirmed). RESTORED while reviewing: 1551c71f (#1746 Kimi K3)'s 4-line mxfp4-pack-quantized branch -- 10 of its 11 files had landed, so compressed-tensors checkpoints in that format were loaded as mode "affine" (wrong dequant, no error); b93707d8 (#1498)'s sanitize-block half, which was a hard AttributeError on load_model of minimax_m3; and c90167b3 (#1711)'s 3-line comment above _COMPRESSED_TENSORS_DROP_SUFFIXES. THE BLOCKER: the other half of b93707d8 -- prepare_inputs' qwen3-omni audio special case (is_qwen3_omni_moe / audio_inputs / is_lossy_audio / normalize_audio_features) is #1498's deleted text verbatim, i.e. CONFIRMED-STALE, but no test drives prepare_inputs with audio through that branch so a ~60-line deletion cannot be validated here. Do NOT mark that region -- marking stale content is the laundering this file exists to prevent. Full evidence in .deletion-exclusions under normalize_audio_features
 # --- TRIAGE (2026-08-10). Missing upstream lines / added lines per file, from a direct
 # --- `git diff upstream/main`. Use this to ORDER the work; it decides nothing on its own
 # --- (AGENTS.md's first rule), but a file with few missing lines is cheap to clear and

@@ -4,7 +4,7 @@ import inspect
 import json
 import logging
 import math
-import os
+import os  # Fork: MLX_VLM_LOG_NAME on the module logger below
 import re
 import struct
 from io import BytesIO
@@ -12,7 +12,7 @@ from pathlib import Path
 from textwrap import dedent
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import json_repair
+import json_repair  # Fork: sanitize_strict_json's tolerant JSON repair
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
@@ -28,6 +28,10 @@ from .quantization.one_bit import _quantization_for_path, replace_one_bit_module
 from .tokenizer_utils import load_tokenizer
 from .trainer.utils import apply_lora_layers
 
+# Fork: MLX_VLM_LOG_NAME (2f5e01dd) so an embedding host can re-root the logger tree;
+# upstream has no module logger here at all and uses bare `logging.*` + `print`.
+# Converting those call sites is the ONLY remaining divergence in this file: 12
+# upstream lines are absent and all 12 are `print`/`logging.*` -> `logger.*`.
 _LOG_NAME = os.environ.get("MLX_VLM_LOG_NAME", "mlx_vlm")
 logger = logging.getLogger(f"{_LOG_NAME}.utils")
 
@@ -521,6 +525,8 @@ def get_class_predicate(skip_vision=False, weights=None, quantization_config=Non
 
 
 def get_model_and_args(config: dict):
+    # Fork: logging.error -> logger.error (2f5e01dd). Message and
+    # behaviour unchanged.
     """
     Retrieve the model object based on the configuration.
 
@@ -619,6 +625,10 @@ def get_model_path(
 
 
 def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
+    # Fork: logging.error/warning -> logger.* (2f5e01dd), plus the fork's
+    # mtp.* filter and text-only-quant strictness relaxation. b93707d8's sanitize
+    # guards and 1551c71f's mxfp4 branch here are UPSTREAM's, restored in c5454e71 --
+    # do not re-derive them from this function's divergence.
     """
     Load and initialize the model from a given path.
 
@@ -1020,6 +1030,7 @@ def sharded_load(
     tensor_group: Optional[mx.distributed.Group] = None,
     pipeline_group: Optional[mx.distributed.Group] = None,
 ):
+    # Fork: print("Materializing") -> logger.info (2f5e01dd).
     # Get model path with everything but weight safetensors
     model_path = get_model_path(repo)
 
@@ -1139,6 +1150,9 @@ def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImagePro
 def load_processor(
     model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
 ) -> ProcessorMixin:
+    # Fork: reads the config before building the processor, so a caller
+    # patching load_config affects it (see tests/test_utils.py). Plus logger
+    # conversions.
 
     config = load_config(model_path, trust_remote_code=True)
     if config.get("model_type") == "laguna":
@@ -1241,6 +1255,7 @@ def create_model_card(
 
 
 def upload_to_hub(path: str, upload_repo: str):
+    # Fork: the final success print -> logger.info (2f5e01dd).
     """
     Uploads the model to Hugging Face hub.
 
@@ -1638,11 +1653,6 @@ def load_audio(
     return audio.mean(axis=1) if audio.ndim > 1 else audio
 
 
-def normalize_audio_features(features: mx.array) -> mx.array:
-    """Normalize mel spectrogram features for lossy audio formats (e.g., MP3)."""
-    return (features - mx.mean(features)) / (mx.std(features) + 1e-6)
-
-
 def load_video(
     video_path: str,
     fps: float = 2.0,
@@ -1794,6 +1804,11 @@ def prepare_inputs(
     return_tensors="mlx",
     **kwargs,
 ):
+    # Fork: the multiple-audio-files warning is a print -> logger.warning
+    # conversion (2f5e01dd); everything else on the audio path is upstream's, and
+    # b93707d8's qwen3-omni special case was REMOVED as stale -- guarded by
+    # TestOmniAudioFeaturesComeFromTheProcessor. The video/pad_to_uniform_size
+    # handling is fork work.
 
     has_images = images is not None and (
         not hasattr(images, "__len__") or len(images) > 0
@@ -1889,28 +1904,9 @@ def prepare_inputs(
                 images = padded_images
 
     # Process audio
-    audio_inputs = None
-    audio_feature_lengths = None
-    is_qwen3_omni_moe = False
-    processor_class_name = (
-        processor.__class__.__name__ if hasattr(processor, "__class__") else ""
-    )
-    if (
-        "qwen3" in processor_class_name.lower()
-        and "omni" in processor_class_name.lower()
-    ):
-        is_qwen3_omni_moe = True
-
-    is_lossy_audio = False
     if audio is not None and len(audio) > 0:
         if not isinstance(audio, list):
             audio = [audio]
-
-        # Check if any audio file is a lossy format (MP3, AAC, OGG, etc.)
-        lossy_extensions = {".mp3", ".m4a"}
-        is_lossy_audio = any(
-            str(f).lower().endswith(tuple(lossy_extensions)) for f in audio
-        )
 
         if len(audio) > 1:
             logger.warning(
@@ -1918,37 +1914,13 @@ def prepare_inputs(
             )
             audio = audio[:1]
 
-        if is_qwen3_omni_moe:
-            audio_arrays = [
-                load_audio(audio_file, sr=processor.feature_extractor.sampling_rate)
-                for audio_file in audio
-            ]
-            audio_arrays = [
-                audio_array.astype(np.float32) for audio_array in audio_arrays
-            ]
-
-            feature_extractor = getattr(processor, "feature_extractor", None)
-            if feature_extractor is None:
-                raise ValueError("Processor missing feature_extractor for audio prep.")
-
-            audio_inputs = feature_extractor(
-                audio_arrays,
-                sampling_rate=feature_extractor.sampling_rate,
-                padding=True,
-                return_attention_mask=True,
-            )
-
-            audio_feature_lengths = np.sum(
-                audio_inputs["attention_mask"], axis=-1, dtype=np.int32
-            )
-        else:
-            feature_extractor = getattr(processor, "feature_extractor", None)
-            sr = (
-                getattr(feature_extractor, "sampling_rate", 16000)
-                if feature_extractor is not None
-                else 16000
-            )
-            audio = [load_audio(audio_file, sr=sr) for audio_file in audio]
+        feature_extractor = getattr(processor, "feature_extractor", None)
+        sr = (
+            getattr(feature_extractor, "sampling_rate", 16000)
+            if feature_extractor is not None
+            else 16000
+        )
+        audio = [load_audio(audio_file, sr=sr) for audio_file in audio]
 
     video_fps = None
     if has_videos:
@@ -2039,24 +2011,6 @@ def prepare_inputs(
                     model_inputs[key] = value
                 else:
                     model_inputs[key] = mx.array(value)
-
-    if audio_inputs is not None:
-        model_inputs["input_features"] = mx.array(audio_inputs["input_features"])
-        model_inputs["feature_attention_mask"] = mx.array(
-            audio_inputs["attention_mask"]
-        ).astype(mx.int32)
-        model_inputs["audio_feature_lengths"] = mx.array(
-            audio_feature_lengths, dtype=mx.int32
-        )
-
-    if is_lossy_audio and "input_features" in model_inputs:
-        f = model_inputs["input_features"]
-        if isinstance(f, list):
-            model_inputs["input_features"] = [
-                normalize_audio_features(mx.array(x)) for x in f
-            ]
-        else:
-            model_inputs["input_features"] = normalize_audio_features(f)
 
     return model_inputs
 
@@ -2250,6 +2204,8 @@ class ThinkingBudgetCriteria:
 
 
 def print_array_report(t: mx.array, label: Optional[str]) -> dict:
+    # Fork: builds one string and emits it via logger.debug instead of
+    # five prints (2f5e01dd), so a report cannot interleave with other output.
     """
     Return a dictionary report of an MLX array similar to PyTorch's tensor representation.
     Args:
@@ -2288,6 +2244,7 @@ def print_array_report(t: mx.array, label: Optional[str]) -> dict:
 
 
 def _escape_math_block(match: re.Match) -> str:
+    # Fork: fork-only, used by sanitize_strict_json; upstream has neither.
     # Double-escape any backslash not followed by another backslash or quote
     return re.sub(r'(?<!\\)\\(?!\\|")', r"\\\\", match.group(0))
 

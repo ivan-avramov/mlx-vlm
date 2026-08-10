@@ -1840,3 +1840,118 @@ class TestResponsesInputTokensNormalizesInstructions:
         _normalize_response_instruction_messages(expected, "Be terse.")
 
         assert counted == expected
+
+
+class TestOmniAudioFeaturesComeFromTheProcessor:
+    """`b93707d8` (#1498) — its `prepare_inputs` half, the mirror of the usual shape.
+
+    Every other guard here protects content a resolution DROPPED. This one protects a
+    deletion: #1498 removed `prepare_inputs`' qwen3-omni audio special case
+    (`is_qwen3_omni_moe` / `audio_inputs` / `audio_feature_lengths` / `is_lossy_audio`
+    / `normalize_audio_features`) in favour of letting the processor do the feature
+    extraction, and this tree had reverted that — our copy was #1498's deleted text
+    verbatim apart from one `print` -> `logger`, i.e. stale upstream code that read
+    exactly like fork work. Its model-side half
+    (`qwen3_omni_moe.Model.sanitize`) landed byte-identical, and its `load_model` half
+    is guarded by `TestSubmoduleSanitizeGuardsOnMissingConfigs`.
+
+    The reason it stayed open so long is worth recording: **no test in `tests/` passed
+    `audio=` to `prepare_inputs`**, so the ~60-line deletion could not be validated
+    and marking it `# Fork:` would have laundered stale code into a documented
+    feature. These guards are that missing coverage. They assert the contract the
+    simplified path depends on — the processor receives audio ARRAYS and whatever it
+    returns is forwarded — rather than re-testing the removed branch.
+    """
+
+    def _fake_omni_processor(self, captured):
+        class _Tokenizer:
+            pad_token = "<pad>"
+            pad_token_id = 0
+
+        class _FeatureExtractor:
+            sampling_rate = 16000
+
+        class Qwen3OmniMoeProcessor:
+            """Named so the deleted branch's class-name sniff WOULD have fired."""
+
+            tokenizer = _Tokenizer()
+            feature_extractor = _FeatureExtractor()
+
+            def __call__(self, text=None, images=None, audio=None, **kwargs):
+                captured["audio"] = audio
+                return {
+                    "input_ids": [[1, 2, 3]],
+                    "attention_mask": [[1, 1, 1]],
+                    "input_features": [[[0.5, 0.25]]],
+                    "feature_attention_mask": [[1, 1]],
+                }
+
+        return Qwen3OmniMoeProcessor()
+
+    def test_processor_output_is_forwarded_and_audio_arrives_as_arrays(
+        self, monkeypatch
+    ):
+        import numpy as np
+
+        import mlx_vlm.utils as utils
+
+        captured = {}
+        monkeypatch.setattr(
+            utils, "load_audio", lambda path, sr=16000: np.zeros(8, dtype=np.float32)
+        )
+
+        model_inputs = utils.prepare_inputs(
+            self._fake_omni_processor(captured),
+            audio=["clip.wav"],
+            prompts=["hi"],
+        )
+
+        # The whole point of #1498: the processor extracts the features.
+        assert "input_features" in model_inputs
+        assert "feature_attention_mask" in model_inputs
+        # And it must receive decoded arrays, not the file path. The deleted branch
+        # left `audio` as paths for omni while converting it for everything else.
+        assert captured["audio"] is not None
+        assert not isinstance(captured["audio"][0], str)
+
+    def test_a_missing_feature_extractor_falls_back_to_16k(self, monkeypatch):
+        """The removed branch raised ValueError here; upstream's path defaults.
+
+        Keeps the `getattr(..., "sampling_rate", 16000)` fallback honest — it is the
+        only thing standing between a processor without a feature_extractor and a
+        TypeError.
+        """
+        import numpy as np
+
+        import mlx_vlm.utils as utils
+
+        captured = {}
+        seen_sr = {}
+
+        def fake_load_audio(path, sr=16000):
+            seen_sr["sr"] = sr
+            return np.zeros(8, dtype=np.float32)
+
+        monkeypatch.setattr(utils, "load_audio", fake_load_audio)
+        processor = self._fake_omni_processor(captured)
+        del type(processor).feature_extractor
+
+        utils.prepare_inputs(processor, audio=["clip.wav"], prompts=["hi"])
+
+        assert seen_sr["sr"] == 16000
+
+    def test_the_stale_branch_has_not_come_back(self):
+        """Structural, because the branch's absence is the fix.
+
+        A future merge that re-offers pre-#1498 content would have no conflict here —
+        the deleting commit is an ancestor of `main`, so git treats our old copy as
+        deliberately kept. This is the tripwire for that.
+        """
+        import inspect
+
+        import mlx_vlm.utils as utils
+
+        source = inspect.getsource(utils.prepare_inputs)
+        for stale in ("is_qwen3_omni_moe", "is_lossy_audio", "audio_feature_lengths"):
+            assert stale not in source, f"pre-#1498 audio branch is back: {stale}"
+        assert not hasattr(utils, "normalize_audio_features")
