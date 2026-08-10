@@ -29,28 +29,33 @@ Four ways a hunk is covered:
      everything below that line is fork territory by declaration;
   3. for changes outside any definition (imports, module constants), a marker
      inside the hunk itself, since there is no enclosing span to attach to.
-  4. it is a pure DELETION of top-level symbols that are all already excused in
+  4. it is a pure DELETION of `def`/`class` names that are ALL already excused in
      `.symbol-exclusions` for this path.
 
 Case 4 exists because there is nothing a marker can attach to. When upstream defines
-a top-level symbol we legitimately do not have, diff attributes the deletion to
-whatever line of ours sits at the seam -- in practice a blank one -- so there is no
-enclosing definition to annotate and no whitespace to converge. Before this, every
-such file was permanently un-drainable no matter how carefully its real sites were
-marked: `generate/dispatch.py` (`_cache_fully_retained`,
-`_prefix_cache_trim_amount`) and `server/generation.py`
-(`_check_configured_context_budget`) both sat at one residual site each with every
-genuine site marked. It also looks exactly like the whitespace probe that trap 9 in
-the handoff warns about, and is not one -- which is the other reason to resolve it
-here rather than leave a reader to tell them apart by hand.
+a symbol we legitimately do not have, diff attributes the deletion to whatever line
+of ours sits at the seam -- in practice the blank line after the preceding
+definition, which no span reaches -- so there is no enclosing definition to annotate
+and no whitespace to converge. Before this, every such file was permanently
+un-drainable no matter how carefully its real sites were marked:
+`generate/dispatch.py` (`_cache_fully_retained`, `_prefix_cache_trim_amount`, both
+top-level) and `server/generation.py` (`_check_configured_context_budget` top-level,
+plus `_sample_top_p_one`, a METHOD of a class we do have) each sat at one residual
+site with every genuine site marked. Such a hunk also looks exactly like the
+whitespace probe that trap 9 in the handoff warns about and is not one, which is the
+other reason to resolve it here rather than leave a reader to tell them apart by
+hand.
 
-The rule is deliberately narrow. It fires only when the deleted lines define at
-least one top-level `def`/`class` AND every such name is excused, so a
-whitespace-only deletion still reports (it is a real alignment artifact), and a
-deletion that removes an unexcused symbol still reports (that is a dropped hunk, and
-`check_upstream_symbols.py` should be catching it too). This does not weaken the
-audit: `.symbol-exclusions` already gates on those same names, with a written reason
-each, so the content is reviewed -- case 4 only stops it being counted twice.
+The rule is deliberately narrow, and "every name excused" is the property doing the
+work -- not the indentation. It fires only when the deleted lines define at least one
+`def`/`class` AND every one of those names is excused, so a whitespace-only deletion
+still reports (a real alignment artifact), and a deletion touching any unexcused name
+still reports (a dropped hunk, which `check_upstream_symbols.py` should also be
+catching). Matching at any indent is deliberate: `.symbol-exclusions` excuses methods
+by name too, and anchoring at column 0 was an over-narrow proxy that left a deleted
+method stuck. This does not weaken the audit -- `.symbol-exclusions` already gates on
+those same names with a written reason each, so the content is reviewed; case 4 only
+stops it being counted twice.
 
 Whole files still being brought under the convention go in
 `.fork-marker-allowlist` with a reason, and that list is meant to shrink. A
@@ -78,8 +83,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 ALLOWLIST_FILE = REPO_ROOT / ".fork-marker-allowlist"
 SYMBOL_EXCLUSIONS_FILE = REPO_ROOT / ".symbol-exclusions"
 
-# A top-level `def`/`class` in a deletion hunk body: column 0 after diff's `-`.
-TOP_LEVEL_DEF_RE = re.compile(r"^-(?:async\s+)?(?:def|class)\s+([A-Za-z_]\w*)")
+# A `def`/`class` in a deletion hunk body, at any indent. Methods count as well as
+# top-level definitions: `.symbol-exclusions` excuses both (see the nine
+# `TestPrefixCacheReuseTrim` methods), and it is the "every name excused" test below
+# that keeps the rule safe -- not the indentation. Anchoring at column 0 was an
+# over-narrow proxy that left `server/generation.py` stuck on a deleted METHOD
+# (`_sample_top_p_one`) whose class is present and markable.
+DELETED_DEF_RE = re.compile(r"^-\s*(?:async\s+)?(?:def|class)\s+([A-Za-z_]\w*)")
 
 # `# Fork:` is the established spelling in models/cache.py. `# Fork-only:` and
 # `# Fork (…):` are accepted so the marker can carry a short qualifier.
@@ -158,11 +168,16 @@ def deletion_of_excused_symbols(
 ) -> tuple[bool, list[str]]:
     """(covered, names) for a pure-deletion hunk body.
 
-    Covered when the body defines at least one top-level `def`/`class` and every
-    one of those names is excused. Returns the names either way so the caller can
-    report what it saw.
+    Covered when the body defines at least one `def`/`class` -- at any indent, so
+    methods count -- and every one of those names is excused. Returns the names
+    either way so the caller can report what it saw.
+
+    "Every name excused" is the safety property. Indentation is not: a deleted
+    METHOD hits the same seam as a deleted top-level symbol (git attributes it to
+    the blank line after the enclosing class, which the class span does not reach),
+    and `.symbol-exclusions` already excuses methods by name.
     """
-    names = [m.group(1) for l in body if (m := TOP_LEVEL_DEF_RE.match(l))]
+    names = [m.group(1) for l in body if (m := DELETED_DEF_RE.match(l))]
     if not names:
         return False, names
     covered = all(any(n == g or fnmatch.fnmatch(n, g) for g in excused) for n in names)

@@ -125,20 +125,28 @@ below.** A file's site and hunk counts measure alignment, so a *reordered* file 
 like the biggest job on the list and is the smallest. Marking is the fallback; the
 better exit is usually CONVERGE.
 
-Two known limits of this check, both hit for real:
+**A pure-deletion hunk cannot carry a marker, so `.symbol-exclusions` covers it
+(case 4).** When upstream defines a symbol we legitimately do not have, the diff
+attributes that deletion to whatever line of ours sits at the seam — the blank line
+after the preceding definition, which no span reaches — so there is no enclosing
+definition to annotate and no whitespace to converge. `generate/dispatch.py` and
+`server/generation.py` were both stuck this way with every real site marked. The
+check now treats such a hunk as covered when **every** `def`/`class` name it removes
+is already excused in `.symbol-exclusions` for that path, and prints the names it
+covered on each run so the coverage stays auditable. Two things to know:
 
-- **A pure-deletion hunk cannot carry a marker.** When upstream defines a top-level
-  symbol we legitimately do not have, the diff attributes that deletion to whatever
-  line of ours sits at the seam — usually a blank one — and there is no enclosing
-  definition to annotate and no whitespace to converge. `generate/dispatch.py`
-  (`_cache_fully_retained`, `_prefix_cache_trim_amount`) and `server/generation.py`
-  (`_check_configured_context_budget`) are both stuck this way even when every real
-  site is marked. Teaching the check to accept a deletion-only hunk whose absent
-  symbols are already in `.symbol-exclusions` would fix both. Until then, say so in
-  the allowlist reason rather than leaving it looking unreviewed.
 - **Such a hunk looks exactly like a whitespace probe and is not one.** Run
   `git diff -U0` on it before concluding either way — a real probe is fixable by
   converging the ordering, this is not.
+- **The rule matches methods too, and that is the point.** "Every name excused" is
+  the safety property; the indent is not. Anchoring at column 0 was an over-narrow
+  first attempt that left `server/generation.py` stuck on a deleted *method*
+  (`_sample_top_p_one`) whose class is present and marked.
+
+`mlx_vlm/tests/test_fork_marker_check.py` pins that narrowness, and is the only test
+of any `dev/` audit. Worth extending rather than replacing: a bug that makes one of
+these checks **more permissive** fails nothing, still prints OK, and silently stops
+reporting dropped content.
 
 ### The fourth direction: is the thing that exists actually reachable?
 
@@ -179,6 +187,33 @@ dropped call site, restore tracked and pending — a debt marker, not approval).
 appears in `docs/upstream-gaps.md` next to several fixed items; this check turns it
 from a habit into a gate. When something looks unused, ask whether upstream calls
 it before concluding it is fork scaffolding.
+
+**A log line is the same shape with no handle at all.** It has no caller, no symbol
+and no test, so nothing above can see it — and a commit whose content is mostly
+logging is therefore the hardest kind to restore completely. `cfcc36d9` (#1634) took
+**three** passes: declared whole once and 14 lines short, finished against the wide
+pass, and still missing two hunks a month later. What found them was neither audit
+nor report but counting the commit's own distinctive message literals in both trees:
+
+```bash
+git show upstream/main:<path> | grep -c 'Generation cancelled: request=%s'
+grep -c 'Generation cancelled: request=%s' <path>
+```
+
+Do that for every logging commit. Counting the *helpers* is not enough — a guard in
+`test_dropped_upstream_guards.py` was already comparing `self._log_*(` call counts
+against upstream and passed throughout, because both survivors were direct
+`logger.info(...)` calls in otherwise byte-identical blocks.
+
+**Corollary for `.symbol-exclusions`: "baseline: pre-existing divergence,
+unreviewed" is a to-do, and reviewing one is often what settles a whole file.** The
+fifth direction below surfaces those entries as its `up-only` column, so the two
+techniques compose: AST-diff the bodies, then resolve whatever `up-only` reports.
+Both of `server/generation.py`'s unreviewed entries turned out to be genuine,
+tested, deliberate divergences (`_check_configured_context_budget` replaced by the
+fork's clamp-instead-of-reject budget; `_sample_top_p_one` superseded by a `_filter`
+that also applies min_p and top_k) — but neither said so, so neither could be
+trusted, and the file could not be signed off while they read "unreviewed".
 
 ### The fifth direction: is this divergence CONTENT, or only ALIGNMENT?
 

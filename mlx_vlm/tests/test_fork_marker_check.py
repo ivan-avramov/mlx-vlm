@@ -114,19 +114,31 @@ class TestDeletionOfExcusedSymbols:
         covered, _ = cfm.deletion_of_excused_symbols(body, EXCUSED)
         assert covered is False, label
 
-    def test_indented_definitions_are_not_top_level(self, cfm):
-        """A method inside a deleted class must not satisfy the rule by itself.
+    def test_covers_a_deleted_method_when_its_name_is_excused(self, cfm):
+        """Methods count, and the indentation is deliberately NOT the safety test.
 
-        The regex anchors at column 0 after diff's `-`. A hunk that deletes only a
-        method body has no top-level definition, so it falls through to the normal
-        enclosing-definition rule, which is correct: the class is still there and
-        can carry the marker.
+        A deleted METHOD hits the same seam as a deleted top-level symbol: git
+        attributes it to the blank line after the enclosing class, which the class
+        span does not reach, so the class's own `# Fork:` marker cannot cover it.
+        `server/generation.py` was stuck exactly there on `_sample_top_p_one` after
+        the first version of this rule anchored at column 0.
+
+        `.symbol-exclusions` excuses methods by name already — the nine
+        `TestPrefixCacheReuseTrim` entries are all methods — so requiring every found
+        name to be excused is what keeps this safe, not the indent.
         """
         covered, names = cfm.deletion_of_excused_symbols(
-            ["-    def _cache_fully_retained(self):"], EXCUSED
+            ["-    def _cache_fully_retained(self):", "-        return True"], EXCUSED
+        )
+        assert covered is True
+        assert names == ["_cache_fully_retained"]
+
+    def test_does_not_cover_an_unexcused_method(self, cfm):
+        """The narrowness has to survive the move to any-indent matching."""
+        covered, _ = cfm.deletion_of_excused_symbols(
+            ["-    def some_new_upstream_method(self):"], EXCUSED
         )
         assert covered is False
-        assert names == []
 
     def test_empty_exclusion_list_covers_nothing(self, cfm):
         """Fail closed: no exclusions means no case-4 coverage at all."""

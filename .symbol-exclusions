@@ -64,8 +64,8 @@ mlx_vlm/generate/dispatch.py::_prefix_cache_trim_amount  # deliberate divergence
 # --- mlx_vlm/sample_utils.py
 
 # --- mlx_vlm/server/generation.py
-mlx_vlm/server/generation.py::_check_configured_context_budget  # baseline: pre-existing divergence, unreviewed
-mlx_vlm/server/generation.py::_sample_top_p_one  # baseline: pre-existing divergence, unreviewed
+mlx_vlm/server/generation.py::_check_configured_context_budget  # REVIEWED 2026-08-10: deliberately removed by fork commit 02e8046d, which replaced reject-if-too-long with clamp-to-remaining-context. Upstream raises PromptTooLongError when prompt+max_tokens exceeds MAX_KV_SIZE; the fork treats max_tokens as intent and clamps to what is left, rejecting only when the remainder is below MIN_OUTPUT_TOKENS. Replacements are _resolve_generation_budget + _apply_generation_budget + get_min_output_tokens (all ours-only), with THINKING_BUDGET_CLAMP_RATIO so a thinking model still has room for a visible answer. Covered by the fork-only tests/test_context_budget.py. Do NOT restore: running both would reject requests the clamp is designed to serve
+mlx_vlm/server/generation.py::_sample_top_p_one  # REVIEWED 2026-08-10: superseded, not dropped. Upstream's _PositionedTargetSampler applies top_p ONLY, via this hand-rolled per-row method; the fork replaced it with a _filter() that applies top_p / min_p / top_k in the same chain order as sample_utils.make_sampler, so _make_sampler can pass all three through instead of silently dropping min_p and top_k on the server's ragged-verification path. A strict superset: with only top_p set the two produce the same draw, and _filter returns logprobs unchanged when no filter is active so the default path stays a plain categorical draw
 
 # --- mlx_vlm/server/openai.py
 

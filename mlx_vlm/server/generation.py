@@ -1,6 +1,6 @@
-import functools
+import functools  # Fork: lru_cache on the thinking-token encode (7e3477b0)
 import gc
-import json
+import json  # Fork: --generation-defaults JSON payload (see get_server_generation_defaults)
 import logging
 import os
 import time
@@ -16,7 +16,7 @@ import mlx.core as mx
 from fastapi import HTTPException
 
 from .. import apc as _apc
-from ..generate import (
+from ..generate import (  # Fork: the fork's generation-engine re-exports (5e9b9503)
     DEFAULT_KV_GROUP_SIZE,
     DEFAULT_KV_QUANT_SCHEME,
     DEFAULT_MAX_TOKENS,
@@ -38,12 +38,12 @@ from ..generate.diffusion import (
     is_diffusion_model,
     stream_diffusion_generate_from_kwargs,
 )
-from ..prompt_utils import (
+from ..prompt_utils import (  # Fork: fork-only, the THINKING_FORMATS registry (1c3f1e50)
     cached_special_token_encode,
     detect_thinking_format,
     prompt_is_inside_thinking,
 )
-from ..sample_utils import (
+from ..sample_utils import (  # Fork: apply_min_p/top_k/top_p for _PositionedTargetSampler._filter; upstream imports only make_* + top_p_sampling
     apply_min_p,
     apply_top_k,
     apply_top_p,
@@ -63,6 +63,8 @@ from ..tokenizer_utils import _ServerTokenStreamer, make_streaming_detokenizer
 from ..utils import ThinkingBudgetCriteria, load, prepare_inputs
 from .runtime import runtime
 
+# Fork: MLX_VLM_LOG_NAME (5e9b9503) so an embedding host can re-root the logger
+# tree; upstream hardcodes "mlx_vlm.server". Same name when the var is unset.
 logger = logging.getLogger(f"{os.environ.get('MLX_VLM_LOG_NAME', 'mlx_vlm')}.server")
 
 DEFAULT_TOKEN_QUEUE_TIMEOUT = 600.0
@@ -72,6 +74,10 @@ DEFAULT_ENABLE_THINKING = False
 METRICS_HISTORY_LIMIT = 100
 METRICS_RECENT_LIMIT = 32
 
+# Fork: this block of constants is fork-only — TOKEN_QUEUE_TIMEOUT_SECS,
+# CACHED_PATH_HEARTBEAT_INTERVAL_SECS and STREAM_TELEMETRY_INTERVAL all serve the
+# fork's KeepAlive-heartbeat cached-request path, which upstream does not have.
+#
 # Maximum tolerable silence on the per-request streaming queue before the
 # cached-path iterator declares the daemon hung. The daemon emits KeepAlive
 # heartbeats per prefill chunk (via ``_step``) and the cached path runs a
@@ -298,6 +304,10 @@ def _position_keys(seed: int, row_ids: List[int], positions: List[int]) -> mx.ar
 
 
 class _PositionedTargetSampler:
+    # Fork: see the docstring below — a marker has to be a COMMENT, a docstring
+    # saying "Fork:" does not satisfy check_fork_markers.py. Upstream's
+    # `_sample_top_p_one` is gone on purpose (superseded by `_filter`, a strict
+    # superset) and is recorded in .symbol-exclusions with that reason.
     """Server sampler with stateless target draws for ragged verification.
 
     Fork: upstream's copy applies top_p only. This one applies top_p / min_p /
@@ -395,6 +405,8 @@ def get_server_thinking_end_token():
 
 
 def get_server_generation_defaults() -> dict:
+    # Fork: fork-only (--generation-defaults). Upstream has no per-model default
+    # payload; applied only to fields the request omits, so request params win.
     """Per-model generation defaults forwarded from the registry (``--generation-defaults``,
     a JSON object stored in ``MLX_VLM_GENERATION_DEFAULTS``). Applied by ``_build_gen_args``
     only for fields the request omits (request params always win).
@@ -475,6 +487,14 @@ def _count_prompt_tokens(raw_inputs: dict) -> int:
     return input_ids.size if hasattr(input_ids, "size") else len(input_ids)
 
 
+# Fork: this constant pair plus _resolve_generation_budget / _apply_generation_budget
+# / get_min_output_tokens below REPLACE upstream's _check_configured_context_budget
+# (02e8046d). Upstream rejects when prompt+max_tokens exceeds MAX_KV_SIZE; the fork
+# treats max_tokens as intent and clamps to what is left, rejecting only below the
+# floor. Reviewed divergence, recorded in .symbol-exclusions, tested by the
+# fork-only tests/test_context_budget.py. Do NOT restore upstream's function:
+# running both would reject requests the clamp exists to serve.
+#
 # Floor for the clamped generation budget. When the remaining context
 # (MAX_KV_SIZE - prompt) falls below this, the request is rejected instead
 # of clamped — a budget this small can't hold a meaningful response.
@@ -493,6 +513,7 @@ def get_min_output_tokens():
 def _resolve_generation_budget(
     prompt_tokens: int, max_tokens: Optional[int], *, log_clamp: bool = True
 ) -> int:
+    # Fork: fork-only (02e8046d) — see the note above DEFAULT_MIN_OUTPUT_TOKENS.
     """Resolve the effective generation budget for a request.
 
     Soft-max semantics: ``max_tokens`` expresses intent. When the remaining
@@ -556,6 +577,8 @@ def get_quantized_kv_start():
 
 
 def get_kv_prealloc_tokens():
+    # Fork: fork-only (739f7ff1). Same KV_PREALLOC_TOKENS floor apc.py reads via
+    # _kv_prealloc_floor; upstream preallocates nothing.
     n = int(os.environ.get("KV_PREALLOC_TOKENS", 0))
     return n or None
 
@@ -1170,6 +1193,9 @@ def _diffusion_block_chunks(results) -> "Generator[StreamingToken, None, None]":
 
 
 class _TokenIterator:
+    # Fork: __next__ wraps upstream's body in a `while True` so KeepAlive heartbeats
+    # from the daemon's prefill loop reset the queue timer without being visible to
+    # the consumer (upstream has no KeepAlive). Everything else is upstream's.
     """Closeable iterator over queued tokens for one generation request.
 
     close() cancels unfinished requests and is safe while another thread is
@@ -2265,6 +2291,11 @@ class ResponseGenerator:
                         if uid in active:
                             batch_gen.remove(uid)
                             info = active.pop(uid)
+                            logger.info(
+                                "Generation cancelled: request=%s generated_tokens=%d",
+                                info.get("request_id", uid),
+                                int(info.get("generated_tokens", 0) or 0),
+                            )
                             try:
                                 info["rqueue"].put(None)
                             except Exception:
@@ -2681,6 +2712,14 @@ class ResponseGenerator:
                         prompt_tokens / prompt_elapsed
                         if prompt_tokens > 0 and prompt_elapsed > 0
                         else None
+                    )
+                    logger.info(
+                        "Prefill completed: request=%s prompt_tokens=%d "
+                        "cached_tokens=0 elapsed=%.3fs rate=%.1f tok/s",
+                        stream_infos[uid].get("request_id", uid),
+                        prompt_tokens,
+                        prompt_elapsed,
+                        float(prompt_tps_map[uid] or 0.0),
                     )
 
                 finished_uids = set()

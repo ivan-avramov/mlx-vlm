@@ -1198,6 +1198,54 @@ class TestServerGenerationLogging:
                 "a dropped call site the per-symbol check cannot see"
             )
 
+    def test_every_log_message_literal_appears_as_often_as_upstream(self):
+        """The sibling guard above counts HELPERS, and that is why it missed two.
+
+        `cfcc36d9` needed a THIRD restore pass. `682043f5` declared it whole and was
+        14 lines short; `59d0229a` finished what the wide pass then reported; and on
+        2026-08-10 two more of its hunks were still absent — a
+        `logger.info("Generation cancelled: ...")` in the batch loop's cancellation
+        path, and one of three `"Prefill completed: ..."` sites (the speculative
+        one). Both are DIRECT `logger.info` calls rather than `self._log_*` helper
+        calls, so the helper-count guard above could never see them, and both sat in
+        blocks otherwise byte-identical to upstream.
+
+        The technique that found them generalises to any logging commit: **count the
+        distinctive message literals in both trees.** A log line has no caller, no
+        symbol and no test, so literal-counting is the only handle on it — which is
+        the concrete form of trap 6's corollary about `print` -> `logger` commits
+        leaving no failing test and no audit hit.
+        """
+        import subprocess
+
+        literals = (
+            "Generation cancelled: request=%s generated_tokens=%d",
+            "Prefill completed: request=%s prompt_tokens=%d ",
+            "Prefill started: request=%s",
+            "Generation completed: request=%s",
+        )
+        ours = open(_generation_path()).read()
+        upstream = subprocess.run(
+            ["git", "show", "upstream/main:mlx_vlm/server/generation.py"],
+            capture_output=True,
+            text=True,
+            cwd=_repo_root(),
+        ).stdout
+        if not upstream:
+            import pytest
+
+            pytest.skip("upstream/main not fetched")
+
+        for literal in literals:
+            theirs = upstream.count(literal)
+            if not theirs:
+                continue  # upstream reworded it; not this guard's business
+            mine = ours.count(literal)
+            assert mine >= theirs, (
+                f"{literal!r}: {mine} occurrence(s) here vs {theirs} upstream — "
+                "a dropped logger call site, invisible to every audit"
+            )
+
 
 def _repo_root() -> str:
     import pathlib

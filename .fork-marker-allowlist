@@ -155,6 +155,33 @@
 #         1171888e note, now confirmed mechanically rather than by spot check.
 #     Also converged: the absolute `from mlx_vlm.models.cache import ...` (9065b024),
 #     the same artifact apc.py had and the third instance of that shape in this file.
+#   server/generation.py — 13 sites -> 0, and BOTH of its "unreviewed"
+#     .symbol-exclusions entries are now reviewed, which is what actually unblocked it:
+#       * `_check_configured_context_budget` — deliberately removed by fork commit
+#         02e8046d, which replaced upstream's reject-if-too-long with clamp-to-remaining
+#         -context (_resolve_generation_budget / _apply_generation_budget /
+#         get_min_output_tokens, plus THINKING_BUDGET_CLAMP_RATIO), covered by the
+#         fork-only tests/test_context_budget.py. Do NOT restore it: running both would
+#         reject requests the clamp exists to serve.
+#       * `_sample_top_p_one` — superseded, not dropped. Upstream's
+#         _PositionedTargetSampler applies top_p ONLY via that hand-rolled per-row
+#         method; the fork replaced it with a _filter() applying top_p / min_p / top_k
+#         in sample_utils.make_sampler's chain order, so _make_sampler stops silently
+#         dropping min_p and top_k on the ragged-verification path. Strict superset.
+#     RESTORED first, and this is the third pass at the same commit: cfcc36d9 (#1634)
+#     was declared whole in 682043f5 (14 lines short), finished in 59d0229a against the
+#     wide pass, and STILL had two hunks missing — logger.info("Generation cancelled:
+#     ...") in the batch loop's cancellation path and one of three "Prefill completed:"
+#     sites (the speculative one). Both are DIRECT logger.info calls in blocks otherwise
+#     byte-identical to upstream, which is why the existing guard counting `self._log_*(`
+#     call sites passed throughout. A log line has no caller, no symbol and no test, so
+#     counting the commit's own MESSAGE LITERALS across both trees is the only handle —
+#     now a guard (test_every_log_message_literal_appears_as_often_as_upstream).
+#     43 of 47 shared definitions were byte-identical; the four that differ are
+#     QueuedGenerationRequest (+2 fields), _PositionedTargetSampler (the _filter
+#     superset), _TokenIterator (a `while True` for KeepAlive heartbeats) and
+#     ResponseGenerator (a 1348 -> 1740 rewrite). NB _PositionedTargetSampler's
+#     docstring already said "Fork:" and did NOT satisfy the check — marker mechanic 2.
 #   tests/test_generate.py — CONVERGED by REORDERING, 5 sites -> 0, and it settles the
 #     open question in this file's own previous entry, which said "either reorder the
 #     fork's methods to upstream's positions, or leave this entry" and warned that a
@@ -223,7 +250,7 @@
 #     against a README that promises it. Guard:
 #     test_dropped_upstream_guards.py::TestApcStoreEmitsItsTrace.
 #
-# Current standing (2026-08-09): 3 files / 41 sites / 82 hunks, down from 32 files /
+# Current standing (2026-08-10): 2 files / 28 sites / 62 hunks, down from 32 files /
 # 175 sites. Re-run `--summary`; do not trust this line either. Every
 # diverged file NOT listed here is marked, including
 # server/request_normalization.py — the gen-args union added fork hunks to a file
@@ -239,7 +266,6 @@
 
 # --- Heavy fork rewrites. AGENTS.md names these as the false-positive-prone
 # --- files; site-by-site provenance is the bulk of the remaining work.
-mlx_vlm/server/generation.py  # 14 sites / 21 hunks. Carries the fork's ResponseGenerator + GPU worker rewrite. LEADS is CLEARED as of 2026-08-10: cfcc36d9 (#1634 generation logging) restored in 682043f5 with all 8 of its .symbol-exclusions entries retired, 29b6c00b (#1508 diffusion unification) in d3a55800, and the sampler commits 36331ea7/b739dfa4/67ca1f05 in a47e7860. The diffusion lane and all five _log_* helpers are now byte-identical to upstream, so do NOT re-derive them from this file's divergence — what remains is genuine fork rewrite
 mlx_vlm/server/openai.py  # 18 sites / 49 hunks. LEADS mostly cleared: f044f36a resolved, cfcc36d9's openai half (the StreamingTimings plumbing) in 682043f5, f3bc6e81 (#1412, the finalizer cache clear) and 84ebae6e (#1641) in 4bd99ca1. 6a8cdff6 (#1411) is also resolved. Still reported here: 4d468e8575 (#1492) and b3d2380d1d (#1266), a few lines each — resolve before marking. NOTE the fork rewrote the streaming chat-completions thinking machinery around THINKING_FORMATS while /v1/responses uses upstream's ThinkingStreamState; 08723a3f unioned their marker sets, so treat those two paths as one decision, not two
 
 # --- Server surfaces, not yet reviewed at site granularity.
@@ -254,7 +280,9 @@ mlx_vlm/utils.py  # REVIEWED site-by-site 2026-08-09; ONE named blocker, not a g
 # ---   [utils.py 32/171 REVIEWED, now 19/159, one named blocker]
 # ---   [apc.py 554/567 CONVERGED, now 2/35 -- it was a REORDERING, not a rewrite;
 # ---    AST-diff bodies before sizing any file here, see its RESOLVED note above]
-# ---   openai.py 76/905 · generation.py 92/665
+# ---   openai.py 76/905
+# ---   [generation.py 92/665 CLEARED: 43 of 47 bodies byte-identical; both its
+# ---    "unreviewed" .symbol-exclusions entries reviewed; cfcc36d9 took a THIRD pass]
 # ---   [turboquant.py 118/529 CLEARED: 91 of 96 bodies byte-identical; the AST-body
 # ---    method found #1433 where three earlier report-based passes had not]
 # ---   [dispatch.py 125/377 CLEARED: fully marked, and its last deletion-only hunk is
@@ -282,6 +310,5 @@ mlx_vlm/utils.py  # REVIEWED site-by-site 2026-08-09; ONE named blocker, not a g
 # --- the spot. The rule is narrow by construction (>= 1 top-level def AND all names
 # --- excused), so a whitespace-only deletion still reports and a deletion touching any
 # --- unexcused symbol still reports; `mlx_vlm/tests/test_fork_marker_check.py` is the
-# --- first test of any dev/ audit and pins exactly that. `server/generation.py` is the
 # --- other file this unblocks — its `_check_configured_context_budget` is an existing
 # --- exclusion entry.
