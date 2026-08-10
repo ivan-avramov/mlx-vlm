@@ -23,18 +23,9 @@ class Model(Qwen3_5Model):
         self.language_model = LanguageModel(config.text_config, config)
 
     def sanitize(self, weights):
-        # The MTP draft shard is separate from the base model. Its presence must
-        # not select the base model's RMSNorm loading convention, so drop it
-        # before deciding whether to shift.
+        # The MTP draft shard is separate from the base model. Its presence
+        # must not select the base model's RMSNorm loading convention.
         weights = {key: value for key, value in weights.items() if "mtp." not in key}
-
-        # The norm-weight shift is NOT idempotent (it unconditionally adds 1.0),
-        # so an already-converted mlx-native checkpoint must not be shifted
-        # again -- that corrupted every norm layer in production. This used to be
-        # a blanket `return weights` when any key was "language_model."-prefixed,
-        # which also skipped mtp filtering, lm_head popping, expert fusion and
-        # key renaming for those checkpoints. Gate per key instead: identical
-        # protection, and the rest of sanitize still runs.
         shift_norm_weights = should_shift_norm_weights(weights)
 
         if self.config.text_config.tie_word_embeddings:
@@ -42,10 +33,10 @@ class Model(Qwen3_5Model):
 
         for l in range(self.config.text_config.num_hidden_layers):
             prefix = f"model.language_model.layers.{l}.mlp"
-            if f"{prefix}.experts.gate_up_proj" in weights:
-                # FUSED layout (Qwen3.6-VL): gate_up_proj is a single stacked
-                # [num_experts, 2 * intermediate_size, hidden_size] tensor.
-                gate_up_weight = weights.pop(f"{prefix}.experts.gate_up_proj")
+            gate_up_key = f"{prefix}.experts.gate_up_proj"
+            if gate_up_key in weights:
+                # process gate_up_proj [num_experts, 2 * intermediate_size, hidden_size]
+                gate_up_weight = weights.pop(gate_up_key)
                 mid = gate_up_weight.shape[-2] // 2
                 weights[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_up_weight[
                     ..., :mid, :
@@ -53,26 +44,18 @@ class Model(Qwen3_5Model):
                 weights[f"{prefix}.switch_mlp.up_proj.weight"] = gate_up_weight[
                     ..., mid:, :
                 ]
+                # down_proj
                 weights[f"{prefix}.switch_mlp.down_proj.weight"] = weights.pop(
                     f"{prefix}.experts.down_proj"
                 )
-            # Fork: the unfused branch is fork work (f0d50c90), landed in parallel
-            # with upstream's own #1472 and probing `gate_proj` where upstream probes
-            # `up_proj`. Equivalent for any real SwiGLU checkpoint, which ships all
-            # three projections per expert; kept rather than churned.
-            elif f"{prefix}.experts.0.gate_proj.weight" in weights:
-                # UNFUSED layout (Ornith / Qwen3-Next style): one [out, in] tensor
-                # per expert. Stack into [num_experts, out, in] for SwitchGLU.
-                num_experts = self.config.text_config.num_experts
-                for proj in ("gate_proj", "up_proj", "down_proj"):
-                    weights[f"{prefix}.switch_mlp.{proj}.weight"] = mx.stack(
+            elif f"{prefix}.experts.0.up_proj.weight" in weights:
+                for name in ["up_proj", "down_proj", "gate_proj"]:
+                    weights[f"{prefix}.switch_mlp.{name}.weight"] = mx.stack(
                         [
-                            weights.pop(f"{prefix}.experts.{e}.{proj}.weight")
-                            for e in range(num_experts)
-                        ],
-                        axis=0,
+                            weights.pop(f"{prefix}.experts.{e}.{name}.weight")
+                            for e in range(self.config.text_config.num_experts)
+                        ]
                     )
-            # else: dense (non-MoE) layer — no expert weights to fuse.
 
         sanitized_weights = {}
         for key, value in weights.items():
