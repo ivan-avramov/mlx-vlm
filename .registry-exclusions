@@ -1,0 +1,64 @@
+# Baseline for dev/check_upstream_registries.py — the registry / re-export audit.
+#
+# Format: `path_glob::symbol_glob  # reason`. Every entry MUST carry a reason; the
+# script refuses to run otherwise. The symbol field for a registry entry or a class
+# attribute itself contains `::` (`MODEL_REMAPPING::'foo'`, `ModelConfig::index_keep`),
+# and the rule is split on the FIRST `::` only, so those are one path and one symbol.
+#
+# What this audit catches, and why it needs to exist separately from the other five:
+# a dropped dict entry, a dropped `__init__.py` re-export and a dropped dataclass
+# field are all `ast.Assign`/`ast.AnnAssign`/`ast.Import*` rather than definitions, so
+# every other check passes. Walk them: the file is present (parity), no `def`/`class`
+# name vanished (symbols), nothing was deleted (deletions), the hunk sits in a file
+# whose fork sites are all marked (fork markers), and the entry is not a helper anyone
+# calls (dead helpers). Four `MODEL_REMAPPING` entries were lost exactly this way —
+# "unlimited-ocr" and "inkling_mm_model" failed with "Model type X not supported"
+# while their implementations sat in the tree byte-identical to upstream — as was
+# `models/gemma4/__init__.py`'s `Gemma4VideoProcessor` re-export.
+#
+# THE TRAP, the same one every other exclusion file carries: a missing entry is
+# usually a dropped hunk. Establish provenance with `git log -S` before excusing one.
+# An entry upstream itself later removed is `check_upstream_deletions.py`'s business,
+# not a reason to add a line here.
+#
+# It compares PRESENCE only, never values: `{"a": 1}` vs `{"a": 2}` passes. Values
+# diverge legitimately all over this fork; keys almost never do. A wrong value is
+# `check_body_divergence.py --file`'s job (that is how #1402's test-certified cache-key
+# bug would surface).
+#
+# Validated to fire before being trusted, on synthetic copies of all four real
+# historical losses: two removed `MODEL_REMAPPING` keys, an `__all__` element, a
+# `Gemma4VideoProcessor` re-export and a `ModelConfig.index_keep` dataclass field.
+# Runs in ~13s over 1149 shared files.
+#
+# Baseline: 5 entries, all re-exports, all reviewed below. Every one is a fork
+# replacement that already carries a `# Fork:` marker at its import site.
+
+# --- The lazy per-thread generation stream (5e9b9503) ---
+# Upstream binds `generation_stream = mx.new_thread_local_stream(...)` eagerly at
+# `generate/common.py` module scope and imports that name. The fork cannot: a stream
+# object created on one thread is not the one `mx.async_eval` resolves on another, so
+# every worker-thread generation path (asyncio executors, the server's BatchGenerator
+# GPU thread) raised "no Stream(gpu, N) in current thread". These three import
+# `_get_generation_stream` instead, which resolves the calling thread's own default
+# stream on first use. `common.__getattr__` still serves the public
+# `generation_stream` name — see tests/test_model_registry.py, which pins that it is
+# NOT eagerly bound.
+mlx_vlm/generate/__init__.py::generation_stream  # REVIEWED: replaced by _get_generation_stream (5e9b9503); see the block comment above and tests/test_model_registry.py
+mlx_vlm/generate/ar.py::generation_stream  # REVIEWED: replaced by _get_generation_stream (5e9b9503); marked at ar.py's import block and again at line ~302
+mlx_vlm/generate/dispatch.py::generation_stream  # REVIEWED: replaced by _get_generation_stream (5e9b9503); marked inline on dispatch.py's `from .common import (...)`
+
+# --- Context-budget policy (02e8046d) ---
+# Upstream's `_check_configured_context_budget` REJECTS a request whose prompt plus
+# max_tokens exceeds the configured context. The fork clamps to the remaining context
+# instead, so it imports `_resolve_generation_budget` (plus THINKING_BUDGET_CLAMP_RATIO)
+# in its place. Covered by the fork-only tests/test_context_budget.py, and the same
+# supersession is already recorded in .symbol-exclusions.
+mlx_vlm/server/__init__.py::_check_configured_context_budget  # REVIEWED: superseded by _resolve_generation_budget's clamp-instead-of-reject policy (02e8046d); see .symbol-exclusions for the same event
+
+# --- Sampler filtering (_PositionedTargetSampler) ---
+# Upstream imports `top_p_sampling` and applies top_p only. The fork imports
+# `apply_top_p` + `apply_min_p` + `apply_top_k` and applies all three in
+# `sample_utils.make_sampler`'s chain order, because the ragged-verification path was
+# silently dropping min_p and top_k. Marked inline on the import block.
+mlx_vlm/server/generation.py::top_p_sampling  # REVIEWED: superseded by _PositionedTargetSampler._filter, which applies apply_top_p/min_p/top_k in make_sampler's chain order; upstream's copy dropped min_p and top_k on the ragged-verification path

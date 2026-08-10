@@ -43,7 +43,9 @@ python dev/check_upstream_deletions.py  # no upstream DELETION silently reverted
 python dev/check_fork_markers.py        # every fork hunk in a shared file is marked
 python dev/check_dead_helpers.py        # no upstream-called helper left unreachable
 python dev/check_body_divergence.py     # no divergence that is only ALIGNMENT
+python dev/check_upstream_registries.py # no registry entry / re-export / field dropped
 python dev/check_body_divergence.py --summary   # then size what conflicted
+python dev/check_body_divergence.py --sweep     # then re-review the markers
 cd mlx_vlm/ && pytest ./tests --ignore=tests/test_smoke.py
 ```
 
@@ -61,7 +63,7 @@ commit that mostly removes code (`29b6c00b`) shows only its insertions and
 closed while still listed**, because attribution is by line content — the exclusion
 baselines, not the commit count, are the progress signal.
 
-**Run all seven checks after every merge — this is not optional.** Six of them gate
+**Run all eight checks after every merge — this is not optional.** Seven of them gate
 (they exit non-zero and CI runs them); `find_dropped_hunks.py` is a lead generator
 and does not. When a merge
 resolution drops content from a commit that upstream already merged, that commit
@@ -396,6 +398,53 @@ one side drops the other's contribution and usually only fails at runtime.
 diff. `memory.md` has the change log; `docs/upstream-gaps.md` is the current gap
 list and the record of how this fork diverges and why.
 
+### The sixth direction: is it even a DEFINITION?
+
+Every check above keys on a `def`, a `class`, a file or a hunk. Nothing keyed on the
+other half of the language. A dropped dict entry, a dropped `__init__.py` re-export and
+a dropped dataclass field are `ast.Assign` / `ast.AnnAssign` / `ast.Import*`, and they
+pass all five: the file is present (parity), no `def`/`class` name vanished (symbols),
+nothing was deleted (deletions), the hunk sits in a file whose fork sites are marked
+(fork markers), and the entry is not a helper anyone calls (dead helpers).
+
+`dev/check_upstream_registries.py` is that check, and **the gap it closes was
+measured, not assumed.** Deleting `models/gemma4/__init__.py`'s
+`Gemma4VideoProcessor` re-export — a real historical loss in this fork — leaves **all
+2817 tests passing and all five other audits green.** Only this one reports it.
+
+Four shapes, each of which has cost a real loss here:
+
+- **registry entry** — a key or element missing from a module-level container both
+  trees assign to the same name. Four `MODEL_REMAPPING` entries went this way, and
+  "unlimited-ocr" / "inkling_mm_model" failed with *"Model type X not supported"*
+  while their implementations sat in the tree byte-identical to upstream.
+- **registry** — a whole module-level container upstream assigns and we do not. A
+  fork *rename* reports as this, which is correct: a rename is exactly the event that
+  loses entries in a merge.
+- **re-export** — a name an upstream import binds that ours does not. A package
+  `__init__.py` is nothing but this.
+- **class attribute** — a class-level assignment we lack. Dataclass fields are the
+  case that matters: every `models/*/config.py` `ModelConfig` is one, and a dropped
+  field silently changes model behaviour rather than raising.
+
+**It compares PRESENCE only, never values.** `{"a": 1}` vs `{"a": 2}` passes, and that
+is deliberate — values diverge legitimately across this fork (every tuned constant)
+while keys almost never do. A wrong value is `check_body_divergence.py --file`'s job;
+that is the shape of #1402's test-certified cache-key bug.
+
+Reviewed hits go in `.registry-exclusions`, currently **5**, all re-exports the fork
+replaced (`generation_stream` ×3 for the lazy per-thread stream,
+`_check_configured_context_budget` for the clamp-instead-of-reject budget,
+`top_p_sampling` for the `_filter` that also applies min_p and top_k). Runs in ~13s.
+
+**Corollary, and it is why this section exists at all: a docstring claiming coverage
+is not coverage.** `check_upstream_symbols.py` listed
+`deepseek_v4/config.py -- ModelConfig.index_block / .index_keep` among its "verified
+instances" for months. It cannot see either — they are `AnnAssign` nodes and that
+script collects only `def`/`class` names. The fields are present today, so they were
+restored, but not by the check that claimed them, and the claim made a whole category
+look covered while nothing covered it.
+
 ## The one rule that matters most
 
 **Never conclude anything about a divergence from a `git diff --numstat` line
@@ -444,7 +493,7 @@ positives. Every hit still needs `git log -S` and a read.
 cd mlx_vlm/ && pytest -s ./tests --ignore=tests/test_smoke.py
 ```
 
-The suite is **green: 2766 passed, 5 skipped, 0 failed.** Keep it that way. (This
+The suite is **green: 2817 passed, 5 skipped, 0 failed.** Keep it that way. (This
 line goes stale on every restore that adds a guard — trust the run, not the number.)
 
 **Compare failing test IDs, not counts.** A change that fixes one test and breaks
@@ -546,13 +595,10 @@ dataclasses off `BaseModelConfig`), `{model_type}.py` (the `Model` class with
 `get_input_embeddings()`), `language.py`, `vision.py`, and
 `processing_{model}.py`.
 
-**Registries are a known blind spot.** `MODEL_REMAPPING`, prompt-format maps,
-drafter registries, tool parsers and `__init__.py` re-exports are all invisible to
-both audits — parity only sees missing files, the symbol check only sees missing
-`def`/`class` names. A dropped dict entry or re-export passes both. Four
-`MODEL_REMAPPING` entries and a `Gemma4VideoProcessor` re-export were lost exactly
-this way. `tests/test_model_registry.py` exercises the entries; extend it when you
-add a registry.
+**Registries were the longest-standing blind spot; `dev/check_upstream_registries.py`
+is now the check.** See "the sixth direction" below. `tests/test_model_registry.py`
+still exercises the specific entries and re-exports it knows about — extend it when you
+add a registry — but the audit is what covers the ones nobody thought to test.
 
 ### Generation (`mlx_vlm/generate/`, a package)
 
@@ -687,7 +733,7 @@ fallback and by two test files.
   file had failures). Because it is PR-only, pushes straight to `main` are never
   style-checked — which is how style drift went unnoticed.
 - `upstream-parity.yml` — runs on pushes to `main` as well as PRs, since this fork
-  is usually committed to directly. Runs the six gating audit scripts.
+  is usually committed to directly. Runs the seven gating audit scripts.
 
 ## Key dependencies
 

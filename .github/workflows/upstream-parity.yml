@@ -75,3 +75,10 @@ jobs:
       # that are alignment masquerading as content, all mechanically fixable.
       - name: Check no divergence is alignment-only
         run: python dev/check_body_divergence.py --upstream-ref upstream/main
+
+      # The sixth direction: a dropped dict entry, __init__.py re-export or dataclass
+      # field is an ast.Assign/AnnAssign/Import, not a definition, so every check above
+      # passes it. Demonstrated: with gemma4/__init__.py's Gemma4VideoProcessor
+      # re-export deleted, all 2817 tests pass and all five checks above stay green.
+      - name: Check no upstream registry entry or re-export is missing
+        run: python dev/check_upstream_registries.py --upstream-ref upstream/main

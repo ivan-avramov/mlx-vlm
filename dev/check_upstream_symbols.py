@@ -10,7 +10,6 @@ and no future merge re-offers it. Unlike a missing file, a missing function is
 invisible to tree-level diffing -- the file is present, just quietly behind.
 
 Verified instances of exactly this at the time of writing:
-  * deepseek_v4/config.py   -- ModelConfig.index_block / .index_keep
   * generate/dispatch.py    -- _prefix_cache_trim_amount / _cache_fully_retained
   * server/generation.py    -- _log_prefill_started / _log_prefill_progress /
                                _log_decode_progress / _request_log_id
@@ -20,6 +19,15 @@ Comparison is per-file and name-only: for each .py file upstream and ours both
 have, every `def`/`class` name upstream defines must also be defined somewhere
 in our copy of that file. It deliberately ignores signatures and bodies -- the
 fork legitimately rewrites those. It only asks: did a name silently vanish?
+
+[correction 2026-08-10] This list used to open with `deepseek_v4/config.py --
+ModelConfig.index_block / .index_keep`. **This script cannot see those.** It collects
+`FunctionDef`/`AsyncFunctionDef`/`ClassDef` names, and a dataclass field is an
+`AnnAssign` that `ast.walk` never yields as a name. Both fields are present today, so
+they were restored -- but not by this check, and claiming them here made a whole
+category look covered when nothing covered it. `dev/check_upstream_registries.py` is
+that category (registry entries, re-exports, class attributes); it was built after
+this correction, and dropping either field is one of the losses its tests reproduce.
 
 Usage:
     python dev/check_upstream_symbols.py [--upstream-ref upstream/main]
