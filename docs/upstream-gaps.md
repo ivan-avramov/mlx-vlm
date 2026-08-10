@@ -525,6 +525,80 @@ restored and `vision.py` stale, the tests fail `TypeError: VisionModel.__call__(
 takes 2 positional arguments but 3 were given`. Landing the pair together is
 still the rule.
 
+## The dropped-hunk report has bottomed out — 19 commits, all closed by review
+
+**Settled 2026-08-10, and this is the section to read before re-investigating any
+`find_dropped_hunks.py` hit.** The wide pass
+(`--min-lines 1 --min-share 0.05 --max-commits 400`) went 72 -> 43 -> 24 -> **19**
+commits. Those 19 will keep appearing forever, and that is correct: **every one of
+them now has an established disposition, and none is missing content.** The report
+attributes by line CONTENT, so a reviewed supersession, a rewrite, or even a local
+variable rename reads identically to a dropped hunk.
+
+`.fork-marker-allowlist` is empty and `.deletion-exclusions` is empty, so the report
+count is no longer a progress signal of any kind. **The exclusion baselines are**
+(`.symbol-exclusions` 14, everything else 0).
+
+Closed because the fork deliberately supersedes them — see each file's `# Fork:`
+markers, which name the commit:
+
+* **`c503fa7b`** (88) — the fork guards rotating-cache prefix reuse with
+  `_rotating_rewind_safe` + a snapshot ring rather than upstream's
+  `_prefix_cache_trim_amount` / `_cache_fully_retained`. `generate/common.py`'s
+  `start_position` branch names `BufferedRotatingKVCache` and explains that it
+  "reports itself trimmable even after evicting" — exactly what `c503fa7b` fixed.
+  Running both would give two different notions of when a rewind is safe. Its 51
+  `test_generate.py` lines are the tests for those symbols, and all 9 are REVIEWED
+  `.symbol-exclusions` entries superseded by the fork's own `TestPrefixCacheReuseTrim`.
+* **`eb7537b9`** (#1210, 20) — reduces **entirely** to `_sample_top_p_one`. Every
+  identifier the report flags (`argsort`, `sorted_probs`, `cumulative_probs`,
+  `take_along_axis`, `top_probs`, `zeros_like`, `softmax`, `top_p_sampling`) lives in
+  that one method's body, which the fork replaced with a `_filter()` applying
+  top_p / min_p / top_k. A REVIEWED `.symbol-exclusions` entry.
+* **`a492e47d`** (6) — `generate/common.py`'s inline uniform-quant path, replaced
+  deliberately. Its `apc.py` line is a content-attribution artifact: all 12 of the
+  lines it added there are present.
+* **`b590c747`** (8) — fork work (`f0d50c90`, ours, four days before upstream's own
+  fix), marked at `qwen3_5_moe.py:59`. **Reclassify rather than close:** the only
+  difference is probing `gate_proj` vs `up_proj`, equivalent for any real SwiGLU
+  checkpoint, so it is a convergence candidate carrying a permanent conflict site.
+
+Closed because upstream's own copy is the defect:
+
+* **`1171888e`** (9) — our `zero_row_tail` is **byte-identical to upstream's live
+  copy**. Upstream defines it **twice** inside `BatchTurboQuantKVCache`, so its first
+  copy is dead code and the report flags that shadowed one as "missing". Confirmed
+  mechanically in 2026-08-10, not by spot check. Same shape as the doubly-defined
+  `TestLagunaProcessor` in `tests/test_processors.py`; both are worth reporting
+  upstream.
+
+Closed because the content is present and the report is measuring alignment:
+
+* **`9edb3c6b`** (#1299, 7) and **`ec0f2354`** (#1228, 3) — both reduce to
+  `thinking_start_token_id` / `thinking_end_token_id` at 2 occurrences vs upstream's 4.
+  Ours calls the same `_thinking_token_ids` helper and unpacks it into `start_id` /
+  `end_id`. **The reported lines are a local variable rename**, with byte-identical
+  logic either side. This is the purest illustration of why the count is not a signal.
+* **`4d468e8575`** (#1492, 4) and **`b3d2380d1d`** (#1266, 3) — both verified FULLY
+  LANDED in `server/openai.py` (video plumbing; per-token thinking split). Said so in
+  that file's markers so nobody re-derives them from its divergence.
+* **`7267aff2`** (#1313, 2) — both halves landed; the reported lines sit inside the
+  fork's EpiCache refactor (`_qwen35_scalar_positions`) of the region it introduced.
+* **`182eef66`** (#1229, 14), **`5034c609`** (#1203, 10), **`ffd7aeff`** (3),
+  **`477d3aeb`** (1), **`dab4cb45`** (1), **`5788472570`** (#628, 1),
+  **`473692ea73`** (1), **`d85ca4d0`** (#1181, 1), **`3947dd03`** (#1029, 1) — each
+  lands in a file that was reviewed site-by-site during the `.fork-marker-allowlist`
+  rollout (`generate/common.py`, `generate/__init__.py`, `server/cli.py`,
+  `generate/dispatch.py`, `generate/ar.py`, `prompt_utils.py`,
+  `tests/test_prompt_utils.py`, `utils.py`) and is accounted for by that file's
+  markers — predominantly the fork's `print`/`logging` -> module-logger conversions
+  and its generation-engine port.
+
+**How to use this list.** If a hit is here, do not re-investigate it; extend the entry
+if you learn something. If a hit is NOT here, it is new — treat it as a lead and run
+`git log -S`. That distinction is the only thing that makes a permanently-nonzero
+report usable.
+
 ## Still open — the systematic audit's backlog
 
 A three-way audit plus `dev/find_dropped_hunks.py` replaced the previous

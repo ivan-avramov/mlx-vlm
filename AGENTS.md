@@ -37,12 +37,27 @@ git fetch upstream
 git merge upstream/main
 python dev/check_upstream_parity.py     # no upstream file silently dropped
 python dev/check_upstream_symbols.py    # no upstream def/class silently dropped
-python dev/find_dropped_hunks.py        # no upstream HUNK silently dropped
+python dev/find_dropped_hunks.py --min-lines 1 --min-share 0.05 \
+        --max-commits 400              # no upstream HUNK silently dropped
 python dev/check_upstream_deletions.py  # no upstream DELETION silently reverted
 python dev/check_fork_markers.py        # every fork hunk in a shared file is marked
 python dev/check_dead_helpers.py        # no upstream-called helper left unreachable
 cd mlx_vlm/ && pytest ./tests --ignore=tests/test_smoke.py
 ```
+
+**`find_dropped_hunks.py` has THREE floors and the bare invocation is decoration.**
+`--min-lines 3`, `--min-share 0.5` and `--max-commits 80` are all defaults, and each
+hides real content: `f044f36a` was hidden by the *share* floor (its `generation.py`
+share is 45%), which nobody expected. The default pass reports ~12 commits; the wide
+pass above reported 43. **Run the wide one, always**, and treat a hit as a lead:
+`docs/upstream-gaps.md` has a section listing every commit that permanently appears in
+it together with why each is closed — check that before investigating anything.
+
+Two further limits, both hit for real. The report **cannot see deletions**, so a
+commit that mostly removes code (`29b6c00b`) shows only its insertions and
+`check_upstream_deletions.py` is what sees the rest. And a commit can be **fully
+closed while still listed**, because attribution is by line content — the exclusion
+baselines, not the commit count, are the progress signal.
 
 **Run all six checks after every merge — this is not optional.** When a merge
 resolution drops content from a commit that upstream already merged, that commit
@@ -283,7 +298,7 @@ Three results so far, and the first one is why this section exists:
   method ordering. Converged 5 sites to 0.
 
 **The exit this unlocks is the one `.fork-marker-allowlist` calls CONVERGE**, and it is
-`docs/handoff-2026-08-10.md` §2f's test-file method applied to library files: take
+the union method below, applied to a library file: take
 upstream's file as the base, re-apply the fork content, mark it. `apc.py` went from 554
 missing lines to 2. Verify the rebuild lost nothing by AST-diffing **before against
 after** — same definition count, zero lost, zero new, module statements identical, only
@@ -614,6 +629,122 @@ fallback and by two test files.
 - `huggingface-hub` — model downloads
 - `Pillow`, `opencv-python`, `miniaudio` — image/video/audio
 - `fastapi`, `uvicorn` — server
+
+## Union-merging a test file, or any file upstream also has
+
+Four for four on `test_utils.py`, `test_trainer_utils.py`,
+`test_batch_quantized_cache.py`, `test_speculative.py`, then on `test_server.py`,
+`test_generate.py` and — as a library file — `apc.py`. **The step order is the point:**
+
+1. AST-compare definition names both ways. **`only_ours` empty does NOT mean
+   checkout-safe** — `test_utils.py` had zero fork-only definitions and real fork
+   content in *bodies*.
+2. Diff the **bodies** of shared definitions (see "the fifth direction"). Ours-only
+   content is either a fork adaptation (keep, mark `# Fork:`) or a weakened assertion
+   (take upstream's). **These look identical in a diff**; `memory.md`'s change log is
+   what distinguishes them.
+3. Take upstream's file as the base so future merges apply, then re-append fork-only
+   definitions below a `# Fork additions below this line` banner.
+4. Union the import block, and mark fork-only imports **inline** (`# Fork:` on the
+   line) — a standalone comment gets hoisted by isort.
+5. Re-run `check_upstream_symbols.py` + `check_fork_markers.py` and prune what stops
+   being excused, **in the same commit**.
+
+Step 2 is the step that pays. In `test_server.py`, 10 of 232 shared bodies differed and
+split four ways: take upstream (5, all asserting behaviour restored the same session),
+keep ours (1, a real fork adaptation, now commented so nobody "converges" it), cosmetic
+(1), and one **test-certified bug** — a fork test edited to assert #1402's buggy cache
+key, so the suite was actively defending it.
+
+## Formatting when `pre-commit` is not installed
+
+`pre-commit` is not in `.venv`. The pinned hooks run standalone:
+
+```bash
+uvx black@26.3.1 <files>
+uvx isort@5.13.2 --profile=black <files>
+uvx autoflake@2.2.1 --check --remove-all-unused-imports --ignore-init-module-imports <files>
+```
+
+`black` warns that Python 3.13 cannot verify code targeting 3.14; that warning is
+expected and the reformat is still correct.
+
+## Traps — every one of these cost a real cycle
+
+Collected from `docs/handoff-2026-08-10.md` when that file was retired (2026-08-10,
+its §2 empty). Ordered
+roughly by how often they bite.
+
+**Environment and tooling**
+
+1. **Always `git -C /Users/ia87221/ws/mlx-vlm`.** `cd` persists between tool calls, and
+   a wrong relative path returns **empty output, not an error** — three times that made
+   a file look fork-only or look byte-identical to upstream. Same class: a zsh
+   `--include=*.py` glob silently swallows a `grep`, and `| head` reports `exit=0` over
+   a hard failure.
+2. **`cp` is aliased to `cp -i`.** A restore-from-backup silently did nothing and left
+   a neutering edit in the tree. Use `command cp -f`, then check `git status`.
+   Better still, **restore from git** (`git checkout HEAD -- <path>`) rather than from
+   `/tmp`: a stale `/tmp` backup from an earlier session will restore the wrong content
+   and the `-i` prompt is what tells you, if you read it.
+3. **Never read a count off a truncated pipe.** Every audit prints its own totals.
+4. **Never count guards off a `-k`-filtered run.** `-k "Reasoning or MarkerUnion"` also
+   matched two pre-existing tests, which is how a commit message came to claim "4 of 6
+   fire" when all 4 of the new ones did. The suite total is the reliable figure.
+5. **`mlx_vlm.generate` is the re-exported *function*, not the module.**
+   `from mlx_vlm.generate import ar` works; `import mlx_vlm.generate.ar as m` and
+   attribute access both fail.
+
+**Provenance**
+
+6. **"Not an ancestor of `upstream/main`" ≠ fork-authored** — upstream squash-merges.
+   Check `git log -1 --format=%an`.
+7. **A partially-restored commit is unfinished, and a "RESOLVED" note can be one half
+   short.** Restore from `git show --stat`, never from a report's file list. For a
+   commit that is mostly `print` -> `logger`, a partial restore leaves **no failing
+   test and no audit hit** — `cfcc36d9` was declared whole three separate times.
+   Worse: a note naming the symbols it verified *present* treats presence as
+   completion, when what is missing can be a **rewrite of a symbol that was there all
+   along** (`7fbc7bc9`). Presence of a symbol says nothing about whether its body is
+   upstream's.
+8. **"Not missing" is not "not dropped".** `#1433`'s prefill gate and `#1598`'s
+   predicate refactor were *narrowings and refactors upstream had already removed* —
+   nothing was absent, so no report could list them and no identifier count could flag
+   them. Only comparing the shared body against upstream's finds this shape.
+9. **A weakened assertion and a legitimate numerical relaxation look identical in a
+   diff.** AST-diff bodies and check `memory.md` for a recorded reason. Worse variant:
+   a fork test had been edited to assert a **buggy** value (#1402's cache key), so the
+   suite actively certified the bug. `only_ours` being empty proves nothing.
+
+**Measurement**
+
+10. **A line-count delta measures ALIGNMENT, not CONTENT.** The general form of the
+    rule above. `apc.py` read as 554 missing lines / 36 sites / 75 hunks and was a
+    reordering. Two commits' entire reported residue turned out to be a **local
+    variable rename**. AST-diff the bodies.
+11. **The per-commit dropped-hunk report does not tell you how much of a file
+    diverges.** It ranks commits it can attribute. Deciding a file was "markable" from
+    it produced the wrong call on `turboquant.py` twice. Use a direct
+    `git diff upstream/main -- <path>` for that question, and the AST body diff to
+    classify what it shows.
+12. **A marker on a whitespace probe line creates a new probe line.** Chasing them in
+    `test_generate.py` went 10 -> 8 -> 1 -> 2 sites. **Converge the ordering instead** —
+    that took it to 0. And check `git diff -U0` before assuming a residual site IS a
+    probe: a deletion-only hunk looks identical and is not fixable that way.
+
+**Proof**
+
+13. **`git stash` reverts to HEAD, which is useless once the fix is committed.** A
+    guard written after its own fix landed will pass against HEAD and prove nothing.
+    Revert to the commit *before* the fix: `git show <fix>^:<path> > <path>`, run,
+    restore.
+14. **A restored upstream test can fail for a reason that has nothing to do with
+    placement.** `221fe0b3`'s streaming test failed three times for three different
+    causes, each hidden behind the last. Do not adjust a restored test to make it pass;
+    find the missing half.
+15. **For a test-file reorder, compare `pytest --collect-only` counts on both sides.**
+    It is the only thing that catches a shadowed definition — which is how the
+    doubly-defined `TestLagunaProcessor` hid a missing symbol.
 
 ## Working agreements
 
