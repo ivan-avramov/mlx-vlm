@@ -6,6 +6,7 @@ import json
 # USER_TURN_OPEN_MARKERS. Upstream's import list has neither.
 import threading
 import time  # Fork: backoff in _encode_retrying_on_borrow_error
+import weakref  # Fork: weak-keyed _TOKEN_ENCODE_CACHE
 from dataclasses import dataclass
 from enum import Enum
 from functools import partial
@@ -207,7 +208,26 @@ delimiters.
 """
 
 
-_TOKEN_ENCODE_CACHE: Dict[Tuple[int, str], List[int]] = {}
+# Keyed by the tokenizer OBJECT, weakly, not by `id(tokenizer)`.
+#
+# An earlier version used `(id(tokenizer), text)`. That is unsafe on a server
+# that swaps models on demand -- and mlx-serve does, evicting on an inactivity
+# timeout -- because CPython recycles the address of a collected object almost
+# immediately, so a surviving entry would hand the NEXT model's requests the
+# PREVIOUS model's token ids. The failure is silent and worse than the crash
+# this cache exists to prevent: ThinkingBudgetCriteria would force a wrong
+# closing token and the budget clip would corrupt output rather than raise.
+#
+# A weak key both fixes that (an entry cannot outlive the tokenizer it
+# describes) and bounds the cache across reloads. Verified safe for the key
+# type before adopting it: neither transformers' `TokenizersBackend` nor a
+# concrete `Qwen2Tokenizer` defines `__eq__` or `__hash__`, so both inherit
+# `object`'s identity semantics -- there is no `__eq__`-without-`__hash__`
+# trap, and two separately-loaded tokenizers with identical vocabularies stay
+# distinct keys instead of colliding.
+_TOKEN_ENCODE_CACHE: "weakref.WeakKeyDictionary[Any, Dict[str, List[int]]]" = (
+    weakref.WeakKeyDictionary()
+)
 _TOKEN_ENCODE_CACHE_LOCK = threading.Lock()
 
 
@@ -239,17 +259,30 @@ def cached_special_token_encode(tokenizer, text: str) -> List[int]:
     Retrying is safe because the ``borrow_mut()`` fails *before* mutating
     anything, so the failed encode had no effect, and the holder's borrow is
     released as soon as its Rust call returns.
+
+    A tokenizer that cannot be a weak key (unhashable, or ``__slots__`` without
+    ``__weakref__``) is simply not cached. Correctness must not depend on the
+    key being cacheable: such a caller still gets the right ids, via the retry,
+    and is never served another object's entry.
     """
-    cache_key = (id(tokenizer), text)
-    cached = _TOKEN_ENCODE_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
+    try:
+        per_tokenizer = _TOKEN_ENCODE_CACHE.get(tokenizer)
+    except TypeError:
+        return _encode_retrying_on_borrow_error(tokenizer, text)
+    if per_tokenizer is not None:
+        cached = per_tokenizer.get(text)
+        if cached is not None:
+            return cached
     with _TOKEN_ENCODE_CACHE_LOCK:
-        cached = _TOKEN_ENCODE_CACHE.get(cache_key)
+        per_tokenizer = _TOKEN_ENCODE_CACHE.get(tokenizer)
+        if per_tokenizer is None:
+            per_tokenizer = {}
+            _TOKEN_ENCODE_CACHE[tokenizer] = per_tokenizer
+        cached = per_tokenizer.get(text)
         if cached is not None:
             return cached
         result = _encode_retrying_on_borrow_error(tokenizer, text)
-        _TOKEN_ENCODE_CACHE[cache_key] = result
+        per_tokenizer[text] = result
         return result
 
 

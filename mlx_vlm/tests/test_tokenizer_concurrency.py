@@ -32,8 +32,10 @@ Two consequences that scoped this fix, both measured on a real
   the reported traceback on the same code path, needs no change.
 """
 
+import gc
 import threading
 import time
+import weakref
 
 import pytest
 
@@ -41,6 +43,7 @@ from mlx_vlm.prompt_utils import (
     _TOKEN_ENCODE_CACHE,
     THINKING_FORMATS,
     _encode_retrying_on_borrow_error,
+    cached_special_token_encode,
     prewarm_special_token_encodes,
 )
 from mlx_vlm.structured import ThinkingAwareLogitsProcessor
@@ -49,13 +52,7 @@ from mlx_vlm.utils import ThinkingBudgetCriteria
 
 @pytest.fixture(autouse=True)
 def _clear_encode_cache():
-    """Isolate tests from each other's cache entries.
-
-    `cached_special_token_encode` keys on `id(tokenizer)`, so a fake tokenizer
-    that has been garbage collected can have its address reused by the next
-    one and hand back the previous fake's ids. Clearing keeps these tests
-    deterministic; the keying itself is a separate pre-existing concern.
-    """
+    """Isolate tests from each other's cache entries."""
     _TOKEN_ENCODE_CACHE.clear()
     yield
     _TOKEN_ENCODE_CACHE.clear()
@@ -274,6 +271,122 @@ def test_prewarm_survives_a_tokenizer_that_cannot_encode():
             raise ValueError("no vocab")
 
     prewarm_special_token_encodes(_Hostile())  # must not raise
+
+
+# ── Cache identity: an entry must not outlive the tokenizer it describes ─────
+# Keying on `id(tokenizer)` is unsafe on a server that swaps models on demand:
+# CPython reuses the address of a collected object almost immediately, so a
+# stale entry hands the NEXT model's requests the PREVIOUS model's token ids.
+# That is silent -- `ThinkingBudgetCriteria` forces a wrong closing token and
+# the budget clip corrupts output instead of raising.
+
+
+class _VocabTokenizer:
+    """A fake whose ids depend on the instance, so a stale hit is visible."""
+
+    def __init__(self, offset):
+        self.offset = offset
+        self.calls = 0
+
+    def encode(self, text, add_special_tokens=True):
+        self.calls += 1
+        return [self.offset + len(text)]
+
+
+def _force_address_reuse(addr, factory, attempts=500):
+    """Allocate until one object lands on `addr`, or give up.
+
+    CPython's allocator recycles a freed same-size block on the very next
+    allocation ~99% of the time; the loop covers the rest. Objects that miss
+    are kept alive so they cannot be recycled into the address themselves.
+    """
+    misses = []
+    for _ in range(attempts):
+        candidate = factory()
+        if id(candidate) == addr:
+            return candidate, misses
+        misses.append(candidate)
+    return None, misses
+
+
+def test_cache_does_not_serve_a_recycled_tokenizer_address():
+    """A new tokenizer at a recycled address must not inherit cached ids.
+
+    This is the model-swap case: mlx-serve loads models on demand and evicts
+    them on an inactivity timeout, so tokenizers really are collected here.
+    """
+    first = _VocabTokenizer(offset=1000)
+    addr = id(first)
+    assert cached_special_token_encode(first, "</think>") == [1008]
+
+    del first
+    gc.collect()
+
+    second, misses = _force_address_reuse(addr, lambda: _VocabTokenizer(offset=2000))
+    if second is None:
+        pytest.skip("CPython did not recycle the address in this run")
+
+    # Pre-fix this returns [1008] -- the *previous* model's id for "</think>".
+    assert cached_special_token_encode(second, "</think>") == [2008]
+    assert second.calls == 1
+    del misses
+
+
+def test_cache_entry_is_dropped_when_its_tokenizer_is_collected():
+    """No unbounded growth across model reloads."""
+    tokenizer = _VocabTokenizer(offset=1000)
+    cached_special_token_encode(tokenizer, "</think>")
+    assert len(_TOKEN_ENCODE_CACHE) == 1
+
+    ref = weakref.ref(tokenizer)
+    del tokenizer
+    gc.collect()
+
+    assert ref() is None
+    assert len(_TOKEN_ENCODE_CACHE) == 0
+
+
+def test_cache_keeps_two_live_tokenizers_distinct():
+    """Two models served concurrently must not share entries.
+
+    HF tokenizers use identity equality (verified: neither `TokenizersBackend`
+    nor `Qwen2Tokenizer` defines `__eq__`/`__hash__`), so distinct instances
+    stay distinct keys even when their vocabularies are identical.
+    """
+    a = _VocabTokenizer(offset=1000)
+    b = _VocabTokenizer(offset=2000)
+
+    assert cached_special_token_encode(a, "</think>") == [1008]
+    assert cached_special_token_encode(b, "</think>") == [2008]
+    # And both are still served from cache, not re-encoded.
+    assert cached_special_token_encode(a, "</think>") == [1008]
+    assert cached_special_token_encode(b, "</think>") == [2008]
+    assert (a.calls, b.calls) == (1, 1)
+
+
+def test_cache_tolerates_a_tokenizer_that_cannot_be_weak_referenced():
+    """Correctness must not depend on the key being cacheable.
+
+    An object with `__slots__` and no `__weakref__` cannot be a weak key. Such
+    a tokenizer simply goes uncached -- it must still get the right ids rather
+    than raising, and must never be served another object's entry.
+    """
+
+    class _NoWeakref:
+        __slots__ = ("offset",)
+
+        def __init__(self, offset):
+            self.offset = offset
+
+        def encode(self, text, add_special_tokens=True):
+            return [self.offset + len(text)]
+
+    with pytest.raises(TypeError):
+        weakref.ref(_NoWeakref(1000))
+
+    tokenizer = _NoWeakref(offset=3000)
+    assert cached_special_token_encode(tokenizer, "</think>") == [3008]
+    assert cached_special_token_encode(tokenizer, "</think>") == [3008]
 
 
 # ── The real-tokenizer reproduction ──────────────────────────────────────────
