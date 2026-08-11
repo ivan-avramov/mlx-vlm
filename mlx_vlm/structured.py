@@ -4,6 +4,10 @@ from typing import Any
 import mlx.core as mx
 import numpy as np
 
+from .prompt_utils import (  # Fork: thread-safe cached encode, see ThinkingAwareLogitsProcessor
+    cached_special_token_encode,
+)
+
 _LLGUIDANCE_MASK_KERNEL = mx.fast.metal_kernel(
     name="mlx_vlm_llguidance_mask",
     input_names=["logits", "mask"],
@@ -156,6 +160,18 @@ class ThinkingAwareLogitsProcessor:
     the next sampled token as the first token of the final answer.
     """
 
+    # Fork: __init__'s two `tokenizer.encode(...)` calls (thinking_start_token
+    # and thinking_end_token) go through
+    # prompt_utils.cached_special_token_encode instead of the raw tokenizer.
+    # ResponseGenerator._wrap_processors_until_thinking_done constructs one of
+    # these per logits processor per request against the tokenizer that
+    # continuous batching shares across request threads, so the raw encodes
+    # raced HF's fast tokenizer and could fail with "Already borrowed" (a Rust
+    # RefCell double-borrow). Both arguments are fixed format strings, never
+    # per-request user text, so they are cacheable. Same defect as
+    # utils.ThinkingBudgetCriteria, found by counting the call sites rather
+    # than stopping at the reported traceback.
+    # Covered by tests/test_tokenizer_concurrency.py.
     def __init__(
         self,
         processor,
@@ -172,11 +188,11 @@ class ThinkingAwareLogitsProcessor:
         self._active = not enable_thinking
         self._active_context: list[int] = []
 
-        self.thinking_start_token_id = tokenizer.encode(
-            thinking_start_token, add_special_tokens=False
+        self.thinking_start_token_id = cached_special_token_encode(
+            tokenizer, thinking_start_token
         )[-1]
-        self.thinking_end_token_id = tokenizer.encode(
-            thinking_end_token, add_special_tokens=False
+        self.thinking_end_token_id = cached_special_token_encode(
+            tokenizer, thinking_end_token
         )[-1]
 
     def clone(self) -> "ThinkingAwareLogitsProcessor":

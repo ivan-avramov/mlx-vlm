@@ -5,6 +5,7 @@ import json
 # fork-only registries below — CACHE_ALIGNMENT_KWARGS, THINKING_FORMATS and
 # USER_TURN_OPEN_MARKERS. Upstream's import list has neither.
 import threading
+import time  # Fork: backoff in _encode_retrying_on_borrow_error
 from dataclasses import dataclass
 from enum import Enum
 from functools import partial
@@ -227,6 +228,17 @@ def cached_special_token_encode(tokenizer, text: str) -> List[int]:
     explicit thinking-token override) -- never arbitrary per-request user
     text -- so the encoded result is deterministic for a given
     (tokenizer, text) pair and safe to compute once and reuse.
+
+    The cache alone does not close the race, which is why the retry below
+    exists. ``_TOKEN_ENCODE_CACHE_LOCK`` only serialises *this* helper's
+    callers against each other; the borrow that actually collides is held by
+    whatever else is inside the Rust tokenizer at that moment -- typically a
+    processor's long padded/truncated encode during ``prepare_inputs``, which
+    releases the GIL while holding a shared borrow. So the first (cold-miss)
+    encode per (tokenizer, text) can still fail even with the cache in place.
+    Retrying is safe because the ``borrow_mut()`` fails *before* mutating
+    anything, so the failed encode had no effect, and the holder's borrow is
+    released as soon as its Rust call returns.
     """
     cache_key = (id(tokenizer), text)
     cached = _TOKEN_ENCODE_CACHE.get(cache_key)
@@ -236,9 +248,61 @@ def cached_special_token_encode(tokenizer, text: str) -> List[int]:
         cached = _TOKEN_ENCODE_CACHE.get(cache_key)
         if cached is not None:
             return cached
-        result = tokenizer.encode(text, add_special_tokens=False)
+        result = _encode_retrying_on_borrow_error(tokenizer, text)
         _TOKEN_ENCODE_CACHE[cache_key] = result
         return result
+
+
+def prewarm_special_token_encodes(tokenizer) -> None:
+    """Populate the encode cache for every known thinking delimiter.
+
+    ``cached_special_token_encode`` removes the *steady-state* race but not the
+    first, cold-miss encode per (tokenizer, text) -- and that one still runs on
+    a request thread, so it can still collide with a concurrent processor
+    encode. Under sustained concurrent tokenization the retry cannot find a
+    free window at all, which a real-tokenizer test in
+    ``tests/test_tokenizer_concurrency.py`` demonstrates.
+
+    Calling this once at model-load time, while the tokenizer is provably
+    single-threaded, moves every cold miss for the standard delimiters off the
+    request path entirely. A request that overrides the thinking tokens with a
+    string not listed here still takes one cold miss, which is what the retry
+    covers.
+
+    Best-effort by design: a tokenizer that cannot encode one of these
+    literals must not make model loading fail.
+    """
+    # Mirrors generate/dispatch.py's DEFAULT_THINKING_{START,END}_TOKEN, which
+    # cannot be imported here -- dispatch.py imports this module.
+    texts = {"<think>", "</think>", "\n"}
+    for fmt in THINKING_FORMATS:
+        texts.update(fmt.openers)
+        texts.update(fmt.closers)
+    for text in texts:
+        try:
+            cached_special_token_encode(tokenizer, text)
+        except Exception:  # noqa: BLE001 - warming is advisory, never fatal
+            continue
+
+
+def _encode_retrying_on_borrow_error(
+    tokenizer, text: str, attempts: int = 8, backoff: float = 0.005
+) -> List[int]:
+    """``tokenizer.encode`` retried past a transient Rust borrow collision.
+
+    Only ``RuntimeError`` whose message is pyo3's borrow-failure text is
+    retried; anything else propagates untouched, and so does the borrow error
+    itself once ``attempts`` are exhausted -- a permanent failure must not be
+    silently swallowed into a wrong token id.
+    """
+    for attempt in range(attempts):
+        try:
+            return tokenizer.encode(text, add_special_tokens=False)
+        except RuntimeError as exc:
+            if "borrowed" not in str(exc).lower() or attempt == attempts - 1:
+                raise
+            time.sleep(backoff * (attempt + 1))
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 def detect_thinking_format(text: str) -> Optional[ThinkingFormat]:

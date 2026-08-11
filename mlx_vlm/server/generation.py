@@ -41,6 +41,7 @@ from ..generate.diffusion import (
 from ..prompt_utils import (  # Fork: fork-only, the THINKING_FORMATS registry (1c3f1e50)
     cached_special_token_encode,
     detect_thinking_format,
+    prewarm_special_token_encodes,
     prompt_is_inside_thinking,
 )
 from ..sample_utils import (  # Fork: apply_min_p/top_k/top_p for _PositionedTargetSampler._filter; upstream imports only make_* + top_p_sampling
@@ -1432,6 +1433,14 @@ class ResponseGenerator:
         self.tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
+        # Warm the thinking-delimiter encode cache while this is still
+        # single-threaded. Continuous batching shares this one tokenizer across
+        # every request thread, and HF's fast tokenizer raises "Already
+        # borrowed" when a plain .encode() races another thread's padded encode.
+        # Doing it here means no request thread ever takes the cold miss for a
+        # standard delimiter. Same reason stop_tokens is resolved above rather
+        # than per request.
+        prewarm_special_token_encodes(self.tokenizer)
 
     def generate(
         self,

@@ -24,6 +24,9 @@ from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
 
 from .models.base import BaseImageProcessor
+from .prompt_utils import (  # Fork: thread-safe cached encode for ThinkingBudgetCriteria
+    cached_special_token_encode,
+)
 from .quantization.one_bit import _quantization_for_path, replace_one_bit_modules
 from .tokenizer_utils import load_tokenizer
 from .trainer.utils import apply_lora_layers
@@ -2127,6 +2130,17 @@ class ThinkingBudgetCriteria:
     forces a closing sequence (e.g. ``\\n</think>``) when budget is exceeded.
     """
 
+    # Fork: __init__'s three `tokenizer.encode(...)` calls (thinking_end_token,
+    # thinking_start_token and "\n") go through
+    # prompt_utils.cached_special_token_encode instead of the raw tokenizer.
+    # Continuous batching shares ONE tokenizer across request threads and this
+    # class is constructed per request, so those raw encodes raced HF's fast
+    # tokenizer and failed with "Already borrowed" (a Rust RefCell
+    # double-borrow) -> HTTP 500. All three arguments are fixed format strings,
+    # never per-request user text, so they are cacheable. Extends 7e3477b,
+    # which routed three sibling call sites through the same helper but not
+    # these. Covered by tests/test_tokenizer_concurrency.py.
+
     def __init__(
         self,
         tokenizer,
@@ -2140,16 +2154,16 @@ class ThinkingBudgetCriteria:
         self.enable_thinking = enable_thinking
 
         # Resolve token IDs from strings
-        self.thinking_end_token_id = tokenizer.encode(
-            thinking_end_token, add_special_tokens=False
+        self.thinking_end_token_id = cached_special_token_encode(
+            tokenizer, thinking_end_token
         )[-1]
 
-        self.thinking_start_token_id = tokenizer.encode(
-            thinking_start_token, add_special_tokens=False
+        self.thinking_start_token_id = cached_special_token_encode(
+            tokenizer, thinking_start_token
         )[-1]
 
         self._forced_sequence: List[int] = []
-        newline_ids = tokenizer.encode("\n", add_special_tokens=False)
+        newline_ids = cached_special_token_encode(tokenizer, "\n")
         if newline_ids:
             self._forced_sequence.append(newline_ids[-1])
         self._forced_sequence.append(self.thinking_end_token_id)
