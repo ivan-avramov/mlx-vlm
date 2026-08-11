@@ -576,6 +576,32 @@ Every check keys on the *existence* of something. This one exists:
 `dev/check_call_arguments.py` now does, and reverting the fix makes it report the site
 and both names outright. See AGENTS.md, "the eighth direction".
 
+**It grew two measures, not one.** The keyword check above is the sharp one — a name
+either arrives or it does not — but it is blind to a purely positional call, where
+`f(a, b, c)` losing `c` has no name to be missing. So each (definition, callee) pair also
+compares **total supplied argument count**, tagged `[arity]`. *Total*, not positional:
+moving an argument between positional and keyword form changes nothing and this fork does
+it freely, and positional-only was measured over the whole tree without adding a single
+true positive. Two rules keep it usable — the **deferred-call idiom is skipped**
+(`asyncio.to_thread(lambda: gen(a, b, c))` against upstream's
+`asyncio.to_thread(gen, a, b, c)` is the same call, and `chat_completions_endpoint` really
+does this), and arity fires **only when the keyword check found nothing** for that pair,
+so one defect is never counted twice. Module-scope calls are covered too, under a
+`<module>` pseudo-definition — measured at zero hits before being added, so the coverage
+was free, and it is a region `check_body_divergence.py`'s `gone` cannot see either.
+
+**An `[arity]` hit is a pointer to a diff, not a conclusion**, because a count cannot say
+*which* argument went. The baseline's two entries are both false positives and both worth
+knowing as shapes: a `[**]` forward that really does supply the names
+(`cli.py::main`'s `basicConfig(**log_kwargs)`), and a fork **extraction**
+(`Qwen3_5Attention::arange` — upstream inlines `mx.arange(cache_offset, cache_offset + L)`
+and `150a76f9` moved it into fork-only `_qwen35_scalar_positions`, so the 2-arg call is
+present and only the enclosing definition changed). Because both baseline entries are
+false positives, the founding-instance proof does not transfer to the arity half, so it
+was validated separately against a real regression: dropping the second argument of
+`mx.tile(position_ids, (3, 1, 1))` in `qwen3_5/language.py` is reported, while **all six
+other gates stay green and `test_models.py` passes**.
+
 ### The marker was false — the fifth one
 
 It claimed all 80 absent upstream lines fell into two named groups, then closed:
