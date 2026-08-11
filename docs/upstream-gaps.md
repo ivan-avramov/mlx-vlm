@@ -32,10 +32,13 @@ missing** while all 21 genuinely-new upstream files arrived normally.
 
 ## Tooling that now guards this
 
-**Six** checks. Five are wired into `.github/workflows/upstream-parity.yml`
+**Ten** checks. Eight are wired into `.github/workflows/upstream-parity.yml`
 (which runs on pushes to `main` too, not just PRs, since this fork is usually
-committed to directly); `find_dropped_hunks.py` stays manual because it is a
-ranked report rather than a pass/fail gate.
+committed to directly); `find_dropped_hunks.py` and `find_untested_fork_code.py`
+stay manual because they are ranked reports rather than pass/fail gates.
+
+**AGENTS.md is authoritative for the current baselines**; the numbers in this
+section have gone stale twice. Read them as history.
 
 | Check | Catches | Baseline file |
 |---|---|---|
@@ -44,9 +47,13 @@ ranked report rather than a pass/fail gate.
 | `dev/check_upstream_deletions.py` | the **reverse**: files/symbols upstream deleted that we kept | `.deletion-exclusions` |
 | `dev/check_fork_markers.py` | fork changes to a shared file that carry no `# Fork:` marker | `.fork-marker-allowlist` |
 | `dev/check_dead_helpers.py` | helpers upstream calls from library code that we reach only from tests | `.dead-helper-exclusions` |
+| `dev/check_body_divergence.py` | divergence that is only ALIGNMENT, not content | `.body-divergence-exclusions` |
+| `dev/check_upstream_registries.py` | dropped dict entries, re-exports, dataclass fields | `.registry-exclusions` |
+| `dev/check_call_arguments.py` | calls passing **fewer keyword arguments** than upstream's | `.call-argument-exclusions` |
 | `dev/find_dropped_hunks.py` | dropped *hunks*, ranked by owning commit (Python **and** docs/config) | — |
+| `dev/find_untested_fork_code.py` | fork-only definitions no test mentions | — |
 
-All five gating checks require a `# reason` on every exclusion and fail if one is
+All eight gating checks require a `# reason` on every exclusion and fail if one is
 missing, and all read the git **index**, so they can gate a commit rather than only
 report on one. `check_upstream_symbols.py` and `check_fork_markers.py` additionally
 warn when an entry no longer excuses anything — a stale exclusion is a hole in the
@@ -64,7 +71,8 @@ python dev/check_dead_helpers.py          # ~10s; dropped call sites
 python dev/find_dropped_hunks.py          # slow; ranked report
 ```
 
-`.symbol-exclusions` currently holds **57 entries**, down from 446 (the mlx-lm
+`.symbol-exclusions` held **57 entries** when this was written and holds **14**
+today, down from 446 (the mlx-lm
 vendoring retired 88, the `test_models.py` take another 57). That number is a
 snapshot of existing divergence, not a defect count: it mixes never-ported upstream
 features, modules this fork deliberately rewrote (`sample_utils`, `apc`, `cache`,
@@ -524,6 +532,86 @@ The coupling was real, though — just the other way round. With `gemma4.py`
 restored and `vision.py` stale, the tests fail `TypeError: VisionModel.__call__()
 takes 2 positional arguments but 3 were given`. Landing the pair together is
 still the rule.
+
+## The eighth direction: a dropped ARGUMENT, and why item 9's closure was a call site short
+
+**Found 2026-08-10 by a cold audit, after every gate had been green for a session.**
+This is the shape to internalise, because it defeated the entire apparatus at full
+strength: seven gating audits green, `.fork-marker-allowlist` empty, all baselines at
+their reviewed values, 3001 tests passing, and the defective site carrying a `# Fork:`
+marker that explicitly asserted completeness.
+
+`generate/dispatch.py::stream_generate` called
+`stream_diffusion_generate_from_kwargs(...)` **without upstream's
+`skip_special_tokens=` and `verbose=`**. The callee, `generate/diffusion.py`, is
+byte-identical to upstream and declares both keyword-only with `= False` defaults, so
+they silently stayed False however the caller set them. `skip_special_tokens` is
+*popped* out of `kwargs` before the branch, so `**kwargs` did not rescue it either.
+
+**Effect:** `--skip-special-tokens` was a **no-op on every diffusion model** (LLaDA2.X,
+diffusion_gemma, nemotron_labs_diffusion). The flag reaches `decode_generated()` in the
+diffusion language models, which decodes *every* streamed token batch — so special
+tokens leaked into user-visible output. `verbose` reaches
+`visualize=bool(verbose or diffusion_show_unmasking)`, so `--verbose` could never
+activate `DiffusionUnmaskingVisualizer` — while `generate()` kept the
+`response.text_already_printed` handling that only that visualizer sets. **The fork was
+internally inconsistent with its own drop, which is the tell that it was a drop and not
+a design.**
+
+### Why nothing saw it
+
+Every check keys on the *existence* of something. This one exists:
+
+- parity — the file is present
+- symbols — the `def` is present
+- deletions — nothing was deleted
+- fork markers — the site is marked (falsely, see below)
+- registries — no module-level container lost an entry
+- body divergence — it *did* surface the line in `gone`, mixed into `stream_generate`'s
+  22 others, all of which are legitimately excused
+- **dead helpers — the near miss, and the instructive one.** It asks whether an
+  upstream-called helper is *reachable* here. It was: it had a caller. **"Called" and
+  "called correctly" are different questions**, and nothing asked the second.
+
+`dev/check_call_arguments.py` now does, and reverting the fix makes it report the site
+and both names outright. See AGENTS.md, "the eighth direction".
+
+### The marker was false — the fifth one
+
+It claimed all 80 absent upstream lines fell into two named groups, then closed:
+
+> `# Everything else upstream does here is still done: ... all appear here at >= upstream's count.`
+
+Two failures in one sentence. It verified the four helpers it *names* and generalised to
+"everything else" — trap #7's "a note naming the symbols it verified present treats
+presence as completion". And it leaned on the identifier-occurrence count, which
+AGENTS.md already calls "strictly weaker" than diffing bodies. The irony is exact:
+`skip_special_tokens` occurs **4 times here against upstream's 5**, so the very
+technique the marker invoked would have caught it had it been applied to that name
+rather than to a hand-picked subset. A tree-wide grep confirmed this was the only
+marker making a count-based completeness claim.
+
+### Item 9 was closed by counting the wrong file
+
+The table's item 9 (`skip_special_tokens`) was marked **"CLOSED 2026-08-10, (a) is
+FIXED"** on the evidence that *"`server/generation.py` now has the same three
+occurrences as upstream in the same shapes"*. That was true, and it is still true — the
+**server** call site is byte-identical to upstream and correctly passes
+`skip_special_tokens=args.skip_special_tokens`.
+
+`29b6c00b` (#1508) has **two** call sites. Only one was counted.
+
+This is precisely the `eda1ec4f` (#1716) shape already recorded in AGENTS.md — *"when a
+commit touches N call sites, count them"* — recurring against the same flag, in the same
+session, on a commit the notes recorded as whole. `29b6c00b` has now been declared
+complete twice and been wrong both times; 10 of its 11 files are byte-identical to
+upstream and the residue was two keyword arguments. **A per-file completeness check
+cannot close a commit whose content is spread across call sites.**
+
+Fixed, with the repro failing before and passing after, and guarded at runtime by
+`tests/test_dropped_upstream_guards.py::TestDiffusionUnification::test_library_diffusion_dispatch_forwards_skip_special_tokens_and_verbose`
+— which was verified to fail against pre-fix `dispatch.py`, not merely to pass against
+the fix (trap #13).
 
 ## The dropped-hunk report has bottomed out — 18 commits, all closed by review
 

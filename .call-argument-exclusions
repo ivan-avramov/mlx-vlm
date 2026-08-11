@@ -1,0 +1,53 @@
+# Baseline for dev/check_call_arguments.py — the dropped-keyword-argument audit.
+#
+# Format: `path_glob::definition_glob::callee_glob  # reason`. Every entry MUST carry
+# a reason; the script refuses to run otherwise. Three fields, not the usual two,
+# because one definition calls many helpers and excusing a whole definition would be
+# far too coarse.
+#
+# What this audit catches: a call that passes FEWER keyword arguments than upstream's
+# call to the same callee. That is **parameter landed, argument dropped**, and it is
+# the one shape all seven other gating checks are blind to by construction — the file
+# is present (parity), the `def` is present (symbols), nothing was deleted
+# (deletions), the hunk's file has its fork sites marked (fork markers), no
+# module-level container lost an entry (registries), and the helper genuinely IS
+# called, which is the specific reason check_dead_helpers.py cannot see it. "Called"
+# and "called correctly" are different questions.
+#
+# The instance it was written for (2026-08-10): `generate/dispatch.py::stream_generate`
+# called `stream_diffusion_generate_from_kwargs(...)` without upstream's
+# `skip_special_tokens=` and `verbose=`. Both keyword-only with `= False` defaults, and
+# `skip_special_tokens` was *popped* out of `kwargs` first so `**kwargs` did not
+# rescue it. `--skip-special-tokens` was therefore a no-op on every diffusion model —
+# it reaches the `decode_generated()` that decodes every streamed token batch. Seven
+# green audits, 3001 green tests, and a `# Fork:` marker asserting "everything else
+# upstream does here is still done".
+#
+# It compares NAMES, never VALUES — the same rule as check_upstream_registries.py.
+# `make_cache=_make_cache` against `make_cache=functools.partial(_make_cache, ...)` is
+# a fork enhancement, not a drop. A wrong value is check_body_divergence.py's job.
+# And it reads asymmetrically: `ours < upstream` is the signal, `ours > upstream` is
+# fork work and stays silent.
+#
+# THE TRAP, the same one as .fork-marker-allowlist and .body-divergence-exclusions:
+# do not excuse a hit by asserting it is deliberate. Establish provenance first —
+# `git log -S'<name>=' -- <path>` — then say what you established. An excused hit is
+# invisible to every later audit, which is exactly what let the founding instance
+# survive behind a marker that claimed completeness.
+#
+# `[**]` on a hit means OUR call forwards `**something`, so the name may still arrive
+# through the dict. Those are reported rather than filtered on purpose: the founding
+# bug is adjacent to that shape (its callee takes a `kwargs` dict positionally), and a
+# check that goes quiet where the answer is hard is the failure mode dev/ exists to
+# prevent. Confirm which dict, and say so in the reason.
+#
+# Positional arity is deliberately not compared — the fork reorders and rewrites call
+# sites freely, and every experiment produced noise without finding anything the
+# keyword comparison missed.
+#
+# Validated to fire before being trusted: reverting the dispatch.py fix makes it
+# report 2 hits and exit 1, naming both dropped kwargs and the exact call site;
+# restoring it drops back to 1. Scoped to files that differ from upstream (a
+# byte-identical file cannot have this defect), which is what keeps it at ~30s.
+
+mlx_vlm/server/cli.py::main::basicConfig  # REVIEWED 2026-08-10: `[**]` false positive, and the reason the tag exists. Upstream passes `level=` and `format=` to logging.basicConfig as literals; the fork builds a `log_kwargs` dict with BOTH of those exact keys (cli.py:533-535) and calls `basicConfig(**log_kwargs)`, so nothing is dropped. It builds a dict precisely because the fork added --log-file / MLX_VLM_LOG_FILE, which selects between `stream=sys.stdout` and `filename=`; you cannot express that with fixed literals. Confirmed by reading the site, not by trusting the tag.

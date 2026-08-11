@@ -26,10 +26,12 @@ git fetch upstream && git log --oneline HEAD..upstream/main   # MUST be empty; m
 .venv/bin/python dev/check_fork_markers.py
 .venv/bin/python dev/check_body_divergence.py        # ~3s
 .venv/bin/python dev/check_upstream_registries.py    # ~13s
+.venv/bin/python dev/check_call_arguments.py         # ~30s
 
 grep -cE '^mlx_vlm' .symbol-exclusions .deletion-exclusions .fork-marker-allowlist \
-    .dead-helper-exclusions .body-divergence-exclusions .registry-exclusions
-# expect 14, 0, 0, 0, 0, 5 — see "Exclusion baselines" below
+    .dead-helper-exclusions .body-divergence-exclusions .registry-exclusions \
+    .call-argument-exclusions
+# expect 14, 0, 0, 0, 0, 5, 1 — see "Exclusion baselines" below
 grep -cE '^mlx_vlm.*# baseline: pre-existing divergence, unreviewed' .symbol-exclusions
 # expect 0 — every remaining exclusion carries a real reason
 ```
@@ -39,7 +41,7 @@ The pytest `cd` **must** be in a subshell as written. After any bare `cd mlx_vlm
 
 ### Exclusion baselines
 
-Seven gating audits, each with its own reviewed baseline. **These are the progress
+Eight gating audits, each with its own reviewed baseline. **These are the progress
 signal, not any report's count.**
 
 | file | baseline | meaning |
@@ -50,6 +52,7 @@ signal, not any report's count.**
 | `.dead-helper-exclusions` | **0** | upstream-called helpers unreachable here |
 | `.body-divergence-exclusions` | **0** | misalignments claimed deliberate |
 | `.registry-exclusions` | **5** | re-exports the fork replaced, all reviewed |
+| `.call-argument-exclusions` | **1** | calls passing fewer kwargs, reviewed (one `[**]`) |
 
 An empty file is **not** a reason to delete it — each keeps its header and RESOLVED
 notes, and the next merge that adds a fork hunk to a shared file will need an entry.
@@ -75,7 +78,7 @@ silently dropped content — came out of resolving large accumulations, because:
 
 - A 90-commit merge produces a resolution nobody can review hunk by hunk, and an
   unreviewable resolution is where content gets dropped without a conflict.
-- The six audits below only work **if they run**. They are cheap after a
+- The eight audits below only work **if they run**. They are cheap after a
   five-commit merge and psychologically skippable after a ninety-commit one.
 - A dropped hunk is unrecoverable by any later merge (see the failure mode
   below), so the cost of a bad resolution is permanent, while the cost of merging
@@ -97,6 +100,7 @@ python dev/check_fork_markers.py        # every fork hunk in a shared file is ma
 python dev/check_dead_helpers.py        # no upstream-called helper left unreachable
 python dev/check_body_divergence.py     # no divergence that is only ALIGNMENT
 python dev/check_upstream_registries.py # no registry entry / re-export / field dropped
+python dev/check_call_arguments.py      # no call passing fewer kwargs than upstream
 python dev/check_body_divergence.py --summary   # then size what conflicted
 python dev/check_body_divergence.py --sweep     # then re-review the markers
 python dev/find_untested_fork_code.py   # fork-only code no test mentions (non-gating)
@@ -117,7 +121,7 @@ commit that mostly removes code (`29b6c00b`) shows only its insertions and
 closed while still listed**, because attribution is by line content — the exclusion
 baselines, not the commit count, are the progress signal.
 
-**Run all nine checks after every merge — this is not optional.** Seven of them gate
+**Run all ten checks after every merge — this is not optional.** Eight of them gate
 (they exit non-zero and CI runs them); `find_dropped_hunks.py` and
 `find_untested_fork_code.py` are lead generators and do not. When a merge
 resolution drops content from a commit that upstream already merged, that commit
@@ -154,10 +158,17 @@ or renames a symbol A -> B and the resolution drops the B half, we keep A.
 as *kept*, and nothing connects the two halves of one event. Three examples, all
 real:
 
-- `server/app.py`'s `_as_plain_dict`, `_request_field_or_default` and
-  `_model_config_field_or_default` are defined **twice** in this tree — here, and
-  in `server/request_normalization.py`, which is where upstream moved them
-  (#1644). Upstream has only the latter. That is *why* that module is orphaned.
+- **[resolved 2026-08-09 by `08723a3f`; kept because the SHAPE is the lesson]**
+  `server/app.py` used to define `_as_plain_dict`, `_request_field_or_default` and
+  `_model_config_field_or_default` a second time, duplicating
+  `server/request_normalization.py`, which is where upstream moved them (#1644).
+  Upstream has only the latter, and carrying both is *why* that module sat
+  orphaned. `app.py` now imports it (`app.py:29`) and delegates
+  (`app.py:60,173,227,239`), guarded by
+  `test_dropped_upstream_guards.py::test_app_delegates_to_the_request_normalization_module`.
+  Do not "converge" the `_as_plain_dict` pair that remains in
+  `request_normalization.py` + `responses_state.py`: **upstream defines it in both
+  of those files too**, so that duplication is parity, not drift.
 - `utils.py::apply_forced_token` was renamed to `pop_forced_token_id` with a
   changed contract (`(next_y) -> mx.array` became `() -> Optional[int]`). We had
   the old name; seven `.symbol-exclusions` entries excused the "missing" new one.
@@ -527,7 +538,7 @@ look covered while nothing covered it.
 ### The seventh direction: who protects the FORK's own code?
 
 Every direction above compares against `upstream/main`. That means **fork-only code is
-invisible to all seven gating checks by construction** — no upstream copy to diff, no
+invisible to all eight gating checks by construction** — no upstream copy to diff, no
 upstream symbol to miss, no upstream hunk to drop, no marker to demand. The whole
 apparatus protects the upstream content this fork carries. Nothing protected the fork's
 own ~800 commits.
@@ -586,6 +597,66 @@ another module had left `runtime.response_generator` set, so the branch was exec
 accident and asserted by nobody. A whole-suite number flatters an individual file; when a
 definition matters, re-run coverage over its own test file.
 
+### The eighth direction: is the call passing everything upstream passes?
+
+Every direction above asks whether something **exists** — a file, a `def`, a deletion,
+a hunk, a registry entry, a body, a caller. None can see a call that exists, is
+reached, and passes **fewer keyword arguments** than upstream's:
+
+    upstream adds a parameter AND passes it at N call sites -> our merge applies the
+    callee's file byte-identically and applies M < N of the call sites -> the
+    parameter exists, is keyword-only with a default, is documented, is unit-tested
+    through the callee, and is silently never supplied
+
+`dev/check_call_arguments.py` is that check. **`check_dead_helpers.py` is the near
+miss, and understanding why matters:** it asks whether an upstream-called helper is
+*reachable* here. The founding instance was reachable — it had a caller. *Called* and
+*called correctly* are different questions, and only this script asks the second.
+
+The instance it was written for (2026-08-10, found during a cold audit):
+`generate/dispatch.py::stream_generate` called
+`stream_diffusion_generate_from_kwargs(...)` without upstream's
+`skip_special_tokens=` and `verbose=`. Both keyword-only with `= False` defaults, and
+`skip_special_tokens` is *popped* out of `kwargs` first, so `**kwargs` did not rescue
+it either. `--skip-special-tokens` was therefore a **no-op on every diffusion model** —
+it reaches the `decode_generated()` that decodes every streamed token batch. All seven
+other audits green, 3001 tests green, `.fork-marker-allowlist` empty, and the site
+carried a `# Fork:` marker asserting *"everything else upstream does here is still
+done"*. It was the second half of `29b6c00b` (#1508), whose *other* call site had been
+restored a session earlier — the `eda1ec4f` shape: **when a commit touches N call
+sites, count them.**
+
+```bash
+python dev/check_call_arguments.py                # the gate, ~30s
+python dev/check_call_arguments.py --file <path>  # one file, verbose
+python dev/check_call_arguments.py --summary      # rank files by hits
+```
+
+Three design rules, each paid for by a false positive in an earlier draft:
+
+- **Names, never values** — the same rule as `check_upstream_registries.py`.
+  `make_cache=_make_cache` vs `make_cache=functools.partial(_make_cache, ...)` is a
+  fork enhancement. A wrong *value* is `check_body_divergence.py --file`'s job.
+- **Read it asymmetrically**, like `find_untested_fork_code.py`'s `tests` column:
+  `ours < upstream` is the only direction worth chasing. `ours > upstream` is fork
+  work and stays silent, or `_make_cache`'s prealloc kwargs would report forever.
+- **Positional arity is not compared.** The fork reorders call sites freely and every
+  experiment produced noise without finding anything the keyword comparison missed.
+
+**`[**]` means our call forwards `**something`, so the name may still arrive through
+the dict.** Those are tagged and still gate rather than being filtered — the founding
+bug is *adjacent* to that shape (its callee takes a `kwargs` dict positionally), and a
+check that goes quiet where the answer is hard is the failure mode `dev/` exists to
+prevent. The single baseline entry is one of these: `server/cli.py::main` really does
+supply `level=` and `format=` via `basicConfig(**log_kwargs)`. Confirm which dict, and
+say so in the reason.
+
+Scoped to files that differ from upstream — a byte-identical file cannot have this
+defect — which is what keeps it at ~30s instead of >5min.
+`mlx_vlm/tests/test_call_argument_check.py` pins it, per the rule that **every new
+gating script needs one**: a bug making one of these checks *more permissive* fails
+nothing and still prints OK.
+
 ## The one rule that matters most
 
 **Never conclude anything about a divergence from a `git diff --numstat` line
@@ -634,7 +705,7 @@ positives. Every hit still needs `git log -S` and a read.
 cd mlx_vlm/ && pytest -s ./tests --ignore=tests/test_smoke.py
 ```
 
-The suite is **green: 3001 passed, 5 skipped, 0 failed.** Keep it that way. (This
+The suite is **green: 3023 passed, 5 skipped, 0 failed.** Keep it that way. (This
 line goes stale on every restore that adds a guard — trust the run, not the number.)
 
 **Compare failing test IDs, not counts.** A change that fixes one test and breaks
@@ -887,7 +958,7 @@ fallback and by two test files.
   file had failures). Because it is PR-only, pushes straight to `main` are never
   style-checked — which is how style drift went unnoticed.
 - `upstream-parity.yml` — runs on pushes to `main` as well as PRs, since this fork
-  is usually committed to directly. Runs the seven gating audit scripts.
+  is usually committed to directly. Runs the eight gating audit scripts.
 
 ## Key dependencies
 
