@@ -690,8 +690,12 @@ prevent. The single baseline entry is one of these: `server/cli.py::main` really
 supply `level=` and `format=` via `basicConfig(**log_kwargs)`. Confirm which dict, and
 say so in the reason.
 
-Scoped to files that differ from upstream — a byte-identical file cannot have this
-defect — which is what keeps it at ~30s instead of >5min.
+It covers module-scope calls too, filed under `<module>` — a registration or
+middleware call (`app.add_middleware(...)`) is exactly the shape that loses a keyword
+in a merge, and `check_body_divergence.py`'s `gone` cannot see module scope either, so
+nothing else would cover it. Added after measuring that it reports zero hits tree-wide,
+so the coverage was free. Scoped to files that differ from upstream — a byte-identical
+file cannot have this defect — which is what keeps it at ~30s instead of >5min.
 `mlx_vlm/tests/test_call_argument_check.py` pins it, per the rule that **every new
 gating script needs one**: a bug making one of these checks *more permissive* fails
 nothing and still prints OK.
@@ -780,7 +784,7 @@ positives. Every hit still needs `git log -S` and a read.
 cd mlx_vlm/ && pytest -s ./tests --ignore=tests/test_smoke.py
 ```
 
-The suite is **green: 3023 passed, 5 skipped, 0 failed.** Keep it that way. (This
+The suite is **green: 3028 passed, 5 skipped, 0 failed.** Keep it that way. (This
 line goes stale on every restore that adds a guard — trust the run, not the number.)
 
 **Compare failing test IDs, not counts.** A change that fixes one test and breaks

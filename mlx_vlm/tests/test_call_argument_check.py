@@ -187,6 +187,50 @@ class TestStarForwardingIsTaggedNotFiltered:
         assert finding[2] == frozenset({"format"})
 
 
+class TestModuleScopeIsCovered:
+    """Module-scope calls, filed under `<module>`.
+
+    Omitted from the first draft, which would have left a real hole: a registration or
+    middleware call at module scope (`app.add_middleware(...)`) is exactly the shape
+    that loses a keyword in a merge, and `check_body_divergence.py`'s `gone` cannot see
+    module scope either — so nothing at all would have covered it. Measured before
+    adding: zero hits tree-wide, so the coverage was free.
+    """
+
+    def test_a_dropped_kwarg_at_module_scope_is_reported(self, cca):
+        up = "app.add_middleware(CORS, allow_origins=['*'], allow_headers=['x'])\n"
+        ours = "app.add_middleware(CORS, allow_origins=['*'])\n"
+        (finding,) = _findings(cca, up, ours)
+        assert finding[0] == cca.MODULE_SCOPE
+        assert finding[2] == frozenset({"allow_headers"})
+
+    def test_module_scope_is_filed_under_a_non_identifier(self, cca):
+        """So it cannot collide with a real definition named `module`."""
+        assert not cca.MODULE_SCOPE.isidentifier()
+
+    def test_module_scope_calls_are_unioned_across_statements(self, cca):
+        """Two statements at module scope are one scope, not two.
+
+        Collected per-statement then merged, so a name passed at one site must excuse
+        the other — the same union rule as multiple call sites inside a definition.
+        """
+        up = "g(a=1)\ng(b=2)\n"
+        ours = "g(b=2)\ng(a=1)\n"
+        assert _findings(cca, up, ours) == []
+
+    def test_a_file_with_no_module_level_statements_has_no_module_entry(self, cca):
+        """Avoids a spurious empty `<module>` row on a pure definitions file."""
+        sites = cca.CallSites("def f():\n    pass\n")
+        assert cca.MODULE_SCOPE not in sites.by_definition
+
+    def test_definition_scope_and_module_scope_do_not_bleed(self, cca):
+        """A kwarg passed inside a function must not excuse the module-scope call."""
+        up = "g(a=1)\n\n\ndef f():\n    g(a=1)\n"
+        ours = "g()\n\n\ndef f():\n    g(a=1)\n"
+        (finding,) = _findings(cca, up, ours)
+        assert finding[0] == cca.MODULE_SCOPE
+
+
 class TestCalleeNameResolution:
     def test_plain_and_dotted_callees_both_resolve_to_the_simple_name(self, cca):
         import ast

@@ -32,11 +32,11 @@ were green, the full suite was green (3001 passed), and the site carried a
 
 ## What it compares, and the asymmetry that makes it usable
 
-For each `def`/`class` **both trees define** in a **shared file**, it collects
-every call inside it, keyed by callee simple name (`f(...)` -> `f`,
-`a.b.f(...)` -> `f`), and unions the keyword names passed to that callee across
-all its call sites in that definition. It then reports where **ours is a strict
-subset of upstream's**.
+For each `def`/`class` **both trees define** in a **shared file**, plus the file's
+module scope (filed under `<module>`), it collects every call inside it, keyed by
+callee simple name (`f(...)` -> `f`, `a.b.f(...)` -> `f`), and unions the keyword
+names passed to that callee across all its call sites in that definition. It then
+reports where **ours is a strict subset of upstream's**.
 
 Reading it asymmetrically is the whole design, and it is the same rule
 `find_untested_fork_code.py` states for its `tests` column:
@@ -88,6 +88,12 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EXCLUSIONS_FILE = REPO_ROOT / ".call-argument-exclusions"
 
+# The pseudo-definition module-scope calls are filed under, so an exclusion can name
+# them. Not a legal Python identifier, so it cannot collide with a real definition;
+# `path::*::callee` still covers it, which is intended. Same trick as
+# check_body_divergence.py's `<file>`.
+MODULE_SCOPE = "<module>"
+
 
 def git(*args: str) -> str:
     return subprocess.run(
@@ -112,14 +118,34 @@ def callee_name(node: ast.expr) -> str | None:
 
 
 class CallSites:
-    """Per-definition map {callee: (kwarg names, uses ** forwarding)} for one file."""
+    """Per-definition map {callee: (kwarg names, uses ** forwarding)} for one file.
+
+    Module-scope calls are collected too, under the pseudo-definition
+    `MODULE_SCOPE` -- `check_body_divergence.py`'s `<file>` convention, and not a legal
+    Python identifier so it cannot collide with a real name. They were omitted in the
+    first draft, which would have left a real hole: a registration or middleware call
+    at module scope (`app.add_middleware(...)`) is exactly the shape that loses a
+    keyword in a merge, and `check_body_divergence.py`'s `gone` cannot see module scope
+    either. Measured before adding: it reports ZERO hits across the tree, so the
+    coverage was free.
+    """
 
     def __init__(self, source: str) -> None:
         self.tree = ast.parse(source)
         self.by_definition: dict[str, dict[str, tuple[set[str], bool]]] = {}
+        module_level: list[ast.stmt] = []
         for node in self.tree.body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 self.by_definition[node.name] = self._collect(node)
+            else:
+                module_level.append(node)
+        if module_level:
+            merged: dict[str, tuple[set[str], bool]] = {}
+            for stmt in module_level:
+                for callee, (names, star) in self._collect(stmt).items():
+                    have, had_star = merged.get(callee, (set(), False))
+                    merged[callee] = (have | names, had_star or star)
+            self.by_definition[MODULE_SCOPE] = merged
 
     @staticmethod
     def _collect(defn: ast.AST) -> dict[str, tuple[set[str], bool]]:
