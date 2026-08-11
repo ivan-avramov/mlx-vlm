@@ -724,11 +724,22 @@ def stream_generate(
     #     The replacement is a strict superset — see the comment at the
     #     `thinking_budget` block below and prompt_utils.THINKING_FORMATS.
     #
-    # Everything else upstream does here is still done: the vision-feature cache,
-    # the APC media-safe-prefix helpers (`multimodal_token_ids_from_config`,
-    # `media_safe_prefix_min`, `prefix_leaves_text_only_suffix`,
-    # `prefix_contains_media_tokens`) and `prompt_cache_state.update` all appear
-    # here at >= upstream's count.
+    # Individually verified as still done, by reading the sites: the
+    # vision-feature cache, the APC media-safe-prefix helpers
+    # (`multimodal_token_ids_from_config`, `media_safe_prefix_min`,
+    # `prefix_leaves_text_only_suffix`, `prefix_contains_media_tokens`) and
+    # `prompt_cache_state.update`.
+    #
+    # This marker used to close with "everything else upstream does here is still
+    # done ... all appear here at >= upstream's count", and that claim was FALSE.
+    # An occurrence count over the symbols a marker happens to name says nothing
+    # about the ones it does not: the diffusion dispatch below had silently
+    # dropped upstream's `skip_special_tokens=` and `verbose=` kwargs, so
+    # --skip-special-tokens was a no-op on every diffusion model while this
+    # comment asserted completeness. Both gates, all seven audits and the whole
+    # suite stayed green, because a helper that is present, imported, called and
+    # unit-tested but called with FEWER ARGUMENTS is invisible to all of them.
+    # Do not restore a blanket "everything else" claim here; per-site or nothing.
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
     verbose = kwargs.pop("verbose", False)
 
@@ -882,6 +893,8 @@ def stream_generate(
             mask,
             skip_special_token_ids,
             kwargs,
+            skip_special_tokens=skip_special_tokens,
+            verbose=verbose,
         )
         return
 

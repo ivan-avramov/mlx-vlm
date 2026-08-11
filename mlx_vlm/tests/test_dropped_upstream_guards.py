@@ -661,9 +661,17 @@ class TestDiffusionUnification:
     The commit landed in six of its eleven files, which is what made it invisible:
     `generate/diffusion.py` is byte-identical to upstream, so
     `stream_diffusion_generate_from_kwargs` and the whole unified engine were
-    present and even called from `generate/dispatch.py`. Only the *server* call
-    site was dropped, and `check_dead_helpers.py` cannot see that because the
+    present and even called from `generate/dispatch.py`. The *server* call site
+    was dropped outright, and `check_dead_helpers.py` cannot see that because the
     helper does have a caller.
+
+    **[2026-08-10] This docstring used to end "Only the *server* call site was
+    dropped." That was wrong, and it is why the second half survived another
+    session.** The commit has TWO call sites and the `generate/dispatch.py` one
+    was also incomplete — present, reached, but invoked with FEWER ARGUMENTS than
+    upstream passes. Count the call sites, do not trust that one of them is fine
+    because the other was fixed; see
+    `test_library_diffusion_dispatch_forwards_skip_special_tokens_and_verbose`.
 
     What made it a live bug rather than dead code: the fork kept
     `_run_diffusion(family)` routing to `_generate_diffusion` when
@@ -810,6 +818,104 @@ class TestDiffusionUnification:
         (chunk,) = list(_DiffusionBlockEmitter().feed(result))
         assert chunk.generation_tps == 4.0
         assert chunk.text == "hello"
+
+    def test_library_diffusion_dispatch_forwards_skip_special_tokens_and_verbose(
+        self, monkeypatch
+    ):
+        """The commit's second call site: `generate/dispatch.py`.
+
+        `stream_diffusion_generate_from_kwargs` declares `skip_special_tokens` and
+        `verbose` keyword-only with `= False` defaults. `stream_generate` popped
+        both out of `kwargs` and then forwarded neither, so they silently stayed
+        False however the caller set them -- and because they were *popped*,
+        `**kwargs` did not rescue them either.
+
+        Not cosmetic: `skip_special_tokens` reaches `decode_generated()` in the
+        diffusion language models, which decodes EVERY streamed token batch, so
+        `--skip-special-tokens` was a no-op on LLaDA2.X, diffusion_gemma and
+        nemotron_labs_diffusion alike. `verbose` reaches
+        `visualize=bool(verbose or diffusion_show_unmasking)`, so `--verbose`
+        could never activate `DiffusionUnmaskingVisualizer` -- while `generate()`
+        kept the `response.text_already_printed` handling that only that
+        visualizer sets, making the fork internally inconsistent with its own drop.
+
+        Runtime, not source-inspected: a dropped keyword argument is invisible to
+        all seven gating audits (the file is present, the def is present, nothing
+        was deleted, the helper IS called, no registry entry moved), so this
+        assertion is the only thing standing between the fix and a silent
+        regression.
+        """
+        import types
+
+        import mlx.core as mx
+
+        from mlx_vlm.generate import dispatch
+
+        captured = {}
+
+        def fake_helper(
+            model,
+            processor,
+            tokenizer,
+            input_ids,
+            pixel_values,
+            mask,
+            skip_special_token_ids,
+            kwargs,
+            *,
+            skip_special_tokens=False,
+            verbose=False,
+            on_result=None,
+        ):
+            captured["skip_special_tokens"] = skip_special_tokens
+            captured["verbose"] = verbose
+            captured["skip_special_token_ids"] = skip_special_token_ids
+            return iter(())
+
+        monkeypatch.setattr(dispatch, "is_diffusion_model", lambda model, kwargs: True)
+        monkeypatch.setattr(
+            dispatch, "stream_diffusion_generate_from_kwargs", fake_helper
+        )
+
+        class Tok:
+            all_special_ids = [1, 2, 3]
+
+            def decode(self, *a, **k):
+                return ""
+
+            def encode(self, s, **k):
+                return [0]
+
+        class Proc:
+            tokenizer = Tok()
+
+        config = types.SimpleNamespace(
+            model_type="llada2_moe", image_token_index=None, eos_token_id=0
+        )
+        model = types.SimpleNamespace(config=config, language_model=None)
+
+        list(
+            dispatch.stream_generate(
+                model,
+                Proc(),
+                "hello",
+                input_ids=mx.array([[5, 6, 7]]),
+                skip_special_tokens=True,
+                verbose=True,
+            )
+        )
+
+        assert captured["skip_special_tokens"] is True, (
+            "stream_generate dropped skip_special_tokens on the diffusion path; "
+            "special tokens leak into every diffusion model's output"
+        )
+        assert captured["verbose"] is True, (
+            "stream_generate dropped verbose on the diffusion path; the unmasking "
+            "visualizer can never activate"
+        )
+        # The positional companion was always passed -- kept here so a future
+        # refactor cannot quietly trade one for the other.
+        assert captured["skip_special_token_ids"] == {1, 2, 3}
 
 
 class TestApcCallSitesFromTheAdapterRefactor:
