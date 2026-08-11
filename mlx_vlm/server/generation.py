@@ -871,6 +871,16 @@ def _build_metrics_envelope(
         "reasoning_tokens": max(0, int(generated_tokens) - int(completion_tokens)),
         "total_tokens": int(prompt_tokens) + int(completion_tokens),
         "prompt_eval_time_s": prompt_eval_time_s,
+        # Fork note for benchmark tables: on a prefix-cache HIT this is an
+        # EFFECTIVE rate, not a hardware one. ``prompt_tps`` comes from
+        # ``generate/dispatch.py``, which divides the whole logical prompt
+        # (reused prefix + suffix) by the time spent prefilling the suffix only,
+        # so a 91%-reused prompt reports ~10x the achievable throughput. That is
+        # upstream's definition and it is the same on every path, so it is
+        # consistent rather than wrong -- but the honest prefill COST on a cache
+        # hit is ``prompt_eval_time_s`` (which inverts it back to real elapsed
+        # seconds) or ``ttft_s``, not this rate. Cross-check ``cached_tokens``
+        # before quoting it.
         "prefill_tok_s": prompt_tps,
         "ttft_s": ttft_s,
         "decode_elapsed_s": decode_elapsed_s,
@@ -1230,6 +1240,12 @@ class _DiffusionBlockEmitter:
                 peak_memory=result.peak_memory,
                 prompt_tps=result.prompt_tps,
                 generation_tps=result.generation_tps,
+                # Fork: 0 at the source today -- the diffusion engine has no
+                # prefix reuse, so nothing sets this on its results. Copied
+                # across anyway so the conversion is total: the cached-session
+                # path shipped ``cached_tokens=0`` to clients for months
+                # precisely because one field was left to its default here.
+                cached_tokens=getattr(result, "cached_tokens", 0) or 0,
                 token_count=token_count,
             )
             self.block_text = []
@@ -1803,6 +1819,32 @@ class ResponseGenerator:
                     except (IndexError, TypeError, AttributeError):
                         lp_scalar = 0.0
 
+                # Fork: copy the measurements the chunk carries onto the token.
+                # ``GenerationMetrics.record_result`` is duck-typed and reads
+                # these off whatever it is handed, so a field omitted here is
+                # not an error -- it silently takes StreamingToken's default,
+                # and the default is indistinguishable from a real measurement:
+                #   cached_tokens -> 0, reported to clients as
+                #     ``usage.prompt_tokens_details.cached_tokens`` == "no prefix
+                #     reused", on the one path where reuse actually happens;
+                #   prompt_tps -> None, which the metrics envelope has no
+                #     fallback for, so it logged ``prefill=0.0 tok/s`` for every
+                #     cached request including cold ones.
+                # ``generation_tps`` is dispatch's decode-only rate (its ``tic``
+                # is reset after prefill), so passing it makes this path report
+                # the same measurement the inline ``backend=generate`` path does.
+                # ``emitted_at`` stamps production time; without it
+                # ``record_chunk`` timestamps at CONSUMPTION, charging the async
+                # queue hand-off to decode. Same ``time.perf_counter`` clock as
+                # the endpoints' ``request_start``, so the two are comparable.
+                # ``getattr`` rather than attribute access because this
+                # conversion is duck-typed by design (``record_result`` reads its
+                # own inputs the same way) and several tests drive it with
+                # minimal chunk stand-ins; a real ``GenerationResult`` always
+                # carries all four. Note this is NOT the defaulting that caused
+                # the bug -- that was omitting the keyword entirely, so a present
+                # value could never arrive. tests/test_cached_tokens_reporting.py
+                # asserts each field's real value reaches the response body.
                 rqueue.put(
                     StreamingToken(
                         text=chunk.text,
@@ -1810,6 +1852,10 @@ class ResponseGenerator:
                         logprobs=lp_scalar,
                         finish_reason=chunk.finish_reason,
                         peak_memory=chunk.peak_memory,
+                        prompt_tps=getattr(chunk, "prompt_tps", None),
+                        generation_tps=getattr(chunk, "generation_tps", None),
+                        cached_tokens=getattr(chunk, "cached_tokens", 0) or 0,
+                        emitted_at=time.perf_counter(),
                     )
                 )
 
@@ -2823,6 +2869,17 @@ class ResponseGenerator:
                         if prompt_tokens > 0 and prompt_elapsed > 0
                         else None
                     )
+                    # cached_tokens is hardcoded 0, and the StreamingToken sites
+                    # below likewise leave it at its default, DELIBERATELY: this
+                    # loop builds a fresh cache per batch via
+                    # make_speculative_prompt_cache and never consults
+                    # request.prompt_cache_state, so no prefix reuse can occur
+                    # here and 0 is the truthful figure rather than a dropped
+                    # measurement. (That a chat-id'd request routed here reuses
+                    # nothing AT ALL is a separate pre-existing limitation of the
+                    # non-suffix drafter paths, not a reporting bug.)
+                    # tests/test_cached_tokens_reporting.py pins this exemption
+                    # and fails if the loop ever gains prompt_cache_state.
                     logger.info(
                         "Prefill completed: request=%s prompt_tokens=%d "
                         "cached_tokens=0 elapsed=%.3fs rate=%.1f tok/s",
