@@ -32,11 +32,12 @@ from ..prompt_utils import (  # Fork: THINKING_FORMATS / detect_thinking_format 
 )
 from ..tool_parsers import _infer_tool_parser_from_processor, load_tool_module
 from ..utils import prepare_inputs, sanitize_strict_json  # Fork: sanitize_strict_json
-from .generation import (
+from .generation import (  # Fork: resolve_backend_label is fork-only — it reports the generation path that RAN
     GenerationMetrics,
     PromptTooLongError,
     _build_metrics_envelope,
     _count_prompt_tokens,
+    resolve_backend_label,
 )
 from .responses_state import (  # Fork: _CONTENT_MARKERS is fork-only (08723a3f's marker-set union); Fork: _step_thinking_state is fork-only — the positional opener scan that replaces upstream's ThinkingStreamState.feed on the streaming chat path
     _CONTENT_MARKERS,
@@ -1686,11 +1687,17 @@ async def responses_endpoint(request: Request):
                         endpoint="/responses",
                         model=openai_request.model,
                         stream=True,
+                        # Fork: upstream infers the label from
+                        # `runtime.response_generator is not None`, which is
+                        # true for the whole process lifetime once a model is
+                        # loaded and so says nothing about this request. The
+                        # worker stamps the path it actually took onto ctx.
                         backend=(
-                            "continuous_batching"
+                            resolve_backend_label(ctx)
                             if runtime.response_generator is not None
                             else "generate"
                         ),
+                        cached_tokens=metrics.cached_tokens,
                         prompt_tokens=usage_stats["input_tokens"],
                         completion_tokens=usage_stats["output_tokens"],
                         generated_tokens=usage_stats["output_tokens"],
@@ -1802,7 +1809,17 @@ async def responses_endpoint(request: Request):
                             ti.close()
                         except Exception:
                             pass
-                        return ctx_.prompt_tokens, text, ot, fr, metrics
+                        # Fork: the trailing element is the path the GPU worker
+                        # actually took. ctx_ is local to this closure, so the
+                        # label has to ride out with the rest of the results.
+                        return (
+                            ctx_.prompt_tokens,
+                            text,
+                            ot,
+                            fr,
+                            metrics,
+                            resolve_backend_label(ctx_),
+                        )
 
                     (
                         prompt_tokens,
@@ -1810,6 +1827,7 @@ async def responses_endpoint(request: Request):
                         output_tokens,
                         finish_reason,
                         metrics,
+                        backend,
                     ) = await asyncio.to_thread(_blocking_resp)
                 else:
                     result = generate(
@@ -1828,6 +1846,9 @@ async def responses_endpoint(request: Request):
                     output_tokens = result.generation_tokens
                     metrics.record_result(result)
                     finish_reason = getattr(result, "finish_reason", None) or "stop"
+                    # Fork: no daemon ran this request; the endpoint called
+                    # generate() itself.
+                    backend = "generate"
 
                 mx.clear_cache()
                 gc.collect()
@@ -1890,11 +1911,11 @@ async def responses_endpoint(request: Request):
                     endpoint="/responses",
                     model=openai_request.model,
                     stream=False,
-                    backend=(
-                        "continuous_batching"
-                        if runtime.response_generator is not None
-                        else "generate"
-                    ),
+                    # Fork: threaded out of the blocking closure above rather
+                    # than inferred from `runtime.response_generator is not
+                    # None`, which only says a daemon is loaded.
+                    backend=backend,
+                    cached_tokens=metrics.cached_tokens,
                     prompt_tokens=prompt_tokens,
                     completion_tokens=output_tokens,
                     generated_tokens=output_tokens,
@@ -2440,11 +2461,20 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         endpoint="/chat/completions",
                         model=request.model,
                         stream=True,
+                        # Fork: this is the site the bug was reported against.
+                        # `runtime.response_generator is not None` is true for
+                        # the whole process lifetime, so every request routed to
+                        # the serial cached-session path was labelled
+                        # "continuous_batching". ctx carries the real path, and
+                        # session_id + cached_tokens say whether the
+                        # serialization bought any prefix reuse.
                         backend=(
-                            "continuous_batching"
+                            resolve_backend_label(ctx)
                             if runtime.response_generator is not None
                             else "generate"
                         ),
+                        session_id=chat_id,
+                        cached_tokens=metrics.cached_tokens,
                         prompt_tokens=(
                             ctx.prompt_tokens
                             if runtime.response_generator is not None
@@ -2576,7 +2606,18 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             token_iter.close()
                         except Exception:
                             pass
-                        return pt, text, gt, fr, metrics, logprobs
+                        # Fork: the trailing element is the path the GPU worker
+                        # actually took. ctx is local to this closure, so the
+                        # label has to ride out with the rest of the results.
+                        return (
+                            pt,
+                            text,
+                            gt,
+                            fr,
+                            metrics,
+                            logprobs,
+                            resolve_backend_label(ctx),
+                        )
 
                     (
                         prompt_tokens,
@@ -2585,6 +2626,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         finish_reason,
                         metrics,
                         collected_logprobs,
+                        backend,
                     ) = await asyncio.to_thread(_blocking_generate)
                 else:
                     gen_result = generate(
@@ -2605,6 +2647,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     output_tokens = gen_result.generation_tokens
                     metrics.record_result(gen_result)
                     finish_reason = getattr(gen_result, "finish_reason", None) or "stop"
+                    # Fork: no daemon ran this request; the endpoint called
+                    # generate() itself.
+                    backend = "generate"
 
                 mx.clear_cache()
                 gc.collect()
@@ -2729,11 +2774,13 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     endpoint="/chat/completions",
                     model=request.model,
                     stream=False,
-                    backend=(
-                        "continuous_batching"
-                        if runtime.response_generator is not None
-                        else "generate"
-                    ),
+                    # Fork: threaded out of the blocking closure above rather
+                    # than inferred from `runtime.response_generator is not
+                    # None`, which only says a daemon is loaded. See the
+                    # streaming site for the full note.
+                    backend=backend,
+                    session_id=chat_id,
+                    cached_tokens=metrics.cached_tokens,
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     generated_tokens=output_tokens,
@@ -2898,7 +2945,11 @@ async def completions_endpoint(request: Request):
                             gen_args,
                         )
                         prompt_tokens = ctx.prompt_tokens
-                        backend = "continuous_batching"
+                        # Fork: was the "continuous_batching" literal, which is
+                        # wrong whenever the worker is on the diffusion or
+                        # speculative loop. This endpoint never passes a
+                        # prompt_cache_state, so it cannot hit cached_session.
+                        backend = resolve_backend_label(ctx)
 
                         def _next_token():
                             try:
@@ -3032,6 +3083,7 @@ async def completions_endpoint(request: Request):
                         model=completion_request.model,
                         stream=True,
                         backend=backend,
+                        cached_tokens=metrics.cached_tokens,
                         prompt_tokens=prompt_tokens,
                         completion_tokens=completion_tokens,
                         generated_tokens=output_tokens,
@@ -3128,7 +3180,16 @@ async def completions_endpoint(request: Request):
                         token_iter.close()
                     except Exception:
                         pass
-                    return ctx.prompt_tokens, text, ot, fr, metrics
+                    # Fork: the trailing element is the path the GPU worker
+                    # actually took; ctx is local to this closure.
+                    return (
+                        ctx.prompt_tokens,
+                        text,
+                        ot,
+                        fr,
+                        metrics,
+                        resolve_backend_label(ctx),
+                    )
 
                 (
                     prompt_tokens,
@@ -3136,8 +3197,8 @@ async def completions_endpoint(request: Request):
                     output_tokens,
                     finish_reason,
                     metrics,
+                    backend,
                 ) = await asyncio.to_thread(_blocking_generate)
-                backend = "continuous_batching"
             else:
                 gen_result = generate(
                     model=model,
@@ -3192,6 +3253,7 @@ async def completions_endpoint(request: Request):
                 model=completion_request.model,
                 stream=False,
                 backend=backend,
+                cached_tokens=metrics.cached_tokens,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 generated_tokens=output_tokens,

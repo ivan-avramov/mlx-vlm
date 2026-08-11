@@ -51,7 +51,11 @@ from .audio import (
     audio_transcriptions_endpoint,
     audio_translations_endpoint,
 )
-from .generation import (  # Fork: adds the fork's KV/session/APC getters
+from .generation import (  # Fork: adds the fork's KV/session/APC getters, the BACKEND_* path labels and resolve_backend_label
+    BACKEND_CACHED_SESSION,
+    BACKEND_CONTINUOUS_BATCHING,
+    BACKEND_DIFFUSION,
+    BACKEND_DIRECT,
     CACHED_PATH_HEARTBEAT_INTERVAL_SECS,
     DEFAULT_ENABLE_THINKING,
     DEFAULT_LOG_PROGRESS_INTERVAL,
@@ -94,6 +98,7 @@ from .generation import (  # Fork: adds the fork's KV/session/APC getters
     get_top_logprobs_k,
     load_model_resources,
     make_streaming_detokenizer,
+    resolve_backend_label,
     run_speculative_server_rounds,
 )
 from .openai import (  # Fork: adds the fork's thinking-format helpers

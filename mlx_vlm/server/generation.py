@@ -102,6 +102,34 @@ STREAM_TELEMETRY_INTERVAL = int(
     os.environ.get("MLX_VLM_STREAM_TELEMETRY_INTERVAL", "500")
 )
 
+# Fork: the metrics/log labels for the generation paths the GPU worker can take.
+# Upstream spells the first three as bare literals at the `_log_prefill_started`
+# call sites; naming them lets `GenerationContext.backend` and the endpoints'
+# metrics envelopes share one vocabulary instead of each site repeating a string.
+# BACKEND_CACHED_SESSION is the fork's inline per-chat `_process_cached_request`
+# path, which upstream has no equivalent of; BACKEND_DIRECT is the no-daemon
+# fallback where an endpoint calls generate()/stream_generate() itself.
+BACKEND_CONTINUOUS_BATCHING = "continuous_batching"
+BACKEND_CACHED_SESSION = "cached_session"
+BACKEND_DIFFUSION = "diffusion"
+BACKEND_DIRECT = "generate"
+
+
+def resolve_backend_label(ctx) -> str:
+    """Fork: report the generation path that RAN, not the one that was available.
+
+    ``ctx`` is the :class:`GenerationContext` the GPU worker handed back, which
+    carries the label stamped where the path was chosen. ``None`` (or any object
+    without the field, e.g. an older test fake) means no daemon handled the
+    request, so the endpoint ran generate()/stream_generate() inline.
+
+    Endpoints must call this instead of testing ``runtime.response_generator is
+    not None``: that predicate answers "is a daemon loaded", not "which path did
+    this request take", and the two answers diverge for every request routed to
+    the serial cached-session path.
+    """
+    return getattr(ctx, "backend", None) or BACKEND_DIRECT
+
 
 class KeepAlive:
     """Heartbeat sentinel emitted by the daemon during long-running prefill
@@ -672,14 +700,21 @@ class ServerMetricsStore:
             self._request_time_total_s += float(payload.get("request_elapsed_s") or 0.0)
             self._decode_time_total_s += float(payload.get("decode_elapsed_s") or 0.0)
             in_flight = self._in_flight
+        # Fork: the line adds session=%s cached_tokens=%d to upstream's format.
+        # backend=%s is upstream's and now carries a truthful value (see
+        # ``resolve_backend_label``); these two are what say whether a request
+        # that took the serial cached-session path actually reused a prefix.
         logger.info(
             "Request completed: endpoint=%s model=%s stream=%s backend=%s "
+            "session=%s cached_tokens=%d "
             "prompt_tokens=%d generated_tokens=%d elapsed=%.3fs "
             "prefill=%.1f tok/s decode=%.1f tok/s finish_reason=%s in_flight=%d",
             payload.get("endpoint"),
             payload.get("model"),
             payload.get("stream"),
             payload.get("backend"),
+            payload.get("session_id"),
+            int(payload.get("cached_tokens") or 0),
             int(payload.get("prompt_tokens") or 0),
             int(payload.get("generated_tokens") or 0),
             float(payload.get("request_elapsed_s") or 0.0),
@@ -801,6 +836,14 @@ def _build_metrics_envelope(
     thinking_enabled: bool = False,
     tool_parser: Optional[str] = None,
     tool_calls: bool = False,
+    # Fork: ``session_id`` and ``cached_tokens`` are fork additions. ``backend``
+    # alone says a request took the serial cached-session path; these two say
+    # whether that serialization bought anything. A cached_session request with
+    # cached_tokens=0 reused no prefix and paid the serialization for nothing,
+    # which is the diagnostic that previously had to be reconstructed from
+    # interleaved prefill/completed timestamps across concurrent requests.
+    session_id: Optional[str] = None,
+    cached_tokens: int = 0,
 ) -> dict:
     token_times = token_times or []
     ttft_s = max(0.0, token_times[0] - request_started_s) if token_times else None
@@ -847,6 +890,9 @@ def _build_metrics_envelope(
         "tool_parser": tool_parser,
         "tool_calls": bool(tool_calls),
         "apc_enabled": runtime.apc_manager is not None,
+        # Fork: see the note on the two parameters above.
+        "session_id": session_id,
+        "cached_tokens": max(0, int(cached_tokens or 0)),
     }
 
 
@@ -1013,6 +1059,18 @@ class GenerationContext:
 
     uid: int
     prompt_tokens: int
+    # Fork: ``backend`` is a fork addition. The GPU worker has four mutually
+    # exclusive paths (continuous batching, the fork's inline per-chat
+    # ``_process_cached_request``, diffusion, speculative) and only the worker
+    # knows which one a given request took. Stamping it here — at the point the
+    # path is chosen, next to the matching ``_log_prefill_started`` call — is
+    # what lets the metrics envelope report the path that RAN. The endpoints
+    # used to infer it from ``runtime.response_generator is not None``, which is
+    # true for the whole process lifetime once a model is loaded and therefore
+    # labelled every serial cached-session request "continuous_batching".
+    # The default matches the plain BatchGenerator path, which is what a bare
+    # ``GenerationContext(uid=..., prompt_tokens=...)`` construction means.
+    backend: str = BACKEND_CONTINUOUS_BATCHING
 
 
 @dataclass
@@ -1633,8 +1691,16 @@ class ResponseGenerator:
         uid = id(rqueue)
 
         # Send back the GenerationContext so generate() can return its
-        # iterator on the caller side. Mirrors the BatchGenerator path.
-        rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
+        # iterator on the caller side. Mirrors the BatchGenerator path, except
+        # for the backend label: this path is B=1 and serial (see the docstring
+        # above), so the metrics envelope must not report it as batched.
+        rqueue.put(
+            GenerationContext(
+                uid=uid,
+                prompt_tokens=prompt_tokens,
+                backend=BACKEND_CACHED_SESSION,
+            )
+        )
 
         # Build kwargs for stream_generate. Mirrors the legacy fallback call
         # in chat_completions_endpoint, plus prompt_cache_state.
@@ -2321,10 +2387,20 @@ class ResponseGenerator:
                     prompt_tokens = request.prompt_tokens
                     args = request.args
                     images = request.images
-                    log_state = self._log_prefill_started(
-                        request, backend="continuous_batching"
-                    )
                     prompt_cache_state = request.prompt_cache_state
+                    # Fork: decide the path label BEFORE logging it. Upstream
+                    # passes the "continuous_batching" literal here because
+                    # upstream has only one path out of this loop; the fork's
+                    # cached-session dispatch below is a second one, and logging
+                    # first would label every serial cached request as batched.
+                    backend_label = (
+                        BACKEND_CACHED_SESSION
+                        if prompt_cache_state is not None
+                        else BACKEND_CONTINUOUS_BATCHING
+                    )
+                    log_state = self._log_prefill_started(
+                        request, backend=backend_label
+                    )
                     formatted_prompt = request.prompt
                     # Dispatch cached requests to the dedicated handler. They
                     # run inline on this daemon thread (the one that owns the
@@ -2413,7 +2489,15 @@ class ResponseGenerator:
                         rqueue.put(e)
                         continue
 
-                    rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
+                    rqueue.put(
+                        GenerationContext(
+                            uid=uid,
+                            prompt_tokens=prompt_tokens,
+                            # Fork: backend= is a fork addition; see the field's
+                            # note on GenerationContext.
+                            backend=BACKEND_CONTINUOUS_BATCHING,
+                        )
+                    )
                     active[uid] = {
                         "rqueue": rqueue,
                         "streamer": _ServerTokenStreamer(
@@ -2473,10 +2557,19 @@ class ResponseGenerator:
                     raw_inputs = request.raw_inputs
                     prompt_tokens = request.prompt_tokens
                     args = request.args
-                    log_state = self._log_prefill_started(request, backend="diffusion")
+                    log_state = self._log_prefill_started(
+                        request, backend=BACKEND_DIFFUSION
+                    )
                     uid_counter += 1
                     uid = uid_counter
-                    rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
+                    # Fork: backend= is a fork addition; see GenerationContext.
+                    rqueue.put(
+                        GenerationContext(
+                            uid=uid,
+                            prompt_tokens=prompt_tokens,
+                            backend=BACKEND_DIFFUSION,
+                        )
+                    )
                     try:
                         self._generate_diffusion(
                             uid, rqueue, raw_inputs, args, cancelled, log_state
@@ -2636,8 +2729,9 @@ class ResponseGenerator:
                     prompt_tokens = request.prompt_tokens
                     args = request.args
                     images = request.images
+                    backend_label = f"speculative_{draft_kind}"
                     log_state = self._log_prefill_started(
-                        request, backend=f"speculative_{draft_kind}"
+                        request, backend=backend_label
                     )
                     input_ids, gen_kwargs = self._gpu_embed(raw_inputs, images)
                     uid = id(rqueue)
@@ -2655,7 +2749,14 @@ class ResponseGenerator:
                     prompt_tokens_map[uid] = prompt_tokens
                     all_input_ids.append(input_ids.squeeze(0).tolist())
                     prompt_kwargs_list.append(gen_kwargs)
-                    rqueue.put(GenerationContext(uid=uid, prompt_tokens=prompt_tokens))
+                    # Fork: backend= is a fork addition; see GenerationContext.
+                    rqueue.put(
+                        GenerationContext(
+                            uid=uid,
+                            prompt_tokens=prompt_tokens,
+                            backend=backend_label,
+                        )
+                    )
                     sampler = self._make_sampler(args) or make_sampler(temp=0)
 
                 B = len(uids)

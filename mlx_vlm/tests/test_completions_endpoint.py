@@ -528,8 +528,18 @@ class TestStreamChunkSerialization:
 
 
 class _FakeCtx:
-    def __init__(self, prompt_tokens=11):
+    """Stand-in for the GenerationContext the GPU worker hands back.
+
+    ``backend`` is not decoration: the endpoint reads it (via
+    ``resolve_backend_label``) to report which path actually ran, so a fake
+    without it makes the request look like it bypassed the worker entirely.
+    Defaults to the continuous-batching label because that is the path this
+    fake stands in for.
+    """
+
+    def __init__(self, prompt_tokens=11, backend="continuous_batching"):
         self.prompt_tokens = prompt_tokens
+        self.backend = backend
 
 
 class _FakeResponseGenerator:

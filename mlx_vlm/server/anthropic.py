@@ -15,11 +15,12 @@ from ..generate import generate, stream_generate
 from ..prompt_utils import apply_chat_template
 from ..tool_parsers import _infer_tool_parser_from_processor, load_tool_module
 from ..utils import prepare_inputs
-from .generation import (
+from .generation import (  # Fork: resolve_backend_label is fork-only — it reports the generation path that RAN
     GenerationMetrics,
     PromptTooLongError,
     _build_metrics_envelope,
     _count_prompt_tokens,
+    resolve_backend_label,
 )
 from .responses_state import (
     ThinkingStreamState,
@@ -629,7 +630,11 @@ async def anthropic_messages_endpoint(http_request: Request):
                             except StopIteration:
                                 return None
 
-                        token_source = "continuous_batching"
+                        # Fork: was the "continuous_batching" literal, which is
+                        # wrong whenever the worker is on the diffusion or
+                        # speculative loop. This endpoint passes no
+                        # prompt_cache_state, so it cannot hit cached_session.
+                        token_source = resolve_backend_label(ctx)
                     else:
                         token_iterator = stream_generate(
                             model=model,
@@ -815,6 +820,7 @@ async def anthropic_messages_endpoint(http_request: Request):
                         model=request.model,
                         stream=True,
                         backend=token_source,
+                        cached_tokens=metrics.cached_tokens,  # Fork: fork-only field
                         prompt_tokens=prompt_tokens,
                         completion_tokens=completion_tokens,
                         generated_tokens=output_tokens,
@@ -916,7 +922,16 @@ async def anthropic_messages_endpoint(http_request: Request):
                         token_iter.close()
                     except Exception:
                         pass
-                    return ctx.prompt_tokens, text, ot, fr, metrics
+                    # Fork: the trailing element is the path the GPU worker
+                    # actually took; ctx is local to this closure.
+                    return (
+                        ctx.prompt_tokens,
+                        text,
+                        ot,
+                        fr,
+                        metrics,
+                        resolve_backend_label(ctx),
+                    )
 
                 (
                     prompt_tokens,
@@ -924,6 +939,7 @@ async def anthropic_messages_endpoint(http_request: Request):
                     output_tokens,
                     finish_reason,
                     metrics,
+                    backend,
                 ) = await asyncio.to_thread(_blocking_generate)
             else:
                 result = generate(
@@ -941,6 +957,9 @@ async def anthropic_messages_endpoint(http_request: Request):
                 output_tokens = result.generation_tokens
                 metrics.record_result(result)
                 finish_reason = getattr(result, "finish_reason", None) or "stop"
+                # Fork: no daemon ran this request; the endpoint called
+                # generate() itself.
+                backend = "generate"
 
             parsed_tool_calls = None
             response_text = full_text
@@ -989,11 +1008,12 @@ async def anthropic_messages_endpoint(http_request: Request):
                 endpoint="/v1/messages",
                 model=request.model,
                 stream=False,
-                backend=(
-                    "continuous_batching"
-                    if runtime.response_generator is not None
-                    else "generate"
-                ),
+                # Fork: threaded out of the blocking closure above rather than
+                # inferred from `runtime.response_generator is not None`, which
+                # is true for the whole process lifetime once a model is loaded
+                # and so says nothing about this request.
+                backend=backend,
+                cached_tokens=metrics.cached_tokens,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 generated_tokens=output_tokens,
