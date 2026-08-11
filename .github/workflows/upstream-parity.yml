@@ -83,14 +83,17 @@ jobs:
       - name: Check no upstream registry entry or re-export is missing
         run: python dev/check_upstream_registries.py --upstream-ref upstream/main
 
-      # The eighth direction: every check above asks whether something EXISTS. None
-      # can see a call that exists, is reached, and passes FEWER KEYWORD ARGUMENTS
-      # than upstream's. check_dead_helpers.py is the near miss — it asks whether an
-      # upstream-called helper is reachable, and the founding instance was reachable;
-      # "called" and "called correctly" are different questions. Demonstrated:
-      # dispatch.py dropped `skip_special_tokens=` and `verbose=` from the diffusion
-      # dispatch, making --skip-special-tokens a no-op on every diffusion model, with
-      # all seven checks above green, 3001 tests green, and a `# Fork:` marker on the
-      # site asserting completeness.
-      - name: Check no call passes fewer keyword arguments than upstream
+      # The eighth direction: every check above asks whether something EXISTS. None can
+      # see a call that exists, is reached, and passes FEWER ARGUMENTS than upstream's.
+      # check_dead_helpers.py is the near miss — it asks whether an upstream-called
+      # helper is reachable, and the founding instance was reachable; "called" and
+      # "called correctly" are different questions. Demonstrated twice:
+      #  - dispatch.py dropped `skip_special_tokens=` and `verbose=` from the diffusion
+      #    dispatch, making --skip-special-tokens a no-op on every diffusion model, with
+      #    all seven checks above green, 3001 tests green, and a `# Fork:` marker on the
+      #    site asserting completeness.
+      #  - the `[arity]` half, for calls with no keyword to be missing: dropping the
+      #    second argument of `mx.tile(position_ids, (3, 1, 1))` in qwen3_5/language.py
+      #    leaves all six checks above green and test_models.py passing.
+      - name: Check no call passes fewer arguments than upstream
         run: python dev/check_call_arguments.py --upstream-ref upstream/main

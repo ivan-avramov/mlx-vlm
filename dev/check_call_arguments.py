@@ -50,9 +50,32 @@ Reading it asymmetrically is the whole design, and it is the same rule
   is a fork enhancement, not a drop, and comparing values would report it. A
   wrong value is `check_body_divergence.py --file`'s job.
 
-Positional arity is deliberately **not** compared. The fork reorders and rewrites
-call sites freely, `*args` forwarding is common, and every experiment produced
-noise without finding anything a keyword comparison missed.
+## The second measure: arity, for the call that has no names to miss
+
+A keyword check is blind to a purely positional call -- `f(a, b, c)` losing `c` has
+no name to be missing. So each (definition, callee) pair also compares **total
+supplied argument count**: positional (excluding `*x`) plus distinct keyword names,
+maxed over the definition's call sites.
+
+**Total, not positional.** Moving an argument between positional and keyword form
+changes nothing and the fork does it freely, so `f(a, b)` against `f(a, b=x)` must
+not report -- and a positional-only count reports it every time.
+
+Two rules keep it honest, both derived from measuring the tree rather than guessed:
+
+* **The deferred-call idiom is skipped.** When our call passes a `lambda`, the real
+  arguments live inside the lambda body where no count can see them:
+  `asyncio.to_thread(lambda: gen(a, b, c))` against upstream's
+  `asyncio.to_thread(gen, a, b, c)` is the same call, and `chat_completions_endpoint`
+  really does this. Without the rule that site reports forever; with it, it does not.
+* **Arity is reported only when the keyword check found nothing** for that pair. A
+  missing name already implies a lower count, so emitting both would double-count one
+  defect and inflate the arity baseline.
+
+An arity hit is a **pointer to a diff, not a conclusion** -- being a count, it cannot
+say *which* argument went. The fork extracting upstream's inline expression into a
+fork-only helper produces one legitimately (the `arange` baseline entry), which is why
+this measure needs its reasons written down rather than being treated as proof.
 
 ## `**kwargs` forwarding, and why those hits are tagged rather than dropped
 
@@ -117,8 +140,48 @@ def callee_name(node: ast.expr) -> str | None:
     return None
 
 
+class CalleeUse:
+    """How one definition calls one callee, unioned over all its call sites.
+
+    `kwargs`  -- every keyword NAME passed at any site.
+    `arity`   -- the largest total supplied-argument count at any site: positional
+                 (excluding `*x`) plus distinct keyword names. **Total, not positional**,
+                 so moving an argument between positional and keyword form -- which the
+                 fork does freely and which changes nothing -- cannot report.
+    `star`    -- some site forwards `*x` or `**x`, so both measures are lower bounds.
+    `defers`  -- some site passes a `lambda`, i.e. the deferred-call idiom, where the
+                 real arguments live inside the lambda body and no count can see them.
+    """
+
+    __slots__ = ("kwargs", "arity", "star", "defers")
+
+    def __init__(self) -> None:
+        self.kwargs: set[str] = set()
+        self.arity = 0
+        self.star = False
+        self.defers = False
+
+    def observe(self, node: ast.Call) -> None:
+        positional = sum(0 if isinstance(a, ast.Starred) else 1 for a in node.args)
+        named = {kw.arg for kw in node.keywords if kw.arg is not None}
+        self.kwargs |= named
+        self.arity = max(self.arity, positional + len(named))
+        if any(isinstance(a, ast.Starred) for a in node.args) or any(
+            kw.arg is None for kw in node.keywords
+        ):
+            self.star = True
+        if any(isinstance(a, ast.Lambda) for a in node.args):
+            self.defers = True
+
+    def merge(self, other: "CalleeUse") -> None:
+        self.kwargs |= other.kwargs
+        self.arity = max(self.arity, other.arity)
+        self.star = self.star or other.star
+        self.defers = self.defers or other.defers
+
+
 class CallSites:
-    """Per-definition map {callee: (kwarg names, uses ** forwarding)} for one file.
+    """Per-definition map {callee: CalleeUse} for one file.
 
     Module-scope calls are collected too, under the pseudo-definition
     `MODULE_SCOPE` -- `check_body_divergence.py`'s `<file>` convention, and not a legal
@@ -132,7 +195,7 @@ class CallSites:
 
     def __init__(self, source: str) -> None:
         self.tree = ast.parse(source)
-        self.by_definition: dict[str, dict[str, tuple[set[str], bool]]] = {}
+        self.by_definition: dict[str, dict[str, CalleeUse]] = {}
         module_level: list[ast.stmt] = []
         for node in self.tree.body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -140,48 +203,56 @@ class CallSites:
             else:
                 module_level.append(node)
         if module_level:
-            merged: dict[str, tuple[set[str], bool]] = {}
+            merged: dict[str, CalleeUse] = {}
             for stmt in module_level:
-                for callee, (names, star) in self._collect(stmt).items():
-                    have, had_star = merged.get(callee, (set(), False))
-                    merged[callee] = (have | names, had_star or star)
+                for callee, use in self._collect(stmt).items():
+                    merged.setdefault(callee, CalleeUse()).merge(use)
             self.by_definition[MODULE_SCOPE] = merged
 
     @staticmethod
-    def _collect(defn: ast.AST) -> dict[str, tuple[set[str], bool]]:
-        calls: dict[str, tuple[set[str], bool]] = {}
+    def _collect(defn: ast.AST) -> dict[str, CalleeUse]:
+        calls: dict[str, CalleeUse] = {}
         for node in ast.walk(defn):
             if not isinstance(node, ast.Call):
                 continue
             name = callee_name(node.func)
             if name is None:
                 continue
-            names, star = calls.get(name, (set(), False))
-            for kw in node.keywords:
-                if kw.arg is None:  # **something
-                    star = True
-                else:
-                    names.add(kw.arg)
-            calls[name] = (names, star)
+            calls.setdefault(name, CalleeUse()).observe(node)
         return calls
 
 
 class Finding:
-    __slots__ = ("path", "definition", "callee", "missing", "star")
+    """One call whose arguments are a strict subset of upstream's, in one of two ways.
+
+    `kind="kwargs"` -- a keyword NAME upstream passes and we never do. The founding
+    instance, and the sharper of the two: a name is unambiguous.
+
+    `kind="arity"` -- we supply FEWER TOTAL ARGUMENTS than upstream at every site. It
+    catches what a name cannot -- an argument dropped from a purely positional call,
+    where there is no name to be missing -- at the cost of being a count, so it cannot
+    see *which* argument went. Treat it as a pointer to a diff, not as a conclusion.
+    """
+
+    __slots__ = ("path", "definition", "callee", "kind", "missing", "counts", "star")
 
     def __init__(
         self,
         path: str,
         definition: str,
         callee: str,
-        missing: set[str],
+        kind: str,
         star: bool,
+        missing: set[str] | None = None,
+        counts: tuple[int, int] | None = None,
     ) -> None:
         self.path = path
         self.definition = definition
         self.callee = callee
-        self.missing = missing
+        self.kind = kind
         self.star = star
+        self.missing = missing or set()
+        self.counts = counts
 
     @property
     def key(self) -> str:
@@ -189,6 +260,12 @@ class Finding:
 
     def describe(self) -> str:
         tag = " [**]" if self.star else ""
+        if self.kind == "arity":
+            up, ours = self.counts or (0, 0)
+            return (
+                f"{self.definition} -> {self.callee}(...) "
+                f"[arity] upstream passes {up} args, we pass {ours}{tag}"
+            )
         names = ", ".join(sorted(self.missing))
         return f"{self.definition} -> {self.callee}({names}=...){tag}"
 
@@ -260,6 +337,52 @@ def shared_python_files(ref: str) -> list[str]:
     return sorted(upstream & ours & diverged)
 
 
+def compare_sites(path: str, up: CallSites, ours: CallSites) -> list[Finding]:
+    """The whole comparison, with no git or filesystem in it.
+
+    Split out from `compare_file` so the tests exercise THIS rather than a copy of it.
+    `test_call_argument_check.py` originally reimplemented this loop, which meant a bug
+    in the real one could pass every test -- the exact "a check that lies is worse than
+    no check" failure the test file exists to prevent, one level up.
+    """
+    findings: list[Finding] = []
+    for definition, up_calls in up.by_definition.items():
+        our_calls = ours.by_definition.get(definition)
+        if our_calls is None:
+            continue  # not a shared definition -- check_upstream_symbols.py's job
+        for callee, up_use in up_calls.items():
+            our_use = our_calls.get(callee)
+            if our_use is None:
+                continue  # a dropped CALL, not a dropped argument
+            missing = up_use.kwargs - our_use.kwargs
+            if missing:
+                findings.append(
+                    Finding(
+                        path,
+                        definition,
+                        callee,
+                        "kwargs",
+                        our_use.star,
+                        missing=missing,
+                    )
+                )
+            # Arity is reported only when the keyword check found nothing: a missing
+            # NAME already implies a lower count, and emitting both would double-count
+            # one defect and make the arity baseline look worse than it is.
+            elif our_use.arity < up_use.arity and not our_use.defers:
+                findings.append(
+                    Finding(
+                        path,
+                        definition,
+                        callee,
+                        "arity",
+                        our_use.star,
+                        counts=(up_use.arity, our_use.arity),
+                    )
+                )
+    return findings
+
+
 def compare_file(path: str, ref: str) -> tuple[list[Finding], str | None]:
     """(findings, error). A read or parse failure is returned, never swallowed."""
     try:
@@ -274,20 +397,7 @@ def compare_file(path: str, ref: str) -> tuple[list[Finding], str | None]:
         ours = CallSites(our_source)
     except SyntaxError as exc:
         return [], f"{path}: unparseable ({exc})"
-
-    findings: list[Finding] = []
-    for definition, up_calls in up.by_definition.items():
-        our_calls = ours.by_definition.get(definition)
-        if our_calls is None:
-            continue  # not a shared definition -- check_upstream_symbols.py's job
-        for callee, (up_names, _up_star) in up_calls.items():
-            if callee not in our_calls:
-                continue  # a dropped CALL, not a dropped argument
-            our_names, our_star = our_calls[callee]
-            missing = up_names - our_names
-            if missing:
-                findings.append(Finding(path, definition, callee, missing, our_star))
-    return findings, None
+    return compare_sites(path, up, ours), None
 
 
 def main() -> int:
@@ -320,7 +430,7 @@ def main() -> int:
     if args.file:
         print(f"{args.file}  vs {ref}")
         if not all_findings and not errors:
-            print("  no keyword argument upstream passes is missing here.")
+            print("  no argument upstream passes is missing here.")
         for finding in all_findings:
             print(f"  {finding.describe()}")
         for error in errors:
@@ -335,7 +445,10 @@ def main() -> int:
             f"{len(all_findings)} unexcused hit(s) across {len(counts)} file(s), "
             f"vs {ref}."
         )
-        print("  A hit is a keyword name upstream passes and we never do.")
+        print(
+            "  A hit is a keyword name upstream passes and we never do, or a\n"
+            "  call where we supply fewer total arguments than upstream does."
+        )
         for path, count in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
             print(f"  {count:5d}  {path}")
         for error in errors:
@@ -351,12 +464,12 @@ def main() -> int:
         return 1
 
     if not all_findings:
-        print(f"OK: no call passes fewer keyword arguments than upstream's, vs {ref}.")
+        print(f"OK: no call passes fewer arguments than upstream's, vs {ref}.")
         return 0
 
     print(
-        f"{len(all_findings)} call(s) pass fewer keyword arguments than "
-        f"upstream's, vs {ref}:",
+        f"{len(all_findings)} call(s) pass fewer arguments than upstream's, "
+        f"vs {ref}:",
         file=sys.stderr,
     )
     by_path: dict[str, list[Finding]] = {}
@@ -371,6 +484,8 @@ def main() -> int:
         "  deliberate fork divergence (add it to .call-argument-exclusions with a\n"
         "  reason). `[**]` means our call forwards **kwargs, so the name may still\n"
         "  arrive through the dict -- confirm before excusing, and say which.\n"
+        "  `[arity]` means we supply fewer TOTAL arguments; being a count it cannot\n"
+        "  say WHICH one went, so read the diff rather than the number.\n"
         "  Establish provenance first: git log -S'<name>=' -- <path>",
         file=sys.stderr,
     )

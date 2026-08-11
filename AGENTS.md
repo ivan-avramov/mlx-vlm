@@ -31,7 +31,7 @@ git fetch upstream && git log --oneline HEAD..upstream/main   # MUST be empty; m
 grep -cE '^mlx_vlm' .symbol-exclusions .deletion-exclusions .fork-marker-allowlist \
     .dead-helper-exclusions .body-divergence-exclusions .registry-exclusions \
     .call-argument-exclusions
-# expect 14, 0, 0, 0, 0, 5, 1 — see "Exclusion baselines" below
+# expect 14, 0, 0, 0, 0, 5, 2 — see "Exclusion baselines" below
 grep -cE '^mlx_vlm.*# baseline: pre-existing divergence, unreviewed' .symbol-exclusions
 # expect 0 — every remaining exclusion carries a real reason
 ```
@@ -52,7 +52,7 @@ signal, not any report's count.**
 | `.dead-helper-exclusions` | **0** | upstream-called helpers unreachable here |
 | `.body-divergence-exclusions` | **0** | misalignments claimed deliberate |
 | `.registry-exclusions` | **5** | re-exports the fork replaced, all reviewed |
-| `.call-argument-exclusions` | **1** | calls passing fewer kwargs, reviewed (one `[**]`) |
+| `.call-argument-exclusions` | **2** | calls passing fewer args, reviewed (one `[**]`, one `[arity]`) |
 
 An empty file is **not** a reason to delete it — each keeps its header and RESOLVED
 notes, and the next merge that adds a fork hunk to a shared file will need an entry.
@@ -100,7 +100,7 @@ python dev/check_fork_markers.py        # every fork hunk in a shared file is ma
 python dev/check_dead_helpers.py        # no upstream-called helper left unreachable
 python dev/check_body_divergence.py     # no divergence that is only ALIGNMENT
 python dev/check_upstream_registries.py # no registry entry / re-export / field dropped
-python dev/check_call_arguments.py      # no call passing fewer kwargs than upstream
+python dev/check_call_arguments.py      # no call passing fewer args than upstream
 python dev/check_body_divergence.py --summary   # then size what conflicted
 python dev/check_body_divergence.py --sweep     # then re-review the markers
 python dev/find_untested_fork_code.py   # fork-only code no test mentions (non-gating)
@@ -679,8 +679,18 @@ Three design rules, each paid for by a false positive in an earlier draft:
 - **Read it asymmetrically**, like `find_untested_fork_code.py`'s `tests` column:
   `ours < upstream` is the only direction worth chasing. `ours > upstream` is fork
   work and stays silent, or `_make_cache`'s prealloc kwargs would report forever.
-- **Positional arity is not compared.** The fork reorders call sites freely and every
-  experiment produced noise without finding anything the keyword comparison missed.
+- **Two measures, and the second is weaker on purpose.** A keyword name is
+  unambiguous, but a purely positional call has no name to be missing — `f(a, b, c)`
+  losing `c` is invisible to it. So each pair also compares **total supplied argument
+  count** (positional excluding `*x`, plus distinct keyword names), tagged `[arity]`.
+  *Total*, not positional: moving an argument between positional and keyword form
+  changes nothing and the fork does it freely. Measured both ways before choosing.
+  Two rules keep it honest — the **deferred-call idiom is skipped** (when our call
+  passes a `lambda` the arguments live inside its body, which is what
+  `asyncio.to_thread(lambda: gen(a, b, c))` does in `server/openai.py`), and arity is
+  reported **only when the keyword check found nothing** for that pair, so one defect
+  is not counted twice. An `[arity]` hit is a **pointer to a diff, not a conclusion**:
+  being a count it cannot say which argument went.
 
 **`[**]` means our call forwards `**something`, so the name may still arrive through
 the dict.** Those are tagged and still gate rather than being filtered — the founding
@@ -784,7 +794,7 @@ positives. Every hit still needs `git log -S` and a read.
 cd mlx_vlm/ && pytest -s ./tests --ignore=tests/test_smoke.py
 ```
 
-The suite is **green: 3028 passed, 5 skipped, 0 failed.** Keep it that way. (This
+The suite is **green: 3036 passed, 5 skipped, 0 failed.** Keep it that way. (This
 line goes stale on every restore that adds a guard — trust the run, not the number.)
 
 **Compare failing test IDs, not counts.** A change that fixes one test and breaks

@@ -40,23 +40,27 @@ def cca():
     return _load()
 
 
+def _findings_full(cca, upstream: str, ours: str):
+    """Real `Finding` objects for a synthetic file pair, via the script's own logic.
+
+    Calls `compare_sites` rather than reimplementing the comparison. An earlier version
+    of this file duplicated that loop, which meant a bug in the real one could pass
+    every test here — the same "a check that lies is worse than no check" failure this
+    file exists to prevent, one level up. `compare_sites` was split out of
+    `compare_file` so this is possible without touching git.
+    """
+    return cca.compare_sites(
+        "mlx_vlm/x.py", cca.CallSites(upstream), cca.CallSites(ours)
+    )
+
+
 def _findings(cca, upstream: str, ours: str):
-    """Findings for one synthetic file pair, keyed as (definition, callee, missing)."""
-    up = cca.CallSites(upstream)
-    our = cca.CallSites(ours)
-    out = []
-    for definition, up_calls in up.by_definition.items():
-        our_calls = our.by_definition.get(definition)
-        if our_calls is None:
-            continue
-        for callee, (up_names, _) in up_calls.items():
-            if callee not in our_calls:
-                continue
-            our_names, star = our_calls[callee]
-            missing = up_names - our_names
-            if missing:
-                out.append((definition, callee, frozenset(missing), star))
-    return out
+    """Keyword findings only, as (definition, callee, missing, star) tuples."""
+    return [
+        (f.definition, f.callee, frozenset(f.missing), f.star)
+        for f in _findings_full(cca, upstream, ours)
+        if f.kind == "kwargs"
+    ]
 
 
 class TestTheFoundingInstance:
@@ -185,6 +189,89 @@ class TestStarForwardingIsTaggedNotFiltered:
         ours = "def f():\n    g(level=1, **opts)\n"
         (finding,) = _findings(cca, up, ours)
         assert finding[2] == frozenset({"format"})
+
+
+class TestArity:
+    """The second measure: total supplied argument count.
+
+    It exists because the keyword check is blind to a purely positional call — `f(a, b,
+    c)` losing `c` has no name to be missing. Being a count it is weaker, so the tests
+    that matter most here are the ones pinning what it must NOT report.
+    """
+
+    def _arity(self, cca, up, ours):
+        f = _findings_full(cca, up, ours)
+        return [x for x in f if x.kind == "arity"]
+
+    def test_a_dropped_positional_argument_is_reported(self, cca):
+        """The gap the keyword check cannot cover."""
+        up = "def f():\n    g(a, b, c)\n"
+        ours = "def f():\n    g(a, b)\n"
+        (finding,) = self._arity(cca, up, ours)
+        assert finding.counts == (3, 2)
+        assert "arity" in finding.describe()
+
+    def test_positional_to_KEYWORD_conversion_is_not_a_finding(self, cca):
+        """Why the measure is TOTAL rather than positional.
+
+        `f(a, b)` -> `f(a, b=x)` changes nothing and the fork does it freely. A
+        positional-only count reports it every time; total does not.
+        """
+        up = "def f():\n    g(a, b)\n"
+        ours = "def f():\n    g(a, b=x)\n"
+        assert self._arity(cca, up, ours) == []
+
+    def test_keyword_to_POSITIONAL_conversion_is_not_a_finding(self, cca):
+        """The mirror direction, which the keyword check WOULD report on its own.
+
+        Kept as a known limit rather than papered over: `g(a, b=1)` -> `g(a, 1)` still
+        raises a kwargs finding because the NAME `b` is gone. That is the sharp check
+        being literal, and the exclusions file is where such a case gets its reason.
+        Arity, at least, stays quiet.
+        """
+        up = "def f():\n    g(a, b=1)\n"
+        ours = "def f():\n    g(a, 1)\n"
+        assert self._arity(cca, up, ours) == []
+
+    def test_the_deferred_call_idiom_is_skipped(self, cca):
+        """`to_thread(lambda: gen(a, b, c))` vs `to_thread(gen, a, b, c)`.
+
+        Same call; the arguments are inside the lambda where no count can see them.
+        server/openai.py really does this, and without the rule it reported forever.
+        """
+        up = "def f():\n    to_thread(gen, a, b, c)\n"
+        ours = "def f():\n    to_thread(lambda: gen(a, b, c))\n"
+        assert self._arity(cca, up, ours) == []
+
+    def test_a_fork_ADDED_argument_is_not_a_finding(self, cca):
+        up = "def f():\n    g(a)\n"
+        ours = "def f():\n    g(a, b, c)\n"
+        assert self._arity(cca, up, ours) == []
+
+    def test_arity_is_the_MAX_across_call_sites_not_the_min(self, cca):
+        """A definition that calls a helper both ways has not dropped anything."""
+        up = "def f():\n    g(a, b, c)\n"
+        ours = "def f():\n    g(a)\n    g(a, b, c)\n"
+        assert self._arity(cca, up, ours) == []
+
+    def test_star_args_do_not_inflate_our_count(self, cca):
+        """`g(*args)` supplies an unknown number, so it must not read as 1.
+
+        Counting the `*args` node as one argument would let a call that forwards
+        everything mask a real drop; instead it contributes 0 and sets the `[**]` tag.
+        """
+        up = "def f():\n    g(a, b, c)\n"
+        ours = "def f():\n    g(*args)\n"
+        (finding,) = self._arity(cca, up, ours)
+        assert finding.counts == (3, 0)
+        assert finding.star is True
+
+    def test_arity_is_suppressed_when_a_kwarg_finding_already_fired(self, cca):
+        """One defect, one finding — otherwise the arity baseline looks worse than it is."""
+        up = "def f():\n    g(a, b=1, c=2)\n"
+        ours = "def f():\n    g(a)\n"
+        kinds = [x.kind for x in _findings_full(cca, up, ours)]
+        assert kinds == ["kwargs"]
 
 
 class TestModuleScopeIsCovered:

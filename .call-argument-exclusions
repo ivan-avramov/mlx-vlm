@@ -41,13 +41,35 @@
 # check that goes quiet where the answer is hard is the failure mode dev/ exists to
 # prevent. Confirm which dict, and say so in the reason.
 #
-# Positional arity is deliberately not compared — the fork reorders and rewrites call
-# sites freely, and every experiment produced noise without finding anything the
-# keyword comparison missed.
+# TWO KINDS OF HIT, and they read differently:
 #
-# Validated to fire before being trusted: reverting the dispatch.py fix makes it
-# report 2 hits and exit 1, naming both dropped kwargs and the exact call site;
-# restoring it drops back to 1. Scoped to files that differ from upstream (a
-# byte-identical file cannot have this defect), which is what keeps it at ~30s.
+#   (no tag)  a keyword NAME upstream passes and we never do. Unambiguous — a name
+#             either arrives or it does not. This is the sharp one.
+#   `[arity]` we supply fewer TOTAL arguments (positional excluding `*x`, plus distinct
+#             keyword names) than upstream at every site in that definition. It exists
+#             because a purely positional call has no name to be missing: `f(a, b, c)`
+#             losing `c` is invisible to the keyword check. Being a COUNT, it cannot say
+#             WHICH argument went — read the diff, never the number. Reported only when
+#             the keyword check found nothing for that pair, so one defect is not
+#             counted twice.
+#
+# TOTAL, not positional: moving an argument between positional and keyword form changes
+# nothing and the fork does it freely, so `f(a, b)` vs `f(a, b=x)` must not report.
+# Measured both ways before choosing — positional-only added no true positive.
+#
+# The DEFERRED-CALL idiom is skipped: when our call passes a `lambda`, the real arguments
+# are inside the lambda body where no count can see them.
+# `asyncio.to_thread(lambda: gen(a, b, c))` vs upstream's `asyncio.to_thread(gen, a, b, c)`
+# is the same call, and server/openai.py::chat_completions_endpoint really does this.
+# Without that rule it reported 4-vs-1 forever; with it, it does not report at all — which
+# is why there is no exclusion entry for it, and why there should never need to be.
+#
+# Validated to fire before being trusted: reverting the dispatch.py fix makes it report
+# 2 hits and exit 1, naming both dropped kwargs and the exact call site; restoring it
+# drops back to 1. The arity half was validated the same way — positional-only vs total
+# vs total-with-lambda-rule were each measured over the whole tree (3, 3, 2 hits) before
+# the rule set was fixed. Scoped to files that differ from upstream (a byte-identical
+# file cannot have this defect), which is what keeps it at ~30s.
 
 mlx_vlm/server/cli.py::main::basicConfig  # REVIEWED 2026-08-10: `[**]` false positive, and the reason the tag exists. Upstream passes `level=` and `format=` to logging.basicConfig as literals; the fork builds a `log_kwargs` dict with BOTH of those exact keys (cli.py:533-535) and calls `basicConfig(**log_kwargs)`, so nothing is dropped. It builds a dict precisely because the fork added --log-file / MLX_VLM_LOG_FILE, which selects between `stream=sys.stdout` and `filename=`; you cannot express that with fixed literals. Confirmed by reading the site, not by trusting the tag.
+mlx_vlm/models/qwen3_5/language.py::Qwen3_5Attention::arange  # REVIEWED 2026-08-10: `[arity]` false positive, and the shape to expect from this measure — a fork EXTRACTION. Upstream inlines `position_ids = mx.arange(cache_offset, cache_offset + L)` in Qwen3_5Attention.__call__'s scalar branch (7267aff2's `else`); the fork moved those four lines into the fork-only helper `_qwen35_scalar_positions` (150a76f9, EpiCache port, authored here — `git log -1 --format=%an` is iavramov, and `git log -S` shows only 150a76f9 and fe26caa0 behind it), so the 2-arg `mx.arange(rope_offset, rope_offset + L)` is present at language.py:1534 and only the ENCLOSING definition changed. Nothing dropped: for a plain cache `rope_offset` falls back to `cache_offset`, making it upstream's arithmetic exactly, and the site carries a `# Fork:` marker saying so. Verified by reading both bodies, not by the count.
