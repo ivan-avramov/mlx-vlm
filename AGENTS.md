@@ -8,8 +8,8 @@ architectures via a plugin-based model system.
 
 ## Starting a session: verify the tree before believing anything
 
-Takes ~6 minutes and it has repeatedly been worth it. Every number in this file goes
-stale eventually; the tree does not lie.
+Takes ~7 minutes (the suite is ~4 of them) and it has repeatedly been worth it. Every
+number in this file goes stale eventually; the tree does not lie.
 
 ```bash
 cd /Users/ia87221/ws/mlx-vlm
@@ -235,11 +235,11 @@ gating script needs one, because a bug that makes one of these checks **more
 permissive** fails nothing, still prints OK, and silently stops reporting dropped
 content. Extend them rather than replacing them.
 
-**A marker is unverified prose, and four of them have been false.** This is the
+**A marker is unverified prose, and five of them have been false.** This is the
 convention's structural weakness and worth stating plainly: `check_fork_markers.py`
 proves a `# Fork:` comment is **present**; nothing proves it is **true**. A false
 marker is worse than a missing one, because a missing one reports and a false one
-makes the site invisible to every later audit. The four:
+makes the site invisible to every later audit. The five:
 
 - three `# Fork: placement only ... Nothing to converge` claims on definitions that
   were byte-identical to upstream and merely *out of order* (`3105b598`);
@@ -249,6 +249,36 @@ makes the site invisible to every later audit. The four:
   overstated fork ownership of shared code, which is the shape that *deters*
   inspection; the same mistake around the `qwen3_5` norm-shift gate hid a live `+2.0`
   double-shift bug.
+- `dispatch.py::stream_generate`'s claim that *"everything else upstream does here is
+  still done ... all appear here at >= upstream's count"*, while the diffusion dispatch
+  right below it had dropped upstream's `skip_special_tokens=` and `verbose=`
+  (`eb044b7d`). See "the eighth direction".
+
+**A marker's CLAIM SHAPE is itself a risk signal, and this is the cheap check.** The
+three shapes rank by how much damage a false one does:
+
+    per-site   "this line differs because X"        -> falsifiable against `gone`
+    scoped     "these N sites are the only ones"    -> falsifiable by counting them
+    blanket    "everything else is still done"      -> NOT falsifiable; assume false
+
+A blanket claim is unverifiable by construction — it asserts something about the lines
+it does *not* name — so it launders every unexamined site in the definition into
+"reviewed". `stream_generate`'s was the only one in the tree, found by grepping for the
+phrasing rather than by reading 61 markers:
+
+```bash
+git grep -n "everything else\|>= upstream\|upstream's count\|all present\|still done" \
+    -- 'mlx_vlm/**.py' | grep -v '^mlx_vlm/tests/'
+```
+
+Distinguish a **completeness** claim ("nothing else is missing") from a **provenance**
+claim ("everything else in this class is upstream's"). The latter is fine and two
+markers legitimately make it. **Never write a blanket completeness claim: per-site or
+nothing.** And note what made this one especially bad — it invoked the
+identifier-occurrence count, which this file already calls "strictly weaker" than
+diffing bodies, and that count *would* have caught the bug (4 occurrences here against
+upstream's 5) had it been applied to the dropped name instead of a hand-picked subset.
+A weak technique aimed at the wrong symbol reads exactly like a strong one.
 
 The check for it is `dev/check_body_divergence.py --file <path>`'s **`gone`**
 column, which lists the upstream lines missing from our whole copy of the file. A
@@ -320,6 +350,15 @@ So when a commit touches N call sites, **count them** rather than trusting its t
 ```bash
 git grep -c '<helper>(' upstream/main -- '*.py'   # then the same here
 ```
+
+**[correction 2026-08-10] That grep counts CALLS, and a call site can be dropped
+without changing the count.** It would NOT have caught `29b6c00b`'s second half: both
+trees call `stream_diffusion_generate_from_kwargs` exactly twice, and what our copy
+dropped was two *keyword arguments* at one of them, making `--skip-special-tokens` a
+no-op on every diffusion model. Run the grep to find the sites, then
+`dev/check_call_arguments.py` for what each site passes — see "the eighth direction".
+The two questions are *is it called* and *is it called correctly*, and this grep only
+answers the first.
 
 **A log line is the same shape with no handle at all.** It has no caller, no symbol
 and no test, so nothing above can see it — and a commit whose content is mostly
@@ -656,6 +695,42 @@ defect — which is what keeps it at ~30s instead of >5min.
 `mlx_vlm/tests/test_call_argument_check.py` pins it, per the rule that **every new
 gating script needs one**: a bug making one of these checks *more permissive* fails
 nothing and still prints OK.
+
+### Adding a ninth direction — what the eighth cost, as a checklist
+
+There will be a ninth: each of the eight was found by hand first, and the pattern is
+always "a category of thing no existing check keys on". What the eighth needed, in the
+order that mattered:
+
+1. **A real instance first.** Do not build a check for a hypothesis. Every one of these
+   eight exists because a concrete bug was found by hand and the question "what would
+   have caught this?" had no answer.
+2. **Name which existing check is the NEAR MISS, and why it misses.** For the eighth it
+   was `check_dead_helpers.py`, and the distinction ("called" vs "called correctly") is
+   what defines the new check's scope. If no check is close, the direction is probably
+   too broad to gate.
+3. **Compare names/presence, not values.** Every check here that stayed useful compares
+   presence; values diverge legitimately across this fork. `check_upstream_registries.py`
+   states this outright and the eighth copied it.
+4. **Decide the asymmetry.** `ours < upstream` is a defect, `ours > upstream` is fork
+   work. A check that reports both is a check that gets switched off.
+5. **Scope to diverged files.** A byte-identical file cannot carry the defect, and this
+   is usually a 10x speed difference — the eighth was >5min tree-wide and ~30s scoped.
+   A gate slow enough to skip is not a gate.
+6. **Validate it FIRES before trusting it green.** Revert the fix, confirm it reports
+   the exact site and exits 1, restore. Write that procedure into the exclusions-file
+   header so the next session can re-run it. An audit that has never been seen to fail
+   is indistinguishable from one that cannot.
+7. **Write its test in `mlx_vlm/tests/`**, covering both directions plus the exclusions
+   contract. Not optional: a permissive bug here fails nothing and still prints OK.
+8. **Wire it into `.github/workflows/upstream-parity.yml`** and add its baseline to the
+   table above, the cold-start block, and the post-merge block. Three places, all of
+   which have gone stale before.
+
+The exclusions file wants a **written reason per entry and a hard error when one is
+missing** — every one of these scripts enforces that, and it is the only thing that
+stops a baseline becoming the "pre-existing divergence, unreviewed" swamp
+`.symbol-exclusions` took months to drain.
 
 ## The one rule that matters most
 
@@ -1039,6 +1114,11 @@ one and delete it on the same trigger.
    `/tmp`: a stale `/tmp` backup from an earlier session will restore the wrong content
    and the `-i` prompt is what tells you, if you read it.
 3. **Never read a count off a truncated pipe.** Every audit prints its own totals.
+   Its sibling: **an EMPTY result is not a passing result.** A backgrounded suite run
+   left a 0-byte output file, and `grep -E "passed|failed"` over it printed nothing —
+   which looks exactly like a clean run with a quiet tail. Re-run it in the foreground
+   rather than inferring; `wc -l` on the output file is the one-second check that says
+   which of the two you have. Same class as the `| head` masking `exit=1` below.
 4. **Never count guards off a `-k`-filtered run.** `-k "Reasoning or MarkerUnion"` also
    matched two pre-existing tests, which is how a commit message came to claim "4 of 6
    fire" when all 4 of the new ones did. The suite total is the reliable figure.
@@ -1058,6 +1138,14 @@ one and delete it on the same trigger.
    completion, when what is missing can be a **rewrite of a symbol that was there all
    along** (`7fbc7bc9`). Presence of a symbol says nothing about whether its body is
    upstream's.
+   **And a PER-FILE byte-identity sweep cannot close a commit either.** The obvious
+   way to check one is `for f in $(git show --name-only ...); do git diff
+   upstream/main -- $f; done`, and for `29b6c00b` that returned **10 of 11 files at
+   0 diff-lines** — which reads as "essentially landed" and is exactly wrong. The
+   whole residue was two keyword arguments inside the eleventh. A 0-diff file tells
+   you nothing you did not already know; **the diverged files are the only ones worth
+   reading, and you must look at the commit's own hunks within them**, not at the
+   file's total divergence. `29b6c00b` has now been declared complete twice.
 8. **"Not missing" is not "not dropped".** `#1433`'s prefill gate and `#1598`'s
    predicate refactor were *narrowings and refactors upstream had already removed* —
    nothing was absent, so no report could list them and no identifier count could flag
