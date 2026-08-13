@@ -5225,6 +5225,7 @@ class TurboQuantKVCache(_BaseCache):
         prealloc_tokens: Optional[int] = None,
         key_bits: Optional[float] = None,
         value_bits: Optional[float] = None,
+        decode_2pass_use_legacy: Optional[bool] = None,
     ):
         import os as _os
 
@@ -5257,6 +5258,23 @@ class TurboQuantKVCache(_BaseCache):
         self._kv_quant_mode = (
             kv_quant_mode or _os.environ.get("TQ_KV_QUANT_MODE", "mse")
         ).lower()
+        # Decode pass-1 selector for A/B measurement: False (default) = the fused GQA tile-reuse
+        # kernel, True = the R-redundant legacy kernel that is its apples-to-apples baseline.
+        #
+        # This was previously reachable ONLY by setting the private attribute by hand, and NOTHING in
+        # the fork set it — the flag appeared in exactly one place, the `getattr` that reads it. It
+        # served a one-off micro-bench and then became dead code, which left the kernel's recorded
+        # win ("lossless, ~1.3x over legacy TQ, +2-7% end-to-end") impossible to re-measure at
+        # runtime. The same 2026-08-13 re-verification pass found APC — another shipped Phase-2 win —
+        # completely inert in production, provable only because APC exposes /metrics counters; this
+        # kernel had no equivalent. A perf lever with no runtime toggle is unauditable by
+        # construction, so it now follows the TQ_FUSED_PREFILL idiom. Default is UNCHANGED.
+        self._decode_2pass_use_legacy = (
+            decode_2pass_use_legacy
+            if decode_2pass_use_legacy is not None
+            else _os.environ.get("TQ_DECODE_2PASS_LEGACY", "0").lower()
+            in ("1", "true", "yes")
+        )
         self.offset = 0
         self.keys = None
         self.values = None
@@ -6327,8 +6345,10 @@ class TurboQuantKVCache(_BaseCache):
                 # dequantizes the kv tile once and serves G=heads_per_group
                 # query-heads (peak G=2 per spike C; G=1 when n_repeats is odd),
                 # cutting the R x-redundant kv read to R/G x. The
-                # ``_decode_2pass_use_legacy`` toggle selects the R x-redundant
-                # legacy kernel for the apples-to-apples micro-bench baseline.
+                # ``_decode_2pass_use_legacy`` selects the R x-redundant legacy kernel as the
+                # apples-to-apples baseline. Set it via ``TQ_DECODE_2PASS_LEGACY=1`` or the
+                # constructor arg (constructor wins), so this lever can actually be A/B'd — see
+                # __init__ for why that was not previously possible.
                 use_legacy = getattr(self, "_decode_2pass_use_legacy", False)
                 heads_per_group = 2 if (n_repeats % 2 == 0) else 1
                 if use_legacy:
