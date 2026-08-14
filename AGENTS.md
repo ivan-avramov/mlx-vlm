@@ -1213,6 +1213,35 @@ one and delete it on the same trigger.
     probe: a deletion-only hunk looks identical and is not fixable that way.
     `check_body_divergence.py` now refuses `# Fork: placement only` outright: all three
     markers in this tree that claimed it were false.
+16. **A literal-string grep cannot scope a SEMANTIC bug, and "one occurrence in the
+    whole fork" is the claim it gets wrong.** `nemotron_h`'s over-strict
+    `(inputs is None) == (inputs_embeds is None)` was reported as the only instance,
+    grepped by its exact condition text and its exact message text. The second one is
+    `gemma3n.py`'s `(input_ids is None) ^ (inputs_embeds is not None)` — different
+    parameter name, different operator, **identical truth table**, invisible to both
+    greps. Search for the *shape* instead (`git grep -nE 'raise ValueError\(.*inputs_embeds'`
+    finds all four candidates tree-wide), then truth-table each hit rather than reading
+    it. This is the same failure as reading a `--numstat` count: a textual tool
+    answering a semantic question.
+17. **Whether an over-strict guard is a BUG depends on whether its branches are
+    EQUIVALENT — not on what today's callers happen to pass.** Both guards above reject
+    both-supplied. Only one is wrong. `nemotron_h`'s two branches both assign the same
+    `hidden_states` and everything downstream is identical, so rejecting both-supplied
+    rejects a harmless call — a bug, and it broke the shared AR loop. `gemma3n`'s
+    branches run *different* learned norms (`soft_embedding_norm` vs
+    `hard_embedding_norm`, separate `Gemma3nRMSNorm` instances), so silently preferring
+    one would pick a different normalisation path: a caller passing both there has a
+    real bug and should be told. **`gemma3n`'s guard is correct — do not widen it for
+    consistency with the `nemotron_h` fix.** Note it is byte-identical to upstream, so
+    it is not a divergence and deliberately has no entry under "Deliberate divergences"
+    (this file already carries two corrections for guardrails that protected
+    non-divergences; do not add a third).
+    **And when demonstrating branch inequivalence, vary the weights PER CHANNEL.** A
+    uniform scale difference between the two norms shows *no* output difference, because
+    `embedding_post_projection_norm` is `with_scale=False` and an RMSNorm cancels a
+    global scalar. The first attempt at this check used a uniform 1.0-vs-2.0 and
+    "proved" the branches equivalent, which is the opposite of the truth; per-channel
+    scales differ by ~1.04 on the same input.
 
 **Proof**
 

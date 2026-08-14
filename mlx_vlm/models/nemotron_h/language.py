@@ -442,8 +442,19 @@ class NemotronHModel(nn.Module):
         cache: Optional[Any] = None,
         inputs_embeds: Optional[mx.array] = None,
     ):
-        if (inputs is None) == (inputs_embeds is None):
-            raise ValueError("Provide exactly one of inputs or inputs_embeds")
+        # Fork: upstream rejects both-supplied as well as neither-supplied
+        # (`if (inputs is None) == (inputs_embeds is None)`). Only neither is
+        # unserviceable -- the branch immediately below already handles
+        # both-supplied by preferring inputs_embeds. Rejecting it broke the
+        # shared AR loop, which passes both: generate/ar.py calls
+        # `model.language_model(y, inputs_embeds=inputs_embeds, ...)` because
+        # for a VLM inputs_embeds is the vision-merged embedding while the
+        # token ids are still carried alongside. That made `mlx_vlm.generate`
+        # raise on every nemotron_h model while the server path (which passes
+        # inputs_embeds only) worked, so the AR loop is right and this guard
+        # was the outlier.
+        if inputs is None and inputs_embeds is None:
+            raise ValueError("Provide inputs or inputs_embeds")
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         elif self.with_embeddings:
