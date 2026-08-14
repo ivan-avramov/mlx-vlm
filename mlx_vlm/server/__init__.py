@@ -136,6 +136,7 @@ from .responses_state import _sse_event as _response_sse_event
 from .responses_state import (  # Fork: adds the THINKING_FORMATS helpers; Fork: _step_thinking_state is fork-only
     _step_thinking_state,
     _store_response,
+    make_response_stream_state,
     process_tool_calls,
     prompt_has_open_thinking,
     response_store,

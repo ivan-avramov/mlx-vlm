@@ -94,7 +94,7 @@ class ThinkingStreamState:
         self.thinking_done = False
         self.buffer = ""
 
-    def feed(self, text: str) -> ThinkingStreamDelta:
+    def feed(self, text: str, last: bool = False) -> ThinkingStreamDelta:
         self.buffer += text or ""
         reasoning = []
         content = []
@@ -144,6 +144,13 @@ class ThinkingStreamState:
 
             self.buffer = self.buffer[idx + len(marker) :].lstrip("\n")
             self.in_thinking = True
+
+        if last and self.buffer:
+            held, self.buffer = self.buffer, ""
+            if self.in_thinking:
+                reasoning.append(self._strip_open_marker(held))
+            else:
+                content.append(_strip_content_markers(held))
 
         return ThinkingStreamDelta(
             reasoning="".join(reasoning) or None,
@@ -204,6 +211,75 @@ class ThinkingStreamState:
                 before, after = text.split(marker, 1)
                 return before + after.lstrip("\n")
         return text
+
+
+class ResponseTemplateStreamState:
+    """Adapt a Transformers response-template parser to server stream deltas."""
+
+    def __init__(self, parser):
+        self.parser = parser
+
+    def feed(self, text: str, last: bool = False) -> ThinkingStreamDelta:
+        reasoning = []
+        content = []
+        thinking_closed = False
+        events = self.parser.feed(text or "")
+        if last:
+            _, final_events = self.parser.finalize()
+            events.extend(final_events)
+
+        for event in events:
+            event_type = event.get("type")
+            field = event.get("field")
+            if event_type == "region_close" and field in (
+                "reasoning",
+                "reasoning_content",
+            ):
+                thinking_closed = True
+            if event_type != "region_chunk":
+                continue
+            chunk = event.get("text")
+            if not chunk:
+                continue
+            if field in ("reasoning", "reasoning_content"):
+                reasoning.append(chunk)
+            elif field == "content":
+                content.append(chunk)
+        return ThinkingStreamDelta(
+            reasoning="".join(reasoning) or None,
+            content="".join(content) or None,
+            thinking_closed=thinking_closed,
+        )
+
+
+def _response_template_tokenizer(processor):
+    if processor is None:
+        return None
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    if getattr(tokenizer, "response_template", None) is None:
+        return None
+    return tokenizer
+
+
+def make_response_stream_state(
+    processor,
+    enable_thinking: bool = False,
+    thinking_start_token: Optional[str] = None,
+    thinking_end_token: Optional[str] = None,
+):
+    tokenizer = _response_template_tokenizer(processor)
+    if tokenizer is not None and hasattr(tokenizer, "get_response_parser"):
+        try:
+            return ResponseTemplateStreamState(tokenizer.get_response_parser(prefix=""))
+        except (AttributeError, TypeError, ValueError):
+            logger.debug(
+                "Falling back from tokenizer response-template parser", exc_info=True
+            )
+    return ThinkingStreamState(
+        enable_thinking,
+        thinking_start_token,
+        thinking_end_token,
+    )
 
 
 def prompt_has_open_thinking(
@@ -388,22 +464,52 @@ def _split_thinking(
     thinking_start_token: Optional[str] = None,
     thinking_end_token: Optional[str] = None,
     starts_in_thinking: bool = False,
+    processor=None,
 ) -> Tuple[Optional[str], str]:
-    # Fork: dispatches to `_split_thinking_by_format` when a registry family is
-    # detected, falling back to upstream's marker-pair logic otherwise.
     """Split thinking tags from content. Returns (reasoning, content).
 
-    When no explicit start/end tokens are supplied, prefer the
-    THINKING_FORMATS registry (most-specific-first) so family literals
-    like Gemma's pipe-delimited ``<|think|>`` resolve correctly and don't
-    collide with the generic ``<think>`` default. Falls back to the
-    hard-coded marker-pair loop for explicit tokens or the
-    ``<|START_THINKING|>`` style defaults that aren't in the registry.
+    Tries three strategies in order of authority: the model's own
+    ``parse_response`` response template, then the THINKING_FORMATS
+    registry, then the hard-coded marker-pair loop.
+
+    The registry is preferred over the marker loop when no explicit
+    start/end tokens are supplied, so family literals like Gemma's
+    pipe-delimited ``<|think|>`` resolve correctly and don't collide with
+    the generic ``<think>`` default. The marker loop still handles
+    explicit tokens and the ``<|START_THINKING|>`` style defaults that
+    aren't in the registry.
     """
+    # Fork: inserts the THINKING_FORMATS registry stage between upstream's
+    # response-template stage and upstream's marker-pair loop. Both upstream
+    # stages are unchanged and still run, in upstream's order relative to
+    # each other; the model's own parse_response still wins when it supplies
+    # one, so this only changes behaviour for models that do not.
     if not text:
         return None, text
 
-    # Registry path: only when the caller didn't pin explicit tokens.
+    tokenizer = _response_template_tokenizer(processor)
+    if tokenizer is not None and hasattr(tokenizer, "parse_response"):
+        try:
+            parsed = tokenizer.parse_response(text, prefix="")
+            if isinstance(parsed, dict) and (
+                "content" in parsed
+                or "reasoning" in parsed
+                or "reasoning_content" in parsed
+            ):
+                reasoning = parsed.get("reasoning_content") or parsed.get("reasoning")
+                content = parsed.get("content")
+                if reasoning is None or isinstance(reasoning, str):
+                    if content is None or isinstance(content, str):
+                        return (
+                            reasoning.strip() if reasoning else None,
+                            content.strip() if content else "",
+                        )
+        except (AttributeError, TypeError, ValueError):
+            logger.debug(
+                "Falling back from tokenizer response-template parser", exc_info=True
+            )
+
+    # Fork: registry path, only when the caller didn't pin explicit tokens.
     if not (thinking_start_token and thinking_end_token):
         fmt = detect_thinking_format(text)
         if fmt is None:
@@ -601,9 +707,13 @@ def _response_output_items_from_text(
     thinking_start_token: Optional[str] = None,
     thinking_end_token: Optional[str] = None,
     reasoning_item_id: Optional[str] = None,
+    processor=None,
 ) -> Tuple[List[Dict[str, Any]], str, Optional[str], str]:
     reasoning, content = _split_thinking(
-        full_text, thinking_start_token, thinking_end_token
+        full_text,
+        thinking_start_token,
+        thinking_end_token,
+        processor=processor,
     )
     reasoning_items = _reasoning_output_items(reasoning, reasoning_item_id)
     if tool_module is not None and chat_tools:

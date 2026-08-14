@@ -39,8 +39,9 @@ from .generation import (  # Fork: resolve_backend_label is fork-only — it rep
     _count_prompt_tokens,
     resolve_backend_label,
 )
-from .responses_state import (  # Fork: _CONTENT_MARKERS is fork-only (08723a3f's marker-set union); Fork: _step_thinking_state is fork-only — the positional opener scan that replaces upstream's ThinkingStreamState.feed on the streaming chat path
+from .responses_state import (  # Fork: _CONTENT_MARKERS is fork-only (08723a3f's marker-set union); Fork: _step_thinking_state is fork-only — the positional opener scan that supersedes upstream's ThinkingStreamState.feed on the streaming chat path when the model ships no parse_response template
     _CONTENT_MARKERS,
+    ResponseTemplateStreamState,
     ThinkingStreamState,
     _normalize_response_input,
     _partial_tag_start_pos,
@@ -50,9 +51,10 @@ from .responses_state import (  # Fork: _CONTENT_MARKERS is fork-only (08723a3f'
     _response_tool_registry,
 )
 from .responses_state import _sse_event as _response_sse_event
-from .responses_state import (  # Fork: _CONTENT_MARKERS is fork-only (08723a3f's marker-set union); Fork: _step_thinking_state is fork-only — the positional opener scan that replaces upstream's ThinkingStreamState.feed on the streaming chat path
+from .responses_state import (  # Fork: _CONTENT_MARKERS is fork-only (08723a3f's marker-set union); Fork: _step_thinking_state is fork-only — the positional opener scan that supersedes upstream's ThinkingStreamState.feed on the streaming chat path when the model ships no parse_response template
     _step_thinking_state,
     _store_response,
+    make_response_stream_state,
     process_tool_calls,
     prompt_has_open_thinking,
     response_store,
@@ -1450,8 +1452,14 @@ async def responses_endpoint(request: Request):
                         if tool_module is not None and chat_tools
                         else None
                     )
-                    thinking_state = ThinkingStreamState(
-                        gen_args.enable_thinking,
+                    thinking_state = make_response_stream_state(
+                        processor,
+                        prompt_has_open_thinking(
+                            formatted_prompt,
+                            gen_args.enable_thinking,
+                            gen_args.thinking_start_token,
+                            gen_args.thinking_end_token,
+                        ),
                         gen_args.thinking_start_token,
                         gen_args.thinking_end_token,
                     )
@@ -1492,7 +1500,9 @@ async def responses_endpoint(request: Request):
                             raw_delta = token.text
                             full_text += raw_delta
                             chunk_rate = metrics.record_chunk(token)
-                            thinking_delta = thinking_state.feed(raw_delta)
+                            thinking_delta = thinking_state.feed(
+                                raw_delta, last=bool(token.finish_reason)
+                            )
                             if thinking_delta.reasoning:
                                 streamed_reasoning += thinking_delta.reasoning
                                 yield _response_sse_event(
@@ -1543,7 +1553,10 @@ async def responses_endpoint(request: Request):
                             raw_delta = chunk.text
                             full_text += raw_delta
                             chunk_rate = metrics.record_chunk(chunk)
-                            thinking_delta = thinking_state.feed(raw_delta)
+                            chunk_finish = getattr(chunk, "finish_reason", None)
+                            thinking_delta = thinking_state.feed(
+                                raw_delta, last=bool(chunk_finish)
+                            )
                             if thinking_delta.reasoning:
                                 streamed_reasoning += thinking_delta.reasoning
                                 yield _response_sse_event(
@@ -1562,7 +1575,6 @@ async def responses_endpoint(request: Request):
                             in_tool_call, delta = suppress_tool_call_content(
                                 full_text, in_tool_call, tc_start, delta
                             )
-                            chunk_finish = getattr(chunk, "finish_reason", None)
                             if chunk_finish is not None:
                                 finish_reason = chunk_finish
                             usage_stats = {
@@ -1584,6 +1596,7 @@ async def responses_endpoint(request: Request):
                             gen_args.thinking_start_token,
                             gen_args.thinking_end_token,
                             reasoning_item_id,
+                            processor=processor,
                         )
                     )
                     tool_output_items = [
@@ -1862,6 +1875,7 @@ async def responses_endpoint(request: Request):
                         tool_registry,
                         gen_args.thinking_start_token,
                         gen_args.thinking_end_token,
+                        processor=processor,
                     )
                 )
                 if output_finish_reason == "tool_calls":
@@ -2223,6 +2237,32 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                         output_tokens = 0
                         request_id = f"chatcmpl-{uuid.uuid4()}"
+                        # Fork: upstream builds a single `thinking_state` here and
+                        # drives it with `.feed()`. We build the same object, but
+                        # only USE it when it is the response-template state --
+                        # i.e. when the model actually ships a `parse_response`
+                        # template, which is upstream's new capability and is
+                        # authoritative when present. Otherwise
+                        # `make_response_stream_state` would hand back a plain
+                        # ThinkingStreamState, and on THIS path the fork's
+                        # `_step_thinking_state` scan supersedes its `.feed()`:
+                        # feed() mis-splits token-spanning tags, leaks tag
+                        # prefixes as content, and handles only one transition
+                        # per token. See `_step_thinking_state`'s docstring.
+                        thinking_state = make_response_stream_state(
+                            processor,
+                            prompt_has_open_thinking(
+                                formatted_prompt,
+                                gen_args.enable_thinking,
+                                gen_args.thinking_start_token,
+                                gen_args.thinking_end_token,
+                            ),
+                            gen_args.thinking_start_token,
+                            gen_args.thinking_end_token,
+                        )
+                        use_response_template = isinstance(
+                            thinking_state, ResponseTemplateStreamState
+                        )
                         # Thinking-state machine driven by the THINKING_FORMATS
                         # registry. Seeded in_thinking=True when the rendered
                         # prompt ends inside a thinking block (Gemma 4 global
@@ -2257,21 +2297,28 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             full_output += token.text
                             chunk_rate = metrics.record_chunk(token)
 
-                            # Detect thinking boundaries. The helper appends
-                            # the token to `accumulated` internally — callers
-                            # pass the *previous* accumulated and the *new*
-                            # token only.
-                            (
-                                in_thinking,
-                                accumulated,
-                                delta_reasoning,
-                                delta_content,
-                            ) = _step_thinking_state(
-                                token.text,
-                                in_thinking,
-                                accumulated,
-                                thinking_format,
-                            )
+                            # Detect thinking boundaries
+                            if use_response_template:
+                                thinking_delta = thinking_state.feed(
+                                    token.text, last=bool(token.finish_reason)
+                                )
+                                delta_reasoning = thinking_delta.reasoning
+                                delta_content = thinking_delta.content
+                            else:
+                                # Fork: the helper appends the token to
+                                # `accumulated` internally — callers pass the
+                                # *previous* accumulated and the *new* token only.
+                                (
+                                    in_thinking,
+                                    accumulated,
+                                    delta_reasoning,
+                                    delta_content,
+                                ) = _step_thinking_state(
+                                    token.text,
+                                    in_thinking,
+                                    accumulated,
+                                    thinking_format,
+                                )
 
                             # Suppress tool-call markup from content
                             in_tool_call, delta_content = suppress_tool_call_content(
@@ -2388,8 +2435,14 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
                         request_id = f"chatcmpl-{uuid.uuid4()}"
                         output_text = ""
-                        thinking_state = ThinkingStreamState(
-                            gen_args.enable_thinking,
+                        thinking_state = make_response_stream_state(
+                            processor,
+                            prompt_has_open_thinking(
+                                formatted_prompt,
+                                gen_args.enable_thinking,
+                                gen_args.thinking_start_token,
+                                gen_args.thinking_end_token,
+                            ),
                             gen_args.thinking_start_token,
                             gen_args.thinking_end_token,
                         )
@@ -2405,7 +2458,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             if chunk_finish is not None:
                                 finish_reason = chunk_finish
 
-                            thinking_delta = thinking_state.feed(chunk.text)
+                            thinking_delta = thinking_state.feed(
+                                chunk.text, last=bool(chunk_finish)
+                            )
                             if thinking_delta.content or thinking_delta.reasoning:
                                 choices = [
                                     ChatStreamChoice(
@@ -2664,6 +2719,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         gen_args.thinking_start_token,
                         gen_args.thinking_end_token,
                     ),
+                    processor=processor,
                 )
 
                 # Count raw generated tokens minus thinking tag tokens

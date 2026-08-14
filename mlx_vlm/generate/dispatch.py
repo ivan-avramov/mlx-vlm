@@ -742,6 +742,12 @@ def stream_generate(
     # Do not restore a blanket "everything else" claim here; per-site or nothing.
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
     verbose = kwargs.pop("verbose", False)
+    # Preserve only explicitly supplied sequence tensors as semantic APC
+    # inputs. Tensors produced by prepare_inputs span the complete prompt and
+    # therefore change whenever text is appended, even when the old token
+    # prefix is identical.
+    custom_inputs_embeds = kwargs.get("inputs_embeds")
+    custom_mask = kwargs.get("mask")
 
     # Ensure stopping criteria reflects the model's EOS token IDs.
     # generate() does this before calling us, but direct callers (e.g. the
@@ -913,8 +919,8 @@ def stream_generate(
             media={
                 "audio": audio_features if audio_features is not None else audio,
                 "video": video_features if video_features is not None else video,
-                "embeddings": kwargs.get("inputs_embeds"),
-                "masks": mask,
+                "embeddings": custom_inputs_embeds,
+                "masks": custom_mask,
             },
             model=model,
             processor=processor,

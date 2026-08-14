@@ -58,9 +58,15 @@ An empty file is **not** a reason to delete it — each keeps its header and RES
 notes, and the next merge that adds a fork hunk to a shared file will need an entry.
 
 Two non-gating lead generators, which are read rather than gated on:
-`find_dropped_hunks.py` (**18** commits, all closed by review — see `upstream-gaps.md`,
+`find_dropped_hunks.py` (**20** commits, all closed by review — see `upstream-gaps.md`,
 "the dropped-hunk report has bottomed out"; that count will never reach zero) and
-`find_untested_fork_code.py` (**10**, all confirmed executed by a coverage run).
+`find_untested_fork_code.py` (**9**, all confirmed executed by a coverage run).
+
+**The dropped-hunk count moves when the FORK edits a file, not only when upstream
+does** — attribution is by line content, so replacing an upstream line with fork work
+makes the commit that introduced it start reporting. Three of the 20 joined that way
+and none was a gap; see the 2026-08-14 rows in `upstream-gaps.md`. Expect a new entry
+after any merge in which you convert an upstream call to a fork helper.
 
 ## Fork & branches
 
@@ -794,8 +800,15 @@ positives. Every hit still needs `git log -S` and a read.
 cd mlx_vlm/ && pytest -s ./tests --ignore=tests/test_smoke.py
 ```
 
-The suite is **green: 3079 passed, 5 skipped, 0 failed.** Keep it that way. (This
+The suite is **green: 3279 passed, 7 skipped, 0 failed.** Keep it that way. (This
 line goes stale on every restore that adds a guard — trust the run, not the number.)
+
+**`mlx-audio>=0.4.8` is required and `requirements.txt` says so as a fork bump.**
+Upstream's nemotron_voicechat (#1817) imports `mlx_audio.codec.models.nemotron_voicechat`,
+which only exists from 0.4.8, while upstream's floor still reads `>=0.4.3`. On 0.4.7
+three test files fail *at collection*, which pytest reports as `Interrupted` — the whole
+suite does not run, and a `| tail` of that output looks nothing like a test failure. If
+the suite reports errors rather than failures, check the dependency floors first.
 
 **Compare failing test IDs, not counts.** A change that fixes one test and breaks
 another shows the same total:
@@ -970,14 +983,21 @@ layers are native: `trainer/lora_layers.py`, `trainer/dora_layers.py`,
 ## mlx-lm: vendored, not depended on
 
 Upstream vendored its infrastructure and stopped importing `mlx_lm` in library
-code; this fork now matches. **Exactly two library files reference it**, the same
-two as upstream:
+code; this fork now matches. **As of the 2026-08-14 merge, NO file in the tree
+imports `mlx_lm` at all** — every remaining hit of the string is a provenance
+comment (`models/qwen3_5/gated_delta.py`, the nine `tool_parsers/*.py` vendoring
+headers, `quant_utils.py`, seven test files) or an unrelated config key
+(`mlx_lm_extra_tensors` in `speculative/drafters/qwen3_5_mtp/split.py`). Verify
+with `git grep -l 'import mlx_lm\|from mlx_lm'`, not with a bare `mlx_lm` grep,
+which is almost all comments.
 
-- `models/text_only.py` — a lazy, optional `from mlx_lm.utils import _get_classes`
-  inside a function, wrapped in `try/except ImportError` with a real message. This
-  is the intended escape hatch for text-only architectures with no native
-  implementation. Keep it.
-- `models/qwen3_5/gated_delta.py` — a provenance *comment*, not an import.
+**[correction 2026-08-14]** This section used to say "exactly two library files
+reference it", the second being `models/text_only.py` — "the intended escape hatch
+for text-only architectures with no native implementation. Keep it." That file no
+longer exists: `738e4406` (#1891) ported 24 MLX-LM models natively and deleted both
+`models/text_only.py` and the `_is_text_only_config` fallback in
+`utils.py::get_model_and_args`, then dropped `mlx-lm` from `requirements.txt`. The
+"keep it" instruction was correct when written and is now the opposite of correct.
 
 So use the native modules: `models/cache.py`, `models/base.py`,
 `models/activations.py`, `models/rope_utils.py`, `models/switch_layers.py`,
@@ -985,8 +1005,15 @@ So use the native modules: `models/cache.py`, `models/base.py`,
 `quant_utils.py`. **Do not add new `mlx_lm` imports to library code.** If
 something seems missing, it is almost certainly in one of those.
 
-`mlx-lm` stays in `requirements.txt` — it is still needed for the text-only
-fallback and by two test files.
+`mlx-lm` is **no longer in `requirements.txt`** (#1891 removed it), which makes the
+rule above load-bearing rather than stylistic: a new `mlx_lm` import is now an
+`ImportError` on a clean install, not a style nit. That trap fired immediately —
+upstream's own new `server/reranking.py` (#1853) imports
+`create_causal_mask` from `mlx_lm.models.base` at module scope, and `server/app.py`
+imports `reranking` at module scope, so `import mlx_vlm.server` failed outright on a
+clean install. The fork points that one line at the byte-identical
+`models/cache.py::create_causal_mask` instead; see the two `# Fork:` markers at the
+top of `reranking.py`. **Re-check this after every merge that adds a server module.**
 
 ## Deliberate divergences — do not "fix" these
 

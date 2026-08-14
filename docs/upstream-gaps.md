@@ -639,7 +639,7 @@ Fixed, with the repro failing before and passing after, and guarded at runtime b
 — which was verified to fail against pre-fix `dispatch.py`, not merely to pass against
 the fix (trap #13).
 
-## The dropped-hunk report has bottomed out — 18 commits, all closed by review
+## The dropped-hunk report has bottomed out — 20 commits, all closed by review
 
 **Settled 2026-08-10, and this is the section to read before re-investigating any
 `find_dropped_hunks.py` hit.** The wide pass
@@ -654,6 +654,30 @@ variable rename reads identically to a dropped hunk.
 `.fork-marker-allowlist` is empty and `.deletion-exclusions` is empty, so the report
 count is no longer a progress signal of any kind. **The exclusion baselines are**
 (`.symbol-exclusions` 14, everything else 0).
+
+**[update 2026-08-14] 18 -> 20, and the two arrivals prove the point above.** Both were
+added by the FORK editing a file, not by upstream dropping anything. The count moves
+whenever fork work replaces an upstream line, because attribution is by line content:
+
+* **`c235cf3c`** (#789, 5, `utils.py`) — the 5 lines are
+  `ThinkingBudgetCriteria`'s three `tokenizer.encode(...)` calls, which the fork routes
+  through `cached_special_token_encode` (`1429e2d9`, `ae3e46c5`) to avoid HF's
+  "Already borrowed" race under continuous batching. Same statements, cached callee.
+  The commit's other 6 missing lines are `apply_forced_token`, which upstream itself
+  renamed to `pop_forced_token_id` — already covered by `.symbol-exclusions`.
+* **`1cec2e8a`** (#1216, 3, `server/openai.py`) — 7 `chunk_data.model_dump_json()`
+  yields that the fork spells `chunk_data.to_sse_json()`, plus two `return` statements
+  the fork widened to carry `resolve_backend_label(ctx)` (`4d67d8bd`). Both marked
+  `# Fork:`; both are supersets, nothing lost.
+* **`8bcab940`** (#1087, 1, `requirements.txt`) — the fork's `mlx-audio>=0.4.3` ->
+  `>=0.4.8` bump, needed by upstream's own nemotron_voicechat. The commit that
+  *introduced* the `>=0.4.3` line is what gets blamed for its absence. This one is a
+  docs/config hit and only visible because `--min-lines-config` is 1.
+
+The method for all three was the same and is worth reusing: extract the commit's added
+lines, subtract the ones absent from `upstream/main` too (those are upstream's own later
+removals, not our gap), and read what is left. A three-line script beats a `git log -S`
+per line.
 
 Closed because the fork deliberately supersedes them — see each file's `# Fork:`
 markers, which name the commit:

@@ -159,7 +159,10 @@ class TestBackendLabelReportsThePathThatRan:
         monkeypatch.setattr(
             rg,
             "_gpu_embed",
-            lambda raw, images=None: (mx.zeros((1, 3), dtype=mx.int32), {}),
+            lambda raw, images=None, apc_semantic_hash=None: (
+                mx.zeros((1, 3), dtype=mx.int32),
+                {},
+            ),
         )
         monkeypatch.setattr(rg, "_make_sampler", lambda args: None)
         monkeypatch.setattr(rg, "_make_logits_processors", lambda args, ids: None)

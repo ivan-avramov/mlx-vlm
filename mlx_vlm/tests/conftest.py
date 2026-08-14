@@ -15,11 +15,22 @@ green), collection is skipped here, in one reviewable place, with a reason each.
 
 Removing an entry is the definition of done for porting that feature: delete the
 line, and the upstream tests for it run as-is.
+
+# Fork: this docstring is fork-only -- upstream's conftest.py (#1846) is just the
+TF32 pin below it, with no docstring. This file is the union of the two.
 """
 
 from __future__ import annotations
 
-import pathlib
+import os
+import pathlib  # Fork: needed by the collection config below; upstream imports only os.
+
+# float32 matmul runs at TF32 precision on hardware with matrix units, which is
+# looser than the float32 references these tests compare against. Set rather than
+# setdefault, so an inherited MLX_ENABLE_TF32=1 doesn't leak into the test run.
+os.environ["MLX_ENABLE_TF32"] = "0"
+
+# Fork additions below this line
 
 # path -> (missing symbol, what porting it actually requires)
 #
