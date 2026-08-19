@@ -1134,6 +1134,8 @@ def _sample_with_positions(
     *,
     row_ids: Optional[List[int]] = None,
     positions: Optional[List[int]] = None,
+    # Fork (O30): per-request seeds on the batch decode path -- None
+    # preserves upstream's single-shared-seed behavior exactly.
     seeds: Optional[List[int]] = None,
 ) -> mx.array:
     sample_target = getattr(sampler, "sample_target", None)
@@ -1146,6 +1148,8 @@ def _sample_with_positions(
     return sampler(logprobs)
 
 
+# Fork: _resolve_seeds is fork-only (O30) -- upstream has no per-request seed
+# resolution on the batch decode path.
 def _resolve_seeds(
     seeds: Optional[List[Optional[int]]], sampler: Callable[[mx.array], mx.array]
 ) -> Optional[List[int]]:

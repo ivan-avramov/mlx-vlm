@@ -10,7 +10,14 @@ from dataclasses import dataclass, field
 from queue import Empty as QueueEmpty
 from queue import Queue
 from threading import Event, Lock, Thread
-from typing import Callable, Generator, List, Optional, Tuple, Union
+from typing import (  # Fork: Union needed by _position_keys's seeds param (O30)
+    Callable,
+    Generator,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import mlx.core as mx
 from fastapi import HTTPException

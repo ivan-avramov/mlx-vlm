@@ -2966,6 +2966,8 @@ def test_batch_apc_extra_hash_tracks_explicit_sequence_tensors():
 
 
 def test_precomputed_semantic_hash_reuses_actual_growing_apc_prefix():
+    # Fork (O30): the sequence tuple `_apc_pick_for` unpacks gained a trailing
+    # `seed` field; this test's tuple literal carries the extra `None`.
     manager = apc_module.APCManager(num_blocks=4, block_size=4)
     manager.exact_cache_guard_tokens = 1
     semantic_hash = 7088136067003016882
@@ -3007,6 +3009,8 @@ def test_precomputed_semantic_hash_reuses_actual_growing_apc_prefix():
 
 
 def test_cold_batch_left_pads_sequence_aligned_prompt_kwargs():
+    # Fork (O30): sequence tuples carry a trailing `seed` field (extra
+    # `None` below) that upstream's tuple shape does not have.
     class EmptyGenerationBatch:
         def __len__(self):
             return 0
@@ -3120,6 +3124,8 @@ def test_prompt_processing_batch_slices_native_mrope_position_ids():
 
 
 def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
+    # Fork (O30): sequence tuples carry a trailing `seed` field (extra
+    # `None` in each tuple literal below).
     bg = object.__new__(BatchGenerator)
     bg.apc_manager = object()
     bg.model = SimpleNamespace(layers=[object()])
@@ -3195,6 +3201,8 @@ def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
 
 
 def test_apc_pick_rejects_image_tokens_and_releases_blocks():
+    # Fork (O30): `_apc_pick_for`'s sequence tuple carries a trailing `seed`
+    # field (the extra `None` in the call below).
     block_size = 4
     image_token_id = 99
     token_ids = [image_token_id, 1, 2, 3, 4]

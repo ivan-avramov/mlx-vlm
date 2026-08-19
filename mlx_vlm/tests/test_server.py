@@ -4142,6 +4142,7 @@ def _completion_fake_generator(tokens, prompt_tokens=8, captured=None):
 
 
 def test_completions_basic_non_streaming(client, monkeypatch):
+    # Fork: legacy /v1/completions endpoint test -- see the banner above.
     model = SimpleNamespace()
     processor = SimpleNamespace()
     config = SimpleNamespace(model_type="qwen2_vl")
@@ -4187,6 +4188,7 @@ def test_completions_basic_non_streaming(client, monkeypatch):
 
 def test_completions_prompt_is_not_chat_templated(client, monkeypatch):
     """The raw prompt must reach the model verbatim — no apply_chat_template."""
+    # Fork: legacy /v1/completions endpoint test -- see the banner above.
     model = SimpleNamespace()
     processor = SimpleNamespace()
     config = SimpleNamespace(model_type="qwen2_vl")
@@ -4226,6 +4228,7 @@ def test_completions_prompt_is_not_chat_templated(client, monkeypatch):
 
 
 def test_completions_stop_sequence_truncates_non_streaming(client, monkeypatch):
+    # Fork: legacy /v1/completions endpoint test -- see the banner above.
     model = SimpleNamespace()
     processor = SimpleNamespace()
     config = SimpleNamespace(model_type="qwen2_vl")
@@ -4256,6 +4259,7 @@ def test_completions_stop_sequence_truncates_non_streaming(client, monkeypatch):
 
 
 def test_completions_echo_prepends_prompt_non_streaming(client, monkeypatch):
+    # Fork: legacy /v1/completions endpoint test -- see the banner above.
     model = SimpleNamespace()
     processor = SimpleNamespace()
     config = SimpleNamespace(model_type="qwen2_vl")
@@ -5266,6 +5270,9 @@ def test_metrics_store_logs_request_lifecycle(caplog):
 
 
 def test_metrics_endpoint_records_chat_completion_metrics(client, monkeypatch):
+    # Fork: body is unchanged from upstream; the fork-content banner and
+    # TestResponseGenerator additions immediately below shift this function's
+    # line numbers enough that a -U0 diff attributes their hunk here too.
     monkeypatch.setattr(server.runtime, "metrics", server.ServerMetricsStore())
     monkeypatch.setattr(server.runtime, "apc_manager", None)
     monkeypatch.setattr(server.runtime, "response_generator", None)
@@ -5347,6 +5354,8 @@ def test_metrics_endpoint_records_chat_completion_metrics(client, monkeypatch):
     assert payload["server"]["loaded_context_size"] == 4096
 
 
+# Fork: organizational section banner (comment-only divergence; the classes
+# below still exist upstream too).
 # ── Continuous batching / ResponseGenerator tests ─────────────────────
 
 
