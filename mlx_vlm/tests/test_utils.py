@@ -524,7 +524,11 @@ def test_load_processor_preserves_additional_eos_tokens_on_reset():
         def __init__(self, tokenizer):
             self.tokenizer = tokenizer
 
+    # Fork: `load_config` must be patched too -- our `load_processor` reads
+    # the config first (to set laguna's `fix_mistral_regex`), which upstream's
+    # does not, so without this "unused-model-path" hits a real HF Hub lookup.
     with (
+        patch("mlx_vlm.utils.load_config", return_value={}),
         patch(
             "mlx_vlm.utils.AutoProcessor.from_pretrained",
             return_value=processor,

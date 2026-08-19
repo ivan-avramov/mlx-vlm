@@ -900,7 +900,12 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     # The model still instantiates the towers (config kept verbatim), so a strict
     # load fails on the absent tower weights. They're never called for text-only
     # inference, so relax strictness in that case (towers stay at init, unused).
-    if strict and hasattr(model, "vision_tower"):
+    #
+    # Fork: `getattr(..., None) is not None`, not bare `hasattr` -- the
+    # text_only_config branch above nulls the attribute rather than deleting
+    # it, so `hasattr` stays True after a drop and this block would otherwise
+    # re-relax strictness needlessly for a case the drop already made safe.
+    if strict and getattr(model, "vision_tower", None) is not None:
         if not any(k.startswith("vision_tower") for k in weights):
             logging.warning(
                 "Text-only quant detected (no vision_tower weights); loading "

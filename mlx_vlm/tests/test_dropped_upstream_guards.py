@@ -1717,21 +1717,28 @@ class TestApcStoreEmitsItsTrace:
 
         monkeypatch.setenv("APC_TRACE", "1")
 
+        # Fork: upstream's exact_cache_min_tokens gate (20eec6cb, default 16
+        # via APC_EXACT_MIN_TOKENS) is new since this test was written -- a
+        # 4-token store now short-circuits before the traced code path runs
+        # at all. 16 tokens clears the gate while keeping the guard itself
+        # untested here (that's exact_cache_min_tokens's own coverage).
+        token_ids = list(range(1, 17))
+        n = len(token_ids)
         cache = KVCache()
-        cache.keys = mx.ones((1, 1, 4, 2))
-        cache.values = mx.ones((1, 1, 4, 2))
-        cache.offset = 4
+        cache.keys = mx.ones((1, 1, n, 2))
+        cache.values = mx.ones((1, 1, n, 2))
+        cache.offset = n
         manager = APCManager(num_blocks=4, block_size=4)
 
         with caplog.at_level(logging.INFO, logger="mlx_vlm.apc"):
-            assert manager.store_exact_cache([1, 2, 3, 4], [cache]) is True
+            assert manager.store_exact_cache(token_ids, [cache]) is True
 
         messages = [r.message for r in caplog.records]
         assert any(
             "APC_TRACE store" in m for m in messages
         ), f"store succeeded but emitted no trace; got {messages}"
         assert any("mode=exact" in m for m in messages)
-        assert any("token_len=4" in m for m in messages)
+        assert any(f"token_len={n}" in m for m in messages)
         assert any("layers=1" in m for m in messages)
 
     def test_disk_trace_flag_goes_through_the_shared_helper(self):
