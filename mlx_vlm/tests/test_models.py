@@ -1730,6 +1730,87 @@ class TestOlmoModel(unittest.TestCase):
         )
 
 
+class TestSmolVLMFlattenedImageFeatures(unittest.TestCase):
+    def test_get_input_embeddings_uses_flattened_connector_output(self):
+        from mlx_vlm.models import smolvlm
+
+        text_config = smolvlm.TextConfig(
+            hidden_size=8,
+            intermediate_size=16,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            num_hidden_layers=1,
+            vocab_size=32,
+        )
+        vision_config = smolvlm.VisionConfig(
+            hidden_size=8,
+            intermediate_size=16,
+            num_attention_heads=2,
+            num_hidden_layers=1,
+            image_size=4,
+            patch_size=2,
+        )
+        model = smolvlm.Model(
+            smolvlm.ModelConfig(
+                text_config=text_config,
+                vision_config=vision_config,
+                image_token_id=31,
+                scale_factor=1,
+            )
+        )
+        input_ids = mx.array([[1, 31, 31, 31, 31, 2]])
+        pixel_values = mx.random.uniform(shape=(1, 1, 3, 4, 4))
+
+        output = model.get_input_embeddings(input_ids, pixel_values=pixel_values)
+
+        self.assertEqual(output.inputs_embeds.shape, (1, 6, 8))
+
+    def test_prepare_inputs_accepts_flattened_image_features(self):
+        from mlx_vlm.models import smolvlm
+
+        model = SimpleNamespace(config=SimpleNamespace(image_token_index=9))
+        input_ids = mx.array([[1, 9, 2, 9, 3]])
+        inputs_embeds = mx.arange(15).reshape(1, 5, 3)
+        image_features = mx.array([[101, 102, 103], [201, 202, 203]])
+
+        output = smolvlm.Model._prepare_inputs_for_multimodal(
+            model, image_features, inputs_embeds, input_ids
+        )
+
+        expected = mx.stack(
+            [
+                inputs_embeds[0, 0],
+                image_features[0],
+                inputs_embeds[0, 2],
+                image_features[1],
+                inputs_embeds[0, 4],
+            ]
+        )[None]
+        self.assertEqual(output.shape, inputs_embeds.shape)
+        self.assertTrue(mx.array_equal(output, expected).item())
+
+    def test_prepare_inputs_rejects_split_image_token_mismatch(self):
+        """#1919 production shape: 81 placeholders vs 13 flattened tiles.
+
+        The Idefics3 1:1 scatter must keep rejecting this. The processor is
+        what expands the prompt to 13 x 81 tokens; do not paper over the
+        mismatch by dropping extra tiles.
+        """
+        from mlx_vlm.models import smolvlm
+
+        model = SimpleNamespace(config=SimpleNamespace(image_token_index=9))
+        n_tokens, n_tiles, hidden = 81, 13, 3
+        seq = 1 + n_tokens + 1
+        input_ids = mx.array([[1] + [9] * n_tokens + [2]])
+        inputs_embeds = mx.zeros((1, seq, hidden))
+        image_features = mx.zeros((n_tiles * n_tokens, hidden))
+
+        with self.assertRaisesRegex(ValueError, r"tokens: 81, features 1053"):
+            smolvlm.Model._prepare_inputs_for_multimodal(
+                model, image_features, inputs_embeds, input_ids
+            )
+
+
 class TestModels(unittest.TestCase):
     def language_test_runner(self, model, model_type, vocab_size, num_layers):
         self.assertEqual(model.model_type, model_type)
@@ -3017,6 +3098,75 @@ class TestModels(unittest.TestCase):
         logits = model(nxt, cache=cache).logits
         self.assertEqual(logits.shape, (1, 1, config.vocab_size))
         self.assertTrue(mx.all(mx.isfinite(logits)).item())
+
+    def test_gemma3_rope_scaling_applies_only_to_global_attention(self):
+        from mlx_vlm.models import gemma3
+        from mlx_vlm.models.gemma3.language import LanguageModel
+
+        config = gemma3.TextConfig(
+            model_type="gemma3_text",
+            hidden_size=16,
+            num_hidden_layers=6,
+            intermediate_size=32,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            vocab_size=32,
+            sliding_window_pattern=3,
+            rope_scaling={"rope_type": "linear", "factor": 8.0},
+        )
+
+        model = LanguageModel(config)
+
+        for layer_idx, layer in enumerate(model.layers):
+            expected_scale = 0.125 if (layer_idx + 1) % 3 == 0 else 1.0
+            self.assertEqual(layer.self_attn.rope.scale, expected_scale)
+
+    def test_gemma3_rope_without_scaling(self):
+        from mlx_vlm.models import gemma3
+        from mlx_vlm.models.gemma3.language import LanguageModel
+
+        config = gemma3.TextConfig(
+            model_type="gemma3_text",
+            hidden_size=16,
+            num_hidden_layers=3,
+            intermediate_size=32,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            vocab_size=32,
+            sliding_window_pattern=3,
+        )
+
+        model = LanguageModel(config)
+
+        for layer in model.layers:
+            self.assertEqual(layer.self_attn.rope.scale, 1.0)
+
+    def test_gemma3n_rope_scaling_applies_only_to_global_attention(self):
+        from mlx_vlm.models import gemma3n
+        from mlx_vlm.models.gemma3n.language import Gemma3nAttention
+
+        config = gemma3n.TextConfig(
+            model_type="gemma3n_text",
+            hidden_size=16,
+            num_hidden_layers=2,
+            intermediate_size=[32, 32],
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            vocab_size=32,
+            layer_types=["sliding_attention", "full_attention"],
+            rope_scaling={"rope_type": "linear", "factor": 8.0},
+        )
+
+        sliding = Gemma3nAttention(config, layer_idx=0, is_kv_shared_layer=False)
+        global_attention = Gemma3nAttention(
+            config, layer_idx=1, is_kv_shared_layer=False
+        )
+
+        self.assertEqual(sliding.rope.scale, 1.0)
+        self.assertEqual(global_attention.rope.scale, 0.125)
 
     def test_llama_language_model(self):
         from mlx_vlm.models import llama
@@ -5678,6 +5828,39 @@ class TestModels(unittest.TestCase):
 
         self.assertEqual(output.shape, (1, 1, 1, 4))
 
+    def test_mllama_rope_scaling_is_applied(self):
+        from mlx_vlm.models import mllama
+        from mlx_vlm.models.rope_utils import Llama3RoPE
+
+        config = mllama.TextConfig(
+            hidden_size=16,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            rope_scaling={
+                "rope_type": "llama3",
+                "factor": 8.0,
+                "high_freq_factor": 4.0,
+                "low_freq_factor": 1.0,
+                "original_max_position_embeddings": 8192,
+            },
+        )
+
+        attn = mllama.language.MllamaTextSelfAttention(config, layer_idx=0)
+        self.assertIsInstance(attn.rope, Llama3RoPE)
+
+    def test_mllama_without_rope_scaling_is_plain(self):
+        from mlx_vlm.models import mllama
+
+        config = mllama.TextConfig(
+            hidden_size=16,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            rope_scaling=None,
+        )
+        attn = mllama.language.MllamaTextSelfAttention(config, layer_idx=0)
+
+        self.assertAlmostEqual(attn.rope.scale, 1.0)
+
     def test_mllama(self):
         from mlx_vlm.models import mllama
 
@@ -5852,6 +6035,28 @@ class TestModels(unittest.TestCase):
 
         self.assertEqual(config.eos_token_id, [151645, 151646])
 
+    def test_molmo_point_applies_rope_scaling_only_to_configured_layers(self):
+        from mlx_vlm.models import molmo_point
+
+        config = molmo_point.TextConfig(
+            hidden_size=16,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=4,
+            vocab_size=16,
+            additional_vocab_size=4,
+            num_hidden_layers=2,
+            intermediate_size=32,
+            max_position_embeddings=16,
+            rope_scaling={"type": "linear", "factor": 2.0},
+            rope_scaling_layers=[1],
+        )
+
+        transformer = molmo_point.language.Molmo2Transformer(config)
+
+        self.assertAlmostEqual(transformer.blocks[0].self_attn.rotary_emb.scale, 1.0)
+        self.assertAlmostEqual(transformer.blocks[1].self_attn.rotary_emb.scale, 0.5)
+
     def test_molmo2_sanitizes_non_finite_image_features(self):
         from mlx_vlm.models.molmo2.molmo2 import (
             MAX_FLOAT16_IMAGE_FEATURE,
@@ -5920,6 +6125,218 @@ class TestModels(unittest.TestCase):
             config.vision_config.image_size,
             channel_first=True,
         )
+
+    def test_nemotron_parse(self):
+        from mlx_vlm.models import nemotron_parse
+
+        text_config = nemotron_parse.TextConfig(
+            d_model=64,
+            decoder_attention_heads=8,
+            decoder_ffn_dim=128,
+            decoder_layers=2,
+            vocab_size=128,
+        )
+        vision_config = nemotron_parse.VisionConfig(
+            hidden_size=64,
+            num_heads=8,
+            mlp_ratio=2.0,
+            num_layers=2,
+            neck_dim=64,
+        )
+        config = nemotron_parse.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            vocab_size=128,
+        )
+        model = nemotron_parse.Model(config)
+
+        batch_size = 1
+        pixel_values = mx.random.normal((batch_size, 3, 64, 64))
+
+        # Forward with no cache (the cache=None fallback path).
+        output = model(pixel_values=pixel_values)
+        self.assertEqual(
+            output.logits.shape, (batch_size, 1, config.text_config.vocab_size)
+        )
+        self.assertEqual(output.encoder_outputs.shape, (batch_size, 5, 64))
+
+        # Every decoder layer must own a distinct cache pair: the cache=None
+        # fallback and make_cache() must produce identical logits.
+        output_cached = model(pixel_values=pixel_values, cache=model.make_cache())
+        self.assertTrue(mx.array_equal(output.logits, output_cached.logits).item())
+        # And the two cache paths must not alias objects across layers.
+        cache = model.make_cache()
+        self.assertEqual(len(cache), config.text_config.decoder_layers)
+        self.assertEqual(
+            len({id(c[0]) for c in cache}), config.text_config.decoder_layers
+        )
+        self.assertEqual(
+            len({id(c[1]) for c in cache}), config.text_config.decoder_layers
+        )
+
+        # Multi-step decode with the cache must advance.
+        cache = model.make_cache()
+        enc = output.encoder_outputs
+        dec = mx.array([[config.text_config.decoder_start_token_id]])
+        for _ in range(3):
+            out = model.language_model(
+                decoder_input_ids=dec,
+                encoder_outputs=enc,
+                cache=cache,
+            )
+            dec = mx.argmax(out.logits[:, -1, :], axis=-1, keepdims=True)
+        self.assertEqual(dec.shape, (batch_size, 1))
+
+    def test_nemotron_parse_input_embeddings(self):
+        from mlx_vlm.models import nemotron_parse
+        from mlx_vlm.models.base import InputEmbeddingsFeatures
+
+        text_config = nemotron_parse.TextConfig(
+            d_model=64,
+            decoder_attention_heads=8,
+            decoder_ffn_dim=128,
+            decoder_layers=2,
+            vocab_size=128,
+        )
+        vision_config = nemotron_parse.VisionConfig(
+            hidden_size=64,
+            num_heads=8,
+            mlp_ratio=2.0,
+            num_layers=2,
+            neck_dim=64,
+        )
+        model = nemotron_parse.Model(
+            nemotron_parse.ModelConfig(
+                text_config=text_config,
+                vision_config=vision_config,
+                vocab_size=128,
+            )
+        )
+
+        pixel_values = mx.random.normal((1, 3, 64, 64))
+        result = model.get_input_embeddings(pixel_values=pixel_values)
+        self.assertIsInstance(result, InputEmbeddingsFeatures)
+        self.assertIsNotNone(result.inputs_embeds)
+        self.assertIsNotNone(result.decoder_inputs_embeds)
+
+        # Deliberate image-only contract: without pixel_values there are no
+        # encoder states to decode against, so this must raise.
+        with self.assertRaises(ValueError):
+            model.get_input_embeddings(input_ids=mx.array([[1, 2, 3]]))
+
+    def test_nemotron_parse_untied_lm_head(self):
+        from mlx_vlm.models import nemotron_parse
+
+        # v1.x checkpoints carry a real, untied lm_head (and no text_config
+        # key at the top level); the config pipeline must keep the decoder's
+        # vocab_size and the sanitize must map lm_head.weight, not rebuild it
+        # from the shared embedding.
+        config_dict = {
+            "model_type": "nemotron_parse",
+            "vocab_size": 52329,
+            "image_size": [2048, 1664],
+            "decoder_start_token_id": 2,
+            "text_config": {},
+            "encoder": {"hidden_size": 64, "num_layers": 2, "patch_size": 16},
+            "decoder": {
+                "d_model": 64,
+                "decoder_attention_heads": 8,
+                "decoder_ffn_dim": 128,
+                "decoder_layers": 2,
+                "vocab_size": 128,
+                "decoder_start_token_id": None,
+            },
+        }
+        config = nemotron_parse.ModelConfig.from_dict(config_dict)
+        self.assertEqual(config.text_config.vocab_size, 128)
+        # The loader pipeline re-derives the text config from the text_config
+        # key after from_dict; it must see the decoder params (with the
+        # top-level decoder_start_token_id override), not the seed {}.
+        self.assertEqual(config_dict["text_config"]["vocab_size"], 128)
+        self.assertEqual(
+            nemotron_parse.TextConfig.from_dict(config_dict["text_config"]).vocab_size,
+            128,
+        )
+
+        weights = {
+            "decoder.embed_tokens.weight": mx.zeros((128, 64)),
+            "lm_head.weight": mx.ones((128, 64)),
+        }
+        sanitized = nemotron_parse.Model.sanitize(weights)
+        # The untied head keeps its own values under language_model.lm_head;
+        # the tied reconstruction would have overwritten it with the shared
+        # embedding.
+        self.assertTrue(
+            mx.array_equal(
+                sanitized["language_model.lm_head.weight"], mx.ones((128, 64))
+            ).item()
+        )
+        self.assertTrue(
+            mx.array_equal(
+                sanitized["language_model.model.shared.weight"], mx.zeros((128, 64))
+            ).item()
+        )
+
+        # Without lm_head.weight the tied fallback still reconstructs it from
+        # the shared embedding (2.0 checkpoints).
+        tied = {k: v for k, v in weights.items() if k != "lm_head.weight"}
+        sanitized_tied = nemotron_parse.Model.sanitize(tied)
+        self.assertTrue(
+            mx.array_equal(
+                sanitized_tied["language_model.lm_head.weight"],
+                sanitized_tied["language_model.model.shared.weight"],
+            ).item()
+        )
+
+    def test_nemotron_parse_prompt_seed_strips_automatic_specials(self):
+        from mlx_vlm.models import nemotron_parse
+
+        text_config = nemotron_parse.TextConfig(
+            d_model=64,
+            decoder_attention_heads=8,
+            decoder_ffn_dim=128,
+            decoder_layers=2,
+            vocab_size=128,
+            bos_token_id=0,
+            eos_token_id=2,
+        )
+        vision_config = nemotron_parse.VisionConfig(
+            hidden_size=64,
+            num_heads=8,
+            mlp_ratio=2.0,
+            num_layers=2,
+            neck_dim=64,
+        )
+        model = nemotron_parse.Model(
+            nemotron_parse.ModelConfig(
+                text_config=text_config,
+                vision_config=vision_config,
+                vocab_size=128,
+            )
+        )
+
+        pixel_values = mx.random.normal((1, 3, 64, 64))
+        encoder_outputs = model.vision_tower(pixel_values)
+
+        # The generate loop hands the tokenizer-wrapped prompt to the
+        # language model together with the start-token embedding; the decoder
+        # must seed from the raw prompt (like the HF reference), so the
+        # wrapped length 8 collapses to the raw length 6.
+        wrapped = mx.array([[0, 2, 0, 7, 8, 9, 10, 2]])
+        start_embed = model.language_model.model.shared(mx.array([[2]]))
+        out = model.language_model(
+            inputs=wrapped,
+            encoder_outputs=encoder_outputs,
+            decoder_inputs_embeds=start_embed,
+        )
+        self.assertEqual(out.logits.shape, (1, 6, 128))
+
+        # A single-token decoder step passes through unchanged.
+        out = model.language_model(
+            decoder_input_ids=mx.array([[3]]),
+            encoder_outputs=encoder_outputs,
+        )
+        self.assertEqual(out.logits.shape, (1, 1, 128))
 
     def test_deepseek_vl_v2(self):
         from mlx_vlm.models import deepseek_vl_v2
@@ -7331,6 +7748,29 @@ class TestModels(unittest.TestCase):
             (config.vision_config.image_size, config.vision_config.image_size),
             vision_feature_layer=0,
         )
+
+    def test_phi4mm_longrope_uses_top_level_original_context_length(self):
+        from mlx_vlm.models import phi4mm
+        from mlx_vlm.models.rope_utils import SuScaledRoPE
+
+        config = phi4mm.ModelConfig(
+            hidden_size=16,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            partial_rotary_factor=0.5,
+            max_position_embeddings=16,
+            original_max_position_embeddings=8,
+            rope_scaling={
+                "type": "longrope",
+                "short_factor": [1.0, 1.0],
+                "long_factor": [2.0, 2.0],
+            },
+        )
+
+        attn = phi4mm.language.Attention(config)
+
+        self.assertIsInstance(attn.rope, SuScaledRoPE)
+        self.assertEqual(attn.rope.original_max_position_embeddings, 8)
 
     def test_phi4mm(self):
         from mlx_vlm.models import phi4mm
@@ -9404,6 +9844,7 @@ class TestGetInputEmbeddings(unittest.TestCase):
                     rms_norm_eps=1e-6,
                     num_key_value_heads=2,
                     head_dim=8,
+                    mm_tokens_per_image=4,
                 ),
                 vision_config=gemma3.VisionConfig(
                     model_type="gemma3",
@@ -10425,6 +10866,111 @@ class TestGetInputEmbeddings(unittest.TestCase):
 
         for key in sanitized:
             self.assertNotIn("language_language_model", key)
+
+    def _got_tiny_config(self):
+        from mlx_vlm.models import got
+
+        return got.ModelConfig(
+            text_config=got.TextConfig(
+                model_type="qwen2",
+                hidden_size=8,
+                num_hidden_layers=1,
+                intermediate_size=16,
+                num_attention_heads=2,
+                rms_norm_eps=1e-6,
+                vocab_size=32,
+            ),
+            vision_config=got.VisionConfig(
+                img_size=32,
+                patch_size=16,
+                embed_dim=8,
+                depth=1,
+                num_heads=2,
+                out_chans=4,
+                out_dim=8,
+                window_size=2,
+                global_attn_indexes=(0,),
+            ),
+            model_type="GOT",
+        )
+
+    def test_got_sanitize_is_idempotent(self):
+        from mlx_vlm.models import got
+
+        model = got.Model(self._got_tiny_config())
+
+        hf_weights = {
+            # torch conv layout: (out_channels, in_channels, kH, kW)
+            "model.vision_tower_high.patch_embed.proj.weight": mx.zeros((8, 3, 16, 16)),
+            "model.vision_tower_high.neck.0.weight": mx.zeros((4, 8, 1, 1)),
+            "model.vision_tower_high.neck.1.weight": mx.zeros((4,)),
+            "model.vision_tower_high.net_2.weight": mx.zeros((8, 4, 3, 3)),
+            "model.mm_projector_vary.weight": mx.zeros((8, 8)),
+            "model.embed_tokens.weight": mx.zeros((32, 8)),
+            "lm_head.weight": mx.zeros((32, 8)),
+        }
+
+        sanitized = model.sanitize(dict(hf_weights))
+
+        self.assertEqual(
+            sanitized["vision_tower.patch_embed.proj.weight"].shape, (8, 16, 16, 3)
+        )
+        self.assertEqual(sanitized["vision_tower.conv1.weight"].shape, (4, 1, 1, 8))
+        self.assertEqual(sanitized["vision_tower.norm1.weight"].shape, (4,))
+        self.assertEqual(sanitized["vision_tower.net_2.weight"].shape, (8, 3, 3, 4))
+        self.assertIn("multi_modal_projector.weight", sanitized)
+        self.assertIn("language_model.model.embed_tokens.weight", sanitized)
+        # tie_word_embeddings is on, so the stored lm_head is dropped
+        self.assertNotIn("language_model.lm_head.weight", sanitized)
+
+        # Converted checkpoints go through sanitize again on load. Transposing a
+        # second time would give (8, 16, 3, 16) and fail load_weights (#1871).
+        twice = model.sanitize(dict(sanitized))
+        for key, value in sanitized.items():
+            self.assertEqual(twice[key].shape, value.shape, key)
+
+    def test_got_config_adds_im_end_to_stop_ids(self):
+        from mlx_vlm.models import got
+
+        params = {
+            "model_type": "GOT",
+            "hidden_size": 8,
+            "num_hidden_layers": 1,
+            "intermediate_size": 16,
+            "num_attention_heads": 2,
+            "rms_norm_eps": 1e-6,
+            "vocab_size": 32,
+            "eos_token_id": 151643,
+        }
+        config = got.ModelConfig.from_dict(params)
+
+        # GOT ends a turn with <|im_end|>, which upstream does not declare.
+        self.assertEqual(config.eos_token_id, [151643, 151645])
+        # Written back, because load_model reapplies the raw dict afterwards.
+        self.assertEqual(params["eos_token_id"], [151643, 151645])
+
+    def test_got_prompt_matches_reference_conversation(self):
+        from mlx_vlm.models.got.processing_got import build_got_prompt
+
+        prompt = build_got_prompt("OCR: ")
+
+        self.assertTrue(prompt.startswith("<|im_start|>system\n"))
+        self.assertIn("<img>" + "<imgpad>" * 256 + "</img>\nOCR: ", prompt)
+        self.assertTrue(prompt.endswith("<|im_end|><|im_start|>assistant\n"))
+        # An already wrapped prompt is passed through untouched.
+        self.assertEqual(build_got_prompt(prompt), prompt)
+        # Without an image there are no patch tokens.
+        self.assertNotIn("<imgpad>", build_got_prompt("OCR: ", has_image=False))
+
+    def test_got_vision_produces_one_token_per_downsampled_patch(self):
+        from mlx_vlm.models import got
+
+        config = self._got_tiny_config()
+        vision_tower = got.Model(config).vision_tower
+
+        # 32/16 = 2x2 patches, then two stride-2 convs -> 1x1 grid.
+        out = vision_tower(mx.zeros((1, 32, 32, 3)))
+        self.assertEqual(out.shape, (1, 1, config.vision_config.out_dim))
 
     def test_paddleocr_vl_text_only_clears_mrope_state(self):
         from mlx_vlm.models import paddleocr_vl
@@ -13987,6 +14533,110 @@ class TestGptOssMixedQuant(unittest.TestCase):
         self.assertTrue(hasattr(q_proj, "biases"))
 
 
+class TestRerankerLoader(unittest.TestCase):
+    def test_identifies_sequence_classifier_architectures(self):
+        import mlx_vlm.reranker_loader as reranker_loader
+
+        architectures = [
+            "BertForSequenceClassification",
+            "ModernBertForSequenceClassification",
+            "XLMRobertaForSequenceClassification",
+        ]
+        for architecture in architectures:
+            with self.subTest(architecture=architecture):
+                self.assertTrue(
+                    reranker_loader.is_sequence_classifier_config(
+                        {"architectures": [architecture]}
+                    )
+                )
+
+    def test_loads_supported_native_sequence_classifier(self):
+        from pathlib import Path
+        from unittest.mock import patch
+
+        import mlx_vlm.reranker_loader as reranker_loader
+
+        for model_type in ("bert", "modernbert", "xlm-roberta"):
+            with self.subTest(model_type=model_type):
+                config = {
+                    "architectures": ["ExampleForSequenceClassification"],
+                    "model_type": model_type,
+                    "num_labels": 1,
+                }
+                sentinel = object()
+                captured = {}
+
+                def fake_load_encoder_model(model_path, **kwargs):
+                    captured["model_path"] = model_path
+                    captured.update(kwargs)
+                    return sentinel
+
+                with patch.object(
+                    reranker_loader,
+                    "load_encoder_model",
+                    side_effect=fake_load_encoder_model,
+                ):
+                    model = reranker_loader.load_sequence_classification_model(
+                        Path("model"), config=config
+                    )
+
+                self.assertIs(model, sentinel)
+                self.assertEqual(
+                    captured["model_class_name"], "SequenceClassificationModel"
+                )
+                self.assertEqual(captured["config"], config)
+                self.assertEqual(captured["config_overrides"], {"num_labels": 1})
+
+    def test_rejects_multi_label_sequence_classifier(self):
+        from pathlib import Path
+
+        import mlx_vlm.reranker_loader as reranker_loader
+
+        config = {
+            "architectures": ["BertForSequenceClassification"],
+            "model_type": "bert",
+            "num_labels": 2,
+        }
+
+        with self.assertRaisesRegex(ValueError, "exactly one output label"):
+            reranker_loader.load_sequence_classification_model(
+                Path("model"), config=config
+            )
+
+    def test_rejects_unsupported_sequence_classifier_family(self):
+        from pathlib import Path
+
+        import mlx_vlm.reranker_loader as reranker_loader
+
+        config = {
+            "architectures": ["DebertaV2ForSequenceClassification"],
+            "model_type": "deberta-v2",
+            "num_labels": 1,
+        }
+
+        with self.assertRaisesRegex(ValueError, "Unsupported reranker model type"):
+            reranker_loader.load_sequence_classification_model(
+                Path("model"), config=config
+            )
+
+    def test_rejects_embedding_checkpoint_as_reranker(self):
+        from pathlib import Path
+        from unittest.mock import patch
+
+        import mlx_vlm.reranker_loader as reranker_loader
+
+        config = {
+            "architectures": ["BertModel"],
+            "model_type": "bert",
+        }
+        with (
+            patch.object(reranker_loader, "get_model_path", return_value=Path("model")),
+            patch.object(reranker_loader, "load_config", return_value=config),
+            self.assertRaisesRegex(ValueError, "sequence-classification checkpoints"),
+        ):
+            reranker_loader.load_reranker("embedding-model")
+
+
 class TestBert(unittest.TestCase):
     def test_bert_embedding_forward(self):
         from mlx_vlm.models import bert
@@ -14010,6 +14660,52 @@ class TestBert(unittest.TestCase):
         self.assertEqual(out.text_embeds.shape, (batch, config.hidden_size))
         norms = mx.linalg.norm(out.text_embeds, axis=-1)
         self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
+
+    def test_bert_sequence_classification_forward(self):
+        from mlx_vlm.models import bert
+
+        config = bert.ModelConfig(
+            model_type="bert",
+            vocab_size=99,
+            hidden_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            intermediate_size=37,
+            max_position_embeddings=64,
+        )
+        model = bert.SequenceClassificationModel(config)
+        output = model(
+            mx.array(np.random.randint(0, config.vocab_size, (2, 5))),
+            attention_mask=mx.ones((2, 5)),
+            token_type_ids=mx.zeros((2, 5), dtype=mx.int32),
+        )
+
+        self.assertEqual(output.logits.shape, (2, 1))
+
+    def test_bert_sequence_classifier_sanitize_keeps_head(self):
+        from mlx_vlm.models import bert
+
+        config = bert.ModelConfig(
+            model_type="bert",
+            vocab_size=99,
+            hidden_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            intermediate_size=37,
+            max_position_embeddings=64,
+        )
+        model = bert.SequenceClassificationModel(config)
+        weights = model.sanitize(
+            {
+                "bert.embeddings.word_embeddings.weight": mx.zeros((99, 32)),
+                "bert.pooler.dense.weight": mx.zeros((32, 32)),
+                "classifier.weight": mx.zeros((1, 32)),
+            }
+        )
+
+        self.assertIn("embeddings.word_embeddings.weight", weights)
+        self.assertIn("pooler.dense.weight", weights)
+        self.assertIn("classifier.weight", weights)
 
 
 class TestXLMRoberta(unittest.TestCase):
@@ -14036,6 +14732,51 @@ class TestXLMRoberta(unittest.TestCase):
         norms = mx.linalg.norm(out.text_embeds, axis=-1)
         self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
 
+    def test_xlm_roberta_sequence_classification_forward(self):
+        from mlx_vlm.models import xlm_roberta
+
+        config = xlm_roberta.ModelConfig(
+            model_type="xlm_roberta",
+            vocab_size=99,
+            hidden_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            intermediate_size=37,
+            max_position_embeddings=64,
+        )
+        model = xlm_roberta.SequenceClassificationModel(config)
+        output = model(
+            mx.array(np.random.randint(2, config.vocab_size, (2, 5))),
+            attention_mask=mx.ones((2, 5)),
+        )
+
+        self.assertEqual(output.logits.shape, (2, 1))
+
+    def test_xlm_roberta_sequence_classifier_sanitize_keeps_head(self):
+        from mlx_vlm.models import xlm_roberta
+
+        config = xlm_roberta.ModelConfig(
+            model_type="xlm_roberta",
+            vocab_size=99,
+            hidden_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            intermediate_size=37,
+            max_position_embeddings=64,
+        )
+        model = xlm_roberta.SequenceClassificationModel(config)
+        weights = model.sanitize(
+            {
+                "roberta.embeddings.word_embeddings.weight": mx.zeros((99, 32)),
+                "classifier.dense.weight": mx.zeros((32, 32)),
+                "classifier.out_proj.weight": mx.zeros((1, 32)),
+            }
+        )
+
+        self.assertIn("embeddings.word_embeddings.weight", weights)
+        self.assertIn("classifier.dense.weight", weights)
+        self.assertIn("classifier.out_proj.weight", weights)
+
 
 class TestModernBert(unittest.TestCase):
     def test_modernbert_embedding_forward(self):
@@ -14061,6 +14802,52 @@ class TestModernBert(unittest.TestCase):
         self.assertEqual(out.text_embeds.shape, (batch, config.hidden_size))
         norms = mx.linalg.norm(out.text_embeds, axis=-1)
         self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
+
+    def test_modernbert_sequence_classification_forward(self):
+        from mlx_vlm.models import modernbert
+
+        config = modernbert.ModelConfig(
+            model_type="modernbert",
+            vocab_size=99,
+            hidden_size=32,
+            num_hidden_layers=3,
+            intermediate_size=48,
+            num_attention_heads=4,
+            global_attn_every_n_layers=2,
+            local_attention=8,
+            classifier_pooling="mean",
+        )
+        model = modernbert.SequenceClassificationModel(config)
+        output = model(
+            mx.array(np.random.randint(0, config.vocab_size, (2, 6))),
+            attention_mask=mx.array([[1, 1, 1, 1, 1, 1], [1, 1, 1, 0, 0, 0]]),
+        )
+
+        self.assertEqual(output.logits.shape, (2, 1))
+
+    def test_modernbert_sequence_classifier_sanitize_keeps_head(self):
+        from mlx_vlm.models import modernbert
+
+        config = modernbert.ModelConfig(
+            model_type="modernbert",
+            vocab_size=99,
+            hidden_size=32,
+            num_hidden_layers=1,
+            intermediate_size=48,
+            num_attention_heads=4,
+        )
+        model = modernbert.SequenceClassificationModel(config)
+        weights = model.sanitize(
+            {
+                "model.embeddings.tok_embeddings.weight": mx.zeros((99, 32)),
+                "head.dense.weight": mx.zeros((32, 32)),
+                "classifier.weight": mx.zeros((1, 32)),
+            }
+        )
+
+        self.assertIn("embeddings.tok_embeddings.weight", weights)
+        self.assertIn("head.dense.weight", weights)
+        self.assertIn("classifier.weight", weights)
 
 
 class TestQwen3Embedding(unittest.TestCase):
@@ -14720,3 +15507,110 @@ class TestCohereCompass(unittest.TestCase):
         processor(text=["short", "longer"], padding=True)
 
         self.assertEqual(processor.tokenizer.last_kwargs["padding_side"], "left")
+
+
+class TestMinistral3Embedding(unittest.TestCase):
+    @staticmethod
+    def _model():
+        from mlx_vlm.models import ministral3_embedding
+
+        config = ministral3_embedding.ModelConfig(
+            model_type="ministral3",
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            vocab_size=99,
+            head_dim=8,
+            max_position_embeddings=64,
+            rope_parameters={
+                "rope_theta": 10000.0,
+                "llama_4_scaling_beta": 0.1,
+                "original_max_position_embeddings": 64,
+            },
+        )
+        mx.random.seed(0)
+        return ministral3_embedding.Model(config), config
+
+    @staticmethod
+    def _cosine(a, b):
+        return (a * b).sum() / (mx.linalg.norm(a) * mx.linalg.norm(b))
+
+    def test_ministral3_embedding_forward(self):
+        model, config = self._model()
+
+        batch, seq = 2, 5
+        input_ids = mx.array(np.random.randint(0, config.vocab_size, (batch, seq)))
+        attention_mask = mx.ones((batch, seq))
+        out = model(input_ids, attention_mask=attention_mask)
+
+        self.assertEqual(out.text_embeds.shape, (batch, config.hidden_size))
+        norms = mx.linalg.norm(out.text_embeds, axis=-1)
+        self.assertTrue(mx.allclose(norms, mx.ones(batch), atol=1e-4).item())
+
+    def test_ministral3_embedding_attends_to_later_tokens(self):
+        model, _ = self._model()
+        mask = mx.ones((1, 4))
+
+        first = model(mx.array([[1, 2, 3, 4]]), attention_mask=mask)
+        changed = model(mx.array([[1, 2, 3, 42]]), attention_mask=mask)
+
+        # A causal backbone would leave token 0 untouched by a later token.
+        delta = mx.abs(
+            first.last_hidden_state[0, 0] - changed.last_hidden_state[0, 0]
+        ).max()
+        self.assertGreater(delta.item(), 1e-3)
+
+    def test_ministral3_embedding_ignores_masked_positions(self):
+        model, _ = self._model()
+        mask = mx.array([[1.0, 1.0, 1.0, 0.0, 0.0]])
+
+        kept = model(mx.array([[1, 2, 3, 0, 0]]), attention_mask=mask).text_embeds
+        swapped = model(mx.array([[1, 2, 3, 77, 88]]), attention_mask=mask).text_embeds
+
+        self.assertTrue(mx.allclose(kept, swapped, atol=1e-6).item())
+
+    def test_ministral3_embedding_is_invariant_to_padding(self):
+        model, _ = self._model()
+
+        alone = model(mx.array([[1, 2, 3]]), attention_mask=mx.ones((1, 3))).text_embeds
+        padded = model(
+            mx.array([[1, 2, 3, 0, 0]]),
+            attention_mask=mx.array([[1.0, 1.0, 1.0, 0.0, 0.0]]),
+        ).text_embeds
+
+        self.assertGreater(self._cosine(alone[0], padded[0]).item(), 1 - 1e-5)
+
+    def test_ministral3_embedding_is_invariant_to_batch_order(self):
+        model, _ = self._model()
+        input_ids = mx.array([[1, 2, 3], [5, 6, 7]])
+        mask = mx.ones((2, 3))
+
+        out = model(input_ids, attention_mask=mask).text_embeds
+        reversed_out = model(input_ids[::-1], attention_mask=mask).text_embeds
+
+        self.assertGreater(self._cosine(out[0], reversed_out[1]).item(), 1 - 1e-5)
+
+    def test_ministral3_embedding_sanitize_drops_lm_head(self):
+        model, _ = self._model()
+
+        weights = model.sanitize(
+            {
+                "lm_head.weight": mx.zeros((2, 2)),
+                "embed_tokens.weight": mx.zeros((2, 2)),
+                "model.norm.weight": mx.zeros((2,)),
+            }
+        )
+
+        self.assertEqual(
+            sorted(weights), ["model.embed_tokens.weight", "model.norm.weight"]
+        )
+
+    def test_ministral3_is_remapped_to_the_embedding_model(self):
+        from mlx_vlm.embedding_loader import EMBEDDING_MODEL_REMAPPING
+
+        self.assertEqual(
+            EMBEDDING_MODEL_REMAPPING["ministral3"], "ministral3_embedding"
+        )

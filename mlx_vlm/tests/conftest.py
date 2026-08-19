@@ -63,3 +63,14 @@ def pytest_report_collectionfinish() -> list[str]:
         symbol, _reason = UNPORTED_UPSTREAM_TESTS[name]
         lines.append(f"  - {name}  (needs {symbol})")
     return lines
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Release thread-local MLX resources before Python finalization."""
+    del session, exitstatus
+
+    import mlx.core as mx
+
+    clear_streams = getattr(mx, "clear_streams", None)
+    if clear_streams is not None:
+        clear_streams()

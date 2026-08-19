@@ -60,7 +60,6 @@ from .generation import (  # Fork: adds the fork's KV/session/APC getters, the B
     DEFAULT_ENABLE_THINKING,
     DEFAULT_LOG_PROGRESS_INTERVAL,
     DEFAULT_SPECULATIVE_BATCH_COALESCE_MS,
-    DEFAULT_TOKEN_QUEUE_TIMEOUT,
     METRICS_HISTORY_LIMIT,
     METRICS_RECENT_LIMIT,
     STREAM_TELEMETRY_INTERVAL,
@@ -145,6 +144,7 @@ from .responses_state import (  # Fork: adds the THINKING_FORMATS helpers; Fork:
     suppress_tool_call_content,
 )
 from .runtime import ModelCacheRegistry, runtime
+from .runtime_config import DEFAULT_TOKEN_QUEUE_TIMEOUT
 from .schemas import (  # Fork: adds the fork's Completion* legacy-endpoint models
     AnthropicMessageParam,
     AnthropicMessageResponse,

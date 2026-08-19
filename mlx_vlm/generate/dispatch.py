@@ -1075,10 +1075,24 @@ def stream_generate(
         # tokenize to subword pieces both ending in ">", so the prior
         # `<think>`-id-in-prompt check forced enable_thinking False and the
         # forced closer would have been a bare ">". See prompt_utils.THINKING_FORMATS.
+        #
+        # Fork: upstream's `prompt_preopens_thinking` (20eec6cb) decouples
+        # "is budget enforcement active" (enable_thinking) from "does the
+        # prompt already sit inside an open block" (prompt_preopens_thinking,
+        # which only seeds the criteria's initial in_thinking state) -- fixing
+        # a latent bug shared by this fork and its pre-fix base: gating
+        # enable_thinking itself on prompt-already-open meant a model that
+        # opens thinking FRESH during generation (no prefilled/system-flagged
+        # opener) never got its runtime open-detection armed, since __call__
+        # also gates on self.enable_thinking. Mirrors the same split adopted
+        # in server/generation.py's _make_thinking_budget_criteria.
+        # prompt_preopens_thinking is threaded through using the fork's
+        # multi-format detector instead of upstream's hardcoded-token
+        # computation, so it inherits the Gemma-4-class fix rather than
+        # reintroducing it.
         decoded_prompt = tokenizer.decode(input_ids.flatten().tolist())
-        enable_thinking = bool(enable_thinking) and prompt_is_inside_thinking(
-            decoded_prompt
-        )
+        prompt_preopens_thinking = prompt_is_inside_thinking(decoded_prompt)
+        enable_thinking = bool(enable_thinking)
         eff_start_token, eff_end_token = thinking_start_token, thinking_end_token
         fmt = detect_thinking_format(decoded_prompt)
         if fmt is not None:
@@ -1097,6 +1111,7 @@ def stream_generate(
             thinking_end_token=eff_end_token,
             thinking_start_token=eff_start_token,
             enable_thinking=enable_thinking,
+            prompt_preopens_thinking=prompt_preopens_thinking,
         )
         kwargs["thinking_budget_criteria"] = tokenizer.thinking_budget_criteria
     else:
@@ -1605,17 +1620,16 @@ def main():
         from .video import (
             pair_adjacent_frames,
             processor_handles_video,
+            resolve_video_inputs,
             sample_video_frames,
-            subsample_evenly,
             timestamped_frame_messages,
         )
 
         if not processor_handles_video(processor):
-            frames, frame_fps = sample_video_frames(args.video, args.fps or 2.0)
-            sampled = len(frames)
             max_frames = max(2, getattr(args, "video_max_frames", 16) or 16)
             pair_hook = getattr(model, "prepare_video_frame_pairs", None)
             if pair_hook is not None:
+                frames, frame_fps = sample_video_frames(args.video, args.fps or 2.0)
                 anchors, first_frames, second_frames = pair_adjacent_frames(
                     frames, max_frames
                 )
@@ -1641,15 +1655,23 @@ def main():
                 video_prompt = _tok.apply_chat_template(
                     msgs, add_generation_prompt=True, tokenize=False
                 )
+                args.video = None
             else:
-                frames = subsample_evenly(frames, max_frames)
+                resolution = resolve_video_inputs(
+                    processor,
+                    args.video,
+                    images=args.image,
+                    fps=args.fps or 2.0,
+                    max_frames=max_frames,
+                )
                 print(
                     f"{processor.__class__.__name__} has no native video "
-                    f"support; sending {len(frames)} of {sampled} sampled "
+                    f"support; sending {resolution.selected_count} of "
+                    f"{resolution.sampled_count} sampled "
                     f"frames as ordered images."
                 )
-                args.image = (args.image or []) + frames
-            args.video = None
+                args.image = resolution.images
+                args.video = resolution.videos or None
 
     num_images = len(args.image) if args.image is not None else 0
     num_audios = len(args.audio) if args.audio is not None else 0
