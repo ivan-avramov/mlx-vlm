@@ -2445,6 +2445,12 @@ def test_kind_none_autodetects_mtp_for_glm4_moe_lite_mtp(tmp_path):
     assert resolve_drafter_kind(path, "dflash") == "mtp"
 
 
+def test_kind_none_autodetects_mtp_for_nemotron_h_mtp(tmp_path):
+    path = _make_drafter_dir(tmp_path, "nemotron_h_mtp")
+    assert resolve_drafter_kind(path, None) == "mtp"
+    assert resolve_drafter_kind(path, "dflash") == "mtp"
+
+
 def test_kind_none_autodetects_eagle3_speculators_config(tmp_path):
     path = tmp_path / "drafter"
     path.mkdir()

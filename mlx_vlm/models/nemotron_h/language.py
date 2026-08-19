@@ -441,6 +441,8 @@ class NemotronHModel(nn.Module):
         inputs=None,
         cache: Optional[Any] = None,
         inputs_embeds: Optional[mx.array] = None,
+        hidden_sink: Optional[list] = None,
+        skip_final_norm: bool = False,
     ):
         # Fork: upstream rejects both-supplied as well as neither-supplied
         # (`if (inputs is None) == (inputs_embeds is None)`). Only neither is
@@ -485,6 +487,18 @@ class NemotronHModel(nn.Module):
                 mask = ssm_mask
             hidden_states = layer(hidden_states, mask=mask, cache=c)
 
+        # Fork: `hidden_sink`/`skip_final_norm` support the MTP speculative
+        # drafter (nemotron_h_mtp), which needs the pre-final-norm hidden
+        # state -- the target's `norm_f` is a SEPARATE parameter from the
+        # MTP head's own `final_layernorm`, so capturing post-norm hidden
+        # here would double-normalize whatever the drafter feeds forward.
+        # Mirrors the `hidden_sink`/`skip_final_norm` contract other
+        # MTP-capable backbones (deepseek_v4, qwen3_5) already expose.
+        if hidden_sink is not None:
+            hidden_sink.append(hidden_states)
+
+        if skip_final_norm:
+            return hidden_states
         return self.norm_f(hidden_states)
 
 
@@ -559,10 +573,38 @@ class LanguageModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         **kwargs,
     ) -> LanguageModelOutput:
+        # Fork: `return_hidden`/`return_shared_kv`/`skip_logits`/
+        # `skip_final_norm` are the generic MTP-verify contract
+        # (speculative/mtp.py's `_mtp_verify_target` fallback calls
+        # `lm(verify_input, cache=prompt_cache, return_hidden=True,
+        # return_shared_kv=True)` and reads `out.hidden_states[-1]`) that the
+        # nemotron_h_mtp drafter needs. nemotron_h has no MLA/GQA cache to
+        # share across layers the way deepseek_v4 does, so
+        # `shared_kv_states` is always an empty dict rather than populated --
+        # the drafter's `set_shared_kv` ignores its contents regardless.
         if inputs is None:
             inputs = kwargs.get("input_ids")
-        out = self.backbone(inputs, cache=cache, inputs_embeds=inputs_embeds)
-        return LanguageModelOutput(logits=self.lm_head(out))
+        return_hidden = kwargs.pop("return_hidden", False)
+        return_shared_kv = kwargs.pop("return_shared_kv", False)
+        skip_logits = kwargs.pop("skip_logits", False)
+        skip_final_norm = kwargs.pop("skip_final_norm", False)
+        hidden_sink = kwargs.pop("hidden_sink", None)
+        if return_hidden and hidden_sink is None:
+            hidden_sink = []
+
+        out = self.backbone(
+            inputs,
+            cache=cache,
+            inputs_embeds=inputs_embeds,
+            hidden_sink=hidden_sink,
+            skip_final_norm=skip_final_norm,
+        )
+        logits = None if skip_logits else self.lm_head(out)
+        return LanguageModelOutput(
+            logits=logits,
+            hidden_states=hidden_sink,
+            shared_kv_states={} if return_shared_kv else None,
+        )
 
     def sanitize(self, weights):
         return Model.sanitize(self, weights)
