@@ -2736,16 +2736,29 @@ class PreallocKVCache(KVCache):
     def __init__(self, prealloc_tokens: int = 0):
         super().__init__()
         self.prealloc_tokens = int(prealloc_tokens or 0)
+        # Fork: D6 shrink-on-retire re-floor flag. Set by shrink_to_offset()
+        # after it releases the floor down to a step-rounded fit; the NEXT
+        # update_and_fetch() must re-apply the full prealloc_tokens floor in
+        # one clean allocation (matching first-fill behavior) rather than
+        # silently falling through to the parent's incremental step-256
+        # growth, which would defeat the floor permanently and reopen the
+        # mid-generation double-buffer OOM prealloc exists to prevent.
+        self._needs_refloor = False
 
     def update_and_fetch(self, keys, values):
-        if self.keys is None and self.prealloc_tokens > 0:
+        if self.prealloc_tokens > 0 and (self.keys is None or self._needs_refloor):
             B, n_kv_heads, _, k_head_dim = keys.shape
             v_head_dim = values.shape[3]
-            prev = self.offset  # 0 on first fill
+            prev = self.offset  # 0 on first fill; >0 on re-floor after shrink
             target = max(prev + keys.shape[2], self.prealloc_tokens)
             cap = ((target + self.step - 1) // self.step) * self.step
-            self.keys = mx.zeros((B, n_kv_heads, cap, k_head_dim), keys.dtype)
-            self.values = mx.zeros((B, n_kv_heads, cap, v_head_dim), values.dtype)
+            new_keys = mx.zeros((B, n_kv_heads, cap, k_head_dim), keys.dtype)
+            new_values = mx.zeros((B, n_kv_heads, cap, v_head_dim), values.dtype)
+            if self.keys is not None and prev > 0:
+                new_keys[..., :prev, :] = self.keys[..., :prev, :]
+                new_values[..., :prev, :] = self.values[..., :prev, :]
+            self.keys, self.values = new_keys, new_values
+            self._needs_refloor = False
             self.offset += keys.shape[2]
             self.keys[..., prev : self.offset, :] = keys
             self.values[..., prev : self.offset, :] = values
@@ -2777,6 +2790,46 @@ class PreallocKVCache(KVCache):
             )
         return quant_cache
 
+    def shrink_to_offset(self):
+        """Reallocate the K/V buffers down to a step-rounded fit for the
+        current ``offset``, releasing any prealloc-floor padding beyond
+        what's actually in use. Returns ``(bytes_before, bytes_after)``; a
+        no-op (equal before/after) when the cache is empty or already
+        tight. The valid prefix (``[:offset]``) is preserved exactly.
+
+        Used by the D6 session-cache shrink-on-retire path (fork-only):
+        a session sitting idle in the server's LRU pool holds its KV
+        cache floored at ``prealloc_tokens`` (up to the full context cap)
+        even when the conversation used a fraction of it. Shrinking after
+        each turn bounds the *resident* cost to sessions actually in
+        flight; the existing first-fill floor logic in
+        ``update_and_fetch`` re-applies the floor lazily the next time
+        this session is used (see ``mlx_vlm/generate/common.py``'s
+        ``_shrink_cache_entries`` / ``_SESSION_SHRINK_ON_RETIRE``).
+        """
+        if self.keys is None:
+            return 0, 0
+        capacity = self.keys.shape[2]
+        target = max(self.step, ((self.offset + self.step - 1) // self.step) * self.step)
+        before = self.keys.nbytes + self.values.nbytes
+        if target >= capacity:
+            return before, before
+        B, n_kv_heads, _, k_head_dim = self.keys.shape
+        v_head_dim = self.values.shape[3]
+        new_keys = mx.zeros((B, n_kv_heads, target, k_head_dim), self.keys.dtype)
+        new_values = mx.zeros((B, n_kv_heads, target, v_head_dim), self.values.dtype)
+        if self.offset > 0:
+            new_keys[..., : self.offset, :] = self.keys[..., : self.offset, :]
+            new_values[..., : self.offset, :] = self.values[..., : self.offset, :]
+        self.keys, self.values = new_keys, new_values
+        if self.prealloc_tokens > 0:
+            # Only a cache actually carrying a floor needs to re-establish
+            # one; prealloc_tokens==0 behaves as plain step-256 growth
+            # both before and after a shrink.
+            self._needs_refloor = True
+        after = self.keys.nbytes + self.values.nbytes
+        return before, after
+
 
 class PreallocQuantizedKVCache(QuantizedKVCache):
     """QuantizedKVCache that pre-allocates the quantized triple (packed uint32 +
@@ -2786,12 +2839,15 @@ class PreallocQuantizedKVCache(QuantizedKVCache):
     def __init__(self, group_size: int = 64, bits: int = 8, prealloc_tokens: int = 0):
         super().__init__(group_size=group_size, bits=bits)
         self.prealloc_tokens = int(prealloc_tokens or 0)
+        # Fork: D6 shrink-on-retire re-floor flag — see
+        # PreallocKVCache._needs_refloor for the full rationale.
+        self._needs_refloor = False
 
     def update_and_fetch(self, keys, values):
-        if self.keys is None and self.prealloc_tokens > 0:
+        if self.prealloc_tokens > 0 and (self.keys is None or self._needs_refloor):
             B, n_kv_heads, num_steps, k_head_dim = keys.shape
             v_head_dim = values.shape[-1]
-            prev = self.offset
+            prev = self.offset  # 0 on first fill; >0 on re-floor after shrink
             el_per_int = 8 * mx.uint32.size // self.bits
             target = max(prev + num_steps, self.prealloc_tokens)
             new_steps = ((target + self.step - 1) // self.step) * self.step
@@ -2804,7 +2860,15 @@ class PreallocQuantizedKVCache(QuantizedKVCache):
                     mx.zeros((*shape, dim // self.group_size), dtype=keys.dtype),
                 )
 
+            old_keys, old_values = self.keys, self.values
             self.keys, self.values = init_quant(k_head_dim), init_quant(v_head_dim)
+            self._needs_refloor = False
+            if old_keys is not None and prev > 0:
+                # Re-floor: copy the shrunk triple's valid prefix into the
+                # freshly (fully) floored buffer before writing the new step.
+                for i in range(len(self.keys)):
+                    self.keys[i][..., :prev, :] = old_keys[i][..., :prev, :]
+                    self.values[i][..., :prev, :] = old_values[i][..., :prev, :]
             self.offset += num_steps
             qk = mx.quantize(keys, group_size=self.group_size, bits=self.bits)
             qv = mx.quantize(values, group_size=self.group_size, bits=self.bits)
@@ -2844,3 +2908,35 @@ class PreallocQuantizedKVCache(QuantizedKVCache):
             c.keys = _grow(src.keys)
             c.values = _grow(src.values)
         return c
+
+    def shrink_to_offset(self):
+        """Reallocate the quantized (packed uint32, scale, bias) triples
+        down to a step-rounded fit for the current ``offset``. Same
+        contract as ``PreallocKVCache.shrink_to_offset`` — see there for
+        the rationale. Returns ``(bytes_before, bytes_after)``.
+        """
+        if self.keys is None:
+            return 0, 0
+        capacity = self.keys[0].shape[2]
+        target = max(self.step, ((self.offset + self.step - 1) // self.step) * self.step)
+        before = sum(a.nbytes for a in self.keys) + sum(a.nbytes for a in self.values)
+        if target >= capacity:
+            return before, before
+
+        def _shrink_triple(triple):
+            out = []
+            for arr in triple:
+                shp = list(arr.shape)
+                shp[2] = target
+                buf = mx.zeros(tuple(shp), dtype=arr.dtype)
+                if self.offset > 0:
+                    buf[..., : self.offset, :] = arr[..., : self.offset, :]
+                out.append(buf)
+            return tuple(out)
+
+        self.keys = _shrink_triple(self.keys)
+        self.values = _shrink_triple(self.values)
+        if self.prealloc_tokens > 0:
+            self._needs_refloor = True
+        after = sum(a.nbytes for a in self.keys) + sum(a.nbytes for a in self.values)
+        return before, after

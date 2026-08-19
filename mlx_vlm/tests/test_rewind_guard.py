@@ -13,6 +13,7 @@ regressions before they reach inference.
 import mlx.core as mx
 import pytest
 
+from mlx_vlm.generate import common  # Fork: D6 shrink-on-retire module globals
 from mlx_vlm.generate import (
     PromptCacheState,
     _adjust_chunk_for_snapshot_landing,
@@ -30,13 +31,17 @@ from mlx_vlm.generate import (
     _restore_rotating_layers_from_snapshots,
     _rotating_post_gen_trim_safe,
     _rotating_rewind_safe,
+    _shrink_cache_entries,
     _should_capture_anchor_pre_prefill,
     _trim_cache,
+    set_session_shrink_on_retire,
 )
 from mlx_vlm.models.cache import (
     ArraysCache,
     BufferedRotatingKVCache,
     KVCache,
+    PreallocKVCache,
+    PreallocQuantizedKVCache,
     RotatingKVCache,
 )
 from mlx_vlm.snapshot import DeltaNetSnapshotRing, capture_rotating
@@ -307,6 +312,163 @@ class TestPromptCacheStateUpdate:
 
         state.update(token_ids=[1, 2, 3], kv_cache=[KVCache()])
         assert len(ring) == 0
+
+
+class TestSessionShrinkOnRetire:
+    """D6: PromptCacheState.update() shrinks a retired session's
+    prealloc-floor cache(s) back to their offset when shrink-on-retire is
+    enabled (set_session_shrink_on_retire / MLX_VLM_SESSION_SHRINK_ON_RETIRE).
+    Off by default -- no behavior change unless explicitly turned on.
+    """
+
+    def setup_method(self):
+        self._saved = common._SESSION_SHRINK_ON_RETIRE
+
+    def teardown_method(self):
+        set_session_shrink_on_retire(self._saved)
+
+    def test_disabled_by_default_leaves_floor_intact(self):
+        set_session_shrink_on_retire(False)
+        state = PromptCacheState()
+        c = PreallocKVCache(prealloc_tokens=262144)
+        c.update_and_fetch(mx.zeros((1, 4, 1000, 32), mx.float16), mx.zeros((1, 4, 1000, 32), mx.float16))
+        assert c.keys.shape[2] == 262144
+
+        state.update(token_ids=list(range(1000)), kv_cache=[c])
+
+        assert c.keys.shape[2] == 262144  # untouched
+
+    def test_enabled_shrinks_retired_cache(self):
+        set_session_shrink_on_retire(True)
+        state = PromptCacheState()
+        c = PreallocKVCache(prealloc_tokens=262144)
+        c.update_and_fetch(mx.zeros((1, 4, 1000, 32), mx.float16), mx.zeros((1, 4, 1000, 32), mx.float16))
+        assert c.keys.shape[2] == 262144
+
+        state.update(token_ids=list(range(1000)), kv_cache=[c])
+
+        assert c.keys.shape[2] == 1024  # floor released to a step-rounded fit
+        assert c.offset == 1000  # content/offset unaffected
+
+    def test_enabled_recurses_into_a_multi_layer_cache_list(self):
+        set_session_shrink_on_retire(True)
+        state = PromptCacheState()
+        c1 = PreallocKVCache(prealloc_tokens=262144)
+        c1.update_and_fetch(mx.zeros((1, 4, 500, 128), mx.float16), mx.zeros((1, 4, 500, 128), mx.float16))
+        # head_dim=128 (divisible by the default group_size=64 for mx.quantize).
+        c2 = PreallocQuantizedKVCache(group_size=64, bits=4, prealloc_tokens=262144)
+        c2.update_and_fetch(mx.zeros((1, 4, 500, 128), mx.float16), mx.zeros((1, 4, 500, 128), mx.float16))
+
+        state.update(token_ids=list(range(500)), kv_cache=[c1, c2])
+
+        assert c1.keys.shape[2] == 512  # ceil(500/256)*256
+        assert c2.keys[0].shape[2] == 512
+
+    def test_enabled_skips_caches_without_shrink_method(self):
+        # Plain KVCache (no prealloc floor) has no shrink_to_offset --
+        # must be silently skipped (duck-typed), not raise.
+        set_session_shrink_on_retire(True)
+        state = PromptCacheState()
+        plain = KVCache()
+        plain.update_and_fetch(mx.zeros((1, 4, 10, 32)), mx.zeros((1, 4, 10, 32)))
+
+        state.update(token_ids=list(range(10)), kv_cache=[plain])  # must not raise
+
+    def test_never_shrinks_a_cache_still_mid_turn(self):
+        # The seam is PromptCacheState.update(), which dispatch.py only
+        # calls once a turn's decode loop has FINISHED (right before
+        # mx.clear_cache()) -- so a cache is only ever shrunk *between*
+        # turns. A cache that hasn't had update() called on it yet (i.e.
+        # is still "mid-turn" from the daemon's point of view) must be
+        # left untouched by another session's retirement.
+        set_session_shrink_on_retire(True)
+        active = PreallocKVCache(prealloc_tokens=262144)
+        active.update_and_fetch(mx.zeros((1, 4, 100, 32), mx.float16), mx.zeros((1, 4, 100, 32), mx.float16))
+
+        other_state = PromptCacheState()
+        other_cache = PreallocKVCache(prealloc_tokens=262144)
+        other_cache.update_and_fetch(mx.zeros((1, 4, 100, 32), mx.float16), mx.zeros((1, 4, 100, 32), mx.float16))
+        other_state.update(token_ids=list(range(100)), kv_cache=[other_cache])
+
+        assert other_cache.keys.shape[2] == 256  # retired session shrunk
+        assert active.keys.shape[2] == 262144  # in-flight session untouched
+
+        # The in-flight session keeps decoding uninterrupted -- it never
+        # saw a shrink, so it re-floors nothing and just appends in place.
+        active.update_and_fetch(
+            mx.zeros((1, 4, 1, 32), mx.float16), mx.zeros((1, 4, 1, 32), mx.float16)
+        )
+        assert active.keys.shape[2] == 262144
+        assert active.offset == 101
+
+    def test_shrink_cache_entries_is_a_noop_for_none(self):
+        # Defensive: PromptCacheState.cache starts as None; update() is
+        # only ever called with a real kv_cache list, but the helper
+        # itself should tolerate an empty/None container gracefully.
+        _shrink_cache_entries([])  # must not raise
+
+
+def _tiny_logits(q, k, v, head_w):
+    """Minimal deterministic single-head causal-attention head, standing in
+    for a tiny mock model's forward pass. Any deterministic function of
+    (q, k, v) works here: this test only needs to show that the (k, v)
+    a shrunk-then-re-floored cache hands back are BIT-IDENTICAL to a
+    never-shrunk cache's, which is exactly the invariant that makes
+    generation "continue identically" after a retired session resumes.
+    """
+    scale = 1.0 / (q.shape[-1] ** 0.5)
+    scores = (q @ k.transpose(0, 1, 3, 2)) * scale
+    weights = mx.softmax(scores, axis=-1)
+    attn_out = weights @ v
+    return attn_out.reshape(1, -1) @ head_w
+
+
+def test_shrink_then_refloor_logits_identical_to_never_shrunk_through_update_seam():
+    """(b) requirement: resuming a shrunk-and-retired session -- through
+    the real PromptCacheState.update() seam, not just the raw cache
+    method -- re-floors lazily-on-next-use and continues generation
+    identically to a session that was never shrunk. Verified at
+    logits level via a tiny deterministic attention head reading
+    directly from the cache's returned (keys, values).
+    """
+    mx.random.seed(0)
+    prompt_k = mx.random.normal((1, 4, 200, 32)).astype(mx.float16)
+    prompt_v = mx.random.normal((1, 4, 200, 32)).astype(mx.float16)
+    head_w = mx.random.normal((4 * 32, 16)).astype(mx.float16)
+    new_tokens = [mx.random.normal((1, 4, 1, 32)).astype(mx.float16) for _ in range(8)]
+
+    saved = common._SESSION_SHRINK_ON_RETIRE
+    try:
+        # Reference: shrink-on-retire disabled throughout.
+        set_session_shrink_on_retire(False)
+        ref_state = PromptCacheState()
+        ref_cache = PreallocKVCache(prealloc_tokens=262144)
+        ref_cache.update_and_fetch(prompt_k, prompt_v)
+        ref_state.update(token_ids=list(range(200)), kv_cache=[ref_cache])
+        ref_logits = []
+        for q in new_tokens:
+            k, v = ref_cache.update_and_fetch(q, q)
+            ref_logits.append(_tiny_logits(q, k, v, head_w))
+
+        # Shrunk-and-retired via update(), then resumed exactly as the
+        # server would on the session's next turn.
+        set_session_shrink_on_retire(True)
+        shrunk_state = PromptCacheState()
+        shrunk_cache = PreallocKVCache(prealloc_tokens=262144)
+        shrunk_cache.update_and_fetch(prompt_k, prompt_v)
+        shrunk_state.update(token_ids=list(range(200)), kv_cache=[shrunk_cache])
+        assert shrunk_cache.keys.shape[2] < 262144  # confirm it actually shrank
+
+        shrunk_logits = []
+        for q in new_tokens:
+            k, v = shrunk_cache.update_and_fetch(q, q)
+            shrunk_logits.append(_tiny_logits(q, k, v, head_w))
+        assert shrunk_cache.keys.shape[2] == 262144  # re-floored on first resume
+
+        for a, b in zip(ref_logits, shrunk_logits):
+            assert mx.array_equal(a, b).item()
+    finally:
+        set_session_shrink_on_retire(saved)
 
 
 class TestPromptCacheStateFindPrefixLength:

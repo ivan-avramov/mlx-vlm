@@ -29,10 +29,12 @@ from .common import (  # Fork: the 5e9b9503 engine port's own helpers
     _restore_rotating_layers_from_snapshots,
     _rotating_post_gen_trim_safe,
     _rotating_rewind_safe,
+    _shrink_cache_entries,
     _should_capture_anchor_pre_prefill,
     _trim_cache,
     maybe_preallocate_kv_cache,
     maybe_quantize_kv_cache,
+    set_session_shrink_on_retire,
     wired_limit,
 )
 from .dispatch import generate, stream_generate
@@ -119,6 +121,8 @@ __all__ = [
     "maybe_quantize_kv_cache",
     "parse_arguments",
     "save_video",
+    # Fork: D6 session-cache shrink-on-retire toggle.
+    "set_session_shrink_on_retire",
     "stream_generate",
     "video_generation_model_class",
     "wired_limit",

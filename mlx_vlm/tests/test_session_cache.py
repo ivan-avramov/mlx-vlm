@@ -30,6 +30,8 @@ def _reset_session_state():
         "ring": srv._deltanet_ring_size,
         "rewind": srv._deltanet_rewind_enabled,
         "anon_sessions": srv._cache_anon_sessions,
+        "headroom_frac": srv._session_evict_headroom_frac,
+        "headroom_signal": srv._memory_headroom_signal,
     }
     # Import-time default of _session_cache_max is now 0 (eviction disabled);
     # seed a small positive cap so tests that rely on a default-enabled cache
@@ -43,6 +45,8 @@ def _reset_session_state():
     srv._deltanet_ring_size = saved["ring"]
     srv._deltanet_rewind_enabled = saved["rewind"]
     srv._cache_anon_sessions = saved["anon_sessions"]
+    srv._session_evict_headroom_frac = saved["headroom_frac"]
+    srv._memory_headroom_signal = saved["headroom_signal"]
 
 
 def _make_request(headers=None, chat_id=None, metadata=None):
@@ -130,6 +134,159 @@ class TestLRUEviction:
         srv.get_or_create_prompt_cache_state("A")
         second_ts = srv._session_caches["A"]["last_used"]
         assert second_ts >= first_ts
+
+
+class TestHeadroomEviction:
+    """D6: in addition to the count-based LRU cap, evict oldest sessions
+    while a headroom signal says memory is tight
+    (MLX_VLM_SESSION_EVICT_HEADROOM_FRAC / srv._session_evict_headroom_frac,
+    0 = disabled). The signal is a callable, srv._memory_headroom_signal,
+    returning (active_bytes, budget_bytes) or None -- swapped out here for
+    a deterministic mock rather than reading real MLX memory counters.
+    """
+
+    def _mock_signal(self, sequence):
+        """Return a callable that yields each (active, budget) pair in
+        `sequence` in turn, then repeats the last one -- lets a test
+        describe "tight, tight, then fine" without guessing call counts.
+        """
+        state = {"i": 0}
+
+        def _signal():
+            i = min(state["i"], len(sequence) - 1)
+            state["i"] += 1
+            return sequence[i]
+
+        return _signal
+
+    def test_disabled_by_default_no_eviction_even_when_tight(self):
+        srv._session_cache_max = 8  # count cap not the thing under test
+        srv._session_evict_headroom_frac = 0.0
+        srv._memory_headroom_signal = self._mock_signal([(9, 10)])  # 90% used
+        srv.get_or_create_prompt_cache_state("A")
+        srv.get_or_create_prompt_cache_state("B")
+        assert set(srv._session_caches.keys()) == {"A", "B"}
+
+    def test_triggers_eviction_when_tight(self):
+        srv._session_cache_max = 8
+        srv._session_evict_headroom_frac = 0.5
+        srv.get_or_create_prompt_cache_state("A")
+        srv.get_or_create_prompt_cache_state("B")
+        # First check (before eviction): tight (90% >= 50% threshold) ->
+        # evicts the LRU (A). Second check (after A is gone): relieved ->
+        # loop stops, B is left alone.
+        srv._memory_headroom_signal = self._mock_signal([(9, 10), (1, 10)])
+        srv.get_or_create_prompt_cache_state("C")
+        assert "A" not in srv._session_caches
+        assert set(srv._session_caches.keys()) == {"B", "C"}
+
+    def test_persistently_tight_evicts_down_to_protected_only(self):
+        # "while tight" is a loop, not a single check -- if the signal
+        # never reports relief, eviction continues until only the
+        # protected (just-created) session remains. Still bounded and
+        # still never touches the protected session (see
+        # test_never_evicts_the_protected_session for the solo case).
+        srv._session_cache_max = 8
+        srv._session_evict_headroom_frac = 0.5
+        srv.get_or_create_prompt_cache_state("A")
+        srv.get_or_create_prompt_cache_state("B")
+        srv.get_or_create_prompt_cache_state("C")
+        srv._memory_headroom_signal = self._mock_signal([(9, 10)])  # never relieved
+        srv.get_or_create_prompt_cache_state("D")
+        assert set(srv._session_caches.keys()) == {"D"}
+
+    def test_holds_when_not_tight(self):
+        srv._session_cache_max = 8
+        srv._session_evict_headroom_frac = 0.5
+        srv._memory_headroom_signal = self._mock_signal([(1, 10)])  # 10% used
+        srv.get_or_create_prompt_cache_state("A")
+        srv.get_or_create_prompt_cache_state("B")
+        srv.get_or_create_prompt_cache_state("C")
+        assert set(srv._session_caches.keys()) == {"A", "B", "C"}
+
+    def test_never_evicts_the_protected_session(self):
+        # Only one session exists (the one just fetched/created) and the
+        # signal is permanently tight -- must not evict it, and must not
+        # loop forever trying.
+        srv._session_cache_max = 8
+        srv._session_evict_headroom_frac = 0.5
+        srv._memory_headroom_signal = self._mock_signal([(9, 10)])
+        srv.get_or_create_prompt_cache_state("solo")
+        assert set(srv._session_caches.keys()) == {"solo"}
+
+    def test_evicts_multiple_while_still_tight(self):
+        srv._session_cache_max = 8
+        srv._session_evict_headroom_frac = 0.5
+        srv.get_or_create_prompt_cache_state("A")
+        srv.get_or_create_prompt_cache_state("B")
+        srv.get_or_create_prompt_cache_state("C")
+        # Reports tight for the first two checks (evicts A, then B), then
+        # relieved (stops before evicting C or the newly-created D).
+        srv._memory_headroom_signal = self._mock_signal([(9, 10), (9, 10), (1, 10)])
+        srv.get_or_create_prompt_cache_state("D")
+        assert set(srv._session_caches.keys()) == {"C", "D"}
+
+    def test_respects_lru_order_oldest_first(self):
+        srv._session_cache_max = 8
+        srv._session_evict_headroom_frac = 0.5
+        srv.get_or_create_prompt_cache_state("A")
+        srv.get_or_create_prompt_cache_state("B")
+        srv.get_or_create_prompt_cache_state("C")
+        # Touch A so B becomes the LRU.
+        srv.get_or_create_prompt_cache_state("A")
+        srv._memory_headroom_signal = self._mock_signal([(9, 10), (1, 10)])
+        srv.get_or_create_prompt_cache_state("D")
+        assert "B" not in srv._session_caches
+        assert set(srv._session_caches.keys()) == {"A", "C", "D"}
+
+    def test_runs_on_cache_hit_too(self):
+        srv._session_cache_max = 8
+        srv._session_evict_headroom_frac = 0.5
+        srv.get_or_create_prompt_cache_state("A")
+        srv.get_or_create_prompt_cache_state("B")
+        srv._memory_headroom_signal = self._mock_signal([(9, 10), (1, 10)])
+        # Re-touching B (a hit, not a create) must still run the headroom
+        # check and can evict A.
+        srv.get_or_create_prompt_cache_state("B")
+        assert "A" not in srv._session_caches
+        assert set(srv._session_caches.keys()) == {"B"}
+
+    def test_noop_when_signal_unavailable(self):
+        srv._session_cache_max = 8
+        srv._session_evict_headroom_frac = 0.5
+        srv._memory_headroom_signal = lambda: None
+        srv.get_or_create_prompt_cache_state("A")
+        srv.get_or_create_prompt_cache_state("B")
+        srv.get_or_create_prompt_cache_state("C")
+        assert set(srv._session_caches.keys()) == {"A", "B", "C"}
+
+    def test_zero_budget_in_signal_is_treated_as_unavailable(self):
+        srv._session_cache_max = 8
+        srv._session_evict_headroom_frac = 0.5
+        srv._memory_headroom_signal = self._mock_signal([(5, 0)])
+        srv.get_or_create_prompt_cache_state("A")
+        srv.get_or_create_prompt_cache_state("B")
+        assert set(srv._session_caches.keys()) == {"A", "B"}
+
+
+class TestEnvFloatHelper:
+    def test_returns_default_when_unset(self, monkeypatch):
+        monkeypatch.delenv("TEST_FLOAT_X", raising=False)
+        assert srv._env_float("TEST_FLOAT_X", 0.5) == 0.5
+
+    def test_parses_valid_value(self, monkeypatch):
+        monkeypatch.setenv("TEST_FLOAT_X", "0.75")
+        assert srv._env_float("TEST_FLOAT_X", 0.0) == 0.75
+
+    def test_falls_back_on_invalid_value(self, monkeypatch):
+        monkeypatch.setenv("TEST_FLOAT_X", "not-a-float")
+        assert srv._env_float("TEST_FLOAT_X", 0.25) == 0.25
+
+    def test_handles_zero_and_negative(self, monkeypatch):
+        monkeypatch.setenv("TEST_FLOAT_X", "0")
+        assert srv._env_float("TEST_FLOAT_X", 0.5) == 0.0
+        monkeypatch.setenv("TEST_FLOAT_X", "-1")
+        assert srv._env_float("TEST_FLOAT_X", 0.5) == -1.0
 
 
 class TestClearSessionCaches:

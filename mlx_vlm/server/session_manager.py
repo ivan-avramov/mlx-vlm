@@ -65,6 +65,88 @@ _cache_anon_sessions: bool = True
 # the few system tokens of prefill and is not worth the routing risk.
 _MIN_HASH_PREFIX_MATCH: int = 2
 
+# --- D6: headroom-aware eviction ---
+# In addition to the count-based LRU cap above, evict oldest sessions while
+# a memory-headroom signal says the box is tight. 0 = disabled (no behavior
+# change) — this is a same-day mitigation layered on top of shrink-on-retire
+# (generate/common.py), not a replacement for it: shrink reduces the STEADY
+# floor per retained session; this bounds session COUNT directly when the
+# signal says even that isn't enough.
+_session_evict_headroom_frac: float = 0.0
+
+
+def _default_memory_headroom_signal() -> Optional[Tuple[int, int]]:
+    """Return ``(active_bytes, budget_bytes)`` for the headroom-eviction
+    check, or ``None`` when the signal can't be computed (the feature then
+    no-ops safely rather than evicting on a guess).
+
+    ``budget_bytes`` prefers MLX's recommended Metal working-set size
+    (``mx.device_info()['max_recommended_working_set_size']`` — the same
+    ceiling ``server.cli._apply_mlx_memory_limits`` sizes the memory limit
+    against), falling back to physical RAM via ``os.sysconf`` when that
+    isn't reported (e.g. non-Metal backends, or a mocked device_info).
+    """
+    try:
+        import mlx.core as mx
+    except Exception:
+        return None
+    try:
+        active = int(mx.get_active_memory())
+    except Exception:
+        return None
+    budget = 0
+    try:
+        budget = int(mx.device_info().get("max_recommended_working_set_size", 0))
+    except Exception:
+        budget = 0
+    if not budget:
+        try:
+            budget = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        except (ValueError, AttributeError, OSError):
+            budget = 0
+    if not budget:
+        return None
+    return active, budget
+
+
+# Overridable (tests substitute a deterministic mock; an embedding host could
+# substitute its own signal, e.g. a pre-resolved mx.set_memory_limit value).
+_memory_headroom_signal = _default_memory_headroom_signal
+
+
+def _evict_for_headroom(protect_id: str) -> None:
+    """Evict oldest sessions (LRU order, excluding ``protect_id`` — the
+    session just fetched/created for THIS request) while the headroom
+    signal reports the box as tight. Bounded by construction: each
+    iteration either evicts (shrinking ``_session_caches`` by one) or
+    returns, and it always returns once only ``protect_id`` is left — so
+    it can never evict the caller's own session or loop forever. Must be
+    called with ``_session_caches_lock`` already held.
+    """
+    if _session_evict_headroom_frac <= 0:
+        return
+    while True:
+        signal = _memory_headroom_signal()
+        if signal is None:
+            return
+        active, budget = signal
+        if budget <= 0 or active < _session_evict_headroom_frac * budget:
+            return
+        victim_id = next(
+            (sid for sid in _session_caches if sid != protect_id), None
+        )
+        if victim_id is None:
+            return  # nothing left to evict but the protected session
+        _session_caches.pop(victim_id, None)
+        logger.info(
+            "Headroom eviction: dropped chat_id=%s (active=%.2f GiB >= "
+            "%.0f%% of %.2f GiB budget)",
+            victim_id,
+            active / (1024**3),
+            _session_evict_headroom_frac * 100,
+            budget / (1024**3),
+        )
+
 
 def _env_int(name: str, default: int) -> int:
     """Read an env var as int with graceful fallback on missing/invalid.
@@ -88,6 +170,19 @@ def _env_choice(name: str, default: str, choices: list) -> str:
     the env value isn't one of the allowed choices (case-insensitive)."""
     val = os.environ.get(name, default).lower()
     return val if val in choices else default
+
+
+def _env_float(name: str, default: float) -> float:
+    """Read an env var as float with graceful fallback on missing/invalid.
+    Mirrors ``_env_int`` — used for ``MLX_VLM_SESSION_EVICT_HEADROOM_FRAC``.
+    """
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    try:
+        return float(val)
+    except ValueError:
+        return default
 
 
 def _resolve_chat_id(raw_request, parsed_request) -> Optional[str]:
@@ -230,6 +325,7 @@ def get_or_create_prompt_cache_state(chat_id: str) -> PromptCacheState:
             entry = _session_caches[chat_id]
             entry["last_used"] = time.time()
             _session_caches.move_to_end(chat_id)
+            _evict_for_headroom(chat_id)
             return entry["state"]
 
         state = PromptCacheState(
@@ -252,6 +348,7 @@ def get_or_create_prompt_cache_state(chat_id: str) -> PromptCacheState:
                 evicted_id,
                 max_sessions,
             )
+        _evict_for_headroom(chat_id)
         return state
 
 
@@ -398,6 +495,8 @@ def configure(
     session_cache_max: Optional[int] = None,
     chat_id_header: Optional[str] = None,
     cache_anon_sessions: Optional[bool] = None,
+    session_shrink_on_retire: Optional[bool] = None,
+    session_evict_headroom_frac: Optional[float] = None,
 ) -> None:
     """Publish CLI-resolved config to the module-level holders.
 
@@ -407,6 +506,7 @@ def configure(
     """
     global _deltanet_ring_size, _deltanet_rewind_enabled
     global _session_cache_max, _chat_id_header, _cache_anon_sessions
+    global _session_evict_headroom_frac
     if deltanet_ring_size is not None:
         _deltanet_ring_size = max(0, int(deltanet_ring_size))
     if deltanet_rewind_enabled is not None:
@@ -417,3 +517,12 @@ def configure(
         _chat_id_header = chat_id_header
     if cache_anon_sessions is not None:
         _cache_anon_sessions = bool(cache_anon_sessions)
+    if session_shrink_on_retire is not None:
+        # Fork: D6 shrink-on-retire toggle lives on generate.common (that's
+        # where PromptCacheState.update() is) — import lazily to avoid a
+        # module-load-order dependency (common.py doesn't import us).
+        from ..generate import set_session_shrink_on_retire
+
+        set_session_shrink_on_retire(bool(session_shrink_on_retire))
+    if session_evict_headroom_frac is not None:
+        _session_evict_headroom_frac = max(0.0, float(session_evict_headroom_frac))

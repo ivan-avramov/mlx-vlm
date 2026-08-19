@@ -323,3 +323,218 @@ def test_turn_capacity_fixed_floor_wins():
         )
         == 262144
     )
+
+
+# --- D6: shrink_to_offset() on the three prealloc-floor cache classes ---
+# (PreallocKVCache, PreallocQuantizedKVCache, TurboQuantKVCache). Used by
+# the session-cache shrink-on-retire path (generate/common.py) to release
+# a retired session's prealloc floor back to the allocator; the existing
+# first-fill floor logic re-applies the floor lazily on the session's next
+# use (re-floor path, tested separately below via update_and_fetch after
+# shrink).
+
+
+def test_prealloc_kvcache_shrink_releases_padding():
+    c = PreallocKVCache(prealloc_tokens=262144)
+    c.update_and_fetch(*_fake(1000))
+    assert c.keys.shape[2] == 262144
+    before, after = c.shrink_to_offset()
+    assert before == 262144 * H * D * 2 * 2  # K+V, fp16
+    assert after < before
+    assert c.keys.shape[2] == 1024  # ceil(1000/256)*256
+    assert c.values.shape[2] == 1024
+    assert c.offset == 1000  # offset unchanged by shrink
+
+
+def test_prealloc_kvcache_shrink_preserves_prefix_exactly():
+    c = PreallocKVCache(prealloc_tokens=262144)
+    k, v = mx.random.normal((1, H, 1000, D)), mx.random.normal((1, H, 1000, D))
+    c.update_and_fetch(k, v)
+    c.shrink_to_offset()
+    assert mx.array_equal(c.keys[..., :1000, :], k).item()
+    assert mx.array_equal(c.values[..., :1000, :], v).item()
+
+
+def test_prealloc_kvcache_shrink_noop_when_already_tight():
+    c = PreallocKVCache(prealloc_tokens=0)
+    c.update_and_fetch(*_fake(1000))
+    assert c.keys.shape[2] == 1024
+    before, after = c.shrink_to_offset()
+    assert before == after
+    assert c.keys.shape[2] == 1024
+
+
+def test_prealloc_kvcache_shrink_noop_on_empty_cache():
+    c = PreallocKVCache(prealloc_tokens=262144)
+    assert c.shrink_to_offset() == (0, 0)
+    assert c.keys is None
+
+
+def test_prealloc_kvcache_shrink_then_refloor_matches_never_shrunk():
+    """The re-floor path: shrink an idle session's cache, then resume it
+    (as the server would on the session's next turn) and confirm decode
+    continues identically to a cache that was never shrunk — i.e. shrink
+    is purely a footprint optimization, not a behavior change."""
+    k, v = mx.random.normal((1, H, 1000, D)).astype(mx.float16), mx.random.normal(
+        (1, H, 1000, D)
+    ).astype(mx.float16)
+
+    reference = PreallocKVCache(prealloc_tokens=262144)
+    reference.update_and_fetch(k, v)
+    for _ in range(50):
+        reference.update_and_fetch(*_fake(1))
+
+    shrunk = PreallocKVCache(prealloc_tokens=262144)
+    shrunk.update_and_fetch(k, v)
+    shrunk.shrink_to_offset()
+    assert shrunk.keys.shape[2] == 1024  # floor released
+    # Re-floor is NOT lazy: it must re-establish the full 262144 floor on
+    # the very next update_and_fetch() (matching first-fill behavior), not
+    # wait for growth past the shrunk 1024 capacity -- waiting would mean a
+    # realloc-during-generation transient, exactly what prealloc exists to
+    # avoid. Assert this on the very first post-shrink call.
+    shrunk.update_and_fetch(*_fake(1))
+    assert shrunk.keys.shape[2] == 262144
+    for _ in range(49):
+        shrunk.update_and_fetch(*_fake(1))
+    assert shrunk.keys.shape[2] == 262144  # zero further reallocs
+    assert shrunk.offset == reference.offset == 1050
+    assert mx.array_equal(
+        shrunk.keys[..., : shrunk.offset, :], reference.keys[..., : reference.offset, :]
+    ).item()
+    assert mx.array_equal(
+        shrunk.values[..., : shrunk.offset, :],
+        reference.values[..., : reference.offset, :],
+    ).item()
+
+
+def test_prealloc_quantized_shrink_releases_padding():
+    c = PreallocQuantizedKVCache(group_size=64, bits=4, prealloc_tokens=262144)
+    c.update_and_fetch(*_fake(1000))
+    assert c.keys[0].shape[2] == 262144
+    before, after = c.shrink_to_offset()
+    assert after < before
+    assert c.keys[0].shape[2] == 1024
+    assert c.offset == 1000
+
+
+def test_prealloc_quantized_shrink_preserves_prefix_exactly():
+    c = PreallocQuantizedKVCache(group_size=64, bits=4, prealloc_tokens=262144)
+    k, v = mx.random.normal((1, H, 1000, D)), mx.random.normal((1, H, 1000, D))
+    c.update_and_fetch(k, v)
+    before_triple = tuple(a[..., :1000, :] for a in c.keys)
+    c.shrink_to_offset()
+    for before_a, after_a in zip(before_triple, c.keys):
+        assert mx.array_equal(before_a, after_a[..., :1000, :]).item()
+
+
+def test_prealloc_quantized_shrink_noop_when_already_tight():
+    c = PreallocQuantizedKVCache(group_size=64, bits=4, prealloc_tokens=0)
+    c.update_and_fetch(*_fake(1000))
+    before, after = c.shrink_to_offset()
+    assert before == after
+
+
+def test_prealloc_quantized_shrink_noop_on_empty_cache():
+    c = PreallocQuantizedKVCache(group_size=64, bits=4, prealloc_tokens=262144)
+    assert c.shrink_to_offset() == (0, 0)
+
+
+def test_prealloc_quantized_shrink_then_refloor_matches_never_shrunk():
+    k, v = mx.random.normal((1, H, 1000, D)).astype(mx.float16), mx.random.normal(
+        (1, H, 1000, D)
+    ).astype(mx.float16)
+
+    reference = PreallocQuantizedKVCache(group_size=64, bits=4, prealloc_tokens=262144)
+    reference.update_and_fetch(k, v)
+    for _ in range(50):
+        reference.update_and_fetch(*_fake(1))
+
+    shrunk = PreallocQuantizedKVCache(group_size=64, bits=4, prealloc_tokens=262144)
+    shrunk.update_and_fetch(k, v)
+    shrunk.shrink_to_offset()
+    assert shrunk.keys[0].shape[2] == 1024
+    # Re-floor is immediate (not lazy) -- the very next update_and_fetch()
+    # re-establishes the full floor, matching first-fill behavior.
+    shrunk.update_and_fetch(*_fake(1))
+    assert shrunk.keys[0].shape[2] == 262144
+    for _ in range(49):
+        shrunk.update_and_fetch(*_fake(1))
+    assert shrunk.keys[0].shape[2] == 262144  # zero further reallocs
+    assert shrunk.offset == reference.offset == 1050
+    for a, b in zip(shrunk.keys, reference.keys):
+        assert mx.array_equal(
+            a[..., : shrunk.offset, :], b[..., : reference.offset, :]
+        ).item()
+
+
+def test_turboquant_shrink_releases_padding():
+    c = TurboQuantKVCache(bits=4, prealloc_tokens=262144)
+    c.update_and_fetch(*_fake(1000))
+    assert _state_length(c.keys) == 262144
+    before, after = c.shrink_to_offset()
+    assert after < before
+    assert _state_length(c.keys) == 1024
+    assert c.offset == 1000
+
+
+def test_turboquant_shrink_preserves_offset_and_state_shape():
+    c = TurboQuantKVCache(bits=4, prealloc_tokens=262144)
+    k, v = mx.random.normal((1, H, 1000, D)), mx.random.normal((1, H, 1000, D))
+    c.update_and_fetch(k, v)
+    ks_before, vs_before = c.state
+    mx.eval(ks_before, vs_before)
+    c.shrink_to_offset()
+    ks_after, vs_after = c.state
+    assert c.offset == 1000
+    # .state is offset-sliced, so post-shrink content must match pre-shrink
+    # content exactly (quantized representation is deterministic given the
+    # same codec/seed -- no re-quantization happens during shrink, only a
+    # copy of the already-quantized bytes).
+    assert mx.array_equal(ks_after.norms, ks_before.norms).item()
+    assert mx.array_equal(ks_after.indices, ks_before.indices).item()
+
+
+def test_turboquant_shrink_noop_when_already_tight():
+    c = TurboQuantKVCache(bits=4, prealloc_tokens=None)
+    c.update_and_fetch(*_fake(1000))
+    before, after = c.shrink_to_offset()
+    assert before == after
+
+
+def test_turboquant_shrink_noop_on_empty_cache():
+    c = TurboQuantKVCache(bits=4, prealloc_tokens=262144)
+    assert c.shrink_to_offset() == (0, 0)
+
+
+def test_turboquant_shrink_then_refloor_re_establishes_floor_immediately():
+    c = TurboQuantKVCache(bits=4, prealloc_tokens=262144)
+    c.update_and_fetch(*_fake(1000))
+    assert _state_length(c.keys) == 262144
+    c.shrink_to_offset()
+    assert _state_length(c.keys) == 1024
+    # Re-floor is immediate (not lazy): the very next update_and_fetch()
+    # must re-establish the full 262144 floor, matching first-fill
+    # behavior, rather than growing incrementally from 1024.
+    c.update_and_fetch(*_fake(1))
+    assert _state_length(c.keys) == 262144
+    assert c.offset == 1001
+    for _ in range(400):
+        c.update_and_fetch(*_fake(1))
+    assert _state_length(c.keys) == 262144  # zero further reallocs
+    assert c.offset == 1401
+
+
+def test_turboquant_shrink_then_refloor_preserves_prefix_bytes():
+    c = TurboQuantKVCache(bits=4, prealloc_tokens=262144)
+    k, v = mx.random.normal((1, H, 1000, D)), mx.random.normal((1, H, 1000, D))
+    c.update_and_fetch(k, v)
+    ks_before, vs_before = c.state
+    mx.eval(ks_before, vs_before)
+    c.shrink_to_offset()
+    c.update_and_fetch(*_fake(1))  # triggers re-floor
+    ks_after, vs_after = c.state
+    # .state is offset-sliced to the ORIGINAL 1000 tokens' worth (the new
+    # decode token is token 1001) -- compare the shared prefix.
+    assert mx.array_equal(ks_after.norms[..., :1000], ks_before.norms).item()
+    assert mx.array_equal(ks_after.indices[..., :1000, :], ks_before.indices).item()

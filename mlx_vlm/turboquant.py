@@ -5284,6 +5284,13 @@ class TurboQuantKVCache(_BaseCache):
         self._cached_state_offset = -1
         self._shadow_keys = None
         self._shadow_values = None
+        # Fork: D6 shrink-on-retire re-floor flag — mirrors
+        # PreallocKVCache._needs_refloor (models/cache.py). Set by
+        # shrink_to_offset() after it releases the prealloc/max_kv_size
+        # floor; the next update_and_fetch() must re-establish the full
+        # floor in one clean allocation instead of silently falling
+        # through to _reserve_state_capacity's incremental growth.
+        self._needs_refloor = False
 
     @classmethod
     def from_cache(
@@ -5415,7 +5422,7 @@ class TurboQuantKVCache(_BaseCache):
             new_values = self.value_codec.quantize(values)
 
         new_end = self.offset + keys.shape[2]
-        if self.keys is None:
+        if self.keys is None or self._needs_refloor:
             _trigger_allocation_hooks()
             # Pre-allocate to the largest of new_end, kv_prealloc_tokens, and
             # max_kv_size (if set), to avoid late-stage double-buffer
@@ -5423,8 +5430,16 @@ class TurboQuantKVCache(_BaseCache):
             initial_alloc = max(
                 new_end, self.prealloc_tokens or 0, self.max_kv_size or 0
             )
+            old_keys, old_values, old_offset = self.keys, self.values, self.offset
             self.keys = _allocate_state_like(new_keys, initial_alloc)
             self.values = _allocate_state_like(new_values, initial_alloc)
+            self._needs_refloor = False
+            if old_keys is not None and old_offset > 0:
+                # Re-floor after a prior shrink_to_offset(): copy the
+                # shrunk buffer's valid prefix into the freshly (fully)
+                # floored allocation before writing the new increment.
+                _write_state(self.keys, _slice_state(old_keys, old_offset), 0)
+                _write_state(self.values, _slice_state(old_values, old_offset), 0)
         else:
             self.keys = _reserve_state_capacity(
                 self.keys, self.offset, new_end, self.cache_step
@@ -5450,6 +5465,43 @@ class TurboQuantKVCache(_BaseCache):
             _QuantizedStateProxy(ks, self.offset, n_heads),
             _QuantizedStateProxy(vs, self.offset, n_heads),
         )
+
+    def shrink_to_offset(self):
+        """Reallocate the TurboQuant K/V state down to a step-rounded fit
+        for the current ``offset``, releasing any prealloc/growth-floor
+        padding beyond what's actually in use. Returns
+        ``(bytes_before, bytes_after)``; a no-op (equal before/after) when
+        the cache is empty or already tight. Mirrors
+        ``PreallocKVCache.shrink_to_offset`` (models/cache.py) for the
+        D6 session-cache shrink-on-retire path — see that docstring for
+        the rationale. The valid prefix is preserved exactly via the same
+        ``_allocate_state_like`` / ``_slice_state`` / ``_write_state``
+        helpers ``_reserve_state_capacity`` uses to grow.
+        """
+        if self.keys is None:
+            return 0, 0
+        capacity = _state_length(self.keys)
+        target = max(
+            self.cache_step,
+            ((self.offset + self.cache_step - 1) // self.cache_step) * self.cache_step,
+        )
+        before = _state_nbytes(self.keys) + _state_nbytes(self.values)
+        if target >= capacity:
+            return before, before
+        new_keys = _allocate_state_like(self.keys, target)
+        new_values = _allocate_state_like(self.values, target)
+        if self.offset > 0:
+            _write_state(new_keys, _slice_state(self.keys, self.offset), 0)
+            _write_state(new_values, _slice_state(self.values, self.offset), 0)
+        self.keys, self.values = new_keys, new_values
+        self._cached_state = None
+        self._cached_state_offset = -1
+        if (self.prealloc_tokens or 0) > 0 or (self.max_kv_size or 0) > 0:
+            # Only a cache that actually carried a floor needs to
+            # re-establish one on next use.
+            self._needs_refloor = True
+        after = _state_nbytes(self.keys) + _state_nbytes(self.values)
+        return before, after
 
     @staticmethod
     def _unwrap(state):

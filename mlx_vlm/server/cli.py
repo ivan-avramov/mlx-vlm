@@ -21,7 +21,11 @@ from .generation import (  # Fork: generation_defaults + thinking getters are fo
     get_server_thinking_end_token,
     get_server_thinking_start_token,
 )
-from .session_manager import _env_choice, _env_int  # Fork: session manager is fork
+from .session_manager import (  # Fork: session manager is fork
+    _env_choice,
+    _env_float,
+    _env_int,
+)
 from .session_manager import configure as _configure_session_manager
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
@@ -493,6 +497,34 @@ def main():
         ),
     )
     parser.add_argument(
+        "--cache-session-shrink",
+        type=str,
+        default=_env_choice("MLX_VLM_SESSION_SHRINK_ON_RETIRE", "off", ["on", "off"]),
+        choices=["on", "off"],
+        help=(
+            "D6: after each turn, shrink that session's KV cache back down "
+            "to its actual used length (releasing any kv_prealloc_tokens "
+            "floor) instead of leaving it floored while idle in the LRU "
+            "pool. The floor re-applies lazily (one clean realloc+copy, no "
+            "growth-during-generation) the next time the session is used. "
+            "Default: off (no behavior change). Env fallback: "
+            "MLX_VLM_SESSION_SHRINK_ON_RETIRE."
+        ),
+    )
+    parser.add_argument(
+        "--cache-session-evict-headroom-frac",
+        type=float,
+        default=_env_float("MLX_VLM_SESSION_EVICT_HEADROOM_FRAC", 0.0),
+        help=(
+            "D6: in addition to --cache-session-max, evict the oldest idle "
+            "session(s) whenever active MLX memory reaches this fraction of "
+            "the recommended Metal working set (falls back to physical RAM "
+            "if that isn't reported). Never evicts the session the current "
+            "request is using. 0 disables this check (default). Env "
+            "fallback: MLX_VLM_SESSION_EVICT_HEADROOM_FRAC."
+        ),
+    )
+    parser.add_argument(
         "--deltanet-rewind",
         type=str,
         default=_env_choice("MLX_VLM_DELTANET_REWIND", "auto", ["on", "off", "auto"]),
@@ -637,13 +669,24 @@ def main():
         session_cache_max=max(0, int(args.cache_session_max)),
         chat_id_header=args.cache_chat_id_header,
         cache_anon_sessions=args.cache_anon_sessions.lower() != "off",
+        session_shrink_on_retire=args.cache_session_shrink.lower() != "off",
+        session_evict_headroom_frac=max(
+            0.0, float(args.cache_session_evict_headroom_frac)
+        ),
     )
     logger.info(
-        "Per-chat cache: explicit-chat-id %s, anonymous hash-chain matching %s",
+        "Per-chat cache: explicit-chat-id %s, anonymous hash-chain matching %s, "
+        "shrink-on-retire %s, headroom-eviction %s",
         "enabled" if args.cache_session_max > 0 else "disabled",
         (
             "enabled"
             if args.cache_anon_sessions.lower() != "off" and args.cache_session_max > 0
+            else "disabled"
+        ),
+        "enabled" if args.cache_session_shrink.lower() != "off" else "disabled",
+        (
+            f"enabled ({args.cache_session_evict_headroom_frac:.2f})"
+            if args.cache_session_evict_headroom_frac > 0
             else "disabled"
         ),
     )

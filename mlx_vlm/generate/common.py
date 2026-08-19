@@ -539,6 +539,76 @@ class GenerationResult:
     diffusion_block_complete: bool = False
 
 
+# ---------------------------------------------------------------------------
+# Fork: D6 session-cache shrink-on-retire.
+#
+# A per-chat PromptCacheState (mlx_vlm/server/session_manager.py) retained in
+# the server's LRU session pool holds its KV cache floored at
+# kv_prealloc_tokens (up to the full context cap, per-model) even when the
+# conversation used a fraction of it -- the floor exists for the ACTIVE
+# session to avoid a mid-generation double-buffer realloc OOM, but it is
+# needless dead weight on every OTHER retained session sitting idle. Off by
+# default (no behavior change) -- see docs/handoff.md D6 for the audit that
+# motivated this (58GB + heavy swap at the default session cap of 8).
+# ---------------------------------------------------------------------------
+_SESSION_SHRINK_ON_RETIRE: bool = os.environ.get(
+    "MLX_VLM_SESSION_SHRINK_ON_RETIRE", "off"
+).strip().lower() not in ("off", "0", "false", "no", "")
+
+
+def set_session_shrink_on_retire(enabled: bool) -> None:
+    """Toggle shrink-on-retire for ``PromptCacheState.update()``.
+
+    Called by ``server.session_manager.configure()`` after CLI-arg/env-var
+    precedence resolution, mirroring ``_session_cache_max``'s pattern.
+    Direct callers of ``PromptCacheState`` that never run ``cli.main()``
+    (``chat.py``, ``chat_ui.py``) see the env-var-resolved default above --
+    off unless the operator explicitly exports the env var.
+    """
+    global _SESSION_SHRINK_ON_RETIRE
+    _SESSION_SHRINK_ON_RETIRE = bool(enabled)
+
+
+def _shrink_cache_entries(entries) -> None:
+    """Recursively call ``shrink_to_offset()`` on every cache leaf that
+    implements it.
+
+    Only ``PreallocKVCache``, ``PreallocQuantizedKVCache``
+    (``models/cache.py``) and ``TurboQuantKVCache`` (``turboquant.py``)
+    define the method -- the three single-sequence cache classes that
+    apply a ``prealloc_tokens`` floor for the per-chat session path. Every
+    other cache type (plain ``KVCache``/``QuantizedKVCache``, the
+    continuous-batching ``Batch*`` variants, ``ArraysCache``/DeltaNet
+    state, ``RotatingKVCache``) has no such method and is silently
+    skipped -- this is deliberately duck-typed rather than an isinstance
+    allow-list so a future prealloc-floor cache class is covered for free.
+    Traversal mirrors ``_trim_cache``'s recursion into list/tuple
+    containers and ``.caches``-bearing composites (``CacheList``).
+    """
+    if isinstance(entries, (list, tuple)):
+        for sub in entries:
+            _shrink_cache_entries(sub)
+        return
+    if hasattr(entries, "caches"):
+        for sub in entries.caches:
+            _shrink_cache_entries(sub)
+        return
+    shrink = getattr(entries, "shrink_to_offset", None)
+    if shrink is None:
+        return
+    before, after = shrink()
+    if after < before:
+        logger.info(
+            "Session cache shrink-on-retire: %s offset=%s freed %.2f MiB "
+            "(%.2f -> %.2f MiB)",
+            type(entries).__name__,
+            getattr(entries, "offset", "?"),
+            (before - after) / (1024**2),
+            before / (1024**2),
+            after / (1024**2),
+        )
+
+
 class PromptCacheState:
     # Fork: upstream stores token_ids + cache and nothing else. This fork adds the
     # snapshot ring (mid-prefill anchors for rotating/SWA caches), the asymmetric
@@ -642,6 +712,14 @@ class PromptCacheState:
         self.cache = kv_cache
         if self.snapshot_ring is not None and self.snapshot_ring.enabled:
             self.snapshot_ring.capture(offset=len(self.token_ids), cache=kv_cache)
+
+        # Fork: D6 shrink-on-retire. This turn just finished (the daemon is
+        # serial per chat_id -- see _process_cached_request's docstring), so
+        # the cache being stored back here is never the one an in-flight
+        # generation is writing to; shrinking now can never race an active
+        # turn. Off by default -- see _SESSION_SHRINK_ON_RETIRE above.
+        if _SESSION_SHRINK_ON_RETIRE:
+            _shrink_cache_entries(kv_cache)
 
 
 # ---------------------------------------------------------------------------
