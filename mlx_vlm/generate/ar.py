@@ -86,11 +86,18 @@ def _position_seed(seed: int, row_id: int, position: int) -> int:
     return int(x & 0xFFFFFFFF)
 
 
-def _position_keys(seed: int, row_ids: List[int], positions: List[int]) -> mx.array:
+def _position_keys(
+    seeds: Union[int, List[int]], row_ids: List[int], positions: List[int]
+) -> mx.array:
+    # Fork (O30): ``seeds`` may be a single value broadcast across every row
+    # (the original, still-default behavior — one shared seed for the whole
+    # call) or a per-row list, so continuous batching can key each row's draw
+    # by ITS OWN declared seed instead of the batch's first request's seed.
+    seed_seq = seeds if isinstance(seeds, (list, tuple)) else [seeds] * len(row_ids)
     return mx.stack(
         [
             mx.random.key(_position_seed(seed, row, pos))
-            for row, pos in zip(row_ids, positions)
+            for seed, row, pos in zip(seed_seq, row_ids, positions)
         ]
     )
 
@@ -114,10 +121,17 @@ class _PositionedTargetSampler:
         *,
         row_ids: List[int],
         positions: List[int],
+        seeds: Optional[List[int]] = None,
     ) -> mx.array:
         if logprobs.shape[0] != len(row_ids) or len(row_ids) != len(positions):
             raise ValueError("row_ids and positions must match logprobs batch size.")
-        keys = _position_keys(self.seed, row_ids, positions)
+        if seeds is not None and len(seeds) != len(row_ids):
+            raise ValueError("seeds must match logprobs batch size.")
+        # Fork (O30): an explicit per-row seeds= overrides self.seed row by
+        # row, so continuous batching can key each row's draw by its own
+        # request's declared seed. Omitting it (the default) reproduces the
+        # prior single-shared-seed behavior byte-for-byte.
+        keys = _position_keys(self.seed if seeds is None else seeds, row_ids, positions)
         if self.top_p > 0 and self.top_p < 1.0:
             return mx.vmap(self._sample_top_p_one, in_axes=(0, 0))(logprobs, keys)
         return mx.vmap(self._sample_one, in_axes=(0, 0))(logprobs, keys)
@@ -1120,11 +1134,33 @@ def _sample_with_positions(
     *,
     row_ids: Optional[List[int]] = None,
     positions: Optional[List[int]] = None,
+    seeds: Optional[List[int]] = None,
 ) -> mx.array:
     sample_target = getattr(sampler, "sample_target", None)
     if callable(sample_target) and row_ids is not None and positions is not None:
+        if seeds is not None:
+            return sample_target(
+                logprobs, row_ids=row_ids, positions=positions, seeds=seeds
+            )
         return sample_target(logprobs, row_ids=row_ids, positions=positions)
     return sampler(logprobs)
+
+
+def _resolve_seeds(
+    seeds: Optional[List[Optional[int]]], sampler: Callable[[mx.array], mx.array]
+) -> Optional[List[int]]:
+    """Fill any per-row ``None`` with the sampler's own default seed.
+
+    Fork (O30). ``seeds`` is ``None`` when no request-level seeds were
+    supplied at all — existing callers (CLI batch_generate, tests, the
+    speculative path) are unaffected and this returns ``None`` so
+    ``_sample_with_positions`` falls back to the sampler's single shared
+    seed, exactly as before this fix.
+    """
+    if seeds is None:
+        return None
+    default_seed = getattr(sampler, "seed", None)
+    return [default_seed if s is None else s for s in seeds]
 
 
 class GenerationBatch:
@@ -1160,6 +1196,7 @@ class GenerationBatch:
             List[Optional[List[Callable[[mx.array, mx.array], mx.array]]]]
         ] = None,
         thinking_budget_criteria: Optional[List[Any]] = None,
+        seeds: Optional[List[Optional[int]]] = None,
     ):
         self.model = model
         self._language_model = getattr(model, "language_model", model)
@@ -1176,6 +1213,11 @@ class GenerationBatch:
         self.thinking_budget_criteria = thinking_budget_criteria or []
         self.token_context = [list(ctx) for ctx in (token_context or [])]
         self._ensure_token_context()
+        # Fork (O30): per-row declared seed, parallel to ``uids``. ``None``
+        # means no request-level seeds were supplied at all (unaffected
+        # callers); an entry of ``None`` within a supplied list means "no
+        # override for this row" and falls back to the sampler's own seed.
+        self.seeds = list(seeds) if seeds is not None else None
 
         self._current_tokens = None
         self._current_lps = None
@@ -1296,6 +1338,7 @@ class GenerationBatch:
             logprobs,
             row_ids=[0] * len(self.uids),
             positions=[n + 1 for n in self._num_tokens],
+            seeds=_resolve_seeds(self.seeds, self.sampler),
         )
 
         self._next_tokens = sampled
@@ -1392,6 +1435,17 @@ class GenerationBatch:
             self.logits_processors = []
             other.logits_processors = []
 
+        # Fork (O30): merge per-row seeds BEFORE self.uids is mutated below,
+        # since a missing side is padded out to ITS OWN current row count.
+        if self.seeds is not None or other.seeds is not None:
+            self_seeds = self.seeds if self.seeds is not None else [None] * len(
+                self.uids
+            )
+            other_seeds = other.seeds if other.seeds is not None else [None] * len(
+                other.uids
+            )
+            self.seeds = self_seeds + other_seeds
+
         self.uids.extend(other.uids)
         self.prompt_cache = _extend_cache(self.prompt_cache, other.prompt_cache)
         self.max_tokens.extend(other.max_tokens)
@@ -1465,6 +1519,8 @@ class GenerationBatch:
             self.thinking_budget_criteria = [
                 self.thinking_budget_criteria[idx] for idx in keep
             ]
+        if self.seeds is not None:
+            self.seeds = [self.seeds[idx] for idx in keep]
 
         if not keep:
             self.prompt_cache.clear()
@@ -1581,6 +1637,7 @@ class GenerationBatch:
         batch.token_context = []
         batch.logits_processors = []
         batch.thinking_budget_criteria = []
+        batch.seeds = None
         batch._current_tokens = None
         batch._current_lps = None
         batch._next_tokens = None
@@ -1822,6 +1879,7 @@ class PromptProcessingBatch:
         draft_kind: Optional[str] = None,
         draft_block_size: Optional[int] = None,
         greedy_sampling: bool = False,
+        seeds: Optional[List[Optional[int]]] = None,
     ):
         self.model = model
         self.uids = uids
@@ -1832,6 +1890,9 @@ class PromptProcessingBatch:
         self.draft_kind = draft_kind
         self.draft_block_size = draft_block_size
         self.greedy_sampling = greedy_sampling
+        # Fork (O30): per-row declared seed, parallel to ``uids``. See
+        # GenerationBatch.seeds for the None-handling contract.
+        self.seeds = list(seeds) if seeds is not None else None
 
         lengths = [len(ids) for ids in input_ids]
         max_length = max(lengths)
@@ -2173,11 +2234,15 @@ class PromptProcessingBatch:
             logits = mx.concatenate(processed_logits, axis=0)
 
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        # Fork (O30): per-row seeds apply to the plain (non-speculative) path
+        # only — the speculative/mtp path is untouched by this fix.
+        is_speculative = self.draft_model is not None and self.draft_kind is not None
         first_tokens = _sample_with_positions(
             sampler,
             logprobs,
             row_ids=[0] * len(self.uids),
             positions=[0] * len(self.uids),
+            seeds=(None if is_speculative else _resolve_seeds(self.seeds, sampler)),
         )
 
         mx.async_eval(first_tokens)
@@ -2243,6 +2308,7 @@ class PromptProcessingBatch:
                 token_context=[list(ctx) for ctx in self._token_context],
                 logits_processors=list(self.logits_processors),
                 thinking_budget_criteria=list(self.thinking_budget_criteria),
+                seeds=(None if self.seeds is None else list(self.seeds)),
             )
         gen_batch.compute_logprobs = compute_logprobs
 
@@ -2564,7 +2630,7 @@ class BatchGenerator:
         """
         if self.apc_manager is None:
             return None
-        uid, ids_list, max_toks, prompt_kwargs, lps, criteria = sequence
+        uid, ids_list, max_toks, prompt_kwargs, lps, criteria, seed = sequence
         if not ids_list or len(ids_list) < 2:
             return None
         return _apc.apc_lookup_plan(
@@ -2604,6 +2670,7 @@ class BatchGenerator:
         prompt_kwargs_list = [s[3] for s in sequences]
         logits_processors = [s[4] for s in sequences]
         thinking_budget_criteria = [s[5] for s in sequences]
+        seeds_list = [s[6] for s in sequences]
 
         # Per-row prefix length and suffix tokens
         prefix_lens = [p["prefix_len"] if p else 0 for p in picks]
@@ -2752,6 +2819,7 @@ class BatchGenerator:
             draft_kind=getattr(self, "draft_kind", None),
             draft_block_size=getattr(self, "draft_block_size", None),
             greedy_sampling=getattr(self, "greedy_sampling", False),
+            seeds=seeds_list,
         )
 
     def _build_apc_meta_for_cold(
@@ -2799,6 +2867,7 @@ class BatchGenerator:
             List[Optional[List[Callable[[mx.array, mx.array], mx.array]]]]
         ] = None,
         thinking_budget_criteria: Optional[List[Any]] = None,
+        seeds: Optional[List[Optional[int]]] = None,
     ):
         uids = []
 
@@ -2815,15 +2884,23 @@ class BatchGenerator:
             thinking_budget_criteria = [None] * len(prompts)
         elif len(thinking_budget_criteria) != len(prompts):
             raise ValueError("Insufficient number of thinking_budget_criteria provided")
+        # Fork (O30): per-request declared seed, threaded alongside every
+        # other per-row field so continuous batching can key each row's draw
+        # by ITS OWN seed instead of the batch's first request's seed.
+        if seeds is None:
+            seeds = [None] * len(prompts)
+        elif len(seeds) != len(prompts):
+            raise ValueError("Insufficient number of seeds provided")
 
-        for p, m, kw, lp, tc in zip(
+        for p, m, kw, lp, tc, sd in zip(
             prompts,
             max_tokens,
             prompt_kwargs,
             logits_processors,
             thinking_budget_criteria,
+            seeds,
         ):
-            self._unprocessed_sequences.append((self.uid_count, p, m, kw, lp, tc))
+            self._unprocessed_sequences.append((self.uid_count, p, m, kw, lp, tc, sd))
             uids.append(self.uid_count)
             self.uid_count += 1
         # Sort in ascending order of length
@@ -2836,7 +2913,9 @@ class BatchGenerator:
         """Remove a sequence from the batch by uid."""
         with mx.stream(self._stream):
             # Waiting in the queue.
-            for i, (seq_uid, _, _, _, _, _) in enumerate(self._unprocessed_sequences):
+            for i, (seq_uid, _, _, _, _, _, _) in enumerate(
+                self._unprocessed_sequences
+            ):
                 if seq_uid == uid:
                     self._unprocessed_sequences.pop(i)
                     return True
@@ -3024,6 +3103,7 @@ class BatchGenerator:
             prompt_kwargs_list = [s[3] for s in sequences]
             logits_processors = [s[4] for s in sequences]
             thinking_budget_criteria = [s[5] for s in sequences]
+            seeds_list = [s[6] for s in sequences]
 
             inputs_embeds, merged_kwargs = _merge_prefill_prompt_kwargs(
                 prompt_kwargs_list, input_ids
@@ -3062,6 +3142,7 @@ class BatchGenerator:
                 draft_kind=getattr(self, "draft_kind", None),
                 draft_block_size=getattr(self, "draft_block_size", None),
                 greedy_sampling=getattr(self, "greedy_sampling", False),
+                seeds=seeds_list,
             )
             self._prompt_tokens_counter += self._prompt_batch.total_prompt_tokens
 

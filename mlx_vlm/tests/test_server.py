@@ -526,6 +526,181 @@ def test_positioned_target_sampler_defaults_unchanged():
     assert base.tolist() == explicit_defaults.tolist()
 
 
+def test_positioned_target_sampler_seeds_override_per_row():
+    """O30: sample_target's optional seeds= lets each row draw under ITS OWN
+    seed, independent of the sampler's single construction-time seed. This is
+    what makes per-request seeds take effect on the batched decode path,
+    where one sampler instance is shared across many simultaneous requests.
+    """
+    sampler = server_generation._PositionedTargetSampler(
+        temperature=1.0, top_p=1.0, seed=999999  # must be ignored when seeds= given
+    )
+    logits = mx.zeros((2, 4096), dtype=mx.float32)
+    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+
+    different = sampler.sample_target(
+        logprobs, row_ids=[0, 0], positions=[3, 3], seeds=[111, 222]
+    )
+    mx.eval(different)
+    assert different.tolist()[0] != different.tolist()[1]
+
+
+def test_positioned_target_sampler_seeds_reproduce_across_calls():
+    """Same declared seed + same position -> identical draw (O30 requirement:
+    determinism per request must be preserved)."""
+    sampler = server_generation._PositionedTargetSampler(
+        temperature=0.7, top_p=1.0, seed=0
+    )
+    logits = mx.array([[0.0, 1.0, 2.0, 3.0]], dtype=mx.float32)
+    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+
+    first = sampler.sample_target(logprobs, row_ids=[0], positions=[7], seeds=[42])
+    second = sampler.sample_target(logprobs, row_ids=[0], positions=[7], seeds=[42])
+    mx.eval(first, second)
+    assert first.tolist() == second.tolist()
+
+
+def test_run_threads_per_request_seed_into_batch_insert(monkeypatch):
+    """O30 end-to-end: ResponseGenerator._run must pass EACH request's OWN
+    declared seed to BatchGenerator.insert(), not only the first request's
+    seed used to construct the BatchGenerator's sampler.
+    """
+    captured = {"seeds": []}
+
+    class FakeDetokenizer:
+        def __init__(self):
+            self.last_segment = ""
+
+        def reset(self):
+            self.last_segment = ""
+
+        def add_token(self, token):
+            self.last_segment = str(token)
+
+        def finalize(self):
+            pass
+
+    class FakeBatchGenerator:
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+            self._next_uid = 1
+            self._active = {}
+
+        def insert(self, *args, **kwargs):
+            del args
+            captured["seeds"].append(kwargs.get("seeds"))
+            uid = self._next_uid
+            self._next_uid += 1
+            self._active[uid] = 0
+            return (uid,)
+
+        def remove(self, uid):
+            return self._active.pop(uid, None) is not None
+
+        @property
+        def unprocessed_prompts(self):
+            return []
+
+        @property
+        def has_pending_prompts(self):
+            return False
+
+        def next(self, **kwargs):
+            del kwargs
+            responses = []
+            finished = []
+            for uid in sorted(self._active):
+                responses.append(
+                    SimpleNamespace(
+                        uid=uid, token=uid, token_logprob=0.0, finish_reason="stop"
+                    )
+                )
+                finished.append(uid)
+            for uid in finished:
+                del self._active[uid]
+            return [], responses
+
+    monkeypatch.setattr(server_generation, "BatchGenerator", FakeBatchGenerator)
+    monkeypatch.setattr(
+        server_generation, "make_streaming_detokenizer", lambda _: FakeDetokenizer()
+    )
+
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    gen.model_path = "demo"
+    gen.adapter_path = None
+    gen.model = None
+    gen.processor = None
+    gen.config = None
+    gen.stop_tokens = set()
+    gen.vision_cache = None
+    gen.draft_model = None
+    gen.draft_kind = None
+    gen.kv_bits = None
+    gen.kv_group_size = server.DEFAULT_KV_GROUP_SIZE
+    gen.kv_quant_scheme = server.DEFAULT_KV_QUANT_SCHEME
+    gen.quantized_kv_start = server.DEFAULT_QUANTIZED_KV_START
+    gen.top_logprobs_k = 0
+    gen.apc_manager = None
+    gen.tokenizer = SimpleNamespace()
+    gen.requests = Queue()
+    gen._stop = False
+    gen._ready = Event()
+    gen._load_error = None
+    gen._cancelled = set()
+    gen._cancel_lock = Lock()
+
+    def fake_initialize_model():
+        gen.model = SimpleNamespace(language_model=object())
+        gen.processor = SimpleNamespace()
+        gen.config = SimpleNamespace()
+        gen.stop_tokens = set()
+        gen.draft_model = None
+        gen.draft_kind = None
+        gen.tokenizer = SimpleNamespace()
+
+    gen._initialize_model = fake_initialize_model
+    gen._gpu_embed = lambda raw_inputs, images=None, apc_semantic_hash=None: (
+        mx.array([[raw_inputs["request_id"]]], dtype=mx.int32),
+        {},
+    )
+
+    request_queues = []
+    seeds_requested = [111, None]
+    for request_id, seed in enumerate(seeds_requested):
+        rqueue = Queue()
+        request_queues.append(rqueue)
+        gen.requests.put(
+            server_generation.QueuedGenerationRequest(
+                rqueue=rqueue,
+                raw_inputs={"request_id": request_id},
+                prompt_tokens=1,
+                args=server.GenerationArguments(max_tokens=2, seed=seed),
+            )
+        )
+
+    worker = Thread(target=gen._run, daemon=True)
+    worker.start()
+
+    try:
+        for rqueue in request_queues:
+            ctx = rqueue.get(timeout=1)
+            assert isinstance(ctx, server.GenerationContext)
+            while True:
+                item = rqueue.get(timeout=1)
+                if item is None:
+                    break
+    finally:
+        gen._stop = True
+        gen.requests.put(None)
+        worker.join(timeout=2)
+
+    # Request 0 declared seed=111; request 1 declared no seed at all, which
+    # must resolve to DEFAULT_SEED (unchanged seedless semantics) — NOT to
+    # request 0's seed, which is what the pre-fix code did (only the first
+    # request's args.seed ever reached the sampler).
+    assert captured["seeds"] == [[111], [server_generation.DEFAULT_SEED]]
+
+
 def test_speculative_server_dispatches_eagle3_batch_loop():
     assert (
         speculative_utils.get_speculative_rounds_batch("eagle3")

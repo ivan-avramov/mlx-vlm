@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from queue import Empty as QueueEmpty
 from queue import Queue
 from threading import Event, Lock, Thread
-from typing import Callable, Generator, List, Optional, Tuple
+from typing import Callable, Generator, List, Optional, Tuple, Union
 
 import mlx.core as mx
 from fastapi import HTTPException
@@ -323,11 +323,18 @@ def _position_seed(seed: int, row_id: int, position: int) -> int:
     return int(x & 0xFFFFFFFF)
 
 
-def _position_keys(seed: int, row_ids: List[int], positions: List[int]) -> mx.array:
+def _position_keys(
+    seeds: Union[int, List[int]], row_ids: List[int], positions: List[int]
+) -> mx.array:
+    # Fork (O30): ``seeds`` may be a single value broadcast across every row
+    # (the original, still-default behavior) or a per-row list, so continuous
+    # batching can key each row's draw by ITS OWN declared seed instead of
+    # the batch's first request's seed.
+    seed_seq = seeds if isinstance(seeds, (list, tuple)) else [seeds] * len(row_ids)
     return mx.stack(
         [
             mx.random.key(_position_seed(seed, row, pos))
-            for row, pos in zip(row_ids, positions)
+            for seed, row, pos in zip(seed_seq, row_ids, positions)
         ]
     )
 
@@ -387,10 +394,17 @@ class _PositionedTargetSampler:
         *,
         row_ids: List[int],
         positions: List[int],
+        seeds: Optional[List[int]] = None,
     ) -> mx.array:
         if logprobs.shape[0] != len(row_ids) or len(row_ids) != len(positions):
             raise ValueError("row_ids and positions must match logprobs batch size.")
-        keys = _position_keys(self.seed, row_ids, positions)
+        if seeds is not None and len(seeds) != len(row_ids):
+            raise ValueError("seeds must match logprobs batch size.")
+        # Fork (O30): an explicit per-row seeds= overrides self.seed row by
+        # row, so continuous batching can key each row's draw by its own
+        # request's declared seed. Omitting it (the default) reproduces the
+        # prior single-shared-seed behavior byte-for-byte.
+        keys = _position_keys(self.seed if seeds is None else seeds, row_ids, positions)
         logprobs = self._filter(logprobs)
         return mx.vmap(self._sample_one, in_axes=(0, 0))(logprobs, keys)
 
@@ -2556,6 +2570,15 @@ class ResponseGenerator:
 
                     try:
                         thinking_budget_criteria = request.thinking_budget_criteria
+                        # Fork (O30): thread THIS request's own declared seed
+                        # through, not just the seed baked into the sampler
+                        # at BatchGenerator-construction time (which only
+                        # ever reflected the FIRST request in the batch).
+                        # None normalizes to DEFAULT_SEED here so it matches
+                        # _PositionedTargetSampler's own seedless semantics.
+                        request_seed = (
+                            DEFAULT_SEED if args.seed is None else int(args.seed)
+                        )
                         (uid,) = batch_gen.insert(
                             [input_ids.squeeze(0).tolist()],
                             max_tokens=args.max_tokens,
@@ -2564,6 +2587,7 @@ class ResponseGenerator:
                                 self._make_logits_processors(args, input_ids)
                             ],
                             thinking_budget_criteria=[thinking_budget_criteria],
+                            seeds=[request_seed],
                         )
                     except Exception as e:
                         rqueue.put(e)

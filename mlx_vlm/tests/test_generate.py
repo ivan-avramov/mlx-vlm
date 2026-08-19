@@ -583,6 +583,39 @@ class TestBatchGenerator:
 
         assert len(uids) == 2
 
+    def test_insert_threads_seeds_into_unprocessed_sequences(
+        self, mock_model, mock_processor
+    ):
+        """O30 wiring: insert(seeds=...) must attach each row's OWN seed to
+        its pending sequence, not silently drop it."""
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+            max_tokens=50,
+        )
+
+        prompts = [[1, 2, 3], [4, 5]]
+        uids = gen.insert(prompts, seeds=[111, 222])
+
+        seed_by_uid = {seq[0]: seq[6] for seq in gen.unprocessed_prompts}
+        assert seed_by_uid[uids[0]] == 111
+        assert seed_by_uid[uids[1]] == 222
+
+    def test_insert_defaults_seeds_to_none_when_not_supplied(
+        self, mock_model, mock_processor
+    ):
+        """Backward compatibility: callers that never pass seeds= (the CLI
+        batch_generate path, existing tests) must be unaffected."""
+        gen = BatchGenerator(
+            model=mock_model.language_model,
+            processor=mock_processor,
+        )
+
+        uids = gen.insert([[1, 2, 3]])
+
+        seed_by_uid = {seq[0]: seq[6] for seq in gen.unprocessed_prompts}
+        assert seed_by_uid[uids[0]] is None
+
     def test_stats(self, mock_model, mock_processor):
         gen = BatchGenerator(
             model=mock_model.language_model,
@@ -887,6 +920,117 @@ class TestBatchGenerator:
         assert [r.token for r in first] == [5]
         assert batch._next_tokens.tolist() == [2]
         assert model.calls == [{}]
+
+    def test_generation_batch_seeds_produce_independent_streams_per_row(self):
+        """O30: two rows sharing ONE GenerationBatch (and thus one sampler
+        instance) must draw under THEIR OWN declared seeds, not the
+        sampler's single construction-time seed."""
+        from mlx_vlm.server import generation as server_generation
+
+        class UniformLogitModel:
+            def __call__(self, input_ids, cache=None, **kwargs):
+                vocab = 4096
+                logits = mx.zeros((input_ids.shape[0], input_ids.shape[1], vocab))
+                return SimpleNamespace(logits=logits)
+
+        sampler = server_generation._PositionedTargetSampler(
+            temperature=1.0, top_p=1.0, seed=0
+        )
+
+        batch = GenerationBatch(
+            model=UniformLogitModel(),
+            uids=[0, 1],
+            inputs=mx.array([5, 5], dtype=mx.int32),
+            prompt_cache=[],
+            sampler=sampler,
+            stop_criteria=lambda token: False,
+            max_tokens=[8, 8],
+            seeds=[111, 222],
+        )
+        batch.compute_logprobs = False
+
+        row0_tokens = []
+        row1_tokens = []
+        for _ in range(6):
+            for r in batch.next():
+                (row0_tokens if r.uid == 0 else row1_tokens).append(r.token)
+
+        assert row0_tokens != row1_tokens
+
+    def test_generation_batch_same_seed_reproduces_regardless_of_batchmates(self):
+        """Determinism is keyed by (seed, position) only — a request drawing
+        under seed=111 must reproduce byte-identically whether it runs alone
+        or is batched alongside an unrelated request with a different seed
+        and a different uid (O30 requirement 2)."""
+        from mlx_vlm.server import generation as server_generation
+
+        class UniformLogitModel:
+            def __call__(self, input_ids, cache=None, **kwargs):
+                vocab = 4096
+                logits = mx.zeros((input_ids.shape[0], input_ids.shape[1], vocab))
+                return SimpleNamespace(logits=logits)
+
+        def make_batch(uids, seeds):
+            sampler = server_generation._PositionedTargetSampler(
+                temperature=1.0, top_p=1.0, seed=0
+            )
+            batch = GenerationBatch(
+                model=UniformLogitModel(),
+                uids=uids,
+                inputs=mx.array([5] * len(uids), dtype=mx.int32),
+                prompt_cache=[],
+                sampler=sampler,
+                stop_criteria=lambda token: False,
+                max_tokens=[8] * len(uids),
+                seeds=seeds,
+            )
+            batch.compute_logprobs = False
+            return batch
+
+        solo = make_batch([0], [111])
+        grouped = make_batch([5, 6], [999, 111])
+
+        solo_tokens = []
+        grouped_tokens = []
+        for _ in range(6):
+            solo_tokens.extend(r.token for r in solo.next())
+            grouped_tokens.extend(r.token for r in grouped.next() if r.uid == 6)
+
+        assert solo_tokens == grouped_tokens
+
+    def test_prompt_processing_batch_generate_honors_per_row_seeds(self):
+        """O30: the FIRST token (sampled inside PromptProcessingBatch.generate,
+        before a GenerationBatch even exists) must also honor per-row seeds."""
+        from mlx_vlm.server import generation as server_generation
+
+        class UniformLogitModel:
+            def __call__(self, input_ids, cache=None, inputs_embeds=None, **kwargs):
+                vocab = 4096
+                logits = mx.zeros(
+                    (inputs_embeds.shape[0], inputs_embeds.shape[1], vocab)
+                )
+                return SimpleNamespace(logits=logits)
+
+        sampler = server_generation._PositionedTargetSampler(
+            temperature=1.0, top_p=1.0, seed=0
+        )
+
+        batch = PromptProcessingBatch(
+            model=UniformLogitModel(),
+            uids=[0, 1],
+            input_ids=[[1, 2, 3], [4, 5, 6]],
+            max_tokens=[4, 4],
+            inputs_embeds=mx.zeros((2, 3, 8)),
+            prompt_kwargs={},
+            prefill_step_size=None,
+            warm_cache=[],
+            seeds=[111, 222],
+        )
+
+        gen_batch = batch.generate(sampler, lambda token: False)
+
+        first_tokens = gen_batch._next_tokens.tolist()
+        assert first_tokens[0] != first_tokens[1]
 
     def test_speculative_generation_batch_drains_full_round(self, monkeypatch):
         def fake_rounds(*args, **kwargs):
@@ -2747,6 +2891,7 @@ def test_precomputed_semantic_hash_reuses_actual_growing_apc_prefix():
             {"_apc_semantic_hash": semantic_hash},
             [],
             None,
+            None,
         )
     )
 
@@ -2800,6 +2945,7 @@ def test_cold_batch_left_pads_sequence_aligned_prompt_kwargs():
                 "_apc_tenant": "tenant",
             },
             [],
+            None,
             None,
         )
         for i, length in enumerate(lengths)
@@ -2898,6 +3044,7 @@ def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
             },
             [],
             None,
+            None,
         ),
         (
             2,
@@ -2910,6 +3057,7 @@ def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
                 "_apc_image_hash": 456,
             },
             [],
+            None,
             None,
         ),
     ]
@@ -2960,7 +3108,7 @@ def test_apc_pick_rejects_image_tokens_and_releases_blocks():
     bg.model = SimpleNamespace(config=SimpleNamespace(image_token_id=image_token_id))
     bg._wire_stack = None
 
-    pick = bg._apc_pick_for((1, token_ids, 1, {}, [], None))
+    pick = bg._apc_pick_for((1, token_ids, 1, {}, [], None, None))
 
     assert pick is None
     assert all(block.ref_cnt == 0 for block in stored)
