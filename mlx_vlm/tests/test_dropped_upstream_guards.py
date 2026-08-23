@@ -1497,6 +1497,7 @@ class TestQwen35MetalOnlyFastPathsAreGuarded:
     def test_use_target_verify_dense_declines_when_kernel_is_none(self, monkeypatch):
         import mlx.core as mx
 
+        from mlx_vlm.models import exact_speculative_verify
         from mlx_vlm.models.qwen3_5 import language as qwen35_language
 
         linear = nn.Linear(64, 64)
@@ -1505,8 +1506,14 @@ class TestQwen35MetalOnlyFastPathsAreGuarded:
         assert qwen35_language._use_target_verify_dense(linear, x, True) is True
 
         # What the module global becomes on a non-Metal backend once the
-        # `if mx.metal.is_available() else None` guard is in place.
-        monkeypatch.setattr(qwen35_language, "_TARGET_VERIFY_GEMV", None)
+        # `if mx.metal.is_available() else None` guard is in place. Upstream's
+        # ea4f1179 (#1987) moved the kernel global from qwen3_5.language's
+        # _TARGET_VERIFY_GEMV into models/exact_speculative_verify.py, which
+        # _use_target_verify_dense now consults via
+        # exact_speculative_verify_dense_available().
+        monkeypatch.setattr(
+            exact_speculative_verify, "_EXACT_SPECULATIVE_VERIFY_GEMV", None
+        )
         assert qwen35_language._use_target_verify_dense(linear, x, True) is False
 
 
@@ -1722,6 +1729,9 @@ class TestApcStoreEmitsItsTrace:
         cache.values = mx.ones((1, 1, 4, 2))
         cache.offset = 4
         manager = APCManager(num_blocks=4, block_size=4)
+        # Upstream #1901 declines exact stores below exact_cache_min_tokens
+        # (default 16); this guard is about the trace line, not the floor.
+        manager.exact_cache_min_tokens = 1
 
         with caplog.at_level(logging.INFO, logger="mlx_vlm.apc"):
             assert manager.store_exact_cache([1, 2, 3, 4], [cache]) is True

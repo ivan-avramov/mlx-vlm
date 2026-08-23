@@ -5,6 +5,7 @@ from typing import Any, Optional, Tuple
 from .laguna_dflash import LagunaDFlashDraftModel
 from .muse_glimmer_assistant import MuseGlimmerAssistantDraftModel
 from .qwen3_dflash import DFlashDraftModel
+from .qwen3_dspark import DSparkDraftModel
 
 KNOWN_DRAFTER_KINDS = {"dflash", "mtp", "eagle3"}
 
@@ -17,7 +18,7 @@ DRAFTER_KIND_BY_MODEL_TYPE = {
     "gemma4_unified_assistant": "mtp",
     "glm4_moe_lite_mtp": "mtp",
     "inkling_mtp": "mtp",
-    "nemotron_h_mtp": "mtp",
+    "nemotron_h_mtp": "mtp",  # Fork: the fork's native nemotron_h MTP drafter (d06ed84e)
     "qwen3_5_mtp": "mtp",
     "laguna": "dflash",
     "muse_glimmer_assistant": "dflash",
@@ -177,6 +178,7 @@ __all__ = [
     "DRAFTER_KIND_BY_MODEL_TYPE",
     "KNOWN_DRAFTER_KINDS",
     "DFlashDraftModel",
+    "DSparkDraftModel",
     "LagunaDFlashDraftModel",
     "MuseGlimmerAssistantDraftModel",
     "load_drafter",

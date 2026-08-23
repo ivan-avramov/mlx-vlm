@@ -639,7 +639,7 @@ Fixed, with the repro failing before and passing after, and guarded at runtime b
 — which was verified to fail against pre-fix `dispatch.py`, not merely to pass against
 the fix (trap #13).
 
-## The dropped-hunk report has bottomed out — 20 commits, all closed by review
+## The dropped-hunk report has bottomed out — 22 commits, all closed by review
 
 **Settled 2026-08-10, and this is the section to read before re-investigating any
 `find_dropped_hunks.py` hit.** The wide pass
@@ -678,6 +678,19 @@ The method for all three was the same and is worth reusing: extract the commit's
 lines, subtract the ones absent from `upstream/main` too (those are upstream's own later
 removals, not our gap), and read what is left. A three-line script beats a `git log -S`
 per line.
+
+**[update 2026-08-22] 20 -> 22 after the weekly merge, same mechanism.** Neither is a gap:
+
+* **`1eb215fe`** (Nemotron-VoiceChat, 3, `models/nemotron_h/language.py`) — the 3 lines
+  are the over-strict `(inputs is None) == (inputs_embeds is None)` guard plus its
+  positional `self.backbone(inputs, ...)` call, which fork commit `0c88817e`
+  deliberately replaced so the shared AR loop's both-supplied call shape is accepted
+  (both branches assign the same `hidden_states`; see AGENTS.md's traps 16/17 for why
+  this guard — unlike `gemma3n`'s — was a bug). Marked `# Fork:` at the site.
+* **`9a32c916`** is tagged `[never merged]` by the report itself — it was never an
+  ancestor, so nothing was dropped; its 1 dispatch.py line matches upstream's
+  `thinking_start_token_id` detection that the fork replaced with the format-aware
+  `prompt_is_inside_thinking` (THINKING_FORMATS registry, marked `# Fork:` at the site).
 
 Closed because the fork deliberately supersedes them — see each file's `# Fork:`
 markers, which name the commit:

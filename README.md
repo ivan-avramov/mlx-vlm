@@ -184,7 +184,7 @@ Speed up generation by drafting several candidate tokens with a small "drafter" 
 
 See [docs/usage.md](docs/usage.md) for Python API examples including batch generation.
 
-#### DFlash (Qwen3.5 and Muse Glimmer)
+#### DFlash and DSpark (Qwen3.5, LFM2.5, and Muse Glimmer)
 
 A lightweight block-diffusion drafter that predicts multiple tokens per round, typically 2–3× faster.
 
@@ -206,6 +206,28 @@ mlx_vlm.generate --model Qwen/Qwen3.5-4B \
 mlx_vlm.server --model Qwen/Qwen3.5-4B \
   --draft-model z-lab/Qwen3.5-4B-DFlash
 ```
+
+Liquid AI's DSpark checkpoint uses a Qwen3-style block drafter plus a learned
+Markov correction head. It is auto-detected and runs through the exact target
+verification path:
+
+```sh
+mlx_vlm.generate --model LiquidAI/LFM2.5-2.6B \
+  --draft-model LiquidAI/LFM2.5-2.6B-DSpark \
+  --prompt "Explain speculative decoding in three sentences." \
+  --max-tokens 256 --temperature 0
+
+mlx_vlm.server --model LiquidAI/LFM2.5-2.6B \
+  --draft-model LiquidAI/LFM2.5-2.6B-DSpark
+```
+
+The published DSpark `block_size: 9` means nine proposals, or ten target rows
+after adding the anchor token. On MLX, DSpark verifies seven proposals plus the
+anchor by default: eight rows exactly fill the verifier threadgroup, while nine
+or ten rows pad to sixteen and run slower. The trained width remains available
+with `--draft-block-size 10`. The checkpoint's confidence head is loaded for
+parity, and DSpark decoding currently requires greedy sampling
+(`temperature=0`).
 
 Muse Glimmer's published assistant checkpoint is auto-detected as DFlash:
 
@@ -470,7 +492,7 @@ mlx_vlm.server --api-key <secret-token>
 - `--tts-model`: Preload a text-to-speech model at server startup
 - `--stt-model`: Preload a speech-to-text model at server startup
 - `--embedding-model`: Preload an embedding model at server startup
-- `--reranker-model`: Preload a Qwen3 or Qwen3-VL reranker model at server startup
+- `--reranker-model`: Preload a supported reranker model at server startup
 - `--adapter-path`: Path for adapter weights to use with the preloaded model
 - `--draft-model`: Speculative drafter path or HF id (e.g. `z-lab/Qwen3.5-4B-DFlash`, `RedHatAI/gemma-4-31B-it-speculator.eagle3`, `google/gemma-4-31B-it-assistant`, `Inferact/MiniMax-M3-EAGLE3`) — enables speculative decoding for ~2× or higher throughput
 - `--draft-kind`: Drafter family — `dflash` (default), `eagle3`, or `mtp` (native/assistant MTP)
@@ -1109,7 +1131,7 @@ curl -X POST "http://localhost:8080/v1/rerank" \
   }'
 ```
 
-Preload a default with `--reranker-model <repo-or-path>`. Qwen3 rerankers accept text, while Qwen3-VL rerankers also accept objects containing `text`, `image`, `image_url`, `video`, or `video_url`.
+Preload a default with `--reranker-model <repo-or-path>`. Supported text rerankers include one-label BERT, XLM-RoBERTa, and ModernBERT sequence-classification checkpoints, plus Qwen3 generative rerankers. Qwen3-VL rerankers also accept objects containing `text`, `image`, `image_url`, `video`, or `video_url`. Sequence-classification rerankers accept text pairs and do not support custom instructions.
 
 ##### Text Input
 

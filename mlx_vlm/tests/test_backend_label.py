@@ -154,6 +154,10 @@ class TestBackendLabelReportsThePathThatRan:
         is the real thing.
         """
         rg = self._bare_response_generator()
+        # _run's finally-clause stream cleanup assumes it owns a dedicated GPU
+        # worker thread; here _run() runs on pytest's main thread, and clearing
+        # the main thread's MLX streams poisons every later test in the session.
+        monkeypatch.setattr(server_generation, "clear_mlx_streams", lambda: None)
         monkeypatch.setattr(rg, "_initialize_model", lambda: None)
         monkeypatch.setattr(server_generation, "is_diffusion_model", lambda m: False)
         monkeypatch.setattr(

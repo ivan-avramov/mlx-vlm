@@ -3,8 +3,9 @@
 Fork-only file, because `tests/test_qwen3_5_mtp_sanitize.py` is shared with upstream and
 restored upstream tests stay byte-identical so future merges apply.
 
-`_config_mtp_file` is fork-only (upstream's `_iter_mtp_keys` iterates
-`_safetensor_files` only) and was the last entry on
+`_config_mtp_file` is fork-only (upstream's `MTPSplitter.iter_selected` iterates
+`_safetensor_files` only; the fork inserts the sidecar fallback there) and was the
+last entry on
 `dev/find_untested_fork_code.py`'s list with no tested caller. It exists because some
 converters — mlx-optiq among them — relocate the sidecar out of the repo root, where a
 non-recursive `*.safetensors` glob will not find it, and record its real path in
@@ -20,7 +21,7 @@ import json
 
 import pytest
 
-from mlx_vlm.speculative.drafters.qwen3_5_mtp.split import _config_mtp_file
+from mlx_vlm.speculative.drafters.mtp_split import _config_mtp_file
 
 
 def _write(tmp_path, config, *, sidecar=None):

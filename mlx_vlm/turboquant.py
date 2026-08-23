@@ -6696,10 +6696,9 @@ class BatchTurboQuantKVCache(_BaseCache):
     # Codec initialisation (deferred until first update)
     # ------------------------------------------------------------------
 
-    def _ensure_codecs(self, keys: mx.array):
+    def _ensure_codecs(self, keys: mx.array, values: mx.array):
         if self.key_codec is not None:
             return
-        D = keys.shape[-1]
         # Delegate to a temporary TurboQuantKVCache to get codec setup right
         tmp = TurboQuantKVCache(
             bits=self.bits,
@@ -6707,7 +6706,7 @@ class BatchTurboQuantKVCache(_BaseCache):
             key_bits=self.key_bits,
             value_bits=self.value_bits,
         )
-        tmp._ensure_codecs(keys, keys)  # values have same D
+        tmp._ensure_codecs(keys, values)
         self.key_codec = tmp.key_codec
         self.value_codec = tmp.value_codec
 
@@ -6716,7 +6715,7 @@ class BatchTurboQuantKVCache(_BaseCache):
     # ------------------------------------------------------------------
 
     def update_and_fetch(self, keys: mx.array, values: mx.array):
-        self._ensure_codecs(keys)
+        self._ensure_codecs(keys, values)
         prev = self._idx
 
         new_keys = self.key_codec.quantize(keys)

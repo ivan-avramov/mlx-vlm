@@ -58,14 +58,18 @@ An empty file is **not** a reason to delete it — each keeps its header and RES
 notes, and the next merge that adds a fork hunk to a shared file will need an entry.
 
 Two non-gating lead generators, which are read rather than gated on:
-`find_dropped_hunks.py` (**20** commits, all closed by review — see `upstream-gaps.md`,
+`find_dropped_hunks.py` (**22** commits, all closed by review — see `upstream-gaps.md`,
 "the dropped-hunk report has bottomed out"; that count will never reach zero) and
-`find_untested_fork_code.py` (**9**, all confirmed executed by a coverage run).
+`find_untested_fork_code.py` (**17** with zero test mentions as of 2026-08-22 — the
+2026-08-10 coverage run confirmed the then-9; the growth since is recent fork work
+(D6 session-floor helpers, O30 seeds, the nemotron_h_mtp splitter) awaiting the next
+coverage pass, not a regression signal).
 
 **The dropped-hunk count moves when the FORK edits a file, not only when upstream
 does** — attribution is by line content, so replacing an upstream line with fork work
-makes the commit that introduced it start reporting. Three of the 20 joined that way
-and none was a gap; see the 2026-08-14 rows in `upstream-gaps.md`. Expect a new entry
+makes the commit that introduced it start reporting. Five of the 22 joined that way
+and none was a gap; see the 2026-08-14 and 2026-08-22 rows in `upstream-gaps.md`.
+Expect a new entry
 after any merge in which you convert an upstream call to a fork helper.
 
 ## Fork & branches
@@ -800,7 +804,9 @@ positives. Every hit still needs `git log -S` and a read.
 cd mlx_vlm/ && pytest -s ./tests --ignore=tests/test_smoke.py
 ```
 
-The suite is **green: 3279 passed, 7 skipped, 0 failed.** Keep it that way. (This
+The suite is **green: 3592 passed, 8 skipped, 0 failed** (2026-08-22, mlx 0.32.1 —
+upstream's tests now target 0.32.1; on 0.32.0 expect Metal aborts). Keep it that
+way. (This
 line goes stale on every restore that adds a guard — trust the run, not the number.)
 
 **`mlx-audio>=0.4.8` is required and `requirements.txt` says so as a fork bump.**
@@ -1078,9 +1084,8 @@ top of `reranking.py`. **Re-check this after every merge that adds a server modu
 
 ## Key dependencies
 
-- `mlx` >= 0.31.2 — core framework
-- `mlx-lm` >= 0.31.3 — text-only fallback only; not imported by library code
-- `mlx-audio` >= 0.4.3
+- `mlx` >= 0.32.0 — core framework (tests effectively need 0.32.1; see "Tests")
+- `mlx-audio` >= 0.4.8 — fork bump; upstream's floor still reads 0.4.3
 - `transformers` >= 5.5.0 — configs, tokenizers, processors
 - `huggingface-hub` — model downloads
 - `Pillow`, `opencv-python`, `miniaudio` — image/video/audio

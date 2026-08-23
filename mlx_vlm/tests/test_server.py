@@ -20,19 +20,57 @@ from fastapi.testclient import TestClient
 from PIL import Image
 from transformers.utils.chat_parsing import ResponseParser, parse_response
 
+import mlx_vlm.reranker_loader as reranker_loader
 import mlx_vlm.server as server
+import mlx_vlm.server.anthropic as server_anthropic
 import mlx_vlm.server.cli as server_cli
 import mlx_vlm.server.generation as server_generation
 import mlx_vlm.server.openai as server_openai
 import mlx_vlm.server.reranking as server_reranking
 import mlx_vlm.speculative.utils as speculative_utils
-import mlx_vlm.utils as vlm_utils
 from mlx_vlm import apc as apc_module
 from mlx_vlm.apc import hash_image_payload
 from mlx_vlm.generate import GenerationResult
 from mlx_vlm.generate.image import ImageGenerationResult
 from mlx_vlm.prompt_utils import apply_chat_template
+from mlx_vlm.server.runtime_config import RuntimeConfig
 from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
+
+
+def test_response_generator_prefill_step_override_wins_over_environment(monkeypatch):
+    class DormantThread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setenv("PREFILL_STEP_SIZE", "2048")
+    monkeypatch.setattr(server_generation, "Thread", DormantThread)
+
+    default_generator = server.ResponseGenerator(model_path="default")
+    overridden_generator = server.ResponseGenerator(
+        model_path="overridden",
+        prefill_step_size=3072,
+    )
+
+    assert default_generator.prefill_step_size == 2048
+    assert overridden_generator.prefill_step_size == 3072
+
+
+def test_response_generator_clears_worker_streams(monkeypatch):
+    gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+    error = RuntimeError("worker failed")
+    gen._run_impl = MagicMock(side_effect=error)
+    clear_streams = MagicMock()
+    monkeypatch.setattr(server_generation, "clear_mlx_streams", clear_streams)
+
+    with pytest.raises(RuntimeError, match="worker failed"):
+        gen._run()
+
+    gen._run_impl.assert_called_once_with()
+    clear_streams.assert_called_once_with()
+
 
 _MUSE_RESPONSE_TEMPLATE = {
     "defaults": {"role": "assistant"},
@@ -900,11 +938,9 @@ def test_get_cached_model_omitted_adapter_inherits_loaded_adapter(monkeypatch):
     server.get_cached_model("demo-model", "adapter-a")
     server.get_cached_model("demo-model")
 
-    assert server.runtime.model_cache["cache_key"] == (
-        "demo-model",
-        "adapter-a",
-        "text_generation",
-    )
+    cache_key = server.runtime.model_cache["cache_key"]
+    assert cache_key[:3] == ("demo-model", "adapter-a", "text_generation")
+    assert cache_key[3] == server.runtime.config.fingerprint(kinds={"text_generation"})
     assert server.runtime.model_cache["adapter_path"] == "adapter-a"
 
 
@@ -969,6 +1005,8 @@ def _unstarted_response_generator():
     gen.vision_cache = None
     gen.draft_model = None
     gen.draft_kind = None
+    gen.draft_model_path = None
+    gen.draft_kind_override = None
     gen.kv_bits = None
     gen.kv_group_size = server.DEFAULT_KV_GROUP_SIZE
     gen.kv_quant_scheme = server.DEFAULT_KV_QUANT_SCHEME
@@ -1020,6 +1058,28 @@ def test_server_demotes_incompatible_mtp_drafter_to_ar(monkeypatch):
     assert gen.processor is processor
     assert gen.draft_model is None
     assert gen.draft_kind is None
+
+
+def test_server_includes_processor_specific_stop_tokens(monkeypatch):
+    config = SimpleNamespace(eos_token_id=[2])
+    model = SimpleNamespace(language_model=SimpleNamespace(config=config))
+    processor = SimpleNamespace(
+        tokenizer=SimpleNamespace(),
+        additional_eos_token_ids=[3],
+    )
+    gen = _unstarted_response_generator()
+
+    monkeypatch.delenv("MLX_VLM_DRAFT_MODEL", raising=False)
+    monkeypatch.delenv("MLX_VLM_DRAFT_KIND", raising=False)
+    monkeypatch.setattr(
+        server_generation,
+        "load_model_resources",
+        lambda *_args, **_kwargs: (model, processor, config),
+    )
+
+    gen._initialize_model()
+
+    assert gen.stop_tokens == {2, 3}
 
 
 def test_server_caches_apc_mode_when_model_initializes(monkeypatch):
@@ -1433,6 +1493,7 @@ def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
     gen.processor = SimpleNamespace()
     gen.config = SimpleNamespace(eos_token_id=3)
     gen.tokenizer = SimpleNamespace(all_special_ids=[0])
+    gen.prefill_step_size = 3072
     captured = {}
 
     def fake_stream_diffusion_generate_from_kwargs(
@@ -1479,7 +1540,6 @@ def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
         "stream_diffusion_generate_from_kwargs",
         fake_stream_diffusion_generate_from_kwargs,
     )
-    monkeypatch.setattr(server_generation, "get_prefill_step_size", lambda: 2048)
     args = server.GenerationArguments(
         max_tokens=4,
         temperature=0.0,
@@ -1530,7 +1590,7 @@ def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
         "top_p": 1.0,
         "top_k": 0,
         "mm_token_type_ids": "types",
-        "prefill_step_size": 2048,
+        "prefill_step_size": 3072,
         "seed": 123,
         "max_denoising_steps": 7,
         "block_length": 16,
@@ -1938,7 +1998,9 @@ class _RecordingSpeculativeLM:
         )
 
 
-def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
+def _run_speculative_prefill_once(
+    monkeypatch, *, draft_kind, request_specs, prefill_step_size=2048
+):
     lm = _RecordingSpeculativeLM(draft_kind)
     gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
     gen.model = SimpleNamespace(language_model=lm)
@@ -1950,6 +2012,7 @@ def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
     gen.stop_tokens = {99}
     gen.requests = Queue()
     gen._stop = False
+    gen.prefill_step_size = prefill_step_size
     gen._make_sampler = lambda args: None
     gen.tokenizer = SimpleNamespace(
         decode=lambda tokens: "".join(str(tok) for tok in tokens)
@@ -2012,6 +2075,7 @@ def _run_speculative_prefill_once(monkeypatch, *, draft_kind, request_specs):
 
     gen._run_speculative()
     call = lm.calls[0]
+    call["prefill_input_lengths"] = [item["inputs"].shape[1] for item in lm.calls]
     call["round_kwargs"] = gen.round_kwargs
     return call
 
@@ -2033,6 +2097,29 @@ def test_speculative_server_threads_greedy_flag_to_mtp_loop(monkeypatch):
     )
 
     assert call["round_kwargs"]["greedy_sampling"] is True
+
+
+def test_speculative_server_honors_prefill_step_override(monkeypatch):
+    monkeypatch.setattr(
+        server_generation, "_chunked_prefill_enabled", lambda *args, **kwargs: True
+    )
+    call = _run_speculative_prefill_once(
+        monkeypatch,
+        draft_kind="mtp",
+        prefill_step_size=2,
+        request_specs=[
+            {
+                "input_ids": mx.array([[11, 12, 13]], dtype=mx.int32),
+                "gen_kwargs": {"inputs_embeds": mx.ones((1, 3, 4), dtype=mx.float32)},
+            },
+            {
+                "input_ids": mx.array([[21, 22, 23]], dtype=mx.int32),
+                "gen_kwargs": {"inputs_embeds": mx.ones((1, 3, 4), dtype=mx.float32)},
+            },
+        ],
+    )
+
+    assert call["prefill_input_lengths"] == [2, 1]
 
 
 def test_speculative_server_prefill_threads_gemma4_per_layer_inputs(monkeypatch):
@@ -3919,9 +4006,12 @@ def test_chat_completions_endpoint_flattens_text_content_parts(client):
     ]
 
 
-def test_chat_completions_endpoint_forwards_video_content(client):
+def test_chat_completions_endpoint_forwards_native_video_content(client):
     model = SimpleNamespace()
-    processor = SimpleNamespace()
+    processor = SimpleNamespace(
+        video_processor=SimpleNamespace(),
+        process=lambda text=None, images=None, videos=None, **kwargs: None,
+    )
     config = SimpleNamespace(model_type="gemma4")
     result = GenerationResult(
         text="done",
@@ -3932,6 +4022,7 @@ def test_chat_completions_endpoint_forwards_video_content(client):
         generation_tps=5.0,
         peak_memory=0.1,
     )
+    from mlx_vlm.generate import video as video_module
 
     with (
         patch.object(
@@ -3941,6 +4032,7 @@ def test_chat_completions_endpoint_forwards_video_content(client):
             server, "apply_chat_template", return_value="prompt"
         ) as mock_template,
         patch.object(server, "generate", return_value=result) as mock_generate,
+        patch.object(video_module, "sample_video_frames") as mock_sample,
     ):
         response = client.post(
             "/chat/completions",
@@ -3964,411 +4056,61 @@ def test_chat_completions_endpoint_forwards_video_content(client):
         {"role": "user", "content": "Describe this video."}
     ]
     assert mock_generate.call_args.kwargs["video"] == ["clip.mp4"]
+    mock_sample.assert_not_called()
 
 
-# ---------------------------------------------------------------------------
-# Fork: legacy OpenAI text-completions endpoint (/v1/completions). Upstream has
-# no CompletionRequest/CompletionResponse at all, so every test below this banner
-# is fork-only.
-# ---------------------------------------------------------------------------
-
-
-def _completion_fake_generator(tokens, prompt_tokens=8, captured=None):
-    """Build a FakeResponseGenerator emitting the given StreamingToken list."""
-
-    class FakeResponseGenerator:
-        tokenizer = SimpleNamespace(decode=lambda tokens: "")
-
-        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
-            return None
-
-        def generate(self, prompt, images=None, audio=None, args=None):
-            if captured is not None:
-                captured["prompt"] = prompt
-                captured["images"] = images
-                captured["audio"] = audio
-                captured["args"] = args
-            return server.GenerationContext(uid=1, prompt_tokens=prompt_tokens), iter(
-                list(tokens)
-            )
-
-    return FakeResponseGenerator()
-
-
-def test_completions_basic_non_streaming(client, monkeypatch):
+def test_chat_completions_endpoint_falls_back_from_video_to_images(client):
     model = SimpleNamespace()
     processor = SimpleNamespace()
-    config = SimpleNamespace(model_type="qwen2_vl")
-    captured = {}
-    tokens = [
-        server.StreamingToken(
-            text="Hello", token=1, logprobs=0.0, finish_reason=None, prompt_tps=20.0
-        ),
-        server.StreamingToken(
-            text=" world", token=2, logprobs=0.0, finish_reason="stop", prompt_tps=20.0
-        ),
-    ]
-    monkeypatch.setattr(
-        server.runtime,
-        "response_generator",
-        _completion_fake_generator(tokens, prompt_tokens=6, captured=captured),
+    config = SimpleNamespace(model_type="mage_vl")
+    result = GenerationResult(
+        text="done",
+        prompt_tokens=8,
+        generation_tokens=4,
+        total_tokens=12,
+        prompt_tps=10.0,
+        generation_tps=5.0,
+        peak_memory=0.1,
     )
+    frames = [object(), object()]
+    from mlx_vlm.generate import video as video_module
 
-    with patch.object(
-        server, "get_cached_model", return_value=(model, processor, config)
-    ):
-        response = client.post(
-            "/v1/completions",
-            json={"model": "demo", "prompt": "Continue: "},
-        )
-
-    assert response.status_code == 200
-    body = response.json()
-    assert body["object"] == "text_completion"
-    assert body["id"].startswith("cmpl-")
-    assert body["model"] == "demo"
-    assert len(body["choices"]) == 1
-    choice = body["choices"][0]
-    assert choice["text"] == "Hello world"
-    assert choice["index"] == 0
-    assert choice["finish_reason"] == "stop"
-    assert choice["logprobs"] is None
-    # usage accounting
-    assert body["usage"]["prompt_tokens"] == 6
-    assert body["usage"]["completion_tokens"] == 2
-    assert body["usage"]["total_tokens"] == 8
-
-
-def test_completions_prompt_is_not_chat_templated(client, monkeypatch):
-    """The raw prompt must reach the model verbatim — no apply_chat_template."""
-    model = SimpleNamespace()
-    processor = SimpleNamespace()
-    config = SimpleNamespace(model_type="qwen2_vl")
-    captured = {}
-    tokens = [
-        server.StreamingToken(
-            text="ok", token=1, logprobs=0.0, finish_reason="stop", prompt_tps=20.0
-        )
-    ]
-    monkeypatch.setattr(
-        server.runtime,
-        "response_generator",
-        _completion_fake_generator(tokens, captured=captured),
-    )
-
-    raw = "<|im_start|>user\nNOT A TEMPLATE\n[INST] verbatim [/INST]"
-    template_mock = MagicMock(return_value="TEMPLATED-PROMPT")
     with (
         patch.object(
             server, "get_cached_model", return_value=(model, processor, config)
         ),
-        patch.object(server, "apply_chat_template", template_mock),
-    ):
-        response = client.post(
-            "/v1/completions",
-            json={"model": "demo", "prompt": raw, "enable_thinking": True},
-        )
-
-    assert response.status_code == 200
-    # apply_chat_template is never called on the completions path.
-    template_mock.assert_not_called()
-    # The model receives the prompt byte-for-byte.
-    assert captured["prompt"] == raw
-    # Thinking is forced off regardless of the request asking for it.
-    assert captured["args"].enable_thinking is False
-    assert captured["args"].thinking_budget is None
-
-
-def test_completions_stop_sequence_truncates_non_streaming(client, monkeypatch):
-    model = SimpleNamespace()
-    processor = SimpleNamespace()
-    config = SimpleNamespace(model_type="qwen2_vl")
-    tokens = [
-        server.StreamingToken(
-            text="keep this", token=1, logprobs=0.0, finish_reason=None
-        ),
-        server.StreamingToken(
-            text="<STOP>drop this", token=2, logprobs=0.0, finish_reason="stop"
-        ),
-    ]
-    monkeypatch.setattr(
-        server.runtime, "response_generator", _completion_fake_generator(tokens)
-    )
-
-    with patch.object(
-        server, "get_cached_model", return_value=(model, processor, config)
-    ):
-        response = client.post(
-            "/v1/completions",
-            json={"model": "demo", "prompt": "p", "stop": "<STOP>"},
-        )
-
-    assert response.status_code == 200
-    choice = response.json()["choices"][0]
-    assert choice["text"] == "keep this"
-    assert choice["finish_reason"] == "stop"
-
-
-def test_completions_echo_prepends_prompt_non_streaming(client, monkeypatch):
-    model = SimpleNamespace()
-    processor = SimpleNamespace()
-    config = SimpleNamespace(model_type="qwen2_vl")
-    tokens = [
-        server.StreamingToken(
-            text=" answer", token=1, logprobs=0.0, finish_reason="stop"
-        )
-    ]
-    monkeypatch.setattr(
-        server.runtime, "response_generator", _completion_fake_generator(tokens)
-    )
-
-    with patch.object(
-        server, "get_cached_model", return_value=(model, processor, config)
-    ):
-        response = client.post(
-            "/v1/completions",
-            json={"model": "demo", "prompt": "Question:", "echo": True},
-        )
-
-    assert response.status_code == 200
-    assert response.json()["choices"][0]["text"] == "Question: answer"
-
-
-def test_completions_streaming_emits_deltas_and_done(client, monkeypatch):
-    model = SimpleNamespace()
-    processor = SimpleNamespace()
-    config = SimpleNamespace(model_type="qwen2_vl")
-    tokens = [
-        server.StreamingToken(
-            text="foo", token=1, logprobs=0.0, finish_reason=None, prompt_tps=20.0
-        ),
-        server.StreamingToken(
-            text="bar", token=2, logprobs=0.0, finish_reason="stop", prompt_tps=20.0
-        ),
-    ]
-    monkeypatch.setattr(
-        server.runtime,
-        "response_generator",
-        _completion_fake_generator(tokens, prompt_tokens=5),
-    )
-
-    with patch.object(
-        server, "get_cached_model", return_value=(model, processor, config)
-    ):
-        response = client.post(
-            "/v1/completions",
-            json={"model": "demo", "prompt": "p", "stream": True},
-        )
-
-    assert response.status_code == 200
-    assert "data: [DONE]" in response.text
-    chunks = [
-        json.loads(line[len("data: ") :])
-        for line in response.text.splitlines()
-        if line.startswith("data: ") and line != "data: [DONE]"
-    ]
-    assert all(chunk["object"] == "text_completion" for chunk in chunks)
-    # Reconstruct streamed text from text-bearing choices.
-    text = "".join(
-        chunk["choices"][0]["text"]
-        for chunk in chunks
-        if chunk.get("choices") and chunk["choices"][0].get("text")
-    )
-    assert text == "foobar"
-    # A terminal choice carries finish_reason="stop".
-    finish_chunks = [
-        chunk
-        for chunk in chunks
-        if chunk.get("choices") and chunk["choices"][0].get("finish_reason") == "stop"
-    ]
-    assert finish_chunks
-    # A trailing usage chunk reports accounting.
-    usage_chunk = next(chunk for chunk in chunks if chunk.get("usage") is not None)
-    assert usage_chunk["choices"] == []
-    assert usage_chunk["usage"]["prompt_tokens"] == 5
-    assert usage_chunk["usage"]["completion_tokens"] == 2
-
-
-def test_completions_streaming_echo_first_chunk(client, monkeypatch):
-    model = SimpleNamespace()
-    processor = SimpleNamespace()
-    config = SimpleNamespace(model_type="qwen2_vl")
-    tokens = [
-        server.StreamingToken(text="gen", token=1, logprobs=0.0, finish_reason="stop")
-    ]
-    monkeypatch.setattr(
-        server.runtime, "response_generator", _completion_fake_generator(tokens)
-    )
-
-    with patch.object(
-        server, "get_cached_model", return_value=(model, processor, config)
-    ):
-        response = client.post(
-            "/v1/completions",
-            json={"model": "demo", "prompt": "PROMPT", "echo": True, "stream": True},
-        )
-
-    assert response.status_code == 200
-    chunks = [
-        json.loads(line[len("data: ") :])
-        for line in response.text.splitlines()
-        if line.startswith("data: ") and line != "data: [DONE]"
-    ]
-    text = "".join(
-        chunk["choices"][0]["text"]
-        for chunk in chunks
-        if chunk.get("choices") and chunk["choices"][0].get("text")
-    )
-    assert text == "PROMPTgen"
-
-
-def test_completions_streaming_stop_sequence_truncates(client, monkeypatch):
-    model = SimpleNamespace()
-    processor = SimpleNamespace()
-    config = SimpleNamespace(model_type="qwen2_vl")
-    tokens = [
-        server.StreamingToken(text="abc", token=1, logprobs=0.0, finish_reason=None),
-        server.StreamingToken(
-            text="DEFstop", token=2, logprobs=0.0, finish_reason=None
-        ),
-        server.StreamingToken(text="zzz", token=3, logprobs=0.0, finish_reason="stop"),
-    ]
-    monkeypatch.setattr(
-        server.runtime, "response_generator", _completion_fake_generator(tokens)
-    )
-
-    with patch.object(
-        server, "get_cached_model", return_value=(model, processor, config)
-    ):
-        response = client.post(
-            "/v1/completions",
-            json={"model": "demo", "prompt": "p", "stop": ["stop"], "stream": True},
-        )
-
-    assert response.status_code == 200
-    chunks = [
-        json.loads(line[len("data: ") :])
-        for line in response.text.splitlines()
-        if line.startswith("data: ") and line != "data: [DONE]"
-    ]
-    text = "".join(
-        chunk["choices"][0]["text"]
-        for chunk in chunks
-        if chunk.get("choices") and chunk["choices"][0].get("text")
-    )
-    # "abc" + "DEF" (text before the "stop" sequence); "zzz" never streamed.
-    assert text == "abcDEF"
-    finish_chunks = [
-        chunk
-        for chunk in chunks
-        if chunk.get("choices") and chunk["choices"][0].get("finish_reason") == "stop"
-    ]
-    assert finish_chunks
-
-
-def test_completions_rejects_n_greater_than_one(client, monkeypatch):
-    model = SimpleNamespace()
-    processor = SimpleNamespace()
-    config = SimpleNamespace(model_type="qwen2_vl")
-    monkeypatch.setattr(
-        server.runtime, "response_generator", _completion_fake_generator([])
-    )
-
-    with patch.object(
-        server, "get_cached_model", return_value=(model, processor, config)
-    ):
-        response = client.post(
-            "/v1/completions",
-            json={"model": "demo", "prompt": "p", "n": 2},
-        )
-
-    assert response.status_code == 400
-    assert "n=2" in response.json()["detail"]
-
-
-def test_completions_requires_model(client):
-    response = client.post("/v1/completions", json={"prompt": "hi"})
-    assert response.status_code == 400
-
-
-def test_completions_generate_fallback_path(client, monkeypatch):
-    """With no ResponseGenerator the endpoint uses generate() with the raw prompt."""
-    monkeypatch.setattr(server.runtime, "response_generator", None)
-    model = SimpleNamespace()
-    processor = SimpleNamespace()
-    config = SimpleNamespace(model_type="qwen2_vl")
-    captured = {}
-
-    def fake_generate(prompt, image=None, audio=None, **kwargs):
-        captured["prompt"] = prompt
-        return GenerationResult(
-            text="raw continuation",
-            prompt_tokens=4,
-            generation_tokens=3,
-            total_tokens=7,
-            prompt_tps=10.0,
-            generation_tps=5.0,
-            peak_memory=0.1,
-            finish_reason="length",
-        )
-
-    template_mock = MagicMock(return_value="TEMPLATED")
-    with (
         patch.object(
-            server, "get_cached_model", return_value=(model, processor, config)
-        ),
-        patch.object(server, "apply_chat_template", template_mock),
-        patch.object(server, "generate", side_effect=fake_generate),
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result) as mock_generate,
+        patch.object(
+            video_module,
+            "sample_video_frames",
+            return_value=(frames, 2.0),
+        ) as mock_sample,
     ):
         response = client.post(
-            "/completions",
-            json={"model": "demo", "prompt": "verbatim prompt"},
+            "/chat/completions",
+            json={
+                "model": "demo",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "video_url", "video_url": {"url": "clip.mp4"}},
+                            {"type": "text", "text": "Describe this video."},
+                        ],
+                    }
+                ],
+            },
         )
 
     assert response.status_code == 200
-    template_mock.assert_not_called()
-    assert captured["prompt"] == "verbatim prompt"
-    body = response.json()
-    assert body["choices"][0]["text"] == "raw continuation"
-    assert body["choices"][0]["finish_reason"] == "length"
-    assert body["usage"]["prompt_tokens"] == 4
-    assert body["usage"]["completion_tokens"] == 3
-
-
-def _registered_paths():
-    """Every route path the app serves, including routers it includes.
-
-    FastAPI >= 0.141 no longer flattens `include_router()` into `app.routes` — it
-    inserts one lazy `_IncludedRouter` node whose `path` is `None` and resolves
-    matches at request time. So scanning `app.routes` alone silently misses every
-    inference route once they live on `inference_router` (#1714). Union in the
-    router we own rather than reaching into the private node.
-    """
-    paths = {r.path for r in server.app.routes if getattr(r, "path", None)}
-    paths |= {
-        r.path
-        for r in server._app_module.inference_router.routes
-        if getattr(r, "path", None)
-    }
-    return paths
-
-
-def test_completions_both_routes_registered():
-    paths = _registered_paths()
-    assert "/completions" in paths
-    assert "/v1/completions" in paths
-
-
-def test_inference_routes_are_served_not_just_registered(client):
-    """Companion to the above: registration on a router is not reachability.
-
-    Guards the failure mode where `include_router()` is forgotten — the paths
-    would still be on `inference_router` and the test above would still pass,
-    while every request 404'd.
-    """
-    for path in ("/completions", "/v1/completions", "/v1/chat/completions"):
-        assert client.post(path, json={}).status_code != 404
-    assert client.get("/v1/models").status_code != 404
+    assert mock_template.call_args.kwargs["num_images"] == 2
+    assert mock_template.call_args.kwargs["video"] is None
+    assert mock_generate.call_args.kwargs["image"] == frames
+    assert mock_generate.call_args.kwargs["video"] == []
+    mock_sample.assert_called_once_with(["clip.mp4"], 2.0)
 
 
 def test_chat_completions_endpoint_preserves_assistant_reasoning_content(client):
@@ -5047,6 +4789,149 @@ def test_anthropic_messages_streaming_emits_tool_use_events(client, monkeypatch)
     assert '"stop_reason": "tool_use"' in body
 
 
+ANTHROPIC_TOOLS = [
+    {
+        "name": "get_time",
+        "description": "Get the current time",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_weather",
+        "description": "Get the current weather",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+]
+
+
+def _anthropic_tool_choice_request(client, tool_choice, tools=ANTHROPIC_TOOLS):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    result = GenerationResult(text="done", prompt_tokens=5, generation_tokens=2)
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server, "generate", return_value=result),
+    ):
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Weather in Paris?"}],
+                "tools": tools,
+                "tool_choice": tool_choice,
+                "max_tokens": 32,
+            },
+        )
+    return response, mock_template
+
+
+def test_anthropic_messages_tool_choice_none_disables_tools(client, monkeypatch):
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+
+    response, mock_template = _anthropic_tool_choice_request(client, {"type": "none"})
+
+    assert response.status_code == 200
+    assert mock_template.call_args.kwargs["tools"] is None
+    assert mock_template.call_args.kwargs["tool_choice"] == "none"
+
+
+def test_anthropic_messages_any_tool_choice_adds_instruction(client, monkeypatch):
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+
+    response, mock_template = _anthropic_tool_choice_request(client, {"type": "any"})
+
+    assert response.status_code == 200
+    messages = mock_template.call_args.args[2]
+    assert "must call one or more" in messages[-1]["content"]
+    selected_tools = mock_template.call_args.kwargs["tools"]
+    assert [tool["function"]["name"] for tool in selected_tools] == [
+        "get_time",
+        "get_weather",
+    ]
+    assert mock_template.call_args.kwargs["tool_choice"] == "required"
+
+
+def test_anthropic_messages_forced_tool_choice_filters_tools(client, monkeypatch):
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+
+    response, mock_template = _anthropic_tool_choice_request(
+        client, {"type": "tool", "name": "get_time"}
+    )
+
+    assert response.status_code == 200
+    messages = mock_template.call_args.args[2]
+    assert "must call the 'get_time' function" in messages[-1]["content"]
+    selected_tools = mock_template.call_args.kwargs["tools"]
+    assert [tool["function"]["name"] for tool in selected_tools] == ["get_time"]
+    assert mock_template.call_args.kwargs["tool_choice"] == {
+        "type": "function",
+        "function": {"name": "get_time"},
+    }
+
+
+@pytest.mark.parametrize(
+    ("tool_choice", "tools", "message"),
+    [
+        (
+            {"type": "tool", "name": "missing"},
+            ANTHROPIC_TOOLS,
+            "unknown function 'missing'",
+        ),
+        ({"type": "any"}, [], "requires at least one tool"),
+    ],
+)
+def test_anthropic_messages_rejects_unsatisfiable_tool_choice(
+    client, monkeypatch, tool_choice, tools, message
+):
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+
+    response, _ = _anthropic_tool_choice_request(client, tool_choice, tools=tools)
+
+    assert response.status_code == 400
+    payload = response.json()
+    assert payload["type"] == "error"
+    assert payload["error"]["type"] == "invalid_request_error"
+    assert message in payload["error"]["message"]
+
+
+def test_anthropic_count_tokens_applies_tool_choice(client, monkeypatch):
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(
+            server, "apply_chat_template", return_value="prompt"
+        ) as mock_template,
+        patch.object(server_anthropic, "prepare_inputs", return_value={}),
+        patch.object(server_anthropic, "_count_prompt_tokens", return_value=7),
+    ):
+        response = client.post(
+            "/v1/messages/count_tokens",
+            json={
+                "model": "demo",
+                "messages": [{"role": "user", "content": "Weather in Paris?"}],
+                "tools": ANTHROPIC_TOOLS,
+                "tool_choice": {"type": "tool", "name": "get_time"},
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"input_tokens": 7}
+    selected_tools = mock_template.call_args.kwargs["tools"]
+    assert [tool["function"]["name"] for tool in selected_tools] == ["get_time"]
+
+
 def test_cache_endpoints_report_disabled_stats_and_reset(client, monkeypatch):
     monkeypatch.setattr(server.runtime, "apc_manager", None)
 
@@ -5213,105 +5098,6 @@ class TestResponseGenerator:
         gen.wait_until_ready = lambda: None
         gen._cpu_preprocess = lambda prompt, images, audio: {"input_ids": [1, 2, 3]}
         return gen
-
-    def test_generate_forwards_videos_to_preprocess_and_queue(self):
-        """videos must reach prepare_inputs AND ride the queue to the GPU thread.
-
-        Upstream #1492's server half: without the queue field the vision
-        embeddings for a video request are silently built from images only.
-        """
-        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
-        gen.wait_until_ready = lambda: None
-        gen.draft_model = None
-        gen._cancel = lambda uid: None
-        seen = {}
-        queued = []
-
-        def fake_cpu_preprocess(prompt, images=None, audio=None, videos=None):
-            seen["videos"] = videos
-            return {"input_ids": mx.array([[1, 2, 3]], dtype=mx.int32)}
-
-        # generate() blocks on rqueue.get() for the GPU thread's context, so
-        # the fake queue has to answer inline.
-        class Requests:
-            def put(self, item):
-                queued.append(item)
-                item.rqueue.put(SimpleNamespace(uid="req-1"))
-
-        gen._cpu_preprocess = fake_cpu_preprocess
-        gen.requests = Requests()
-
-        gen.generate(
-            "describe the clip",
-            videos=["clip.mp4"],
-            args=server.GenerationArguments(max_tokens=4),
-        )
-
-        assert seen["videos"] == ["clip.mp4"]
-        assert isinstance(queued[0], server_generation.QueuedGenerationRequest)
-        assert queued[0].videos == ["clip.mp4"]
-
-    def test_generate_omits_videos_arg_when_none(self):
-        """A videos=None request must still call the 3-arg _cpu_preprocess.
-
-        ``_preprocess_request`` exists purely to keep that call shape, so
-        overrides/fakes that predate the videos parameter keep working.
-        """
-        gen = self._bare_generator()  # _cpu_preprocess takes exactly 3 args
-        gen._cancel = lambda uid: None
-        queued = []
-
-        class Requests:
-            def put(self, item):
-                queued.append(item)
-                item.rqueue.put(SimpleNamespace(uid="req-1"))
-
-        gen.requests = Requests()
-
-        gen.generate("hello", args=server.GenerationArguments(max_tokens=4))
-
-        assert queued[0].videos is None
-
-    def test_diffusion_daemon_consumes_full_request_object(self):
-        """Regression: the diffusion loop unpacked a bare 5-tuple.
-
-        ``generate()`` has always queued more fields than that (the fork adds
-        prompt_cache_state + prompt), so every diffusion request raised
-        ValueError before the queue became a QueuedGenerationRequest.
-        """
-        gen = _unstarted_response_generator()
-        rqueue: Queue = Queue()
-        request = server_generation.QueuedGenerationRequest(
-            rqueue=rqueue,
-            raw_inputs={"input_ids": mx.array([[1, 2]], dtype=mx.int32)},
-            prompt_tokens=2,
-            args=server.GenerationArguments(max_tokens=1),
-            prompt_cache_state=SimpleNamespace(),
-            prompt="hello",
-        )
-
-        collected = {"count": 0}
-
-        def collect_pending_requests(**_kwargs):
-            collected["count"] += 1
-            if collected["count"] == 1:
-                return [request], False
-            return [], True
-
-        handled = []
-        gen._collect_pending_requests = collect_pending_requests
-        gen._generate_diffusion = (
-            lambda uid, rq, raw, args, cancelled, log_state=None: handled.append(
-                (uid, raw, args)
-            )
-        )
-
-        gen._run_diffusion()
-
-        assert len(handled) == 1
-        assert handled[0][2].max_tokens == 1
-        assert isinstance(rqueue.get_nowait(), server.GenerationContext)
-        assert rqueue.get_nowait() is None
 
     def test_generate_rejects_requests_over_configured_context_limit(self, monkeypatch):
         gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
@@ -5526,21 +5312,25 @@ class TestResponseGenerator:
 
     def test_token_queue_timeout_defaults_to_long_prefill_window(self, monkeypatch):
         monkeypatch.delenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", raising=False)
+        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
 
         assert server.get_token_queue_timeout() == 600.0
 
     def test_token_queue_timeout_accepts_namespaced_env(self, monkeypatch):
         monkeypatch.setenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", "42.5")
+        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
 
         assert server.get_token_queue_timeout() == 42.5
 
     def test_token_queue_timeout_invalid_values_fall_back_to_default(self, monkeypatch):
         monkeypatch.setenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", "bad")
+        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
 
         assert server.get_token_queue_timeout() == 600.0
 
     def test_token_queue_timeout_can_disable_timeout(self, monkeypatch):
         monkeypatch.setenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", "0")
+        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
 
         assert server.get_token_queue_timeout() is None
 
@@ -5555,7 +5345,7 @@ class TestResponseGenerator:
 
         gen.requests = Requests()
         gen._cancel = cancelled.append
-        monkeypatch.setenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", "0.01")
+        monkeypatch.setattr(server.runtime.config, "token_queue_timeout", 0.01)
 
         _, token_iter = gen.generate("hello")
 
@@ -5626,7 +5416,9 @@ class TestResponseGenerator:
 
         gen.requests = Requests()
         gen._cancel = cancelled.append
-        monkeypatch.setenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", str(timeout_s * 10))
+        monkeypatch.setattr(
+            server.runtime.config, "token_queue_timeout", timeout_s * 10
+        )
 
         _, token_iter = gen.generate("hello")
 
@@ -6127,6 +5919,7 @@ class TestResponseGenerator:
         gen.quantized_kv_start = server.DEFAULT_QUANTIZED_KV_START
         gen.top_logprobs_k = 0
         gen.apc_manager = None
+        gen.prefill_step_size = 3072
         gen.tokenizer = SimpleNamespace()
         gen.requests = Queue()
         gen._stop = False
@@ -6185,6 +5978,7 @@ class TestResponseGenerator:
         assert kwargs["draft_block_size"] == 6
         assert kwargs["greedy_sampling"] is True
         assert kwargs["compute_logprobs"] is False
+        assert kwargs["prefill_step_size"] == 3072
         assert batch_state["instance"].next_active_sizes == [2]
 
     def test_run_coalesces_idle_mtp_batch_generator(self, monkeypatch):
@@ -6219,7 +6013,7 @@ class TestResponseGenerator:
         gen._run_speculative = lambda: pytest.fail("MTP should use BatchGenerator")
         gen._collect_pending_requests = fake_collect_pending_requests
 
-        gen._run()
+        gen._run_impl()
 
         assert calls == [(False, 0.037)]
 
@@ -6597,6 +6391,42 @@ class TestResponseGenerator:
         )
 
         assert processors == [structured_processor]
+
+    def test_server_generation_delays_structured_processors_for_self_opening_model(
+        self, monkeypatch
+    ):
+        """Regression test for issue #1911."""
+
+        class SimpleTokenizer:
+            def encode(self, text, add_special_tokens=False):
+                return {"<think>": [10], "</think>": [20]}[text]
+
+        repetition_processor = lambda tokens, logits: logits
+        structured_processor = lambda tokens, logits: logits
+
+        monkeypatch.setattr(
+            server_generation,
+            "make_logits_processors",
+            lambda *_args: [repetition_processor],
+        )
+
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.tokenizer = SimpleTokenizer()
+        args = server.GenerationArguments(
+            enable_thinking=True,
+            thinking_start_token="<think>",
+            thinking_end_token="</think>",
+            logits_processors=[structured_processor],
+        )
+
+        processors = gen._make_logits_processors(
+            args,
+            mx.array([[1, 2, 3]], dtype=mx.int32),
+        )
+
+        assert processors[0] is repetition_processor
+        assert isinstance(processors[1], server_generation.ThinkingAwareLogitsProcessor)
+        assert processors[1].processor is structured_processor
 
     def test_build_gen_args_from_openai_request(self):
         req = SimpleNamespace(
@@ -7583,6 +7413,108 @@ class TestResponseGenerator:
 
         assert "Prefill progress: request=req-1 tokens=2/6 (33.3%)" in caplog.text
 
+    def test_generate_forwards_videos_to_preprocess_and_queue(self):
+        # Fork: fork-only test (upstream #1492's server half, restored here).
+        """videos must reach prepare_inputs AND ride the queue to the GPU thread.
+
+        Upstream #1492's server half: without the queue field the vision
+        embeddings for a video request are silently built from images only.
+        """
+        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        gen.wait_until_ready = lambda: None
+        gen.draft_model = None
+        gen._cancel = lambda uid: None
+        seen = {}
+        queued = []
+
+        def fake_cpu_preprocess(prompt, images=None, audio=None, videos=None):
+            seen["videos"] = videos
+            return {"input_ids": mx.array([[1, 2, 3]], dtype=mx.int32)}
+
+        # generate() blocks on rqueue.get() for the GPU thread's context, so
+        # the fake queue has to answer inline.
+        class Requests:
+            def put(self, item):
+                queued.append(item)
+                item.rqueue.put(SimpleNamespace(uid="req-1"))
+
+        gen._cpu_preprocess = fake_cpu_preprocess
+        gen.requests = Requests()
+
+        gen.generate(
+            "describe the clip",
+            videos=["clip.mp4"],
+            args=server.GenerationArguments(max_tokens=4),
+        )
+
+        assert seen["videos"] == ["clip.mp4"]
+        assert isinstance(queued[0], server_generation.QueuedGenerationRequest)
+        assert queued[0].videos == ["clip.mp4"]
+
+    def test_generate_omits_videos_arg_when_none(self):
+        # Fork: fork-only test for the videos call-shape compatibility.
+        """A videos=None request must still call the 3-arg _cpu_preprocess.
+
+        ``_preprocess_request`` exists purely to keep that call shape, so
+        overrides/fakes that predate the videos parameter keep working.
+        """
+        gen = self._bare_generator()  # _cpu_preprocess takes exactly 3 args
+        gen._cancel = lambda uid: None
+        queued = []
+
+        class Requests:
+            def put(self, item):
+                queued.append(item)
+                item.rqueue.put(SimpleNamespace(uid="req-1"))
+
+        gen.requests = Requests()
+
+        gen.generate("hello", args=server.GenerationArguments(max_tokens=4))
+
+        assert queued[0].videos is None
+
+    def test_diffusion_daemon_consumes_full_request_object(self):
+        # Fork: fork-only regression test (the fork queues extra request fields).
+        """Regression: the diffusion loop unpacked a bare 5-tuple.
+
+        ``generate()`` has always queued more fields than that (the fork adds
+        prompt_cache_state + prompt), so every diffusion request raised
+        ValueError before the queue became a QueuedGenerationRequest.
+        """
+        gen = _unstarted_response_generator()
+        rqueue: Queue = Queue()
+        request = server_generation.QueuedGenerationRequest(
+            rqueue=rqueue,
+            raw_inputs={"input_ids": mx.array([[1, 2]], dtype=mx.int32)},
+            prompt_tokens=2,
+            args=server.GenerationArguments(max_tokens=1),
+            prompt_cache_state=SimpleNamespace(),
+            prompt="hello",
+        )
+
+        collected = {"count": 0}
+
+        def collect_pending_requests(**_kwargs):
+            collected["count"] += 1
+            if collected["count"] == 1:
+                return [request], False
+            return [], True
+
+        handled = []
+        gen._collect_pending_requests = collect_pending_requests
+        gen._generate_diffusion = (
+            lambda uid, rq, raw, args, cancelled, log_state=None: handled.append(
+                (uid, raw, args)
+            )
+        )
+
+        gen._run_diffusion()
+
+        assert len(handled) == 1
+        assert handled[0][2].max_tokens == 1
+        assert isinstance(rqueue.get_nowait(), server.GenerationContext)
+        assert rqueue.get_nowait() is None
+
 
 class TestSplitThinking:
     """Tests for thinking tag parsing."""
@@ -8016,6 +7948,298 @@ class TestCountThinkingTagTokens:
         assert server._count_thinking_tag_tokens("plain text") == 0
 
 
+class TestQuantizedKVBits:
+    def test_kv_bits_unset_returns_none(self, monkeypatch):
+        monkeypatch.delenv("KV_BITS", raising=False)
+        assert server_generation.get_quantized_kv_bits() is None
+
+    def test_kv_bits_applies(self, monkeypatch):
+        monkeypatch.setenv("KV_BITS", "3.5")
+        assert server_generation.get_quantized_kv_bits() == 3.5
+
+    @pytest.mark.parametrize(
+        "model_path",
+        [
+            "mlx-community/gemma-4-31B-it-qat-mxfp4",
+            "mlx-community/gemma-4-31B-it-QAT-mxfp4",
+            "/models/qat-experiments/llama-3",
+            "some-org/qatar-news-llm",
+        ],
+    )
+    def test_kv_bits_not_suppressed_by_model_path(self, monkeypatch, model_path):
+        # KV cache quantization is independent of how the weights were trained,
+        # so nothing in the model path may suppress it (#1333).
+        monkeypatch.setenv("KV_BITS", "3.5")
+        monkeypatch.setenv("MAX_KV_SIZE", "0")
+        assert server_generation.get_quantized_kv_bits() == 3.5
+        assert server_generation.get_max_kv_size(model_path) is None
+
+    def test_split_bits_agree_with_uniform_bits(self, monkeypatch):
+        # The split path never had a model-path guard; both must behave alike.
+        monkeypatch.setenv("KV_BITS", "3.5")
+        monkeypatch.setenv("KV_KEY_BITS", "3")
+        monkeypatch.setenv("KV_VALUE_BITS", "4")
+        assert server_generation.get_quantized_kv_bits() == 3.5
+        assert server_generation.get_quantized_kv_split_bits() == (3.0, 4.0)
+
+
+class TestRuntimeConfig:
+    def test_from_env_seeds_defaults(self, monkeypatch):
+        monkeypatch.setenv("KV_QUANT_SCHEME", "group")
+        monkeypatch.setenv("KV_BITS", "6")
+        monkeypatch.setenv("APC_ENABLED", "1")
+        monkeypatch.setenv("MLX_VLM_VISION_CACHE_SIZE", "33")
+        cfg = RuntimeConfig.from_env()
+        assert cfg.kv_quant_scheme == "group"
+        assert cfg.kv_bits == 6.0
+        assert cfg.apc_enabled is True
+        assert cfg.vision_cache_size == 33
+
+    def test_fingerprint_stable_and_scoped(self):
+        cfg = RuntimeConfig.from_env()
+        fp = cfg.fingerprint()
+        assert fp == cfg.fingerprint()  # stable across calls
+
+        cfg2 = RuntimeConfig.from_env()
+        assert cfg2.fingerprint() == fp
+
+        # toggling a dead APC knob while APC is off must not invalidate
+        cfg2.apc_block_size = 64
+        assert cfg2.fingerprint() == fp
+
+        # toggling an effective knob must invalidate
+        cfg2.vision_cache_size = 40
+        assert cfg2.fingerprint() != fp
+
+    def test_apply_changes_validates_and_coerces(self):
+        cfg = RuntimeConfig.from_env()
+        applied, rejected = cfg.apply_changes(
+            {
+                "kv_bits": "8",  # str -> float coercion
+                "apc_enabled": "true",
+                "vision_cache_size": "50",
+                "not_a_knob": 1,
+            }
+        )
+        assert applied == {
+            "kv_bits": 8.0,
+            "apc_enabled": True,
+            "vision_cache_size": 50,
+        }
+        assert rejected == [{"name": "not_a_knob", "reason": "unknown knob"}]
+        assert cfg.kv_bits == 8.0
+        assert cfg.apc_enabled is True
+        assert cfg.vision_cache_size == 50
+
+    def test_apply_changes_rejects_bad_values(self):
+        cfg = RuntimeConfig.from_env()
+        applied, rejected = cfg.apply_changes({"kv_bits": "not-a-number"})
+        assert applied == {}
+        assert len(rejected) == 1
+        assert rejected[0]["name"] == "kv_bits"
+        assert cfg.kv_bits is None  # unchanged
+
+    def test_reload_kinds_scoped(self):
+        cfg = RuntimeConfig.from_env()
+        applied, _ = cfg.apply_changes({"kv_quant_scheme": "turboquant"})
+        assert cfg.reload_kinds(applied) == {"text_generation"}
+        applied, _ = cfg.apply_changes({"vision_cache_size": 10})
+        assert cfg.reload_kinds(applied) == {"image_generation", "image_edit"}
+
+    def test_reload_kinds_excludes_live_knobs(self):
+        cfg = RuntimeConfig.from_env()
+        before = cfg.fingerprint()
+        applied, _ = cfg.apply_changes(
+            {"max_kv_size": 4096, "token_queue_timeout": 30.0}
+        )
+        assert applied == {"max_kv_size": 4096, "token_queue_timeout": 30.0}
+        assert cfg.reload_kinds(applied) == set()
+        assert cfg.fingerprint() == before
+
+    def test_reload_kinds_excludes_apc_knobs_while_disabled(self):
+        cfg = RuntimeConfig.from_env()
+        cfg.apply_changes({"apc_enabled": False})
+        before = cfg.fingerprint()
+
+        applied, _ = cfg.apply_changes({"apc_block_size": 32})
+        assert applied == {"apc_block_size": 32}
+        assert cfg.reload_kinds(applied) == set()
+        assert cfg.fingerprint() == before
+
+        applied, _ = cfg.apply_changes({"apc_enabled": True, "apc_block_size": 64})
+        assert cfg.reload_kinds(applied) == {"text_generation"}
+        assert cfg.fingerprint() != before
+
+    def test_settings_endpoints_get_and_patch(self, client, monkeypatch):
+        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
+        cfg = server.runtime.config
+
+        r = client.get("/v1/settings")
+        assert r.status_code == 200
+        body = r.json()
+        assert set(body) == {"schema", "current", "fingerprint"}
+        names = {k["name"] for k in body["schema"]}
+        assert "kv_bits" in names and "apc_enabled" in names
+        assert body["current"]["kv_quant_scheme"] == cfg.kv_quant_scheme
+
+        before = cfg.fingerprint()
+        r = client.patch("/v1/settings", json={"kv_quant_scheme": "turboquant"})
+        assert r.status_code == 200
+        body = r.json()
+        assert body["applied"] == {"kv_quant_scheme": "turboquant"}
+        assert body["rejected"] == []
+        assert body["reload_kinds"] == ["text_generation"]
+        assert body["current"]["kv_quant_scheme"] == "turboquant"
+        assert body["fingerprint"] != before
+
+        r = client.get("/v1/settings")
+        assert r.json()["current"]["kv_quant_scheme"] == "turboquant"
+
+        # unknown knobs are never applied
+        r = client.patch("/v1/settings", json={"bogus": 1})
+        assert r.status_code == 200
+        assert r.json()["applied"] == {}
+        assert r.json()["rejected"] == [{"name": "bogus", "reason": "unknown knob"}]
+
+    def test_settings_patch_requires_json_object(self, client, monkeypatch):
+        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
+        r = client.patch("/v1/settings", json=[1, 2, 3])
+        assert r.status_code == 400
+
+
+class TestRuntimeConfigAdditions:
+    def test_schema_includes_live_and_reloadable_knobs(self):
+        cfg = RuntimeConfig.from_env()
+        spec = {k["name"]: k for k in cfg.schema()}
+        for name in (
+            "max_kv_size",
+            "token_queue_timeout",
+            "spec_draft_model",
+            "spec_draft_kind",
+        ):
+            assert name in spec
+            assert spec[name]["reload_kinds"] == ["text_generation"]
+
+    def test_token_queue_timeout_is_live(self, client, monkeypatch):
+        monkeypatch.delenv("MLX_VLM_TOKEN_QUEUE_TIMEOUT", raising=False)
+        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
+        cfg = server.runtime.config
+        fingerprint = cfg.fingerprint()
+
+        response = client.patch("/v1/settings", json={"token_queue_timeout": 1200})
+
+        assert response.status_code == 200
+        assert response.json()["applied"] == {"token_queue_timeout": 1200.0}
+        assert server.get_token_queue_timeout() == 1200.0
+        assert cfg.fingerprint() == fingerprint
+
+        response = client.patch("/v1/settings", json={"token_queue_timeout": 0})
+
+        assert response.json()["applied"] == {"token_queue_timeout": None}
+        assert server.get_token_queue_timeout() is None
+
+    def test_max_kv_size_is_live_context_limit(self, monkeypatch):
+        import mlx_vlm.server.generation as server_generation
+
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", 4096)
+        assert server_generation.get_configured_context_limit() == 4096
+
+        monkeypatch.setattr(server.runtime.config, "max_kv_size", None)
+        monkeypatch.delenv("MAX_KV_SIZE", raising=False)
+        assert server_generation.get_configured_context_limit() is None
+
+    def test_spec_draft_knob_reaches_generator(self, monkeypatch):
+        class FakeResponseGenerator:
+            last_kwargs = {}
+
+            def __init__(self, *args, **kwargs):
+                FakeResponseGenerator.last_kwargs = kwargs
+                self.model = SimpleNamespace()
+                self.processor = SimpleNamespace()
+                self.config = SimpleNamespace(model_type="qwen2_vl")
+
+            def wait_until_ready(self):
+                return self.model, self.processor, self.config
+
+            def stop_and_join(self):
+                pass
+
+        monkeypatch.setattr(
+            server._app_module, "ResponseGenerator", FakeResponseGenerator
+        )
+        monkeypatch.setattr(server._app_module._apc, "from_env", lambda *_, **__: None)
+        monkeypatch.setattr(server.runtime, "model_cache", {})
+        monkeypatch.setattr(server.runtime, "response_generator", None)
+        monkeypatch.setattr(server.runtime, "apc_manager", None)
+        monkeypatch.setattr(server.runtime.config, "spec_draft_model", "draft-x")
+        monkeypatch.setattr(server.runtime.config, "spec_draft_kind", "auto")
+
+        server.get_cached_model("demo-model")
+        assert FakeResponseGenerator.last_kwargs["draft_model_path"] == "draft-x"
+        assert FakeResponseGenerator.last_kwargs["draft_kind"] == "auto"
+
+    def test_settings_patch_replace_semantics(self, client, monkeypatch):
+        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
+        cfg = server.runtime.config
+        assert cfg.apc_enabled is False
+
+        client.patch(
+            "/v1/settings",
+            json={"kv_quant_scheme": "turboquant", "apc_enabled": True},
+        )
+        assert cfg.kv_quant_scheme == "turboquant"
+        assert cfg.apc_enabled is True
+
+        r = client.patch(
+            "/v1/settings",
+            json={"op": "replace", "values": {"kv_quant_scheme": "uniform"}},
+        )
+        body = r.json()
+        assert body["op"] == "replace"
+        assert cfg.kv_quant_scheme == "uniform"
+        assert cfg.apc_enabled is False
+
+        r = client.patch("/v1/settings", json={"op": "bogus", "values": {}})
+        assert r.status_code == 400
+
+        r = client.patch("/v1/settings", json={"op": "replace", "values": "x"})
+        assert r.status_code == 400
+
+
+def test_runtime_config_fingerprint_is_kind_scoped():
+    cfg = RuntimeConfig.from_env()
+    text_fp = cfg.fingerprint(kinds={"text_generation"})
+    vision_fp = cfg.fingerprint(kinds={"image_generation"})
+
+    cfg.apply_changes({"kv_quant_scheme": "turboquant"})
+    assert cfg.fingerprint(kinds={"text_generation"}) != text_fp
+    assert cfg.fingerprint(kinds={"image_generation"}) == vision_fp
+
+    cfg.apply_changes({"vision_cache_size": 64})
+    assert cfg.fingerprint(kinds={"image_generation"}) != vision_fp
+    assert cfg.fingerprint(kinds={"text_generation"}) != text_fp
+
+
+def test_runtime_config_live_knob_not_in_fingerprint():
+    cfg = RuntimeConfig.from_env()
+    fp = cfg.fingerprint()
+    cfg.apply_changes({"max_kv_size": 8192})
+    assert cfg.fingerprint() == fp
+
+
+def test_runtime_config_enum_knobs_reject_invalid():
+    cfg = RuntimeConfig.from_env()
+    applied, rejected = cfg.apply_changes({"kv_quant_scheme": "bogus"})
+    assert applied == {}
+    assert rejected[0]["name"] == "kv_quant_scheme"
+    assert "bogus" in rejected[0]["reason"]
+    assert cfg.kv_quant_scheme == "uniform"
+
+    applied, rejected = cfg.apply_changes({"kv_quant_scheme": "turboquant"})
+    assert applied == {"kv_quant_scheme": "turboquant"}
+    assert rejected == []
+
+
 class TestReranking:
     def test_requires_model(self, client, monkeypatch):
         monkeypatch.delenv("MLX_VLM_PRELOAD_RERANKER_MODEL", raising=False)
@@ -8243,6 +8467,107 @@ class TestReranking:
         assert tokens == 5
         assert batches == [["0", "1"], ["2", "3"], ["4"]]
 
+    def test_generative_reranker_uses_default_instruction(self, monkeypatch):
+        instructions = []
+
+        def fake_score_batch(model, processor, query, documents, instruction):
+            del model, processor, query
+            instructions.append(instruction)
+            return [0.5] * len(documents), len(documents)
+
+        monkeypatch.setattr(server_reranking, "_score_text_batch", fake_score_batch)
+
+        server_reranking.score_documents(
+            object(),
+            object(),
+            SimpleNamespace(model_type="qwen3"),
+            server_reranking.RerankItem(text="query"),
+            [server_reranking.RerankItem(text="document")],
+            None,
+        )
+
+        assert instructions == [server_reranking.DEFAULT_INSTRUCTION]
+
+    def test_sequence_classifier_scores_tokenized_pairs(self):
+        calls = []
+
+        class Tokenizer:
+            model_max_length = 6
+
+            def __call__(self, queries, documents, **kwargs):
+                calls.append((queries, documents, kwargs))
+                return {
+                    "input_ids": np.array([[1, 2, 3, 0], [1, 4, 5, 6]]),
+                    "attention_mask": np.array([[1, 1, 1, 0], [1, 1, 1, 1]]),
+                    "token_type_ids": np.array([[0, 0, 1, 0], [0, 0, 1, 1]]),
+                }
+
+        class Model:
+            def __call__(self, **inputs):
+                assert set(inputs) == {
+                    "input_ids",
+                    "attention_mask",
+                    "token_type_ids",
+                }
+                return SimpleNamespace(logits=mx.array([[-2.0], [2.0]]))
+
+        scores, tokens = server_reranking.score_documents(
+            Model(),
+            Tokenizer(),
+            SimpleNamespace(model_type="bert", max_position_embeddings=4),
+            server_reranking.RerankItem(text="query"),
+            [
+                server_reranking.RerankItem(text="first"),
+                server_reranking.RerankItem(text="second"),
+            ],
+            None,
+        )
+
+        assert scores == pytest.approx([1 / (1 + math.exp(2)), 1 / (1 + math.exp(-2))])
+        assert tokens == 7
+        assert calls == [
+            (
+                ["query", "query"],
+                ["first", "second"],
+                {
+                    "padding": True,
+                    "truncation": True,
+                    "max_length": 4,
+                    "return_tensors": "np",
+                },
+            )
+        ]
+
+    @pytest.mark.parametrize(
+        "query,documents,instruction,error",
+        [
+            (
+                server_reranking.RerankItem(image="query.png"),
+                [server_reranking.RerankItem(text="document")],
+                None,
+                "do not support image or video",
+            ),
+            (
+                server_reranking.RerankItem(text="query"),
+                [server_reranking.RerankItem(text="document")],
+                "rank legal documents",
+                "do not support custom instructions",
+            ),
+        ],
+    )
+    def test_sequence_classifier_rejects_unsupported_inputs(
+        self, query, documents, instruction, error
+    ):
+        with pytest.raises(ValueError, match=error):
+            server_reranking.score_documents(
+                object(),
+                object(),
+                SimpleNamespace(model_type="modernbert"),
+                query,
+                documents,
+                instruction,
+            )
+
     def test_attention_mask_combines_padding_and_causality(self):
         mask = server_reranking._attention_mask(mx.array([[0, 1, 1], [1, 1, 0]]))
 
@@ -8318,7 +8643,9 @@ class TestReranking:
         monkeypatch.setattr(server.runtime, "model_cache", registry)
         model = SimpleNamespace(config=SimpleNamespace(model_type="qwen3"))
         processor = object()
-        monkeypatch.setattr(vlm_utils, "load", lambda path: (model, processor))
+        monkeypatch.setattr(
+            reranker_loader, "load_reranker", lambda path: (model, processor)
+        )
         monkeypatch.setattr(
             server._app_module, "ensure_reranker_chat_template", lambda *args: None
         )
@@ -8331,12 +8658,15 @@ class TestReranking:
             "reranker",
             None,
             "reranker",
+            server.runtime.config.fingerprint(kinds={"reranker"}),
         )
 
     def test_loader_rejects_unsupported_family(self, monkeypatch):
         monkeypatch.setattr(server.runtime, "model_cache", server.ModelCacheRegistry())
-        model = SimpleNamespace(config=SimpleNamespace(model_type="bert"))
-        monkeypatch.setattr(vlm_utils, "load", lambda path: (model, object()))
+        model = SimpleNamespace(config=SimpleNamespace(model_type="deberta_v2"))
+        monkeypatch.setattr(
+            reranker_loader, "load_reranker", lambda path: (model, object())
+        )
 
         with pytest.raises(
             server.HTTPException, match="Unsupported reranker model type"
@@ -8344,6 +8674,23 @@ class TestReranking:
             server.get_cached_model("reranker", None, model_kind="reranker")
 
         assert exc.value.status_code == 400
+
+    def test_loader_skips_chat_template_for_sequence_classifier(self, monkeypatch):
+        monkeypatch.setattr(server.runtime, "model_cache", server.ModelCacheRegistry())
+        model = SimpleNamespace(config=SimpleNamespace(model_type="bert"))
+        processor = object()
+        monkeypatch.setattr(
+            reranker_loader, "load_reranker", lambda path: (model, processor)
+        )
+        monkeypatch.setattr(
+            server._app_module,
+            "ensure_reranker_chat_template",
+            lambda *args: pytest.fail("sequence classifiers do not use chat templates"),
+        )
+
+        loaded = server.get_cached_model("reranker", None, model_kind="reranker")
+
+        assert loaded == (model, processor, model.config)
 
 
 # ============================================================================
@@ -9715,3 +10062,412 @@ class TestStreamingChatThinkingStateSelection:
         )
 
         assert reasoning == ""
+
+
+# ---------------------------------------------------------------------------
+# Fork: legacy OpenAI text-completions endpoint (/v1/completions). Upstream has
+# no CompletionRequest/CompletionResponse at all, so every test below this banner
+# is fork-only.
+# ---------------------------------------------------------------------------
+
+
+def _completion_fake_generator(tokens, prompt_tokens=8, captured=None):
+    """Build a FakeResponseGenerator emitting the given StreamingToken list."""
+
+    class FakeResponseGenerator:
+        tokenizer = SimpleNamespace(decode=lambda tokens: "")
+
+        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
+            return None
+
+        def generate(self, prompt, images=None, audio=None, args=None):
+            if captured is not None:
+                captured["prompt"] = prompt
+                captured["images"] = images
+                captured["audio"] = audio
+                captured["args"] = args
+            return server.GenerationContext(uid=1, prompt_tokens=prompt_tokens), iter(
+                list(tokens)
+            )
+
+    return FakeResponseGenerator()
+
+
+def test_completions_basic_non_streaming(client, monkeypatch):
+    # Fork: fork-only — the legacy /v1/completions endpoint is fork work (b75c18b7).
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    captured = {}
+    tokens = [
+        server.StreamingToken(
+            text="Hello", token=1, logprobs=0.0, finish_reason=None, prompt_tps=20.0
+        ),
+        server.StreamingToken(
+            text=" world", token=2, logprobs=0.0, finish_reason="stop", prompt_tps=20.0
+        ),
+    ]
+    monkeypatch.setattr(
+        server.runtime,
+        "response_generator",
+        _completion_fake_generator(tokens, prompt_tokens=6, captured=captured),
+    )
+
+    with patch.object(
+        server, "get_cached_model", return_value=(model, processor, config)
+    ):
+        response = client.post(
+            "/v1/completions",
+            json={"model": "demo", "prompt": "Continue: "},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["object"] == "text_completion"
+    assert body["id"].startswith("cmpl-")
+    assert body["model"] == "demo"
+    assert len(body["choices"]) == 1
+    choice = body["choices"][0]
+    assert choice["text"] == "Hello world"
+    assert choice["index"] == 0
+    assert choice["finish_reason"] == "stop"
+    assert choice["logprobs"] is None
+    # usage accounting
+    assert body["usage"]["prompt_tokens"] == 6
+    assert body["usage"]["completion_tokens"] == 2
+    assert body["usage"]["total_tokens"] == 8
+
+
+def test_completions_prompt_is_not_chat_templated(client, monkeypatch):
+    # Fork: fork-only — the legacy /v1/completions endpoint is fork work (b75c18b7).
+    """The raw prompt must reach the model verbatim — no apply_chat_template."""
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    captured = {}
+    tokens = [
+        server.StreamingToken(
+            text="ok", token=1, logprobs=0.0, finish_reason="stop", prompt_tps=20.0
+        )
+    ]
+    monkeypatch.setattr(
+        server.runtime,
+        "response_generator",
+        _completion_fake_generator(tokens, captured=captured),
+    )
+
+    raw = "<|im_start|>user\nNOT A TEMPLATE\n[INST] verbatim [/INST]"
+    template_mock = MagicMock(return_value="TEMPLATED-PROMPT")
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", template_mock),
+    ):
+        response = client.post(
+            "/v1/completions",
+            json={"model": "demo", "prompt": raw, "enable_thinking": True},
+        )
+
+    assert response.status_code == 200
+    # apply_chat_template is never called on the completions path.
+    template_mock.assert_not_called()
+    # The model receives the prompt byte-for-byte.
+    assert captured["prompt"] == raw
+    # Thinking is forced off regardless of the request asking for it.
+    assert captured["args"].enable_thinking is False
+    assert captured["args"].thinking_budget is None
+
+
+def test_completions_stop_sequence_truncates_non_streaming(client, monkeypatch):
+    # Fork: fork-only — the legacy /v1/completions endpoint is fork work (b75c18b7).
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    tokens = [
+        server.StreamingToken(
+            text="keep this", token=1, logprobs=0.0, finish_reason=None
+        ),
+        server.StreamingToken(
+            text="<STOP>drop this", token=2, logprobs=0.0, finish_reason="stop"
+        ),
+    ]
+    monkeypatch.setattr(
+        server.runtime, "response_generator", _completion_fake_generator(tokens)
+    )
+
+    with patch.object(
+        server, "get_cached_model", return_value=(model, processor, config)
+    ):
+        response = client.post(
+            "/v1/completions",
+            json={"model": "demo", "prompt": "p", "stop": "<STOP>"},
+        )
+
+    assert response.status_code == 200
+    choice = response.json()["choices"][0]
+    assert choice["text"] == "keep this"
+    assert choice["finish_reason"] == "stop"
+
+
+def test_completions_echo_prepends_prompt_non_streaming(client, monkeypatch):
+    # Fork: fork-only — the legacy /v1/completions endpoint is fork work (b75c18b7).
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    tokens = [
+        server.StreamingToken(
+            text=" answer", token=1, logprobs=0.0, finish_reason="stop"
+        )
+    ]
+    monkeypatch.setattr(
+        server.runtime, "response_generator", _completion_fake_generator(tokens)
+    )
+
+    with patch.object(
+        server, "get_cached_model", return_value=(model, processor, config)
+    ):
+        response = client.post(
+            "/v1/completions",
+            json={"model": "demo", "prompt": "Question:", "echo": True},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["text"] == "Question: answer"
+
+
+def test_completions_streaming_emits_deltas_and_done(client, monkeypatch):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    tokens = [
+        server.StreamingToken(
+            text="foo", token=1, logprobs=0.0, finish_reason=None, prompt_tps=20.0
+        ),
+        server.StreamingToken(
+            text="bar", token=2, logprobs=0.0, finish_reason="stop", prompt_tps=20.0
+        ),
+    ]
+    monkeypatch.setattr(
+        server.runtime,
+        "response_generator",
+        _completion_fake_generator(tokens, prompt_tokens=5),
+    )
+
+    with patch.object(
+        server, "get_cached_model", return_value=(model, processor, config)
+    ):
+        response = client.post(
+            "/v1/completions",
+            json={"model": "demo", "prompt": "p", "stream": True},
+        )
+
+    assert response.status_code == 200
+    assert "data: [DONE]" in response.text
+    chunks = [
+        json.loads(line[len("data: ") :])
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    assert all(chunk["object"] == "text_completion" for chunk in chunks)
+    # Reconstruct streamed text from text-bearing choices.
+    text = "".join(
+        chunk["choices"][0]["text"]
+        for chunk in chunks
+        if chunk.get("choices") and chunk["choices"][0].get("text")
+    )
+    assert text == "foobar"
+    # A terminal choice carries finish_reason="stop".
+    finish_chunks = [
+        chunk
+        for chunk in chunks
+        if chunk.get("choices") and chunk["choices"][0].get("finish_reason") == "stop"
+    ]
+    assert finish_chunks
+    # A trailing usage chunk reports accounting.
+    usage_chunk = next(chunk for chunk in chunks if chunk.get("usage") is not None)
+    assert usage_chunk["choices"] == []
+    assert usage_chunk["usage"]["prompt_tokens"] == 5
+    assert usage_chunk["usage"]["completion_tokens"] == 2
+
+
+def test_completions_streaming_echo_first_chunk(client, monkeypatch):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    tokens = [
+        server.StreamingToken(text="gen", token=1, logprobs=0.0, finish_reason="stop")
+    ]
+    monkeypatch.setattr(
+        server.runtime, "response_generator", _completion_fake_generator(tokens)
+    )
+
+    with patch.object(
+        server, "get_cached_model", return_value=(model, processor, config)
+    ):
+        response = client.post(
+            "/v1/completions",
+            json={"model": "demo", "prompt": "PROMPT", "echo": True, "stream": True},
+        )
+
+    assert response.status_code == 200
+    chunks = [
+        json.loads(line[len("data: ") :])
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    text = "".join(
+        chunk["choices"][0]["text"]
+        for chunk in chunks
+        if chunk.get("choices") and chunk["choices"][0].get("text")
+    )
+    assert text == "PROMPTgen"
+
+
+def test_completions_streaming_stop_sequence_truncates(client, monkeypatch):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    tokens = [
+        server.StreamingToken(text="abc", token=1, logprobs=0.0, finish_reason=None),
+        server.StreamingToken(
+            text="DEFstop", token=2, logprobs=0.0, finish_reason=None
+        ),
+        server.StreamingToken(text="zzz", token=3, logprobs=0.0, finish_reason="stop"),
+    ]
+    monkeypatch.setattr(
+        server.runtime, "response_generator", _completion_fake_generator(tokens)
+    )
+
+    with patch.object(
+        server, "get_cached_model", return_value=(model, processor, config)
+    ):
+        response = client.post(
+            "/v1/completions",
+            json={"model": "demo", "prompt": "p", "stop": ["stop"], "stream": True},
+        )
+
+    assert response.status_code == 200
+    chunks = [
+        json.loads(line[len("data: ") :])
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line != "data: [DONE]"
+    ]
+    text = "".join(
+        chunk["choices"][0]["text"]
+        for chunk in chunks
+        if chunk.get("choices") and chunk["choices"][0].get("text")
+    )
+    # "abc" + "DEF" (text before the "stop" sequence); "zzz" never streamed.
+    assert text == "abcDEF"
+    finish_chunks = [
+        chunk
+        for chunk in chunks
+        if chunk.get("choices") and chunk["choices"][0].get("finish_reason") == "stop"
+    ]
+    assert finish_chunks
+
+
+def test_completions_rejects_n_greater_than_one(client, monkeypatch):
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    monkeypatch.setattr(
+        server.runtime, "response_generator", _completion_fake_generator([])
+    )
+
+    with patch.object(
+        server, "get_cached_model", return_value=(model, processor, config)
+    ):
+        response = client.post(
+            "/v1/completions",
+            json={"model": "demo", "prompt": "p", "n": 2},
+        )
+
+    assert response.status_code == 400
+    assert "n=2" in response.json()["detail"]
+
+
+def test_completions_requires_model(client):
+    response = client.post("/v1/completions", json={"prompt": "hi"})
+    assert response.status_code == 400
+
+
+def test_completions_generate_fallback_path(client, monkeypatch):
+    """With no ResponseGenerator the endpoint uses generate() with the raw prompt."""
+    monkeypatch.setattr(server.runtime, "response_generator", None)
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+    captured = {}
+
+    def fake_generate(prompt, image=None, audio=None, **kwargs):
+        captured["prompt"] = prompt
+        return GenerationResult(
+            text="raw continuation",
+            prompt_tokens=4,
+            generation_tokens=3,
+            total_tokens=7,
+            prompt_tps=10.0,
+            generation_tps=5.0,
+            peak_memory=0.1,
+            finish_reason="length",
+        )
+
+    template_mock = MagicMock(return_value="TEMPLATED")
+    with (
+        patch.object(
+            server, "get_cached_model", return_value=(model, processor, config)
+        ),
+        patch.object(server, "apply_chat_template", template_mock),
+        patch.object(server, "generate", side_effect=fake_generate),
+    ):
+        response = client.post(
+            "/completions",
+            json={"model": "demo", "prompt": "verbatim prompt"},
+        )
+
+    assert response.status_code == 200
+    template_mock.assert_not_called()
+    assert captured["prompt"] == "verbatim prompt"
+    body = response.json()
+    assert body["choices"][0]["text"] == "raw continuation"
+    assert body["choices"][0]["finish_reason"] == "length"
+    assert body["usage"]["prompt_tokens"] == 4
+    assert body["usage"]["completion_tokens"] == 3
+
+
+def _registered_paths():
+    """Every route path the app serves, including routers it includes.
+
+    FastAPI >= 0.141 no longer flattens `include_router()` into `app.routes` — it
+    inserts one lazy `_IncludedRouter` node whose `path` is `None` and resolves
+    matches at request time. So scanning `app.routes` alone silently misses every
+    inference route once they live on `inference_router` (#1714). Union in the
+    router we own rather than reaching into the private node.
+    """
+    paths = {r.path for r in server.app.routes if getattr(r, "path", None)}
+    paths |= {
+        r.path
+        for r in server._app_module.inference_router.routes
+        if getattr(r, "path", None)
+    }
+    return paths
+
+
+def test_completions_both_routes_registered():
+    paths = _registered_paths()
+    assert "/completions" in paths
+    assert "/v1/completions" in paths
+
+
+def test_inference_routes_are_served_not_just_registered(client):
+    """Companion to the above: registration on a router is not reachability.
+
+    Guards the failure mode where `include_router()` is forgotten — the paths
+    would still be on `inference_router` and the test above would still pass,
+    while every request 404'd.
+    """
+    for path in ("/completions", "/v1/completions", "/v1/chat/completions"):
+        assert client.post(path, json={}).status_code != 404
+    assert client.get("/v1/models").status_code != 404
