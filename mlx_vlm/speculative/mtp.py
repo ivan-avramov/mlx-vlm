@@ -534,6 +534,7 @@ def _mtp_rounds(
     draft_block_size: Optional[int] = None,
     token_dtype: mx.Dtype = mx.int32,
     greedy_sampling: bool = False,
+    thinking_budget_criteria: Optional[Any] = None,
 ) -> Generator[Tuple[int, None], None, None]:
     """Gemma 4 MTP (Single-Position Multi-Token) speculative-decoding round loop.
 
@@ -596,6 +597,40 @@ def _mtp_rounds(
     emitted = 1  # caller already yielded the first bonus
 
     while emitted < max_tokens:
+        # Fork (O40): thinking budget, ported verbatim in contract from
+        # run_suffix_decoding_rounds — the caller (stream_generate) drives the
+        # criteria's __call__ per yielded token; this loop only checks
+        # ``budget_exceeded`` at the round top and forces the model's real
+        # end-of-thinking token so generation leaves the block and answers.
+        # Block granularity (<= one draft block of overshoot); never fires
+        # without a criteria. The pending bonus is committed with a width-1
+        # verify forward FIRST — it was yielded but is not yet in the target
+        # cache, and the forced token must land after it, not instead of it.
+        if thinking_budget_criteria is not None and getattr(
+            thinking_budget_criteria, "budget_exceeded", False
+        ):
+            with mx.stream(generation_stream):
+                verify = _mtp_verify_target(
+                    lm,
+                    mx.array([[b]], dtype=token_dtype),
+                    prompt_cache,
+                    sampler,
+                    sample_target_tokens=False,
+                )
+            hidden = _mtp_draft_hidden(lm, verify.hidden[:, -1:, :])
+            kv_offset += 1
+            draft_model.set_shared_kv(
+                _slice_shared_kv_after_reject(verify.shared_kv_states, 0),
+                kv_offset,
+                position=_mtp_draft_position(kv_offset),
+                kv_valid_len=kv_offset,
+            )
+            end_id = int(thinking_budget_criteria.thinking_end_token_id)
+            yield end_id, None
+            emitted += 1
+            b = end_id
+            continue
+
         bs = _mtp_next_block_size(
             draft_model,
             block_total,

@@ -152,6 +152,47 @@ def resolve_drafter_kind(model_path, kind: Optional[str] = None) -> str:
     return kind
 
 
+def require_draft_config(draft_kind, draft_model_path) -> None:
+    """Fail-loud guard (F2): a weights-backed draft kind with no drafter path must
+    REFUSE, never silently serve plain decode. The server's load path is gated on
+    ``if draft_model_path:``, so ``--draft-kind mtp`` alone used to skip drafter
+    loading entirely — the operator believed MTP was on while measuring plain
+    autoregressive decode (campaign O40, 2026-08-24: a week of MTP measurements,
+    including a milestone close, were voided this way). ``suffix`` is drafter-free
+    and exempt; a path with no kind auto-detects; no kind + no path is plain decode
+    by request and fine."""
+    if draft_kind in KNOWN_DRAFTER_KINDS and not draft_model_path:
+        raise ValueError(
+            f"draft kind {draft_kind!r} requires a drafter path (--draft-model / "
+            f"MLX_VLM_DRAFT_MODEL): refusing to start and silently serve plain "
+            f"decode. Drop the draft kind for plain decode, or provide the drafter."
+        )
+
+
+def drafter_incompat_policy(error: Exception):
+    """Policy for a drafter that loaded but failed compatibility validation.
+    Default: REFUSE (raise RuntimeError) — the old warn-and-fall-back downgrade is
+    the same silent-plain-decode failure mode as a missing path. Set
+    MLX_VLM_DRAFT_ALLOW_FALLBACK=1 for a deliberate degraded start; then this
+    returns ``(None, None)`` (draft_model, draft_kind) and the caller serves plain
+    decode with a warning."""
+    import os
+
+    if os.environ.get("MLX_VLM_DRAFT_ALLOW_FALLBACK") == "1":
+        logger.warning(
+            "Speculative drafter is incompatible with the target model; "
+            "MLX_VLM_DRAFT_ALLOW_FALLBACK=1 set, falling back to autoregressive "
+            "generation: %s",
+            error,
+        )
+        return (None, None)
+    raise RuntimeError(
+        "Speculative drafter is incompatible with the target model; refusing to "
+        "start and silently serve plain decode (set MLX_VLM_DRAFT_ALLOW_FALLBACK=1 "
+        f"for a deliberate degraded start): {error}"
+    ) from error
+
+
 def load_drafter(
     path_or_repo: str, kind: Optional[str] = None, **kwargs
 ) -> Tuple[object, str]:
@@ -181,7 +222,9 @@ __all__ = [
     "DSparkDraftModel",
     "LagunaDFlashDraftModel",
     "MuseGlimmerAssistantDraftModel",
+    "drafter_incompat_policy",
     "load_drafter",
+    "require_draft_config",
     "resolve_drafter_kind",
     "validate_drafter_compatibility",
 ]

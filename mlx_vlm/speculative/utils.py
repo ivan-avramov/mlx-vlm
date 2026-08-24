@@ -355,6 +355,8 @@ def run_speculative_rounds(
                 draft_block_size=draft_block_size,
                 token_dtype=input_ids.dtype,
                 greedy_sampling=sampler_is_greedy,
+                # Fork (O40): budget support, suffix-parity (see _mtp_rounds).
+                thinking_budget_criteria=thinking_budget_criteria,
             )
         else:
             mx.eval(first_token)

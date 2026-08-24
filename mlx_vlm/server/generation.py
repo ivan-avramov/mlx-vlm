@@ -1477,8 +1477,15 @@ class ResponseGenerator:
         draft_model_path = self.draft_model_path or os.environ.get(
             "MLX_VLM_DRAFT_MODEL"
         )
+        # F2 fail-loud (O40, 2026-08-24): a weights-backed draft kind with no drafter
+        # path must refuse HERE, not silently skip the block below and serve plain
+        # decode. Surfaces via _load_error -> wait_until_ready(), failing the start.
+        from ..speculative.drafters import require_draft_config
+
+        require_draft_config(draft_kind, draft_model_path)
         if draft_model_path:
             from ..speculative.drafters import (
+                drafter_incompat_policy,
                 load_drafter,
                 validate_drafter_compatibility,
             )
@@ -1501,13 +1508,9 @@ class ResponseGenerator:
             try:
                 validate_drafter_compatibility(model, draft_model, draft_kind)
             except ValueError as e:
-                logger.warning(
-                    "Speculative drafter is incompatible with the target model; "
-                    "falling back to autoregressive generation: %s",
-                    e,
-                )
-                draft_model = None
-                draft_kind = None
+                # F2: refuse by default; MLX_VLM_DRAFT_ALLOW_FALLBACK=1 restores the
+                # old warn-and-fall-back for deliberate degraded starts.
+                draft_model, draft_kind = drafter_incompat_policy(e)
             else:
                 logger.info("Drafter ready; speculative decoding enabled.")
         elif draft_kind == "suffix":
