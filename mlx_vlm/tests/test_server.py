@@ -1024,7 +1024,46 @@ def _unstarted_response_generator():
     return gen
 
 
+def test_server_refuses_incompatible_mtp_drafter_by_default(monkeypatch):
+    """Contract change (O40, 2026-08-24): an incompatible drafter REFUSES the start
+    instead of silently demoting to plain decode — the silent demote is the exact
+    failure mode that voided a week of MTP measurements (a server the operator
+    believed had MTP on measured plain autoregressive decode). The old behavior
+    survives behind MLX_VLM_DRAFT_ALLOW_FALLBACK=1 (next test)."""
+    target_config = SimpleNamespace(
+        model_type="gemma4_text",
+        hidden_size=5376,
+        eos_token_id=[],
+    )
+    model = SimpleNamespace(language_model=SimpleNamespace(config=target_config))
+    processor = SimpleNamespace(tokenizer=SimpleNamespace())
+    drafter = SimpleNamespace(
+        config=SimpleNamespace(
+            model_type="gemma4_assistant",
+            backbone_hidden_size=1536,
+        )
+    )
+    gen = _unstarted_response_generator()
+
+    monkeypatch.delenv("MLX_VLM_DRAFT_ALLOW_FALLBACK", raising=False)
+    monkeypatch.setenv("MLX_VLM_DRAFT_MODEL", "assistant")
+    monkeypatch.setenv("MLX_VLM_DRAFT_KIND", "mtp")
+    monkeypatch.setattr(
+        server_generation,
+        "load_model_resources",
+        lambda *_args, **_kwargs: (model, processor, target_config),
+    )
+    monkeypatch.setattr(
+        "mlx_vlm.speculative.drafters.load_drafter",
+        lambda *_args, **_kwargs: (drafter, "mtp"),
+    )
+
+    with pytest.raises(RuntimeError, match="MLX_VLM_DRAFT_ALLOW_FALLBACK"):
+        gen._initialize_model()
+
+
 def test_server_demotes_incompatible_mtp_drafter_to_ar(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_DRAFT_ALLOW_FALLBACK", "1")
     target_config = SimpleNamespace(
         model_type="gemma4_text",
         hidden_size=5376,
@@ -1107,6 +1146,9 @@ def test_server_caches_apc_mode_when_model_initializes(monkeypatch):
 
 
 def test_server_serves_ar_requests_after_drafter_mismatch(monkeypatch):
+    # O40: the deliberate degraded start now requires the env gate (see
+    # test_server_refuses_incompatible_mtp_drafter_by_default).
+    monkeypatch.setenv("MLX_VLM_DRAFT_ALLOW_FALLBACK", "1")
     class FakeDetokenizer:
         def __init__(self):
             self.last_segment = ""

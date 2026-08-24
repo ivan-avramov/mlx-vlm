@@ -193,6 +193,40 @@ def get_token_queue_timeout():
     return runtime.config.token_queue_timeout
 
 
+def _inline_draft_kwargs(draft_kind, draft_model, args) -> dict:
+    """gen_kwargs wiring for the cached/inline path (O40). suffix AND mtp run inline
+    through generate_step -> run_speculative_rounds (B==1); structured output falls
+    back to plain decode for both (grammar-blind drafts + the speculative path applies
+    no grammar mask — the suffix precedent); eagle3/dflash never wire inline."""
+    if (
+        draft_kind in ("suffix", "mtp")
+        and draft_model is not None
+        and not getattr(args, "logits_processors", None)
+    ):
+        return {"draft_model": draft_model, "draft_kind": draft_kind}
+    return {}
+
+
+def _drafter_conflict(draft_kind, draft_model_loaded, args, *, cached: bool):
+    """generate()'s reject gate for drafter/feature conflicts; returns an error message
+    or None. thinking_budget is honored by suffix (any path, forces the close at the
+    cap) and by mtp on the CACHED path (inline round loop, test_mtp_thinking_budget);
+    the batched paths have no criteria support yet, so budget + a non-suffix drafter
+    still errors there. Structured output on the cached path falls back to plain
+    decode (see _inline_draft_kwargs); on the batched path it still errors for
+    non-suffix drafters."""
+    if not draft_model_loaded:
+        return None
+    inline_capable = draft_kind == "suffix" or (draft_kind == "mtp" and cached)
+    if inline_capable:
+        return None
+    if getattr(args, "logits_processors", None) is not None:
+        return "Structured response_format is not supported with speculative decoding."
+    if getattr(args, "thinking_budget", None) is not None:
+        return "thinking_budget is not supported with speculative decoding in the server."
+    return None
+
+
 def get_speculative_batch_coalesce_s():
     raw = os.environ.get(
         "MLX_VLM_SPEC_BATCH_COALESCE_MS", str(DEFAULT_SPECULATIVE_BATCH_COALESCE_MS)
@@ -1576,27 +1610,19 @@ class ResponseGenerator:
         """
         self.wait_until_ready()
         args = args or GenerationArguments(max_tokens=get_server_max_tokens())
-        # Drafter-free suffix decoding coexists with both features: it honors
-        # thinking_budget (forces the close at the cap) and falls back to plain
-        # decode for structured output (see _process_cached_request). Other
-        # drafter kinds don't implement either, so they still error.
-        _is_suffix = getattr(self, "draft_kind", None) == "suffix"
-        if (
-            self.draft_model is not None
-            and not _is_suffix
-            and args.logits_processors is not None
-        ):
-            raise ValueError(
-                "Structured response_format is not supported with speculative decoding."
-            )
-        if (
-            self.draft_model is not None
-            and not _is_suffix
-            and args.thinking_budget is not None
-        ):
-            raise ValueError(
-                "thinking_budget is not supported with speculative decoding in the server."
-            )
+        # Drafter/feature conflicts (O40): suffix coexists with thinking_budget and
+        # structured output on any path; mtp does on the CACHED path (inline round
+        # loop honors the budget; structured output falls back to plain decode).
+        # Batched paths have no criteria support yet, so those combinations still
+        # error — see _drafter_conflict.
+        _conflict = _drafter_conflict(
+            getattr(self, "draft_kind", None),
+            self.draft_model is not None,
+            args,
+            cached=prompt_cache_state is not None,
+        )
+        if _conflict is not None:
+            raise ValueError(_conflict)
         rqueue: Queue = Queue()
         request_started_at = time.perf_counter()
 
@@ -1799,18 +1825,18 @@ class ResponseGenerator:
             gen_kwargs["kv_group_size"] = self.kv_group_size
             gen_kwargs["kv_quant_scheme"] = self.kv_quant_scheme
             gen_kwargs["quantized_kv_start"] = self.quantized_kv_start
-        # Drafter-free suffix decoding runs on this inline single-chat path via
-        # generate_step (B==1). Other drafter kinds use the batched paths.
-        # Structured output (logits_processors) falls back to plain decode: an
-        # n-gram drafter is grammar-blind so its drafts get rejected anyway, and
-        # the speculative path doesn't apply the grammar mask.
-        if (
-            getattr(self, "draft_kind", None) == "suffix"
-            and getattr(self, "draft_model", None) is not None
-            and not getattr(args, "logits_processors", None)
-        ):
-            gen_kwargs["draft_model"] = self.draft_model
-            gen_kwargs["draft_kind"] = "suffix"
+        # Speculative decoding on this inline single-chat path (B==1) via
+        # generate_step: suffix (drafter-free) and mtp (O40) both wire through;
+        # structured output falls back to plain decode (grammar-blind drafts, no
+        # grammar mask on the speculative path); eagle3/dflash use the batched
+        # paths only. See _inline_draft_kwargs.
+        _draft_kwargs = _inline_draft_kwargs(
+            getattr(self, "draft_kind", None),
+            getattr(self, "draft_model", None),
+            args,
+        )
+        if _draft_kwargs:
+            gen_kwargs.update(_draft_kwargs)
             _dbs = _get_draft_block_size_from_env()
             if _dbs is not None:
                 gen_kwargs["draft_block_size"] = _dbs
