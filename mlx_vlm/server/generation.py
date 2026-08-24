@@ -217,12 +217,13 @@ def _drafter_conflict(draft_kind, draft_model_loaded, args, *, cached: bool):
     non-suffix drafters."""
     if not draft_model_loaded:
         return None
-    inline_capable = draft_kind == "suffix" or (draft_kind == "mtp" and cached)
-    if inline_capable:
+    if draft_kind == "suffix" or (draft_kind == "mtp" and cached):
         return None
     if getattr(args, "logits_processors", None) is not None:
         return "Structured response_format is not supported with speculative decoding."
-    if getattr(args, "thinking_budget", None) is not None:
+    # mtp honors the budget on the batched path too (B==1 round loop; a coalesced
+    # B>1 budget batch refuses loudly downstream rather than truncating silently).
+    if draft_kind != "mtp" and getattr(args, "thinking_budget", None) is not None:
         return "thinking_budget is not supported with speculative decoding in the server."
     return None
 

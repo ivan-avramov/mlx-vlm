@@ -189,3 +189,155 @@ def test_run_speculative_rounds_forwards_criteria_to_the_mtp_branch():
             )
         )
     assert seen.get("criteria") is criteria
+
+
+# --------------------------------------------------------------------------- batched loop
+# The continuous-batching path (BatchGenerator -> SpeculativeGenerationBatch ->
+# run_speculative_server_rounds -> _mtp_rounds_batch) is where ALL anonymous server
+# traffic decodes — including benchmark generation, whose deployed profile always sets a
+# thinking budget. v1 scope mirrors suffix's: budget enforcement at B==1 (the campaign
+# runs --num-threads 1); criteria with B>1 refuses loudly rather than silently ignoring
+# the budget.
+
+from mlx_vlm.speculative.utils import _mtp_rounds_batch  # noqa: E402
+
+
+def _run_batch(criteria, B=1, max_tokens=4):
+    verify_widths = []
+
+    def fake_verify(lm, verify_input, *args, **kwargs):
+        verify_widths.append(int(verify_input.shape[1]))
+        w = int(verify_input.shape[1])
+        return speculative_utils._MTPVerifyResult(
+            hidden=mx.zeros((verify_input.shape[0], w, 2), dtype=mx.float32),
+            shared_kv_states={},
+            target_tokens=mx.zeros((verify_input.shape[0], w), dtype=mx.int32) + 9,
+            gdn_states=None,
+        )
+
+    def fake_draft_block_active(draft_model, b_active, hidden, bs, sampler, dtype,
+                                positions, **kw):
+        return mx.array([[7, 8]] * len(b_active), dtype=mx.int32)
+
+    def fake_walk(draft_tokens, target_tokens, budgets):
+        n = draft_tokens.shape[0]
+        return [1] * n, [[9, 10]] * n
+
+    draft = _Draft()
+    model = SimpleNamespace(language_model=_LM())
+    with (
+        patch.object(mtp_utils, "_mtp_verify_target", side_effect=fake_verify),
+        patch.object(mtp_utils, "_mtp_draft_block_active", fake_draft_block_active),
+        patch.object(mtp_utils, "_speculative_walk_batch", side_effect=fake_walk),
+    ):
+        rounds = []
+        for tok_list, _meta in _mtp_rounds_batch(
+            model,
+            draft,
+            [SimpleNamespace(offset=0)],
+            mx.zeros((B, 1, 2), dtype=mx.float32),
+            {},
+            first_bonus=mx.array([1] * B, dtype=mx.int32),
+            max_tokens=max_tokens,
+            sampler=lambda logits: mx.argmax(logits, axis=-1),
+            draft_block_size=3,
+            token_dtype=mx.int32,
+            greedy_sampling=True,
+            thinking_budget_criteria=criteria,
+        ):
+            rounds.append(tok_list)
+    return rounds, verify_widths
+
+
+def test_batch_tripped_budget_forces_end_token_at_b1():
+    rounds, verify_widths = _run_batch([_Criteria(trip_reads=1)])
+    assert rounds[0] == [END_ID], (
+        "with the budget exceeded at the round top, the forced end token must be the "
+        "next emission for the row")
+    assert verify_widths[0] == 1, "pending bonus committed with a width-1 forward first"
+
+
+def test_batch_untripped_criteria_changes_nothing():
+    with_c, _ = _run_batch([_Criteria(trip_reads=0)])
+    without_c, _ = _run_batch(None)
+    assert with_c == without_c
+
+
+def test_batch_criteria_with_b_gt_1_refuses():
+    import pytest
+
+    with pytest.raises(ValueError, match="batch"):
+        _run_batch([_Criteria(trip_reads=0), _Criteria(trip_reads=0)], B=2)
+
+
+# --------------------------------------------------------------------------- plumbing
+def test_server_rounds_forwards_criteria_to_the_batch_loop():
+    seen = {}
+
+    def fake_batch(*args, **kwargs):
+        seen["criteria"] = kwargs.get("thinking_budget_criteria")
+        return iter(())
+
+    crit = [_Criteria(trip_reads=0)]
+    with patch.object(speculative_utils, "_mtp_rounds_batch", side_effect=fake_batch):
+        list(
+            speculative_utils.run_speculative_server_rounds(
+                SimpleNamespace(language_model=_LM()),
+                SimpleNamespace(config=SimpleNamespace(block_size=3)),
+                [SimpleNamespace(offset=0)],
+                mx.zeros((1, 1, 2), dtype=mx.float32),
+                draft_kind="mtp",
+                first_bonus=mx.array([1], dtype=mx.int32),
+                max_tokens=4,
+                sampler=lambda logits: mx.argmax(logits, axis=-1),
+                thinking_budget_criteria=crit,
+            )
+        )
+    assert seen.get("criteria") is crit
+
+
+def test_speculative_generation_batch_drives_and_forwards_criteria():
+    """The wrapper must (a) drive the criteria's __call__ on every emitted token —
+    that is what keeps `budget_exceeded` current, the round loop only reads it —
+    and (b) hand the criteria list to run_speculative_server_rounds."""
+    from mlx_vlm.generate import ar
+
+    calls = []
+
+    class _RecordingCriteria:
+        thinking_end_token_id = END_ID
+        budget_exceeded = False
+
+        def __call__(self, token_id):
+            calls.append(token_id)
+            return None
+
+    seen = {}
+
+    def fake_server_rounds(*args, **kwargs):
+        seen["criteria"] = kwargs.get("thinking_budget_criteria")
+        yield [7], {"round_pos": 0, "round_len": 1}
+
+    crit = _RecordingCriteria()
+    batch = ar.SpeculativeGenerationBatch(
+        model=SimpleNamespace(language_model=_LM()),
+        draft_model=SimpleNamespace(config=SimpleNamespace(block_size=3)),
+        draft_kind="mtp",
+        uids=[11],
+        first_tokens=mx.array([5], dtype=mx.int32),
+        prompt_cache=[SimpleNamespace(offset=0)],
+        sampler=lambda logits: mx.argmax(logits, axis=-1),
+        stop_criteria=lambda token: False,
+        max_tokens=[8],
+        hidden=mx.zeros((1, 1, 2), dtype=mx.float32),
+        shared_kv_states={},
+        prompt_tokens=mx.array([[1, 2]], dtype=mx.int32),
+        thinking_budget_criteria=[crit],
+    )
+    with patch.object(ar, "run_speculative_server_rounds", side_effect=fake_server_rounds):
+        first = batch.next()   # first-bonus send
+        second = batch.next()  # one round
+    assert [r.token for r in first] == [5]
+    assert [r.token for r in second] == [7]
+    assert calls == [5, 7], "every emitted token must drive the criteria"
+    assert seen.get("criteria") == [crit]

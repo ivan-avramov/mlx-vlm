@@ -63,9 +63,13 @@ class TestDrafterConflictGate:
             is None
         )
 
-    def test_budget_with_mtp_on_batched_path_still_errors(self):
-        msg = _drafter_conflict("mtp", True, _args(thinking_budget=81920), cached=False)
-        assert msg is not None and "thinking_budget" in msg
+    def test_budget_with_mtp_on_batched_path_is_allowed(self):
+        """The batched mtp round loop enforces the budget at B==1 (a coalesced B>1
+        budget batch refuses loudly downstream); the blanket rejection is gone."""
+        assert (
+            _drafter_conflict("mtp", True, _args(thinking_budget=81920), cached=False)
+            is None
+        )
 
     def test_budget_with_suffix_is_allowed_any_path(self):
         for cached in (True, False):

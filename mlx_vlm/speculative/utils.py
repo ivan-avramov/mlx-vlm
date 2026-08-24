@@ -159,6 +159,7 @@ def run_speculative_server_rounds(
     eos_token_ids: Optional[set] = None,
     prompt_tokens: Optional[mx.array] = None,
     row_ids: Optional[List[int]] = None,
+    thinking_budget_criteria: Optional[List[Any]] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     # Fork: dispatches draft_kind == "suffix" to the fork's drafter-free
     # n-gram / prompt-lookup speculation (863441c9), which upstream does not
@@ -230,6 +231,16 @@ def run_speculative_server_rounds(
         )
         return
 
+    # Fork (O40): a budget with a kind whose round loop cannot enforce it must
+    # refuse loudly — an ignored budget is an unmeasured truncation.
+    if thinking_budget_criteria and any(
+        c is not None for c in thinking_budget_criteria
+    ) and draft_kind != "mtp":
+        raise ValueError(
+            f"thinking_budget is not supported with draft kind {draft_kind!r} on the "
+            "batched server path (only mtp implements the budget round loop)."
+        )
+
     if draft_kind == "mtp":
         yield from _mtp_rounds_batch(
             model,
@@ -246,6 +257,7 @@ def run_speculative_server_rounds(
             eos_token_ids=eos_token_ids,
             greedy_sampling=greedy_sampling,
             row_ids=row_ids,
+            thinking_budget_criteria=thinking_budget_criteria,
         )
         return
 

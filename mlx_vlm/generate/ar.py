@@ -1687,6 +1687,7 @@ class SpeculativeGenerationBatch:
         draft_block_size: Optional[int] = None,
         token_dtype: mx.Dtype = mx.int32,
         greedy_sampling: bool = False,
+        thinking_budget_criteria: Optional[List[Any]] = None,
     ):
         self.model = model
         self.draft_model = draft_model
@@ -1708,6 +1709,17 @@ class SpeculativeGenerationBatch:
         self._finished = [False] * len(uids)
         self._sent_first = False
         self._rounds_iter = None
+        # Fork (O40): per-row thinking-budget criteria. This wrapper DRIVES each
+        # criteria's __call__ on every emitted token (that is what keeps
+        # budget_exceeded current — the round loop only reads it) and hands the
+        # list to run_speculative_server_rounds for round-top enforcement.
+        self.thinking_budget_criteria = thinking_budget_criteria or []
+
+    def _drive_criteria(self, row: int, token: int) -> None:
+        if row < len(self.thinking_budget_criteria):
+            criteria = self.thinking_budget_criteria[row]
+            if criteria is not None:
+                criteria(int(token))
 
     def __len__(self):
         return sum(not done for done in self._finished)
@@ -1749,6 +1761,7 @@ class SpeculativeGenerationBatch:
             if token is None or self._finished[row]:
                 continue
             token = int(token)
+            self._drive_criteria(row, token)
             self._num_tokens[row] += 1
             finish_reason = self._finish_reason(row, token)
             if finish_reason is not None:
@@ -1790,6 +1803,7 @@ class SpeculativeGenerationBatch:
             eos_token_ids=None,
             prompt_tokens=self.prompt_tokens,
             row_ids=[0] * len(self._all_uids),
+            thinking_budget_criteria=self.thinking_budget_criteria,
         )
 
     def next(self) -> List[GenerationBatch.Response]:
@@ -1804,6 +1818,7 @@ class SpeculativeGenerationBatch:
                 if self._finished[row]:
                     continue
                 token = int(token)
+                self._drive_criteria(row, token)
                 self._num_tokens[row] += 1
                 finish_reason = self._finish_reason(row, token)
                 if finish_reason is not None:
@@ -2313,6 +2328,9 @@ class PromptProcessingBatch:
                 draft_block_size=self.draft_block_size,
                 token_dtype=self._input_ids.dtype,
                 greedy_sampling=self.greedy_sampling,
+                # Fork (O40): budget criteria ride into the speculative wrapper
+                # (per-row; enforced at B==1 by the mtp round loop).
+                thinking_budget_criteria=list(self.thinking_budget_criteria),
             )
             compute_logprobs = False
         else:

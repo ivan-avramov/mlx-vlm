@@ -861,6 +861,7 @@ def _mtp_rounds_batch(
     eos_token_ids: Optional[set] = None,
     greedy_sampling: bool = False,
     row_ids: Optional[List[int]] = None,
+    thinking_budget_criteria: Optional[List[Any]] = None,
 ) -> Generator[Tuple[List[Optional[int]], None], None, None]:
     """Batched Gemma 4 MTP round loop (B >= 1).
 
@@ -878,6 +879,17 @@ def _mtp_rounds_batch(
         )
 
     B = first_bonus.shape[0]
+    # Fork (O40): thinking budget at B==1 (v1 scope, mirroring suffix's own
+    # "batch_size == 1 in v1"); a criteria with B>1 REFUSES loudly rather than
+    # silently ignoring the budget — the campaign's benchmark traffic is
+    # single-threaded, and an ignored budget is an unmeasured truncation.
+    _crit_list = thinking_budget_criteria or []
+    _criteria = next((c for c in _crit_list if c is not None), None)
+    if _criteria is not None and B != 1:
+        raise ValueError(
+            "thinking_budget with mtp speculative decoding supports "
+            f"batch_size == 1 in v1; got batch_size={B}."
+        )
     row_ids = list(range(B)) if row_ids is None else list(row_ids)
     block_total = _dflash_block_total(draft_model, draft_block_size)
     configured_block_total = int(getattr(draft_model.config, "block_size", block_total))
@@ -916,6 +928,46 @@ def _mtp_rounds_batch(
     active_idx = list(range(B))
 
     while len(active_idx) > 0:
+        # Fork (O40): budget check at the round top — same contract as the
+        # singleton `_mtp_rounds` (caller drives the criteria per yielded token;
+        # <= one draft block of overshoot). Commit the pending bonus with a
+        # width-1 verify forward, force the end-of-thinking token, rebind the
+        # drafter's shared KV at the advanced position, and resume rounds.
+        if _criteria is not None and getattr(_criteria, "budget_exceeded", False):
+            row = active_idx[0]
+            with mx.stream(generation_stream):
+                verify = _mtp_verify_target(
+                    lm,
+                    mx.array([[b[row]]], dtype=token_dtype),
+                    prompt_cache,
+                    sampler,
+                    sample_target_tokens=False,
+                )
+            hidden = _mtp_draft_hidden(lm, verify.hidden[:, -1:, :])
+            positions[row] = positions[row] + 1
+            draft_model.set_shared_kv(
+                _slice_shared_kv_after_reject(verify.shared_kv_states, 0),
+                kv_offset=positions[row],
+                position=_mtp_draft_position(mx.array([positions[row]])),
+                kv_valid_len=mx.array([positions[row]]),
+                left_padding=_batch_cache_left_padding(prompt_cache),
+            )
+            end_id = int(_criteria.thinking_end_token_id)
+            tokens_out: List[Optional[int]] = [None] * B
+            tokens_out[row] = end_id
+            emitted[row] += 1
+            if emitted[row] >= max_tokens:
+                finished[row] = True
+            if eos_token_ids is not None and end_id in eos_token_ids:
+                finished[row] = True
+            if stop_check is not None and stop_check(row, end_id):
+                finished[row] = True
+            yield tokens_out, {"round_pos": 0, "round_len": 1}
+            b[row] = end_id
+            if finished[row]:
+                break
+            continue
+
         remaining = [
             max(1, max_tokens - emitted[active_idx[j]] + 1)
             for j in range(len(active_idx))
