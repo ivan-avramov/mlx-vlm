@@ -152,6 +152,9 @@ def resolve_drafter_kind(model_path, kind: Optional[str] = None) -> str:
     return kind
 
 
+# Fork: fail-loud drafter-config guard (O40, 7886b40) — upstream has no such guard;
+# its server silently serves plain decode when --draft-kind names a weights-backed
+# kind with no drafter path.
 def require_draft_config(draft_kind, draft_model_path) -> None:
     """Fail-loud guard (F2): a weights-backed draft kind with no drafter path must
     REFUSE, never silently serve plain decode. The server's load path is gated on
@@ -222,9 +225,9 @@ __all__ = [
     "DSparkDraftModel",
     "LagunaDFlashDraftModel",
     "MuseGlimmerAssistantDraftModel",
-    "drafter_incompat_policy",
+    "drafter_incompat_policy",  # Fork: O40 fail-loud surface (7886b40)
     "load_drafter",
-    "require_draft_config",
-    "resolve_drafter_kind",
-    "validate_drafter_compatibility",
+    "require_draft_config",  # Fork: O40 fail-loud surface (7886b40)
+    "resolve_drafter_kind",  # Fork: O40 fail-loud surface (7886b40)
+    "validate_drafter_compatibility",  # Fork: O40 fail-loud surface (7886b40)
 ]
