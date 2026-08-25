@@ -193,6 +193,8 @@ def get_token_queue_timeout():
     return runtime.config.token_queue_timeout
 
 
+# Fork: cached/inline-path speculative wiring (O40, 715b06b) — upstream's server has
+# no inline drafter dispatch.
 def _inline_draft_kwargs(draft_kind, draft_model, args) -> dict:
     """gen_kwargs wiring for the cached/inline path (O40). suffix AND mtp run inline
     through generate_step -> run_speculative_rounds (B==1); structured output falls
@@ -224,7 +226,9 @@ def _drafter_conflict(draft_kind, draft_model_loaded, args, *, cached: bool):
     # mtp honors the budget on the batched path too (B==1 round loop; a coalesced
     # B>1 budget batch refuses loudly downstream rather than truncating silently).
     if draft_kind != "mtp" and getattr(args, "thinking_budget", None) is not None:
-        return "thinking_budget is not supported with speculative decoding in the server."
+        return (
+            "thinking_budget is not supported with speculative decoding in the server."
+        )
     return None
 
 
@@ -1836,11 +1840,18 @@ class ResponseGenerator:
             getattr(self, "draft_model", None),
             args,
         )
+        spec_snapshot = None
         if _draft_kwargs:
             gen_kwargs.update(_draft_kwargs)
             _dbs = _get_draft_block_size_from_env()
             if _dbs is not None:
                 gen_kwargs["draft_block_size"] = _dbs
+            # Snapshot the drafter's lifetime counters so the final chunk can
+            # report this request's draft stats — the same snapshot-and-diff
+            # the batched path uses (exact at B==1, which this path is). The
+            # chunks themselves never carry draft_* fields, so without this
+            # the response reports null counters while speculation is live.
+            spec_snapshot = speculative_stats_snapshot(_draft_kwargs["draft_model"])
 
         # Local import to avoid a circular dependency at module load and so
         # the cached-path heartbeat tests can monkeypatch
@@ -1932,6 +1943,21 @@ class ResponseGenerator:
                 # the bug -- that was omitting the keyword entirely, so a present
                 # value could never arrive. tests/test_cached_tokens_reporting.py
                 # asserts each field's real value reaches the response body.
+                # Per-request draft counters on the FINAL chunk, mirroring the
+                # batched path (_step): diff the drafter's lifetime counters
+                # against the pre-request snapshot. Same null-not-zero
+                # semantics — a wired request that ran no rounds (e.g. the
+                # ar.py processor fallback dropped it to plain decode) reports
+                # None, so a tripwire reads it as NOT engaged.
+                draft_rounds = draft_accepted = draft_total = None
+                request_draft_kind = None
+                if chunk.finish_reason is not None and spec_snapshot is not None:
+                    draft_rounds, draft_accepted, draft_total = speculative_stats_since(
+                        _draft_kwargs["draft_model"], spec_snapshot
+                    )
+                    if draft_rounds is not None:
+                        request_draft_kind = _draft_kwargs["draft_kind"]
+
                 rqueue.put(
                     StreamingToken(
                         text=chunk.text,
@@ -1942,6 +1968,10 @@ class ResponseGenerator:
                         prompt_tps=getattr(chunk, "prompt_tps", None),
                         generation_tps=getattr(chunk, "generation_tps", None),
                         cached_tokens=getattr(chunk, "cached_tokens", 0) or 0,
+                        draft_kind=request_draft_kind,
+                        draft_rounds=draft_rounds,
+                        draft_n_accepted=draft_accepted,
+                        draft_n=draft_total,
                         emitted_at=time.perf_counter(),
                     )
                 )

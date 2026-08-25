@@ -1024,6 +1024,7 @@ def _unstarted_response_generator():
     return gen
 
 
+# Fork: O40 fail-loud drafter tests (715b06b) — no upstream counterpart.
 def test_server_refuses_incompatible_mtp_drafter_by_default(monkeypatch):
     """Contract change (O40, 2026-08-24): an incompatible drafter REFUSES the start
     instead of silently demoting to plain decode — the silent demote is the exact
@@ -1063,6 +1064,8 @@ def test_server_refuses_incompatible_mtp_drafter_by_default(monkeypatch):
 
 
 def test_server_demotes_incompatible_mtp_drafter_to_ar(monkeypatch):
+    # Fork: O40 — the pre-O40 silent demote survives only behind the env gate
+    # (715b06b). No upstream counterpart.
     monkeypatch.setenv("MLX_VLM_DRAFT_ALLOW_FALLBACK", "1")
     target_config = SimpleNamespace(
         model_type="gemma4_text",
@@ -1146,9 +1149,12 @@ def test_server_caches_apc_mode_when_model_initializes(monkeypatch):
 
 
 def test_server_serves_ar_requests_after_drafter_mismatch(monkeypatch):
-    # O40: the deliberate degraded start now requires the env gate (see
-    # test_server_refuses_incompatible_mtp_drafter_by_default).
+    # Fork: O40 — degraded-start serving path behind the env gate (715b06b); the
+    # deliberate degraded start now requires the gate (see
+    # test_server_refuses_incompatible_mtp_drafter_by_default). No upstream
+    # counterpart.
     monkeypatch.setenv("MLX_VLM_DRAFT_ALLOW_FALLBACK", "1")
+
     class FakeDetokenizer:
         def __init__(self):
             self.last_segment = ""
@@ -9989,6 +9995,119 @@ class TestCachedPathHeartbeatWatchdog:
         assert items[-1] is None
         # The error gets logged AND surfaced as an Exception item.
         assert any(isinstance(it, RuntimeError) for it in items)
+
+
+class TestCachedPathDraftCounters:
+    """O40 follow-up (mlx_local_stack C24): the cached/inline path must attach
+    the same per-request draft counters the batched path puts on its final
+    StreamingToken (draft_kind/draft_rounds/draft_n/draft_n_accepted), computed
+    by snapshot-and-diff of the drafter's lifetime counters. Without this the
+    response timings carry nulls while the inline mtp loop is engaged (measured
+    live 2026-08-24: 1.93x decode with the drafter loaded, all counters null),
+    so an engagement tripwire reading the response cannot certify engagement.
+    """
+
+    @staticmethod
+    def _rg(drafter=None):
+        rg = server.ResponseGenerator.__new__(server.ResponseGenerator)
+        rg.model = SimpleNamespace()
+        rg.processor = SimpleNamespace()
+        rg.vision_cache = None
+        rg.kv_bits = None
+        rg.kv_group_size = None
+        rg.kv_quant_scheme = None
+        rg.quantized_kv_start = None
+        rg._cancelled = set()
+        rg._cancel_lock = __import__("threading").Lock()
+        if drafter is not None:
+            rg.draft_kind = "mtp"
+            rg.draft_model = drafter
+        return rg
+
+    @staticmethod
+    def _final_token(rqueue):
+        items = []
+        while not rqueue.empty():
+            items.append(rqueue.get_nowait())
+        tokens = [it for it in items if isinstance(it, server.StreamingToken)]
+        assert tokens, f"no StreamingToken in {[type(i).__name__ for i in items]}"
+        return tokens[-1]
+
+    def _run(self, rg, fake_stream_generate, monkeypatch):
+        import sys
+        from queue import Queue
+
+        monkeypatch.setattr(
+            sys.modules["mlx_vlm.generate"], "stream_generate", fake_stream_generate
+        )
+        rqueue: Queue = Queue()
+        rg._process_cached_request(
+            rqueue=rqueue,
+            prompt="x",
+            images=None,
+            args=server.GenerationArguments(),
+            prompt_tokens=1,
+            prompt_cache_state=SimpleNamespace(),
+        )
+        return self._final_token(rqueue)
+
+    def test_engaged_request_reports_counters(self, monkeypatch):
+        drafter = SimpleNamespace(
+            speculative_total_rounds=10,
+            speculative_total_accepted=20.0,
+            speculative_total_drafted=30,
+        )
+
+        def fake_stream_generate(**kwargs):
+            # The inline round loop bumps the drafter's lifetime counters
+            # (_record_speculative_round); simulate 3 rounds / 7 drafted / 5
+            # accepted happening during this request.
+            drafter.speculative_total_rounds += 3
+            drafter.speculative_total_accepted += 5.0
+            drafter.speculative_total_drafted += 7
+            yield SimpleNamespace(
+                token=1, text="x", logprobs=None, finish_reason="stop", peak_memory=0.0
+            )
+
+        tok = self._run(self._rg(drafter), fake_stream_generate, monkeypatch)
+        assert tok.draft_kind == "mtp"
+        assert tok.draft_rounds == 3
+        assert tok.draft_n == 7
+        assert tok.draft_n_accepted == 5
+
+    def test_wired_but_zero_rounds_reports_none(self, monkeypatch):
+        # Same null-not-zero semantics as the batched path: a request that
+        # wired a drafter but ran no rounds (e.g. the ar.py processor fallback
+        # dropped to plain decode) reports None everywhere, so a tripwire
+        # reads it as NOT engaged.
+        drafter = SimpleNamespace(
+            speculative_total_rounds=10,
+            speculative_total_accepted=20.0,
+            speculative_total_drafted=30,
+        )
+
+        def fake_stream_generate(**kwargs):
+            yield SimpleNamespace(
+                token=1, text="x", logprobs=None, finish_reason="stop", peak_memory=0.0
+            )
+
+        tok = self._run(self._rg(drafter), fake_stream_generate, monkeypatch)
+        assert tok.draft_kind is None
+        assert tok.draft_rounds is None
+        assert tok.draft_n is None
+        assert tok.draft_n_accepted is None
+
+    def test_no_drafter_reports_none(self, monkeypatch):
+        def fake_stream_generate(**kwargs):
+            yield SimpleNamespace(
+                token=1, text="x", logprobs=None, finish_reason="stop", peak_memory=0.0
+            )
+
+        tok = self._run(self._rg(), fake_stream_generate, monkeypatch)
+        assert tok.draft_kind is None
+        assert tok.draft_rounds is None
+        assert tok.draft_n is None
+        assert tok.draft_n_accepted is None
 
 
 class TestStreamingChatThinkingStateSelection:
