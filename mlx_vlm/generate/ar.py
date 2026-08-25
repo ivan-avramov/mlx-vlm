@@ -194,9 +194,15 @@ def _suffix_structured_fallback(draft_kind, logits_processors, processors=None) 
     ``logits_processors``); when supplied it is the authoritative signal. The
     two-arg form (``logits_processors`` only) is kept for backward compatibility.
     An n-gram drafter is grammar-blind anyway, so there's no speedup to lose.
-    Other drafter kinds are unaffected here (gated elsewhere).
+
+    mtp joined the inline speculative path in O40 and its round loop is
+    processor-blind the same way (``run_speculative_rounds`` never applies
+    them), so it is gated here identically — the name predates that. Without
+    this, an inline mtp request with an active penalty SPECULATED and silently
+    dropped the penalty's effect on the distribution. Batched-only drafter
+    kinds (eagle3/dflash) are unaffected here (gated elsewhere).
     """
-    if draft_kind != "suffix":
+    if draft_kind not in ("suffix", "mtp"):
         return False
     if processors:
         return True

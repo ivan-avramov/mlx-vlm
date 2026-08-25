@@ -785,16 +785,23 @@ def test_suffix_structured_fallback():
     # no grammar -> speculate
     assert _suffix_structured_fallback("suffix", None) is False
     assert _suffix_structured_fallback("suffix", []) is False
-    # other drafter kinds are not gated here
+    # mtp runs the same processor-blind inline speculative path as suffix
+    # (O40), so it falls back under processors the same way. The earlier
+    # expectation here (False) certified the silently-dropped-penalty hole:
+    # ar.py's gate let mtp speculate past active processors.
+    assert _suffix_structured_fallback("mtp", [object()]) is True
+    assert _suffix_structured_fallback("mtp", None) is False
+    assert _suffix_structured_fallback("mtp", None, [object()]) is True
+    assert _suffix_structured_fallback("mtp", None, []) is False
+    # batched-only drafter kinds are not gated here
     assert _suffix_structured_fallback("dflash", [object()]) is False
-    assert _suffix_structured_fallback("mtp", [object()]) is False
     assert _suffix_structured_fallback(None, [object()]) is False
     # NEW: any active processor (penalties/bias built into the combined
     # `processors` list) also forces fallback so it isn't silently dropped.
     assert _suffix_structured_fallback("suffix", None, [object()]) is True
     assert _suffix_structured_fallback("suffix", None, []) is False
     assert _suffix_structured_fallback("suffix", None, None) is False
-    # non-suffix drafters remain ungated even with processors present
+    # batched-only drafters remain ungated even with processors present
     assert _suffix_structured_fallback("dflash", None, [object()]) is False
     # processors takes precedence as the authoritative signal
     assert _suffix_structured_fallback("suffix", [], [object()]) is True
