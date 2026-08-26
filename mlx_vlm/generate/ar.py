@@ -20,7 +20,13 @@ from ..kv_quant import from_legacy as kv_quant_from_legacy
 from ..models import cache
 from ..models.epicache import EpiCacheKVCache  # Fork: EpiCache is fork-only
 from ..prompt_utils import apply_chat_template
-from ..sample_utils import make_logits_processors, make_sampler, top_p_sampling
+from ..sample_utils import (  # Fork (C26): apply_* feed _PositionedTargetSampler._filter
+    apply_min_p,
+    apply_top_k,
+    apply_top_p,
+    make_logits_processors,
+    make_sampler,
+)
 from ..speculative.utils import (
     make_speculative_prompt_cache,
     run_speculative_rounds,
@@ -103,17 +109,56 @@ def _position_keys(
 
 
 class _PositionedTargetSampler:
-    """Sampler with stateless target draws keyed by generated-token position."""
+    # Fork (C26): widened from upstream's top_p-only copy to the full
+    # top_p / min_p / top_k filter chain (same order as `sample_utils.
+    # make_sampler`) and DE-DUPLICATED — `server/generation.py` now imports
+    # THIS class instead of carrying a second copy. Two drifted twins were the
+    # root cause of C26: the narrow copy here forced `generate_step`'s seeded
+    # branch to exclude top_k/min_p, so every deployed profile (top_k=20)
+    # silently fell into unseeded `make_sampler` and the request seed was
+    # dropped. Upstream's `_sample_top_p_one` is superseded by `_filter`
+    # (recorded in .symbol-exclusions, same ruling as the server copy).
+    """Sampler with stateless target draws keyed by generated-token position.
 
-    def __init__(self, *, temperature: float, top_p: float, seed: int):
+    Applies top_p / min_p / top_k filtering on the full [B, vocab] batch, then
+    draws per row with a position-keyed RNG so draws are reproducible by
+    (seed, row_id, position) and invariant to how rows are grouped into batches.
+    """
+
+    def __init__(
+        self,
+        *,
+        temperature: float,
+        top_p: float,
+        seed: Optional[int],
+        top_k: int = 0,
+        min_p: float = 0.0,
+    ):
         self.temperature = float(temperature)
         self.top_p = float(top_p)
-        self.seed = int(seed)
+        self.top_k = int(top_k)
+        self.min_p = float(min_p)
+        # 0 mirrors dispatch.DEFAULT_SEED, which cannot be imported here
+        # (dispatch imports this module).
+        self.seed = 0 if seed is None else int(seed)
+
+    def _filter(self, logprobs: mx.array) -> mx.array:
+        # No active filter -> return unchanged so the default path stays
+        # byte-identical to a plain categorical draw.
+        if not (0.0 < self.top_p < 1.0 or self.min_p != 0.0 or self.top_k > 0):
+            return logprobs
+        if logprobs.dtype == mx.bfloat16:
+            logprobs = logprobs.astype(mx.float32)
+        if 0.0 < self.top_p < 1.0:
+            logprobs = apply_top_p(logprobs, self.top_p)
+        if self.min_p != 0.0:
+            logprobs = apply_min_p(logprobs, self.min_p)
+        if self.top_k > 0:
+            logprobs = apply_top_k(logprobs, self.top_k)
+        return logprobs
 
     def __call__(self, logprobs: mx.array) -> mx.array:
-        if self.top_p > 0 and self.top_p < 1.0:
-            return top_p_sampling(logprobs, self.top_p, self.temperature)
-        return mx.random.categorical(logprobs * (1 / self.temperature))
+        return mx.random.categorical(self._filter(logprobs) * (1 / self.temperature))
 
     def sample_target(
         self,
@@ -132,27 +177,11 @@ class _PositionedTargetSampler:
         # request's declared seed. Omitting it (the default) reproduces the
         # prior single-shared-seed behavior byte-for-byte.
         keys = _position_keys(self.seed if seeds is None else seeds, row_ids, positions)
-        if self.top_p > 0 and self.top_p < 1.0:
-            return mx.vmap(self._sample_top_p_one, in_axes=(0, 0))(logprobs, keys)
+        logprobs = self._filter(logprobs)
         return mx.vmap(self._sample_one, in_axes=(0, 0))(logprobs, keys)
 
     def _sample_one(self, logprobs: mx.array, key: mx.array) -> mx.array:
         return mx.random.categorical(logprobs * (1 / self.temperature), key=key)
-
-    def _sample_top_p_one(self, logprobs: mx.array, key: mx.array) -> mx.array:
-        if logprobs.dtype == mx.bfloat16:
-            logprobs = logprobs.astype(mx.float32)
-        probs = mx.softmax(logprobs / self.temperature, axis=-1)
-        sorted_indices = mx.argsort(probs, axis=-1)
-        sorted_probs = mx.take_along_axis(probs, sorted_indices, axis=-1)
-        cumulative_probs = mx.cumsum(sorted_probs, axis=-1)
-        top_probs = mx.where(
-            cumulative_probs > 1 - self.top_p,
-            sorted_probs,
-            mx.zeros_like(sorted_probs),
-        )
-        sampled_pos = mx.random.categorical(mx.log(top_probs), key=key)
-        return mx.take_along_axis(sorted_indices, sampled_pos[..., None], axis=-1)[0]
 
 
 def _generate_module_override(name: str, fallback):
@@ -347,11 +376,14 @@ def generate_step(
 
     sampler_is_greedy = sampler is None and temperature == 0
     if sampler is None:
+        # Fork (C26): the guard once also required min_p/top_k at defaults —
+        # with every deployed profile setting top_k: 20 the seeded branch was
+        # unreachable and request seeds were silently dropped. The sampler now
+        # carries the full top_p/min_p/top_k chain; only the knobs it still
+        # lacks (top_n_sigma, p_less, typical_p) force the unseeded fallback.
         if (
             seed is not None
             and temperature > 0
-            and min_p == DEFAULT_MIN_P
-            and top_k == DEFAULT_TOP_K
             and top_n_sigma == DEFAULT_TOP_N_SIGMA
             and not p_less
             and typical_p == 1.0
@@ -360,6 +392,8 @@ def generate_step(
                 temperature=temperature,
                 top_p=top_p,
                 seed=seed,
+                top_k=top_k,
+                min_p=min_p,
             )
         else:
             sampler = _generate_module_override("make_sampler", make_sampler)(

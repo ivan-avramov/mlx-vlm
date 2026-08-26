@@ -27,6 +27,7 @@
 # --- mlx_vlm/convert.py
 
 # --- mlx_vlm/generate/ar.py
+mlx_vlm/generate/ar.py::_sample_top_p_one  # REVIEWED 2026-08-26 (C26): superseded, not dropped. Same ruling as the server/generation.py entry below: _PositionedTargetSampler was widened to the _filter() chain (top_p/min_p/top_k, sample_utils order) and the two twins de-duplicated — server/generation.py now imports this class. The narrow twin's top_k/min_p gap is what made generate_step's seeded guard unreachable on deployed profiles (request seeds silently dropped).
 
 # --- mlx_vlm/generate/diffusion.py
 

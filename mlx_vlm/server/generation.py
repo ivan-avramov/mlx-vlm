@@ -52,10 +52,7 @@ from ..prompt_utils import (  # Fork: fork-only, the THINKING_FORMATS registry (
     prewarm_special_token_encodes,
     prompt_is_inside_thinking,
 )
-from ..sample_utils import (  # Fork: apply_min_p/top_k/top_p for _PositionedTargetSampler._filter; upstream imports only make_* + top_p_sampling
-    apply_min_p,
-    apply_top_k,
-    apply_top_p,
+from ..sample_utils import (  # Fork (C26): apply_* moved with _PositionedTargetSampler to generate/ar.py
     make_logits_processors,
     make_sampler,
 )
@@ -345,103 +342,18 @@ def _run_chunked_speculative_prefill(
     return out, remaining_input_ids
 
 
-def _position_seed(seed: int, row_id: int, position: int) -> int:
-    x = (int(seed) ^ 0x9E3779B9) & 0xFFFFFFFF
-    x = (x + (int(row_id) + 1) * 0x85EBCA6B) & 0xFFFFFFFF
-    x = (x ^ ((int(position) + 1) * 0xC2B2AE35)) & 0xFFFFFFFF
-    x ^= x >> 16
-    x = (x * 0x7FEB352D) & 0xFFFFFFFF
-    x ^= x >> 15
-    return int(x & 0xFFFFFFFF)
-
-
-def _position_keys(
-    seeds: Union[int, List[int]], row_ids: List[int], positions: List[int]
-) -> mx.array:
-    # Fork (O30): ``seeds`` may be a single value broadcast across every row
-    # (the original, still-default behavior) or a per-row list, so continuous
-    # batching can key each row's draw by ITS OWN declared seed instead of
-    # the batch's first request's seed.
-    seed_seq = seeds if isinstance(seeds, (list, tuple)) else [seeds] * len(row_ids)
-    return mx.stack(
-        [
-            mx.random.key(_position_seed(seed, row, pos))
-            for seed, row, pos in zip(seed_seq, row_ids, positions)
-        ]
-    )
-
-
-class _PositionedTargetSampler:
-    # Fork: see the docstring below — a marker has to be a COMMENT, a docstring
-    # saying "Fork:" does not satisfy check_fork_markers.py. Upstream's
-    # `_sample_top_p_one` is gone on purpose (superseded by `_filter`, a strict
-    # superset) and is recorded in .symbol-exclusions with that reason.
-    """Server sampler with stateless target draws for ragged verification.
-
-    Fork: upstream's copy applies top_p only. This one applies top_p / min_p /
-    top_k filtering (same chain order as `sample_utils.make_sampler`), which is why
-    `_make_sampler` passes those through here rather than dropping them.
-
-    Applies the filters on the full [B, vocab] batch, then draws per
-    row with a position-keyed RNG so draws are reproducible by
-    (seed, row_id, position) and invariant to how rows are grouped into batches.
-    """
-
-    def __init__(
-        self,
-        *,
-        temperature: float,
-        top_p: float,
-        seed: Optional[int],
-        top_k: int = 0,
-        min_p: float = 0.0,
-    ):
-        self.temperature = float(temperature)
-        self.top_p = float(top_p)
-        self.top_k = int(top_k)
-        self.min_p = float(min_p)
-        self.seed = DEFAULT_SEED if seed is None else int(seed)
-
-    def _filter(self, logprobs: mx.array) -> mx.array:
-        # No active filter -> return unchanged so the default path stays
-        # byte-identical to a plain categorical draw.
-        if not (0.0 < self.top_p < 1.0 or self.min_p != 0.0 or self.top_k > 0):
-            return logprobs
-        if logprobs.dtype == mx.bfloat16:
-            logprobs = logprobs.astype(mx.float32)
-        if 0.0 < self.top_p < 1.0:
-            logprobs = apply_top_p(logprobs, self.top_p)
-        if self.min_p != 0.0:
-            logprobs = apply_min_p(logprobs, self.min_p)
-        if self.top_k > 0:
-            logprobs = apply_top_k(logprobs, self.top_k)
-        return logprobs
-
-    def __call__(self, logprobs: mx.array) -> mx.array:
-        return mx.random.categorical(self._filter(logprobs) * (1 / self.temperature))
-
-    def sample_target(
-        self,
-        logprobs: mx.array,
-        *,
-        row_ids: List[int],
-        positions: List[int],
-        seeds: Optional[List[int]] = None,
-    ) -> mx.array:
-        if logprobs.shape[0] != len(row_ids) or len(row_ids) != len(positions):
-            raise ValueError("row_ids and positions must match logprobs batch size.")
-        if seeds is not None and len(seeds) != len(row_ids):
-            raise ValueError("seeds must match logprobs batch size.")
-        # Fork (O30): an explicit per-row seeds= overrides self.seed row by
-        # row, so continuous batching can key each row's draw by its own
-        # request's declared seed. Omitting it (the default) reproduces the
-        # prior single-shared-seed behavior byte-for-byte.
-        keys = _position_keys(self.seed if seeds is None else seeds, row_ids, positions)
-        logprobs = self._filter(logprobs)
-        return mx.vmap(self._sample_one, in_axes=(0, 0))(logprobs, keys)
-
-    def _sample_one(self, logprobs: mx.array, key: mx.array) -> mx.array:
-        return mx.random.categorical(logprobs * (1 / self.temperature), key=key)
+# Fork (C26): _position_seed/_position_keys/_PositionedTargetSampler are
+# DE-DUPLICATED into generate/ar.py — this module carried a drifted twin of the
+# ar copy, and the drift (ar's twin lacking top_k/min_p) is what made
+# generate_step's seeded guard unreachable on every deployed profile, silently
+# dropping request seeds (C26). One definition, imported here, keeps the two
+# serving paths distributionally identical by construction. The names stay
+# bound in this module for existing importers and the dropped-upstream guard.
+from ..generate.ar import (  # noqa: E402  Fork (C26): see de-duplication note above
+    _PositionedTargetSampler,
+    _position_keys,
+    _position_seed,
+)
 
 
 def _sample_last_token(
