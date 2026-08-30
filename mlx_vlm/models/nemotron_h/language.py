@@ -11,7 +11,9 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import ArraysCache, KVCache
-from ..recurrent_rollback import RecurrentStateRollbackMixin  # Fork: MTP speculative-verify rollback contract (see recurrent_rollback.py docstring)
+from ..recurrent_rollback import (
+    RecurrentStateRollbackMixin,
+)  # Fork: MTP speculative-verify rollback contract (see recurrent_rollback.py docstring)
 from ..ssm import ssm_update
 from ..switch_layers import SwitchMLP
 from .config import ModelConfig

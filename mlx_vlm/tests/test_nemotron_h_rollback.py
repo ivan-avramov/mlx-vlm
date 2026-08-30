@@ -406,7 +406,9 @@ class TestRollbackErrorHandling:
         # loop) also happens to mention capture_recurrent_states, so a
         # looser match wouldn't actually distinguish "failed early and
         # clearly" from "failed late with a less specific message."
-        with pytest.raises(RuntimeError, match="verify ran without capture_recurrent_states"):
+        with pytest.raises(
+            RuntimeError, match="verify ran without capture_recurrent_states"
+        ):
             model.rollback_speculative_cache(
                 cache, None, accepted=0, block_size=BLOCK_SIZE
             )
