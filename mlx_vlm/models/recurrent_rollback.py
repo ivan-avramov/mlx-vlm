@@ -3,8 +3,8 @@
 Fork-only module -- upstream has no MTP speculative decoding at all, so there is
 no upstream counterpart to diverge from or stay in sync with.
 
-Why this lives here and not in a model file
---------------------------------------------
+Why this lives here and not in ``models/nemotron_h/language.py``
+------------------------------------------------------------------
 ``mlx_vlm/speculative/mtp.py`` defines a contract every MTP-capable target
 ``LanguageModel`` must implement: ``speculative_verify_logits``,
 ``speculative_verify_hidden``, ``speculative_logits_from_hidden``,
@@ -16,26 +16,51 @@ interleaved with plain attention KV layers -- most of this contract is
 architecture-agnostic: how you slice ``accepted``/``block_size``, how you trim
 a trimmable KV cache, how you fail loud when a batch can't be rolled back
 exactly. Only *producing* the per-position recurrent-state snapshots requires
-reaching into the model's own forward pass.
+reaching into the model's own forward pass, and only re-applying the model's
+final norm (see ``speculative_final_norm`` below) is architecture-specific.
 
 Putting the reusable half in this mixin -- rather than duplicating it inside
 ``mlx_vlm/models/nemotron_h/language.py`` -- means a future upstream sync of
 that file only has to reconcile the couple of small ``# Fork:`` hunks that
 call into this module, not a few hundred lines of rollback logic. It also
 means the next hybrid-recurrent model (mamba2 or otherwise) that wants this
-contract can mix this class in directly instead of re-deriving it.
+contract can mix this class in directly instead of re-deriving it. It lives
+under ``mlx_vlm/models/`` (an otherwise-empty package, so no import-cycle risk)
+rather than under ``mlx_vlm/speculative/`` because ``speculative/__init__.py``
+pulls in the drafter registry, and a drafter (``nemotron_h_mtp``) imports
+*from* ``models/nemotron_h/language.py`` -- so a model file importing anything
+under ``speculative/`` risks a cycle the moment that registry starts eagerly
+importing drafters.
 
-Unlike qwen3_5's GatedDeltaNet, nemotron_h's mamba2 mixer keeps its
-(conv_state, ssm_state) update in a plain Python loop over ``_conv``/``_ssm``
-(see ``models/ssm.py:ssm_attn`` -- an exact, chunk-size-invariant scan, not an
-approximation). That means there is no need for a specialized verify-time
-kernel that exposes intermediate per-position states the way qwen3_5's fused
-GDN kernel does: replaying a (tiny, <=~4-token) verify block one position at a
-time through the model's own ``__call__`` against the same evolving cache
-already produces the exact per-position ``(conv_state, ssm_state)``, because
-that is bit-for-bit what a normal one-token-at-a-time decode does. The model
-side of that (``mlx_vlm/models/nemotron_h/language.py``'s ``recurrent_sink``
-plumbing) just drives that replay and hands the snapshots back here.
+Why replaying the verify block one token at a time is exact
+-------------------------------------------------------------
+Unlike qwen3_5's GatedDeltaNet, nemotron_h's mamba2 mixer has no dedicated
+verify-time kernel that exposes intermediate per-position states. Instead,
+``models/ssm.py:ssm_update`` already dispatches, per call, either an exact
+chunked scan (``ssm_attn``, used whenever ``seq_len > 1``, or off-GPU, or with
+no prior state) or -- for a single new token against existing state, on GPU
+with Metal available -- a dedicated single-step ``ssm_update_kernel``
+(``models/ssm.py`` ~211-232). Both of those are exactly what ordinary
+one-token-at-a-time decoding already uses; nothing is special-cased for
+verify. So replaying a (tiny, <=~4-token) verify block one position at a time
+through the model's own ``__call__`` against the same evolving cache runs the
+IDENTICAL code path -- and, on GPU, the identical kernel -- that a normal
+decode step would, rather than some alternate "replay" algorithm that merely
+happens to agree with it. THAT structural identity, not chunk-size invariance
+per se, is why the captured ``(conv_state, ssm_state)`` after each replayed
+position is exact: ``ssm_attn``'s chunked scan is in fact chunk-invariant too,
+but that isn't load-bearing here, because the replay never runs it at
+width > 1. The model side of this
+(``mlx_vlm/models/nemotron_h/language.py``'s ``recurrent_sink`` plumbing)
+just drives the replay and hands the snapshots back here.
+
+Note: this fork's CPU-pinned test suite
+(``mlx_vlm/tests/test_nemotron_h_rollback.py``) only exercises the
+``ssm_attn`` chunked-scan branch -- CPU never dispatches
+``ssm_update_kernel`` (see the ``seq_len``/device guard in
+``models/ssm.py:ssm_update``). GPU-kernel-path exactness for this replay is
+therefore unverified by that suite and would need a GPU-side check to
+confirm.
 """
 
 from typing import Any, List, Optional, Sequence, Union
@@ -76,12 +101,32 @@ class RecurrentStateRollbackMixin:
         at non-recurrent-layer positions, and at each recurrent-layer position
         a list of ``(conv_state, ssm_state)`` snapshots, one per input
         position, captured under ``capture_recurrent_states=True``;
-      * exposes a plain ``self.lm_head`` linear/callable for
-        ``speculative_logits_from_hidden``.
+      * returns a *pre-final-norm* hidden state from that call (nemotron_h's
+        ``hidden_sink`` does, deliberately -- the MTP drafter needs pre-norm
+        hidden too), and exposes a plain ``self.lm_head`` linear/callable, so
+        this mixin's own ``speculative_logits_from_hidden`` must re-apply the
+        final norm itself via ``speculative_final_norm`` (identity by
+        default) before calling ``lm_head`` -- override it when the host's
+        hidden_sink is pre-norm, matching the model's real
+        ``lm_head(final_norm(hidden))`` logits.
     """
 
+    def speculative_final_norm(self, hidden: mx.array) -> mx.array:
+        """Applied to a pre-final-norm hidden before ``lm_head`` below.
+
+        Identity by default (matches a host whose ``hidden_sink`` is already
+        post-norm, e.g. qwen3_5). A host that captures PRE-norm hidden (e.g.
+        nemotron_h, whose drafter needs the pre-norm state) must override
+        this to apply its own final norm -- otherwise
+        ``speculative_logits_from_hidden``/``speculative_argmax_from_hidden``
+        silently diverge from the model's real ``lm_head(final_norm(hidden))``
+        logits, corrupting MTP's target-token sampling and acceptance
+        comparison.
+        """
+        return hidden
+
     def speculative_logits_from_hidden(self, hidden: mx.array) -> mx.array:
-        return self.lm_head(hidden)
+        return self.lm_head(self.speculative_final_norm(hidden))
 
     def speculative_argmax_from_hidden(self, hidden: mx.array) -> mx.array:
         return mx.argmax(self.speculative_logits_from_hidden(hidden), axis=-1)
@@ -162,6 +207,30 @@ class RecurrentStateRollbackMixin:
             )
         trim = block_size - n
         batch_size = len(accepted_list)
+
+        # Fork: fail EARLY and by NAME when the caller never captured
+        # recurrent state at all, rather than letting the loop below raise a
+        # per-cache-index "missing snapshot" error on whichever recurrent
+        # layer happens to be enumerated first. `states is None` means verify
+        # ran without `capture_recurrent_states` -- which currently only
+        # happens for a non-mtp draft_kind (dflash/eagle3/suffix), none of
+        # which route through this mixin's `speculative_verify_hidden`/
+        # `_logits`. `hasattr(lm, "rollback_speculative_cache")` alone can't
+        # tell mtp.py's callers that up front, so this has to be the backstop.
+        if states is None and any(
+            c is not None and _is_recurrent_cache(c) for c in caches
+        ):
+            raise RuntimeError(
+                "rollback_speculative_cache: called with states=None, but "
+                "this target has recurrent (mamba2) cache layers that need "
+                "per-position state to roll back. verify ran without "
+                "capture_recurrent_states -- this target only supports "
+                "draft_kind=mtp (whose verify calls "
+                "speculative_verify_hidden/_logits with "
+                "capture_recurrent_states=True); other draft kinds "
+                "(dflash/eagle3/suffix) cannot use nemotron_h as an "
+                "MTP-style rollback target."
+            )
 
         for idx, cache_entry in enumerate(caches):
             if cache_entry is None:

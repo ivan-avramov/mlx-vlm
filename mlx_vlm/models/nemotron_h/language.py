@@ -11,16 +11,10 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import ArraysCache, KVCache
+from ..recurrent_rollback import RecurrentStateRollbackMixin  # Fork: MTP speculative-verify rollback contract (see recurrent_rollback.py docstring)
 from ..ssm import ssm_update
 from ..switch_layers import SwitchMLP
 from .config import ModelConfig
-
-# Fork: mixin providing the MTP speculative-verify rollback contract
-# (rollback_speculative_cache / speculative_verify_logits / _hidden /
-# speculative_logits_from_hidden / speculative_argmax_from_hidden). See
-# mlx_vlm/speculative/recurrent_rollback.py for why this generic logic lives
-# outside this upstream-owned file.
-from ...speculative.recurrent_rollback import RecurrentStateRollbackMixin
 
 
 class MambaRMSNormGated(nn.Module):
@@ -475,20 +469,40 @@ class NemotronHModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
+        # Fork: shared tail for every exit path below (`hidden_sink`/
+        # `skip_final_norm` support the MTP speculative drafter
+        # (nemotron_h_mtp), which needs the pre-final-norm hidden state --
+        # the target's `norm_f` is a SEPARATE parameter from the MTP head's
+        # own `final_layernorm`, so capturing post-norm hidden here would
+        # double-normalize whatever the drafter feeds forward. Mirrors the
+        # `hidden_sink`/`skip_final_norm` contract other MTP-capable
+        # backbones (deepseek_v4, qwen3_5) already expose. Factored into a
+        # closure so the recursive `recurrent_sink` branch just below doesn't
+        # have to duplicate it.
+        def _finish(hidden_states):
+            if hidden_sink is not None:
+                hidden_sink.append(hidden_states)
+            if skip_final_norm:
+                return hidden_states
+            return self.norm_f(hidden_states)
+
         # Fork: `recurrent_sink` drives the MTP speculative-verify rollback
-        # contract (mlx_vlm/speculative/recurrent_rollback.py). Mamba2's
-        # chunked scan (_conv/_ssm below, via models/ssm.py's `ssm_attn`) only
-        # exposes each ArraysCache-backed layer's state AFTER the whole call,
-        # but rollback needs the state after EACH position of the verify
-        # block. `ssm_attn`'s scan is an exact, chunk-size-invariant
-        # algorithm (not an approximation), so replaying the block one
-        # position at a time through this SAME `__call__` -- against the
-        # SAME, evolving `cache` -- reproduces exactly what a normal
-        # one-token-at-a-time decode would leave in each layer's cache.
-        # Verify blocks are tiny (<=~4 tokens per MTP round), so this
-        # per-position Python recursion is cheap; the scan kernel itself is
-        # untouched. See the per-layer capture a few lines into the loop
-        # below for where each snapshot actually gets read.
+        # contract (mlx_vlm/models/recurrent_rollback.py). Mamba2's per-call
+        # state update (_conv/_ssm below, via models/ssm.py's `ssm_update`)
+        # only exposes each ArraysCache-backed layer's state AFTER the whole
+        # call, but rollback needs the state after EACH position of the
+        # verify block. Replaying the block one position at a time through
+        # this SAME `__call__` -- against the SAME, evolving `cache` --
+        # reproduces exactly what a normal one-token-at-a-time decode would
+        # leave in each layer's cache, because it runs the IDENTICAL code
+        # path (and, on GPU, the identical kernel) a normal decode step does
+        # -- see recurrent_rollback.py's module docstring for why that
+        # structural identity, not chunk-size invariance, is the actual
+        # source of exactness. Verify blocks are tiny (<=~4 tokens per MTP
+        # round), so this per-position Python recursion is cheap; the scan/
+        # kernel dispatch itself is untouched. See the per-layer capture a
+        # few lines into the loop below for where each snapshot actually
+        # gets read.
         if recurrent_sink is not None and hidden_states.shape[1] > 1:
             steps = [
                 self(
@@ -499,12 +513,7 @@ class NemotronHModel(nn.Module):
                 )
                 for t in range(hidden_states.shape[1])
             ]
-            hidden_states = mx.concatenate(steps, axis=1)
-            if hidden_sink is not None:
-                hidden_sink.append(hidden_states)
-            if skip_final_norm:
-                return hidden_states
-            return self.norm_f(hidden_states)
+            return _finish(mx.concatenate(steps, axis=1))
 
         has_attention = any(layer.block_type == "*" for layer in self.layers)
         has_mamba = any(layer.block_type == "M" for layer in self.layers)
@@ -540,19 +549,7 @@ class NemotronHModel(nn.Module):
                     recurrent_sink[idx] = []
                 recurrent_sink[idx].append((c[0], c[1]))
 
-        # Fork: `hidden_sink`/`skip_final_norm` support the MTP speculative
-        # drafter (nemotron_h_mtp), which needs the pre-final-norm hidden
-        # state -- the target's `norm_f` is a SEPARATE parameter from the
-        # MTP head's own `final_layernorm`, so capturing post-norm hidden
-        # here would double-normalize whatever the drafter feeds forward.
-        # Mirrors the `hidden_sink`/`skip_final_norm` contract other
-        # MTP-capable backbones (deepseek_v4, qwen3_5) already expose.
-        if hidden_sink is not None:
-            hidden_sink.append(hidden_states)
-
-        if skip_final_norm:
-            return hidden_states
-        return self.norm_f(hidden_states)
+        return _finish(hidden_states)
 
 
 class Model(nn.Module):
@@ -652,7 +649,7 @@ class LanguageModel(RecurrentStateRollbackMixin, nn.Module):
 
         # Fork: `capture_recurrent_states` is the other half of the MTP
         # speculative-verify rollback contract
-        # (speculative/recurrent_rollback.py's RecurrentStateRollbackMixin,
+        # (models/recurrent_rollback.py's RecurrentStateRollbackMixin,
         # mixed into this class above). It asks the backbone to record every
         # mamba2 layer's (conv_state, ssm_state) after each position of this
         # call, aligned index-for-index with `cache`, so
@@ -682,6 +679,16 @@ class LanguageModel(RecurrentStateRollbackMixin, nn.Module):
             shared_kv_states={} if return_shared_kv else None,
             gdn_states=recurrent_sink,
         )
+
+    # Fork: RecurrentStateRollbackMixin's speculative_logits_from_hidden
+    # calls this before lm_head. hidden_sink (above) deliberately captures
+    # PRE-norm_f hidden -- the MTP drafter needs it -- but the model's real
+    # logits are lm_head(norm_f(hidden)) (see Model.__call__ above). Without
+    # this override, speculative_logits_from_hidden/_argmax_from_hidden
+    # would silently use un-normed hidden, diverging from the real forward
+    # and corrupting MTP's target-token sampling and acceptance comparison.
+    def speculative_final_norm(self, hidden: mx.array) -> mx.array:
+        return self.backbone.norm_f(hidden)
 
     def sanitize(self, weights):
         return Model.sanitize(self, weights)
