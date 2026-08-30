@@ -15,6 +15,13 @@ from ..ssm import ssm_update
 from ..switch_layers import SwitchMLP
 from .config import ModelConfig
 
+# Fork: mixin providing the MTP speculative-verify rollback contract
+# (rollback_speculative_cache / speculative_verify_logits / _hidden /
+# speculative_logits_from_hidden / speculative_argmax_from_hidden). See
+# mlx_vlm/speculative/recurrent_rollback.py for why this generic logic lives
+# outside this upstream-owned file.
+from ...speculative.recurrent_rollback import RecurrentStateRollbackMixin
+
 
 class MambaRMSNormGated(nn.Module):
     def __init__(self, hidden_size: int, eps: float, group_size: int):
@@ -443,6 +450,7 @@ class NemotronHModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         hidden_sink: Optional[list] = None,
         skip_final_norm: bool = False,
+        recurrent_sink: Optional[list] = None,
     ):
         # Fork: upstream rejects both-supplied as well as neither-supplied
         # (`if (inputs is None) == (inputs_embeds is None)`). Only neither is
@@ -466,6 +474,38 @@ class NemotronHModel(nn.Module):
 
         if cache is None:
             cache = [None] * len(self.layers)
+
+        # Fork: `recurrent_sink` drives the MTP speculative-verify rollback
+        # contract (mlx_vlm/speculative/recurrent_rollback.py). Mamba2's
+        # chunked scan (_conv/_ssm below, via models/ssm.py's `ssm_attn`) only
+        # exposes each ArraysCache-backed layer's state AFTER the whole call,
+        # but rollback needs the state after EACH position of the verify
+        # block. `ssm_attn`'s scan is an exact, chunk-size-invariant
+        # algorithm (not an approximation), so replaying the block one
+        # position at a time through this SAME `__call__` -- against the
+        # SAME, evolving `cache` -- reproduces exactly what a normal
+        # one-token-at-a-time decode would leave in each layer's cache.
+        # Verify blocks are tiny (<=~4 tokens per MTP round), so this
+        # per-position Python recursion is cheap; the scan kernel itself is
+        # untouched. See the per-layer capture a few lines into the loop
+        # below for where each snapshot actually gets read.
+        if recurrent_sink is not None and hidden_states.shape[1] > 1:
+            steps = [
+                self(
+                    inputs_embeds=hidden_states[:, t : t + 1],
+                    cache=cache,
+                    skip_final_norm=True,
+                    recurrent_sink=recurrent_sink,
+                )
+                for t in range(hidden_states.shape[1])
+            ]
+            hidden_states = mx.concatenate(steps, axis=1)
+            if hidden_sink is not None:
+                hidden_sink.append(hidden_states)
+            if skip_final_norm:
+                return hidden_states
+            return self.norm_f(hidden_states)
+
         has_attention = any(layer.block_type == "*" for layer in self.layers)
         has_mamba = any(layer.block_type == "M" for layer in self.layers)
         attn_cache = cache[self.fa_idx] if has_attention else None
@@ -486,6 +526,19 @@ class NemotronHModel(nn.Module):
             else:
                 mask = ssm_mask
             hidden_states = layer(hidden_states, mask=mask, cache=c)
+
+            # Fork: record this mamba layer's post-step (conv_state,
+            # ssm_state) for the caller's `recurrent_sink` (see the
+            # recursive branch above -- this loop only ever runs one
+            # position at a time when `recurrent_sink` is not None).
+            # Reading it straight off `c` after the mixer call keeps this
+            # in lockstep with whatever `_conv`/`_ssm` actually stored, with
+            # no duplicated state logic here.
+            if recurrent_sink is not None and layer.block_type == "M":
+                idx = cache_counter - 1
+                if recurrent_sink[idx] is None:
+                    recurrent_sink[idx] = []
+                recurrent_sink[idx].append((c[0], c[1]))
 
         # Fork: `hidden_sink`/`skip_final_norm` support the MTP speculative
         # drafter (nemotron_h_mtp), which needs the pre-final-norm hidden
@@ -557,7 +610,12 @@ class Model(nn.Module):
         return predicate
 
 
-class LanguageModel(nn.Module):
+# Fork: `RecurrentStateRollbackMixin` supplies the MTP speculative-verify
+# rollback contract (rollback_speculative_cache / speculative_verify_logits /
+# speculative_verify_hidden / speculative_logits_from_hidden /
+# speculative_argmax_from_hidden); see recurrent_rollback.py's module
+# docstring for why that logic lives outside this file.
+class LanguageModel(RecurrentStateRollbackMixin, nn.Module):
     def __init__(self, args: ModelConfig):
         super().__init__()
         self.args = args
@@ -592,18 +650,37 @@ class LanguageModel(nn.Module):
         if return_hidden and hidden_sink is None:
             hidden_sink = []
 
+        # Fork: `capture_recurrent_states` is the other half of the MTP
+        # speculative-verify rollback contract
+        # (speculative/recurrent_rollback.py's RecurrentStateRollbackMixin,
+        # mixed into this class above). It asks the backbone to record every
+        # mamba2 layer's (conv_state, ssm_state) after each position of this
+        # call, aligned index-for-index with `cache`, so
+        # `rollback_speculative_cache` can restore any accepted position
+        # exactly.
+        capture_recurrent_states = kwargs.pop("capture_recurrent_states", False)
+        recurrent_sink = None
+        if capture_recurrent_states:
+            if cache is None:
+                raise ValueError(
+                    "capture_recurrent_states requires an existing prompt_cache"
+                )
+            recurrent_sink = [None] * len(cache)
+
         out = self.backbone(
             inputs,
             cache=cache,
             inputs_embeds=inputs_embeds,
             hidden_sink=hidden_sink,
             skip_final_norm=skip_final_norm,
+            recurrent_sink=recurrent_sink,
         )
         logits = None if skip_logits else self.lm_head(out)
         return LanguageModelOutput(
             logits=logits,
             hidden_states=hidden_sink,
             shared_kv_states={} if return_shared_kv else None,
+            gdn_states=recurrent_sink,
         )
 
     def sanitize(self, weights):
