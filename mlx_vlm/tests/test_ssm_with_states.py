@@ -139,6 +139,44 @@ class TestOpsTwinMatchesLoopedSingleStep:
         ).item()
 
 
+class TestOpsTwinMask:
+    def test_false_position_freezes_state_and_zeroes_y(self):
+        """A masked-out (`mask == False`) position must carry the state
+        forward UNCHANGED and write `y == 0` there -- mirrors
+        `_gated_delta_with_states_ops`'s masked branch. `ssm_attn` (the
+        CPU dispatcher's chunked-scan path) has no equivalent masked-`y`
+        behavior, so this is checked against a hand-computed frozen state,
+        not against `ssm_update`/`ssm_attn`."""
+        b, t, h, dh, g, ds = 2, 4, 4, 8, 2, 16
+        x, A_log, B, C, D, dt, dt_bias, state0 = _random_inputs(
+            b, t, h, dh, g, ds, seed=55
+        )
+        dt_clipped = compute_dt(dt, dt_bias, TIME_STEP_LIMIT)
+
+        # Row 0: position 2 invalid. Row 1: fully valid (control).
+        mask = mx.array([[True, True, False, True], [True, True, True, True]])
+
+        y, final_state, states = _ssm_with_states_ops(
+            x, A_log, B, C, D, dt_clipped, state0, mask
+        )
+        mx.eval(y, final_state, states)
+
+        # Masked position: state frozen at the prior position's value,
+        # y zeroed.
+        assert mx.array_equal(states[0, 2], states[0, 1]).item()
+        assert mx.allclose(y[0, 2], mx.zeros_like(y[0, 2])).item()
+        # Un-masked positions still evolve normally (not frozen/zeroed).
+        assert not mx.array_equal(states[0, 1], states[0, 0]).item()
+        assert not mx.allclose(y[0, 1], mx.zeros_like(y[0, 1])).item()
+        # Control row (no masked positions) never freezes.
+        for pos in range(1, t):
+            assert not mx.array_equal(states[1, pos], states[1, pos - 1]).item()
+
+        # states[:, -1] still equals the final state even with a masked
+        # position earlier in the block.
+        assert mx.allclose(final_state, states[:, -1], rtol=1e-6, atol=1e-6).item()
+
+
 class TestDispatcherOnCPU:
     def test_ssm_update_with_states_matches_ops_twin_on_cpu(self):
         """`ssm_update_with_states` must route to the ops twin off-GPU (this
@@ -161,6 +199,29 @@ class TestDispatcherOnCPU:
         assert mx.array_equal(y_disp, y_ops).item()
         assert mx.array_equal(states_disp, states_ops).item()
         assert mx.array_equal(final_state_disp, final_state_ops).item()
+
+    def test_lengths_raises_not_implemented(self):
+        """`lengths` has no with-states counterpart (see
+        `ssm_update_with_states`'s docstring) -- must fail loud, not
+        silently ignore it."""
+        b, t, h, dh, g, ds = 1, 2, 4, 8, 2, 16
+        x, A_log, B, C, D, dt, dt_bias, state0 = _random_inputs(
+            b, t, h, dh, g, ds, seed=11
+        )
+        lengths = mx.array([t])
+        with pytest.raises(NotImplementedError, match="lengths"):
+            ssm_update_with_states(
+                x,
+                A_log,
+                B,
+                C,
+                D,
+                dt,
+                dt_bias,
+                state0,
+                TIME_STEP_LIMIT,
+                lengths=lengths,
+            )
 
     def test_state_none_starts_from_zeros(self):
         b, t, h, dh, g, ds = 1, 2, 4, 8, 2, 16
@@ -187,48 +248,52 @@ class TestDispatcherOnCPU:
 )
 class TestMetalKernelMatchesSingleStepKernel:
     def test_kernel_matches_ssm_update_kernel_applied_t_times(self):
+        previous_device = mx.default_device()
         mx.set_default_device(mx.gpu)
-        b, t, h, dh, g, ds = 2, 4, 4, 32, 2, 32
-        x, A_log, B, C, D, dt, dt_bias, state0 = _random_inputs(
-            b, t, h, dh, g, ds, seed=123
-        )
-
-        y_kernel, final_state_kernel, states_kernel = ssm_update_with_states(
-            x, A_log, B, C, D, dt, dt_bias, state0, TIME_STEP_LIMIT
-        )
-
-        state = state0
-        ys = []
-        states = []
-        for tt in range(t):
-            y_t, state = ssm_update_kernel(
-                x[:, tt : tt + 1],
-                A_log,
-                B[:, tt : tt + 1],
-                C[:, tt : tt + 1],
-                D,
-                dt[:, tt : tt + 1],
-                dt_bias,
-                state,
-                TIME_STEP_LIMIT,
+        try:
+            b, t, h, dh, g, ds = 2, 4, 4, 32, 2, 32
+            x, A_log, B, C, D, dt, dt_bias, state0 = _random_inputs(
+                b, t, h, dh, g, ds, seed=123
             )
-            ys.append(y_t)
-            states.append(state)
-        y_ref = mx.concatenate(ys, axis=1)
-        states_ref = mx.stack(states, axis=1)
-        final_state_ref = state
 
-        mx.eval(
-            y_kernel,
-            final_state_kernel,
-            states_kernel,
-            y_ref,
-            final_state_ref,
-            states_ref,
-        )
+            y_kernel, final_state_kernel, states_kernel = ssm_update_with_states(
+                x, A_log, B, C, D, dt, dt_bias, state0, TIME_STEP_LIMIT
+            )
 
-        assert mx.allclose(y_kernel, y_ref, rtol=1e-6, atol=1e-6).item()
-        assert mx.allclose(states_kernel, states_ref, rtol=1e-6, atol=1e-6).item()
-        assert mx.allclose(
-            final_state_kernel, final_state_ref, rtol=1e-6, atol=1e-6
-        ).item()
+            state = state0
+            ys = []
+            states = []
+            for tt in range(t):
+                y_t, state = ssm_update_kernel(
+                    x[:, tt : tt + 1],
+                    A_log,
+                    B[:, tt : tt + 1],
+                    C[:, tt : tt + 1],
+                    D,
+                    dt[:, tt : tt + 1],
+                    dt_bias,
+                    state,
+                    TIME_STEP_LIMIT,
+                )
+                ys.append(y_t)
+                states.append(state)
+            y_ref = mx.concatenate(ys, axis=1)
+            states_ref = mx.stack(states, axis=1)
+            final_state_ref = state
+
+            mx.eval(
+                y_kernel,
+                final_state_kernel,
+                states_kernel,
+                y_ref,
+                final_state_ref,
+                states_ref,
+            )
+
+            assert mx.allclose(y_kernel, y_ref, rtol=1e-6, atol=1e-6).item()
+            assert mx.allclose(states_kernel, states_ref, rtol=1e-6, atol=1e-6).item()
+            assert mx.allclose(
+                final_state_kernel, final_state_ref, rtol=1e-6, atol=1e-6
+            ).item()
+        finally:
+            mx.set_default_device(previous_device)

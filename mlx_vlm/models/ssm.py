@@ -97,21 +97,38 @@ def ssm_update_kernel(
     )
 
 
-def make_ssm_with_states_kernel():
+def make_ssm_with_states_kernel(has_mask: bool = False):
     """Same recurrence as `make_ssm_kernel`'s single-step body, looped over
     `T` positions inside one thread (state carried in a register across the
     loop) instead of one launch per position -- mirrors
     `qwen3_5/gated_delta.py:_make_gated_delta_with_states_kernel`. Emits the
     per-position state after every t (`states`) in addition to `out` and the
     final `state_out`, so a verify block no longer needs the caller to
-    replay the model one token at a time to observe intermediate state."""
+    replay the model one token at a time to observe intermediate state.
+
+    Template `NG` is the number of state groups (`B`/`C`'s group dim) --
+    named differently from `make_ssm_kernel`'s single-step `G` (which means
+    heads-per-group there, since with T==1 a flat batch*group index can be
+    derived directly) to avoid confusion now that heads-per-group is instead
+    derived inside the kernel (`H / NG`).
+
+    `has_mask=True` builds the masked variant (mirrors
+    `_make_gated_delta_with_states_kernel(has_mask=True)`, same
+    `mask[b_idx * T + t]` idiom): at an invalid (masked-out) position the
+    state update is skipped entirely (state carried forward unchanged),
+    `out` is written as 0 for that position, and `states` still records the
+    (unchanged) state -- so a caller can always read `states[:, t]`
+    regardless of validity.
+    """
     if not mx.metal.is_available():
         return None
-    source = """
+
+    mask_source = "mask[b_idx * T + t]" if has_mask else "true"
+    source = f"""
         auto n = thread_position_in_grid.z;
         auto b_idx = n / H;
         auto h_idx = n % H;
-        constexpr int heads_per_group = H / G;
+        constexpr int heads_per_group = H / NG;
         auto g_idx = h_idx / heads_per_group;
         constexpr int n_per_t = Ds / 32;
 
@@ -121,8 +138,8 @@ def make_ssm_with_states_kernel():
         auto x_ = X + (b_idx * T * H + h_idx) * Dh;
         auto out_ = out + (b_idx * T * H + h_idx) * Dh;
         auto dt_ = dt + b_idx * T * H + h_idx;
-        auto B_ = B + b_idx * T * G * Ds + g_idx * Ds;
-        auto C_ = C + b_idx * T * G * Ds + g_idx * Ds;
+        auto B_ = B + b_idx * T * NG * Ds + g_idx * Ds;
+        auto C_ = C + b_idx * T * NG * Ds + g_idx * Ds;
         auto states_ = states + (b_idx * T * H + h_idx) * Dh * Ds + d_idx * Ds;
 
         auto i_state = state_in + (n * Dh + d_idx) * Ds;
@@ -132,55 +149,64 @@ def make_ssm_with_states_kernel():
         auto D_h = static_cast<float>(D[h_idx]);
 
         float state[n_per_t];
-        for (int i = 0; i < n_per_t; ++i) {
+        for (int i = 0; i < n_per_t; ++i) {{
             auto s_idx = n_per_t * ds_idx + i;
             state[i] = static_cast<float>(i_state[s_idx]);
-        }
+        }}
 
-        for (int t = 0; t < T; ++t) {
-            auto dt_t = static_cast<float>(dt_[0]);
-            auto dA = fast::exp(A * dt_t);
-            auto x_t = static_cast<float>(x_[d_idx]);
+        for (int t = 0; t < T; ++t) {{
+            if ({mask_source}) {{
+                auto dt_t = static_cast<float>(dt_[0]);
+                auto dA = fast::exp(A * dt_t);
+                auto x_t = static_cast<float>(x_[d_idx]);
 
-            float acc = 0.0;
-            for (int i = 0; i < n_per_t; ++i) {
-                auto s_idx = n_per_t * ds_idx + i;
-                auto dB_by_x = x_t * dt_t * static_cast<float>(B_[s_idx]);
-                state[i] = dA * state[i] + dB_by_x;
-                acc += state[i] * C_[s_idx];
-            }
-            acc = simd_sum(acc);
-            if (thread_index_in_simdgroup == 0) {
-                out_[d_idx] = static_cast<InT>(acc + x_t * D_h);
-            }
+                float acc = 0.0;
+                for (int i = 0; i < n_per_t; ++i) {{
+                    auto s_idx = n_per_t * ds_idx + i;
+                    auto dB_by_x = x_t * dt_t * static_cast<float>(B_[s_idx]);
+                    state[i] = dA * state[i] + dB_by_x;
+                    acc += state[i] * C_[s_idx];
+                }}
+                acc = simd_sum(acc);
+                if (thread_index_in_simdgroup == 0) {{
+                    out_[d_idx] = static_cast<InT>(acc + x_t * D_h);
+                }}
+            }} else {{
+                out_[d_idx] = static_cast<InT>(0);
+            }}
 
-            for (int i = 0; i < n_per_t; ++i) {
+            for (int i = 0; i < n_per_t; ++i) {{
                 auto s_idx = n_per_t * ds_idx + i;
                 states_[s_idx] = static_cast<StT>(state[i]);
-            }
+            }}
 
             x_ += H * Dh;
             out_ += H * Dh;
             dt_ += H;
-            B_ += G * Ds;
-            C_ += G * Ds;
+            B_ += NG * Ds;
+            C_ += NG * Ds;
             states_ += H * Dh * Ds;
-        }
+        }}
 
-        for (int i = 0; i < n_per_t; ++i) {
+        for (int i = 0; i < n_per_t; ++i) {{
             auto s_idx = n_per_t * ds_idx + i;
             o_state[s_idx] = static_cast<StT>(state[i]);
-        }
+        }}
     """
+    inputs = ["X", "A_log", "B", "C", "D", "dt", "state_in"]
+    if has_mask:
+        inputs.append("mask")
+    suffix = "_mask" if has_mask else ""
     return mx.fast.metal_kernel(
-        name="ssm_with_states_kernel",
-        input_names=["X", "A_log", "B", "C", "D", "dt", "state_in"],
+        name=f"ssm_with_states_kernel{suffix}",
+        input_names=inputs,
         output_names=["out", "state_out", "states"],
         source=source,
     )
 
 
-_ssm_with_states_kernel = make_ssm_with_states_kernel()
+_ssm_with_states_kernel = make_ssm_with_states_kernel(False)
+_ssm_with_states_kernel_masked = make_ssm_with_states_kernel(True)
 
 
 def _ssm_with_states_ops(
@@ -204,6 +230,13 @@ def _ssm_with_states_ops(
     (padded) positions, mirroring `_gated_delta_with_states_ops`'s masked
     branch -- there is no `lengths` handling here (see
     `ssm_update_with_states`'s docstring for why that's out of scope).
+    Masked-position `y` is intentionally 0 here (like the reference kernel/
+    ops), which `ssm_attn` does NOT do (it has no masked-`y` behavior at
+    all -- it only ever freezes `next_state` via `lengths`); `states` still
+    matches `ssm_attn` at every position (masked or not), so this only
+    matters for `y`, and only at masked positions, which the MTP-verify
+    capture path never produces (verify always runs on a real, unmasked
+    block).
     """
     b, l, h, dh = x.shape
     _, _, g, ds = B.shape
@@ -255,14 +288,19 @@ def ssm_update_with_states(
 ) -> Tuple[mx.array, mx.array, mx.array]:
     """Dispatcher for the with-states path: returns `(y, final_state,
     states)` where `states[:, t]` is the state AFTER position t. Kernel on
-    GPU+Metal with no mask/lengths (the single in-thread-per-position loop
-    has no notion of a padding mask); the ops twin otherwise (CPU, or a
-    masked batch on GPU). `lengths` (`ssm_attn`'s cross-chunk
-    valid-remaining-steps bookkeeping, driven by `ArraysCache.lengths`) has
-    no with-states counterpart -- this path only exists for the nemotron_h
-    MTP-verify capture, which already requires `cache.lengths is None`
-    (see `NemotronHMamba2Mixer._conv`'s capture branch), so this fails
-    loud rather than silently mishandling it."""
+    GPU+Metal (masked variant selected when `mask is not None` -- a batched
+    `ArraysCache` sets `left_padding` unconditionally on `to_batch_cache`,
+    so `ArraysCache.make_mask` returns a non-None, all-True mask for every
+    B>1 call even with no real padding; gating the kernel on `mask is None`
+    would silently route every such call through the ops twin on GPU). The
+    ops twin runs instead on CPU, when Metal/the kernel is unavailable, or
+    when `Ds` isn't a multiple of 32 (`n_per_t = Ds / 32` would be 0 or drop
+    a remainder, silently under-covering the state). `lengths` (`ssm_attn`'s
+    cross-chunk valid-remaining-steps bookkeeping, driven by
+    `ArraysCache.lengths`) has no with-states counterpart -- this path only
+    exists for the nemotron_h MTP-verify capture, which already requires
+    `cache.lengths is None` (see `NemotronHMamba2Mixer._conv`'s capture
+    branch), so this fails loud rather than silently mishandling it."""
     if lengths is not None:
         raise NotImplementedError(
             "ssm_update_with_states: `lengths` (cross-chunk continuation "
@@ -275,25 +313,34 @@ def ssm_update_with_states(
         state = mx.zeros((n, h, d, ds), dtype=mx.float32)
     dt = compute_dt(dt, dt_bias, time_step_limit)
 
-    if (
-        mask is not None
-        or mx.default_device() != mx.gpu
-        or not mx.metal.is_available()
-        or _ssm_with_states_kernel is None
-    ):
+    use_kernel = (
+        mx.default_device() == mx.gpu
+        and mx.metal.is_available()
+        and ds % 32 == 0
+        and _ssm_with_states_kernel is not None
+    )
+    if not use_kernel:
+        return _ssm_with_states_ops(hidden_states, A_log, B, C, D, dt, state, mask)
+
+    kernel = _ssm_with_states_kernel
+    inputs = [hidden_states, A_log, B, C, D, dt, state]
+    if mask is not None:
+        kernel = _ssm_with_states_kernel_masked
+        inputs.append(mask)
+    if kernel is None:
         return _ssm_with_states_ops(hidden_states, A_log, B, C, D, dt, state, mask)
 
     input_type = hidden_states.dtype
     state_type = state.dtype
-    return _ssm_with_states_kernel(
-        inputs=[hidden_states, A_log, B, C, D, dt, state],
+    return kernel(
+        inputs=inputs,
         template=[
             ("InT", input_type),
             ("StT", state_type),
             ("Dh", d),
             ("Ds", ds),
             ("H", h),
-            ("G", hb),
+            ("NG", hb),
             ("T", t_len),
         ],
         grid=(32, d, h * n),

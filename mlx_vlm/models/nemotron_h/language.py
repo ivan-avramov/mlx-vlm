@@ -220,6 +220,9 @@ class NemotronHMamba2Mixer(nn.Module):
         capture_sink: Optional[list] = None,
     ) -> mx.array:
 
+        if capture_sink is not None and cache is None:
+            raise ValueError("capture_sink requires a cache")
+
         projected = self.in_proj(hidden_states)
 
         gate, conv_input, dt = self._split_projected_states(projected)

@@ -41,13 +41,28 @@ on GPU, mirroring
 Python-loop twin, ``_ssm_with_states_ops``, off-GPU) that runs ONE launch per
 mamba2 layer over the whole (tiny, <=~4-token) verify block and emits the
 ``(conv_state, ssm_state)`` snapshot after EVERY position, not just the last.
-Exactness follows from both implementations applying the IDENTICAL
-single-step recurrence (``dA = exp(A*dt)``, ``state = dA*state + x*dt*B``,
-``y = sum(state*C) + x*D``) in the SAME per-position order that ordinary
-one-token-at-a-time decoding already uses -- the kernel just carries the
-state in a register across positions instead of round-tripping it through a
-Python call per position. ``models/nemotron_h/language.py``'s
-``NemotronHMamba2Mixer`` threads a ``capture_sink`` list through
+Both implementations apply the IDENTICAL single-step recurrence
+(``dA = exp(A*dt)``, ``state = dA*state + x*dt*B``, ``y = sum(state*C) +
+x*D``) in the SAME per-position order that ordinary one-token-at-a-time
+decoding already uses -- the kernel just carries the state in a register
+across positions instead of round-tripping it through a Python call per
+position. The two paths' exactness guarantees differ, though:
+
+* GPU (``ssm_with_states_kernel``): bit-identical to ``ssm_update_kernel``
+  (the single-step kernel) applied T times, because the carried state is
+  always fp32 (``state[n_per_t]`` in the kernel body) -- a register carry
+  across positions is only rounding-neutral at fp32; see
+  ``test_ssm_with_states.py``'s GPU-gated test (skipped unless
+  ``MLX_VLM_GPU_TESTS=1``), which checks this with ``rtol=atol=1e-6``.
+* CPU (``_ssm_with_states_ops``): mathematically identical to, but NOT
+  bit-identical to, a sequential loop of ``ssm_update`` (which on CPU
+  dispatches ``ssm_attn``'s chunked parallel scan) -- the per-position
+  recurrence and the chunked scan are two different orderings of the same
+  arithmetic, so they agree only within floating-point tolerance
+  (``test_ssm_with_states.py`` uses ``rtol=atol=1e-4``), not exactly.
+
+``models/nemotron_h/language.py``'s ``NemotronHMamba2Mixer`` threads a
+``capture_sink`` list through
 ``_conv``/``_ssm`` to collect these snapshots (conv state via plain slicing
 of the padded conv input -- no compute -- ssm state via
 ``ssm_update_with_states``); ``NemotronHModel.__call__`` fills

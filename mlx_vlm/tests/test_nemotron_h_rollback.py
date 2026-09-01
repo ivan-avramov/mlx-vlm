@@ -439,19 +439,28 @@ class TestOnePassVerifyNoReplay:
     position -- see `recurrent_rollback.py`'s module docstring and
     `mlx_vlm/models/ssm.py:ssm_update_with_states`. Before this fix,
     `NemotronHModel.__call__`'s per-position replay branch called the mixer
-    once per position PER LAYER, i.e. `BLOCK_SIZE * num_mamba_layers` times.
+    once per position PER LAYER, i.e. `T * num_mamba_layers` times.
+
+    Uses a TWO-mamba-layer pattern (`"MM*-"`), not the module's default
+    `"M*-"` (one mamba layer): with only one mamba layer, `T *
+    num_mamba_layers == T`, which for some T coincidentally equals
+    `num_mamba_layers` for other reasons and is a weaker regression guard.
+    With 2 layers and T=3, the old replay's call count (6) is unambiguously
+    distinguishable from the fixed one-pass count (2).
     """
 
     def test_capture_calls_mixer_once_per_layer_not_once_per_position(self):
-        model = _model()
+        mx.random.seed(0)
+        model = LanguageModel(_config(hybrid_override_pattern="MM*-"))
         cache = model.make_cache()
         model(PREFIX, cache=cache)
 
         num_mamba_layers = sum(
             1 for layer in model.backbone.layers if layer.block_type == "M"
         )
-        assert num_mamba_layers >= 1
+        assert num_mamba_layers == 2
 
+        verify_block = BLOCK[:3]  # T=3 -> old replay would call 3 * 2 = 6
         call_count = 0
         original_call = NemotronHMamba2Mixer.__call__
 
@@ -462,8 +471,10 @@ class TestOnePassVerifyNoReplay:
 
         NemotronHMamba2Mixer.__call__ = counting_call
         try:
-            model.speculative_verify_hidden(mx.array([BLOCK], dtype=mx.int32), cache)
+            model.speculative_verify_hidden(
+                mx.array([verify_block], dtype=mx.int32), cache
+            )
         finally:
             NemotronHMamba2Mixer.__call__ = original_call
 
-        assert call_count == num_mamba_layers
+        assert call_count == num_mamba_layers == 2
