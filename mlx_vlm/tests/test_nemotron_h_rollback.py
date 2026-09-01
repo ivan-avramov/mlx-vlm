@@ -33,7 +33,7 @@ import pytest
 
 from mlx_vlm.models.cache import ArraysCache, KVCache
 from mlx_vlm.models.nemotron_h.config import ModelConfig
-from mlx_vlm.models.nemotron_h.language import LanguageModel
+from mlx_vlm.models.nemotron_h.language import LanguageModel, NemotronHMamba2Mixer
 
 HIDDEN_SIZE = 16
 VOCAB_SIZE = 32
@@ -430,3 +430,40 @@ class TestRollbackErrorHandling:
             model.rollback_speculative_cache(
                 cache, [None] * len(cache), accepted=BLOCK_SIZE, block_size=BLOCK_SIZE
             )
+
+
+class TestOnePassVerifyNoReplay:
+    """Regression guard for the replay's removal: a captured verify over
+    T>1 tokens must call each mamba2 layer's mixer forward ONCE (one Metal
+    launch per layer, via `ssm_update_with_states`), not once per verified
+    position -- see `recurrent_rollback.py`'s module docstring and
+    `mlx_vlm/models/ssm.py:ssm_update_with_states`. Before this fix,
+    `NemotronHModel.__call__`'s per-position replay branch called the mixer
+    once per position PER LAYER, i.e. `BLOCK_SIZE * num_mamba_layers` times.
+    """
+
+    def test_capture_calls_mixer_once_per_layer_not_once_per_position(self):
+        model = _model()
+        cache = model.make_cache()
+        model(PREFIX, cache=cache)
+
+        num_mamba_layers = sum(
+            1 for layer in model.backbone.layers if layer.block_type == "M"
+        )
+        assert num_mamba_layers >= 1
+
+        call_count = 0
+        original_call = NemotronHMamba2Mixer.__call__
+
+        def counting_call(self, *args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return original_call(self, *args, **kwargs)
+
+        NemotronHMamba2Mixer.__call__ = counting_call
+        try:
+            model.speculative_verify_hidden(mx.array([BLOCK], dtype=mx.int32), cache)
+        finally:
+            NemotronHMamba2Mixer.__call__ = original_call
+
+        assert call_count == num_mamba_layers

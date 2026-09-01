@@ -32,35 +32,37 @@ pulls in the drafter registry, and a drafter (``nemotron_h_mtp``) imports
 under ``speculative/`` risks a cycle the moment that registry starts eagerly
 importing drafters.
 
-Why replaying the verify block one token at a time is exact
+Why the per-position snapshots are exact
 -------------------------------------------------------------
-Unlike qwen3_5's GatedDeltaNet, nemotron_h's mamba2 mixer has no dedicated
-verify-time kernel that exposes intermediate per-position states. Instead,
-``models/ssm.py:ssm_update`` already dispatches, per call, either an exact
-chunked scan (``ssm_attn``, used whenever ``seq_len > 1``, or off-GPU, or with
-no prior state) or -- for a single new token against existing state, on GPU
-with Metal available -- a dedicated single-step ``ssm_update_kernel``
-(``models/ssm.py`` ~211-232). Both of those are exactly what ordinary
-one-token-at-a-time decoding already uses; nothing is special-cased for
-verify. So replaying a (tiny, <=~4-token) verify block one position at a time
-through the model's own ``__call__`` against the same evolving cache runs the
-IDENTICAL code path -- and, on GPU, the identical kernel -- that a normal
-decode step would, rather than some alternate "replay" algorithm that merely
-happens to agree with it. THAT structural identity, not chunk-size invariance
-per se, is why the captured ``(conv_state, ssm_state)`` after each replayed
-position is exact: ``ssm_attn``'s chunked scan is in fact chunk-invariant too,
-but that isn't load-bearing here, because the replay never runs it at
-width > 1. The model side of this
-(``mlx_vlm/models/nemotron_h/language.py``'s ``recurrent_sink`` plumbing)
-just drives the replay and hands the snapshots back here.
+Like qwen3_5's GatedDeltaNet, nemotron_h's mamba2 mixer now has a dedicated
+with-states path (``models/ssm.py:ssm_update_with_states`` -- a Metal kernel
+on GPU, mirroring
+``qwen3_5/gated_delta.py:_make_gated_delta_with_states_kernel``, and a pure-mx
+Python-loop twin, ``_ssm_with_states_ops``, off-GPU) that runs ONE launch per
+mamba2 layer over the whole (tiny, <=~4-token) verify block and emits the
+``(conv_state, ssm_state)`` snapshot after EVERY position, not just the last.
+Exactness follows from both implementations applying the IDENTICAL
+single-step recurrence (``dA = exp(A*dt)``, ``state = dA*state + x*dt*B``,
+``y = sum(state*C) + x*D``) in the SAME per-position order that ordinary
+one-token-at-a-time decoding already uses -- the kernel just carries the
+state in a register across positions instead of round-tripping it through a
+Python call per position. ``models/nemotron_h/language.py``'s
+``NemotronHMamba2Mixer`` threads a ``capture_sink`` list through
+``_conv``/``_ssm`` to collect these snapshots (conv state via plain slicing
+of the padded conv input -- no compute -- ssm state via
+``ssm_update_with_states``); ``NemotronHModel.__call__`` fills
+``recurrent_sink[idx]`` from it per mamba layer, one snapshot list per layer,
+same structure this module's contract always expected.
 
-Note: this fork's CPU-pinned test suite
-(``mlx_vlm/tests/test_nemotron_h_rollback.py``) only exercises the
-``ssm_attn`` chunked-scan branch -- CPU never dispatches
-``ssm_update_kernel`` (see the ``seq_len``/device guard in
-``models/ssm.py:ssm_update``). GPU-kernel-path exactness for this replay is
-therefore unverified by that suite and would need a GPU-side check to
-confirm.
+Note: this fork's CPU-pinned test suites
+(``mlx_vlm/tests/test_nemotron_h_rollback.py``,
+``mlx_vlm/tests/test_ssm_with_states.py``) only exercise the ops-twin
+(``_ssm_with_states_ops``) branch -- CPU never dispatches the Metal
+``ssm_with_states_kernel`` (see the device guard in
+``models/ssm.py:ssm_update_with_states``). GPU-kernel-path exactness is
+covered by ``test_ssm_with_states.py``'s GPU-gated test (skipped unless
+``MLX_VLM_GPU_TESTS=1``), which checks the kernel against
+``ssm_update_kernel`` (the single-step kernel) applied T times.
 """
 
 from typing import Any, List, Optional, Sequence, Union

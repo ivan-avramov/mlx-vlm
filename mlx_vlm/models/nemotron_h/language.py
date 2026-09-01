@@ -1,4 +1,4 @@
-from typing import Any, Optional
+from typing import Any, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -14,7 +14,7 @@ from ..cache import ArraysCache, KVCache
 from ..recurrent_rollback import (
     RecurrentStateRollbackMixin,
 )  # Fork: MTP speculative-verify rollback contract (see recurrent_rollback.py docstring)
-from ..ssm import ssm_update
+from ..ssm import ssm_update, ssm_update_with_states
 from ..switch_layers import SwitchMLP
 from .config import ModelConfig
 
@@ -103,10 +103,12 @@ class NemotronHMamba2Mixer(nn.Module):
         conv_input: mx.array,
         cache: Optional[ArraysCache],
         mask: Optional[mx.array],
-    ) -> mx.array:
+        capture_states: bool = False,
+    ) -> Tuple[mx.array, Optional[list]]:
         if mask is not None:
             conv_input = mx.where(mask[..., None], conv_input, 0)
 
+        conv_states = None
         if cache is not None:
             if cache[0] is None:
                 conv_state = mx.zeros(
@@ -117,7 +119,30 @@ class NemotronHMamba2Mixer(nn.Module):
                 conv_state = cache[0]
             padded_input = mx.concatenate([conv_state, conv_input], axis=1)
             n_keep = self.conv_kernel_size - 1
-            if cache.lengths is not None:
+            if capture_states:
+                # Fork: MTP-verify capture (recurrent_sink/gdn_states, see
+                # NemotronHModel.__call__ and recurrent_rollback.py). Pure
+                # slicing, no compute: the conv state after position t is
+                # the n_keep-wide window ending at t in the padded input --
+                # at t == T-1 this is `padded_input[:, -n_keep:, :]`,
+                # identical to the non-capture branch below. Left-padded
+                # batches (`cache.lengths` set) use the take_along_axis
+                # per-row-offset trick below instead, which this slicing
+                # doesn't account for -- out of scope (the rollback contract
+                # this feeds already requires uniform batch acceptance).
+                if cache.lengths is not None:
+                    raise NotImplementedError(
+                        "NemotronHMamba2Mixer._conv: capture_states with "
+                        "cache.lengths set (left-padded batch) is not "
+                        "supported -- MTP-verify capture assumes a "
+                        "uniform, non-left-padded batch."
+                    )
+                conv_states = [
+                    padded_input[:, t + 1 : t + 1 + n_keep, :]
+                    for t in range(conv_input.shape[1])
+                ]
+                cache[0] = conv_states[-1]
+            elif cache.lengths is not None:
                 t = padded_input.shape[1]
                 ends = mx.clip(cache.lengths, 0, t - n_keep)
                 positions = (ends[:, None] + mx.arange(n_keep))[..., None]
@@ -130,7 +155,7 @@ class NemotronHMamba2Mixer(nn.Module):
             )
 
         conv_output = self.conv1d(padded_input)
-        return nn.silu(conv_output)
+        return nn.silu(conv_output), conv_states
 
     def _ssm(
         self,
@@ -140,7 +165,8 @@ class NemotronHMamba2Mixer(nn.Module):
         dt: mx.array,
         cache: Optional[ArraysCache],
         mask: Optional[mx.array],
-    ) -> mx.array:
+        capture_states: bool = False,
+    ) -> Tuple[mx.array, Optional[list]]:
         batch_size, seq_len, _ = hidden_states.shape
 
         hidden_states = hidden_states.reshape(
@@ -153,34 +179,54 @@ class NemotronHMamba2Mixer(nn.Module):
         else:
             state = None
 
-        y, state = ssm_update(
-            hidden_states,
-            self.A_log,
-            B,
-            C,
-            self.D.astype(hidden_states.dtype),
-            dt,
-            self.dt_bias,
-            state,
-            self.time_step_limit,
-            mask,
-        )
+        ssm_states = None
+        if capture_states:
+            y, state, states = ssm_update_with_states(
+                hidden_states,
+                self.A_log,
+                B,
+                C,
+                self.D.astype(hidden_states.dtype),
+                dt,
+                self.dt_bias,
+                state,
+                self.time_step_limit,
+                mask,
+            )
+            ssm_states = [states[:, t] for t in range(states.shape[1])]
+        else:
+            y, state = ssm_update(
+                hidden_states,
+                self.A_log,
+                B,
+                C,
+                self.D.astype(hidden_states.dtype),
+                dt,
+                self.dt_bias,
+                state,
+                self.time_step_limit,
+                mask,
+            )
         if cache:
             cache[1] = state
 
-        return y.reshape(batch_size, seq_len, self.intermediate_size)
+        return y.reshape(batch_size, seq_len, self.intermediate_size), ssm_states
 
     def __call__(
         self,
         hidden_states: mx.array,
         mask: Optional[mx.array],
         cache: Optional[ArraysCache] = None,
+        capture_sink: Optional[list] = None,
     ) -> mx.array:
 
         projected = self.in_proj(hidden_states)
 
         gate, conv_input, dt = self._split_projected_states(projected)
-        conv_output = self._conv(conv_input, cache, mask)
+        capture_states = capture_sink is not None
+        conv_output, conv_states = self._conv(
+            conv_input, cache, mask, capture_states=capture_states
+        )
         hidden_states_ssm, B, C = mx.split(
             conv_output,
             [
@@ -189,9 +235,17 @@ class NemotronHMamba2Mixer(nn.Module):
             ],
             axis=-1,
         )
-        y = self._ssm(hidden_states_ssm, B, C, dt, cache, mask)
+        y, ssm_states = self._ssm(
+            hidden_states_ssm, B, C, dt, cache, mask, capture_states=capture_states
+        )
         if cache:
             cache.advance(y.shape[1])
+        if capture_states:
+            # Fork: MTP-verify capture -- one snapshot per input position,
+            # aligned index-for-index with conv_states (see NemotronHModel
+            # .__call__'s recurrent_sink plumbing and
+            # recurrent_rollback.py's rollback contract).
+            capture_sink.extend(zip(conv_states, ssm_states))
         y = self.norm(y, gate)
         return self.out_proj(y)
 
@@ -405,9 +459,14 @@ class NemotronHBlock(nn.Module):
         x,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        capture_sink: Optional[list] = None,
     ):
         hidden_states = self.norm(x)
-        if self.block_type == "M" or self.block_type == "*":
+        if self.block_type == "M":
+            hidden_states = self.mixer(
+                hidden_states, mask=mask, cache=cache, capture_sink=capture_sink
+            )
+        elif self.block_type == "*":
             hidden_states = self.mixer(hidden_states, mask=mask, cache=cache)
         else:
             hidden_states = self.mixer(hidden_states)
@@ -478,9 +537,7 @@ class NemotronHModel(nn.Module):
         # own `final_layernorm`, so capturing post-norm hidden here would
         # double-normalize whatever the drafter feeds forward. Mirrors the
         # `hidden_sink`/`skip_final_norm` contract other MTP-capable
-        # backbones (deepseek_v4, qwen3_5) already expose. Factored into a
-        # closure so the recursive `recurrent_sink` branch just below doesn't
-        # have to duplicate it.
+        # backbones (deepseek_v4, qwen3_5) already expose.
         def _finish(hidden_states):
             if hidden_sink is not None:
                 hidden_sink.append(hidden_states)
@@ -489,34 +546,19 @@ class NemotronHModel(nn.Module):
             return self.norm_f(hidden_states)
 
         # Fork: `recurrent_sink` drives the MTP speculative-verify rollback
-        # contract (mlx_vlm/models/recurrent_rollback.py). Mamba2's per-call
-        # state update (_conv/_ssm below, via models/ssm.py's `ssm_update`)
-        # only exposes each ArraysCache-backed layer's state AFTER the whole
-        # call, but rollback needs the state after EACH position of the
-        # verify block. Replaying the block one position at a time through
-        # this SAME `__call__` -- against the SAME, evolving `cache` --
-        # reproduces exactly what a normal one-token-at-a-time decode would
-        # leave in each layer's cache, because it runs the IDENTICAL code
-        # path (and, on GPU, the identical kernel) a normal decode step does
-        # -- see recurrent_rollback.py's module docstring for why that
-        # structural identity, not chunk-size invariance, is the actual
-        # source of exactness. Verify blocks are tiny (<=~4 tokens per MTP
-        # round), so this per-position Python recursion is cheap; the scan/
-        # kernel dispatch itself is untouched. See the per-layer capture a
-        # few lines into the loop below for where each snapshot actually
-        # gets read.
-        if recurrent_sink is not None and hidden_states.shape[1] > 1:
-            steps = [
-                self(
-                    inputs_embeds=hidden_states[:, t : t + 1],
-                    cache=cache,
-                    skip_final_norm=True,
-                    recurrent_sink=recurrent_sink,
-                )
-                for t in range(hidden_states.shape[1])
-            ]
-            return _finish(mx.concatenate(steps, axis=1))
-
+        # contract (mlx_vlm/models/recurrent_rollback.py). Each mamba2
+        # layer's `_conv`/`_ssm` (models/ssm.py's `ssm_update_with_states`)
+        # now emits the per-position `(conv_state, ssm_state)` snapshot
+        # directly from ONE forward -- one Metal launch per layer, not one
+        # per verify-block position -- via the `capture_sink` list threaded
+        # through the loop below (see NemotronHMamba2Mixer.__call__).
+        # Exactness comes from the kernel/ops-twin applying the SAME
+        # single-step recurrence, in the SAME order, that a normal
+        # one-token-at-a-time decode would; see
+        # `mlx_vlm/models/ssm.py:ssm_update_with_states`'s docstring and
+        # `test_ssm_with_states.py` for the kernel-vs-single-step-loop check
+        # that pins this down. See recurrent_rollback.py's module docstring
+        # for the full rationale.
         has_attention = any(layer.block_type == "*" for layer in self.layers)
         has_mamba = any(layer.block_type == "M" for layer in self.layers)
         attn_cache = cache[self.fa_idx] if has_attention else None
@@ -536,20 +578,15 @@ class NemotronHModel(nn.Module):
                 mask = attn_mask
             else:
                 mask = ssm_mask
-            hidden_states = layer(hidden_states, mask=mask, cache=c)
 
-            # Fork: record this mamba layer's post-step (conv_state,
-            # ssm_state) for the caller's `recurrent_sink` (see the
-            # recursive branch above -- this loop only ever runs one
-            # position at a time when `recurrent_sink` is not None).
-            # Reading it straight off `c` after the mixer call keeps this
-            # in lockstep with whatever `_conv`/`_ssm` actually stored, with
-            # no duplicated state logic here.
+            capture_sink_for_layer = None
             if recurrent_sink is not None and layer.block_type == "M":
-                idx = cache_counter - 1
-                if recurrent_sink[idx] is None:
-                    recurrent_sink[idx] = []
-                recurrent_sink[idx].append((c[0], c[1]))
+                capture_sink_for_layer = []
+            hidden_states = layer(
+                hidden_states, mask=mask, cache=c, capture_sink=capture_sink_for_layer
+            )
+            if capture_sink_for_layer is not None:
+                recurrent_sink[cache_counter - 1] = capture_sink_for_layer
 
         return _finish(hidden_states)
 
