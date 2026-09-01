@@ -1,9 +1,24 @@
-"""Env-gated MTP round/head profiler (M29 H1, 2026-08-31).
+"""Env-gated MTP round/head profiler (M29 H1, 2026-08-31; fix round 2026-09-01).
 
 CPU-pinned (no GPU, no real model): the round-loop tests use the same fakes
 as ``test_mtp_thinking_budget.py`` (patched ``_mtp_verify_target`` /
 ``_mtp_acceptance_walk``); the head-loop tests reuse
 ``test_nemotron_h_mtp.py``'s tiny synthetic drafter/target helpers.
+
+Fix round (verifier verdict FIX-FIRST on commit 7a1e6d48):
+F1 two new phases (``yield``, ``accept``) so consumer/attribution time
+    stops leaking into ``rollback``/``other``.
+F2 the early-return path (yield loop hits ``max_tokens`` mid-round) now
+    marks ``yield`` and calls ``end_unit`` before returning, so that
+    round's own draft/verify/walk time is no longer counted in totals
+    without a matching unit in the per-round means.
+F3 ``round_profiler_from_env`` resets the head singleton so per-request
+    head lines are not cumulative across a multi-request server session.
+F4 this file gained: an exact-count synchronize assertion (a), a direct
+    fence-order unit test of ``_PhaseTimer.mark`` (b), accepted/rd and
+    n_draft/rd + yield/accept-field assertions (c), a two-generation
+    head-not-cumulative test (d), and a rollback-mark-actually-fires
+    comparison against an accept-all run (e).
 """
 
 import re
@@ -20,6 +35,7 @@ from mlx_vlm.speculative import mtp_profile
 from mlx_vlm.speculative.mtp_profile import (
     MTPHeadProfiler,
     MTPRoundProfiler,
+    _PhaseTimer,
     cache_state_arrays,
     reset_head_profiler,
 )
@@ -34,6 +50,7 @@ from mlx_vlm.tests.test_nemotron_h_mtp import (
 ROUND_LINE_RE = re.compile(
     r"^\[mtp_profile\] rounds=(?P<rounds>\d+) draft=(?P<draft>[-\d.]+) "
     r"verify=(?P<verify>[-\d.]+) walk=(?P<walk>[-\d.]+) "
+    r"yield=(?P<yield_>[-\d.]+) accept=(?P<accept>[-\d.]+) "
     r"rollback=(?P<rollback>[-\d.]+) other=(?P<other>[-\d.]+) "
     r"emitted/rd=(?P<emitted_rd>[-\d.]+) accepted/rd=(?P<accepted_rd>[-\d.]+) "
     r"n_draft/rd=(?P<n_draft_rd>[-\d.]+) round_ms=(?P<round_ms>[-\d.]+) "
@@ -46,10 +63,18 @@ HEAD_LINE_RE = re.compile(
     r"final=(?P<final>[01])$"
 )
 
-# 3 full rounds (2 emitted tokens each, from the fixed (1, [9, 10]) walk fake)
-# plus a 4th partial round whose yield loop hits max_tokens and returns early
-# (skipping that round's rollback + end_unit -- see mtp.py's _mtp_rounds).
-ROUNDS_MAX_TOKENS = 8
+# 3 rounds, all clean: with the fixed (1, [9, 10]) walk fake and block_size=3
+# (bs=3, n_draft=2 every round), max_tokens=7 makes the loop's own
+# max-tokens check trip exactly on round 3's SECOND (last) yielded token --
+# i.e. the "early return" round is, numerically, a round that already
+# yielded its full 2 tokens. So all 3 rounds end up with emitted=2,
+# accepted=1, n_draft=2 -> emitted/rd=2.0, accepted/rd=1.0, n_draft/rd=2.0
+# exactly. (At the old ROUNDS_MAX_TOKENS=8, round 4 starts with a smaller
+# bs=2 block and both end_unit's counters and "rounds" itself would differ
+# from the old test's "rounds=3" -- 7 was chosen specifically so the F2 fix
+# reproduces the pre-fix "rounds=3" line shape while now genuinely covering
+# 3 end_unit calls instead of 2.)
+ROUNDS_MAX_TOKENS = 7
 
 
 class _CacheEntry:
@@ -92,7 +117,9 @@ def _verify(width):
     )
 
 
-def _run_rounds(max_tokens=ROUNDS_MAX_TOKENS, prompt_cache=None):
+def _run_rounds(
+    max_tokens=ROUNDS_MAX_TOKENS, prompt_cache=None, walk_return=(1, [9, 10])
+):
     draft = _Draft()
     model = SimpleNamespace(language_model=_LM())
     cache = prompt_cache if prompt_cache is not None else [_CacheEntry()]
@@ -100,7 +127,7 @@ def _run_rounds(max_tokens=ROUNDS_MAX_TOKENS, prompt_cache=None):
         patch.object(
             mtp_utils, "_mtp_verify_target", side_effect=lambda *a, **k: _verify(3)
         ),
-        patch.object(mtp_utils, "_mtp_acceptance_walk", return_value=(1, [9, 10])),
+        patch.object(mtp_utils, "_mtp_acceptance_walk", return_value=walk_return),
     ):
         toks = [
             t
@@ -136,11 +163,49 @@ class TestCollect:
         assert all(isinstance(a, mx.array) for a in arrays)
 
 
+class TestMarkFenceOrder:
+    """F4b: mark() must eval the phase's arrays BEFORE synchronizing -- MLX is
+    lazy, so a sync with no preceding eval measures nothing meaningful for a
+    marked-with-arrays phase."""
+
+    def _recorders(self, monkeypatch):
+        order = []
+        real_eval, real_sync = mx.eval, mx.synchronize
+
+        def rec_eval(*args, **kwargs):
+            order.append("eval")
+            return real_eval(*args, **kwargs)
+
+        def rec_sync(*args, **kwargs):
+            order.append("sync")
+            return real_sync(*args, **kwargs)
+
+        monkeypatch.setattr(mx, "eval", rec_eval)
+        monkeypatch.setattr(mx, "synchronize", rec_sync)
+        return order
+
+    def test_mark_with_arrays_evals_immediately_before_synchronizing(self, monkeypatch):
+        order = self._recorders(monkeypatch)
+        timer = _PhaseTimer("t", ["p"], "unit")
+        timer.begin()
+        order.clear()
+        timer.mark("p", mx.zeros((2, 2)))
+        assert order == ["eval", "sync"]
+
+    def test_mark_without_arrays_synchronizes_but_never_evals(self, monkeypatch):
+        order = self._recorders(monkeypatch)
+        timer = _PhaseTimer("t", ["p"], "unit")
+        timer.begin()
+        order.clear()
+        timer.mark("p")
+        assert order == ["sync"]
+
+
 class TestRoundProfilerEnv:
     def test_env_set_emits_summary_line_with_all_fields(self, monkeypatch, capsys):
         monkeypatch.setenv(mtp_profile.ENV_ROUNDS, "1")
         toks, draft = _run_rounds()
-        assert len(toks) == 7  # 3 full rounds x 2 + 1 partial round x 1
+        assert len(toks) == 6  # 3 rounds x 2 emitted tokens each (see comment above)
 
         err = capsys.readouterr().err
         lines = [l for l in err.splitlines() if l.startswith("[mtp_profile] ")]
@@ -157,6 +222,8 @@ class TestRoundProfilerEnv:
             "draft",
             "verify",
             "walk",
+            "yield_",
+            "accept",
             "rollback",
             "other",
             "emitted_rd",
@@ -168,7 +235,11 @@ class TestRoundProfilerEnv:
             assert value == value  # not NaN
             assert value >= 0.0
             assert value != float("inf")
+        # F4c: clean rates at max_tokens=7 (every round emitted 2, accepted 1,
+        # drafted 2 -- see the ROUNDS_MAX_TOKENS comment).
         assert float(fields["emitted_rd"]) == 2.0
+        assert float(fields["accepted_rd"]) == 1.0
+        assert float(fields["n_draft_rd"]) == 2.0
 
     def test_env_unset_zero_extra_synchronize_calls(self, monkeypatch, capsys):
         monkeypatch.delenv(mtp_profile.ENV_ROUNDS, raising=False)
@@ -184,6 +255,36 @@ class TestRoundProfilerEnv:
         assert calls["n"] == 0
         err = capsys.readouterr().err
         assert "[mtp_profile]" not in err
+
+    def test_env_set_exact_synchronize_count(self, monkeypatch, capsys):
+        """F4a: pin the EXACT sync count so a neutered mark() (or one that
+        drops its sync) cannot pass silently.
+
+        Arithmetic for ROUNDS_MAX_TOKENS=7, block_size=3 (bs=3, n_draft=2
+        every round), walk fake fixed at (1, [9, 10]):
+          begin()                                          -> 1 sync
+          round 1 (full):   other,draft,verify,walk,
+                             yield,accept,rollback           -> 7 marks -> 7 syncs
+          round 2 (full):   same 7 marks                     -> 7 syncs
+          round 3 (early return at the 2nd yielded token,
+                   i.e. i=1): other,draft,verify,walk,
+                   yield (early-return branch)                -> 5 marks -> 5 syncs
+                   (no accept/rollback -- the early return
+                   happens before that code)
+          report(final=True): no sync of its own
+          total = 1 + 7 + 7 + 5 = 20
+        """
+        monkeypatch.setenv(mtp_profile.ENV_ROUNDS, "1")
+        real_sync = mx.synchronize
+        calls = {"n": 0}
+
+        def counting_sync(*args, **kwargs):
+            calls["n"] += 1
+            return real_sync(*args, **kwargs)
+
+        monkeypatch.setattr(mx, "synchronize", counting_sync)
+        _run_rounds()
+        assert calls["n"] == 20
 
     def test_every_2_emits_a_non_final_line_before_the_final_line(
         self, monkeypatch, capsys
@@ -210,7 +311,8 @@ class TestRoundProfilerEnv:
         monkeypatch.setenv(mtp_profile.ENV_ROUNDS, "1")
         cache = [_CacheEntry()]
         # bs=3 (block_size) and accepted=1 (fixed by the walk fake) => accepted
-        # < bs - 1 on every full round, so rollback_speculative_cache is
+        # < bs - 1 on every FULL round (1 and 2; round 3 early-returns before
+        # reaching the rollback check), so rollback_speculative_cache is
         # reached and cache_state_arrays(prompt_cache) sees the fake state.
         calls = {"n": 0}
         real_rollback = _LM.rollback_speculative_cache
@@ -221,7 +323,7 @@ class TestRoundProfilerEnv:
 
         with patch.object(_LM, "rollback_speculative_cache", counting_rollback):
             _run_rounds(prompt_cache=cache)
-        assert calls["n"] >= 1
+        assert calls["n"] == 2
 
         err = capsys.readouterr().err
         final_line = [
@@ -231,6 +333,30 @@ class TestRoundProfilerEnv:
         ][0]
         m = ROUND_LINE_RE.match(final_line)
         assert float(m.group("rollback")) >= 0.0
+
+    def test_rollback_mark_fires_vs_accept_all_run(self, monkeypatch):
+        """F4e: rollback only fires when accepted < bs - 1. Compare a real
+        rollback-path run (calls ``cache_state_arrays``, accepted=1 < bs-1=2)
+        against an accept-all run (accepted=2 == bs-1=2, rollback never
+        called) -- the accept-all run must call ``cache_state_arrays`` zero
+        times, and the rollback-path run must call it exactly on the 2 full
+        rounds (see the exact-count test above)."""
+        monkeypatch.setenv(mtp_profile.ENV_ROUNDS, "1")
+        calls = {"n": 0}
+        real_collect = mtp_profile.cache_state_arrays
+
+        def counting_collect(prompt_cache):
+            calls["n"] += 1
+            return real_collect(prompt_cache)
+
+        with patch.object(mtp_profile, "cache_state_arrays", counting_collect):
+            _run_rounds(walk_return=(1, [9, 10]))  # accepted=1 < bs-1=2
+        assert calls["n"] == 2
+
+        calls["n"] = 0
+        with patch.object(mtp_profile, "cache_state_arrays", counting_collect):
+            _run_rounds(walk_return=(2, [9, 10]))  # accepted=2 == bs-1=2: accept-all
+        assert calls["n"] == 0
 
 
 class TestHeadProfilerEnv:
@@ -291,13 +417,18 @@ class TestRoundFinalFlushesHead:
     ):
         monkeypatch.setenv(mtp_profile.ENV_ROUNDS, "1")
         monkeypatch.setenv(mtp_profile.ENV_HEAD, "1")
-        # Create the head singleton the way draft_block would.
+
+        # round_profiler_from_env() resets the head singleton (F3), so the
+        # head singleton must be created AFTER it, the way draft_block
+        # creates it mid-round in the real flow.
+        prof = mtp_profile.round_profiler_from_env()
+        prof.begin()
         head = mtp_profile.head_profiler_from_env()
         head.begin()
         head.mark("eval", mx.zeros((1,)))
         head.end_unit()
 
-        _run_rounds()
+        prof.report(final=True)
 
         err = capsys.readouterr().err
         round_final = [
@@ -320,3 +451,48 @@ class TestRoundFinalFlushesHead:
         _run_rounds()  # must not raise
         err = capsys.readouterr().err
         assert "[mtp_profile_head]" not in err
+
+
+class TestHeadNotCumulativeAcrossGenerations:
+    def test_second_generation_head_line_counts_only_its_own_draft_tokens(
+        self, monkeypatch, capsys
+    ):
+        """F3/F4d: two consecutive fake generations under both env vars --
+        the second head final line must start from draft_tokens counted for
+        that generation only, not carry generation 1's count forward."""
+        monkeypatch.setenv(mtp_profile.ENV_ROUNDS, "1")
+        monkeypatch.setenv(mtp_profile.ENV_HEAD, "1")
+
+        # Generation 1: 3 simulated draft tokens.
+        round1 = mtp_profile.round_profiler_from_env()
+        round1.begin()
+        head1 = mtp_profile.head_profiler_from_env()
+        for _ in range(3):
+            head1.begin()
+            head1.mark("eval", mx.zeros((1,)))
+            head1.end_unit()
+        round1.report(final=True)
+        capsys.readouterr()  # discard generation 1's lines
+
+        # Generation 2: 2 simulated draft tokens. round_profiler_from_env()
+        # must give generation 2 a fresh head singleton.
+        round2 = mtp_profile.round_profiler_from_env()
+        round2.begin()
+        head2 = mtp_profile.head_profiler_from_env()
+        assert head2 is not head1
+        for _ in range(2):
+            head2.begin()
+            head2.mark("eval", mx.zeros((1,)))
+            head2.end_unit()
+        round2.report(final=True)
+
+        err = capsys.readouterr().err
+        head_final = [
+            l
+            for l in err.splitlines()
+            if l.startswith("[mtp_profile_head] ") and l.endswith("final=1")
+        ]
+        assert len(head_final) == 1
+        m = HEAD_LINE_RE.match(head_final[0])
+        assert m is not None, head_final[0]
+        assert m.group("draft_tokens") == "2"

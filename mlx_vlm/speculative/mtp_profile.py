@@ -113,12 +113,21 @@ class _PhaseTimer:
 
 
 class MTPRoundProfiler(_PhaseTimer):
-    """Per-round phase timing for ``_mtp_rounds`` (server single-request path)."""
+    """Per-round phase timing for ``_mtp_rounds`` (server single-request path).
+
+    Phase notes for the two non-obvious buckets (fix round, 2026-09-01):
+    ``yield`` = consumer time between yielded tokens (detokenizer, thinking
+    -budget criteria, SSE write) -- paid by the draft-OFF decode path too,
+    so it is NOT an MTP lever even though it is measured here.
+    ``other`` = loop head (block-size selection), sampler_rng bookkeeping,
+    ``set_shared_kv``, ``clear_cache``, and the thinking-budget branch (which
+    carries no marks of its own).
+    """
 
     def __init__(self) -> None:
         super().__init__(
             "mtp_profile",
-            ["draft", "verify", "walk", "rollback", "other"],
+            ["draft", "verify", "walk", "yield", "accept", "rollback", "other"],
             "round",
         )
 
@@ -126,16 +135,19 @@ class MTPRoundProfiler(_PhaseTimer):
         draft = self._per_unit_ms("draft")
         verify = self._per_unit_ms("verify")
         walk = self._per_unit_ms("walk")
+        yield_ms = self._per_unit_ms("yield")
+        accept = self._per_unit_ms("accept")
         rollback = self._per_unit_ms("rollback")
         other = self._per_unit_ms("other")
-        round_ms = draft + verify + walk + rollback + other
+        round_ms = draft + verify + walk + yield_ms + accept + rollback + other
         units = self.units
         emitted_rd = self.counters.get("emitted", 0.0) / units if units else 0.0
         accepted_rd = self.counters.get("accepted", 0.0) / units if units else 0.0
         n_draft_rd = self.counters.get("n_draft", 0.0) / units if units else 0.0
         return (
             f"[mtp_profile] rounds={units} draft={draft:.2f} verify={verify:.2f} "
-            f"walk={walk:.2f} rollback={rollback:.2f} other={other:.2f} "
+            f"walk={walk:.2f} yield={yield_ms:.2f} accept={accept:.2f} "
+            f"rollback={rollback:.2f} other={other:.2f} "
             f"emitted/rd={emitted_rd:.2f} accepted/rd={accepted_rd:.2f} "
             f"n_draft/rd={n_draft_rd:.2f} round_ms={round_ms:.2f} "
             f"final={1 if final else 0}"
@@ -147,7 +159,11 @@ class MTPRoundProfiler(_PhaseTimer):
 
 
 class MTPHeadProfiler(_PhaseTimer):
-    """Per-draft-token phase timing for ``NemotronHMTPDraftModel.draft_block``."""
+    """Per-draft-token phase timing for ``NemotronHMTPDraftModel.draft_block``.
+
+    ``sampler`` = graph-build time only; the argmax/sampler kernel itself
+    executes (and is timed) under ``eval``.
+    """
 
     def __init__(self) -> None:
         super().__init__(
@@ -172,9 +188,18 @@ _head_profiler_instance: Optional[MTPHeadProfiler] = None
 
 
 def round_profiler_from_env() -> Optional[MTPRoundProfiler]:
-    """New profiler per generation, or ``None`` if unset (the hot-path guard)."""
+    """New profiler per generation, or ``None`` if unset (the hot-path guard).
+
+    Also resets the head singleton: the head profiler has no
+    end-of-generation signal of its own (``draft_block`` doesn't know when a
+    request ends), so without this a multi-request server session would mix
+    every request's draft-token timings into one running head profiler. Each
+    generation gets a fresh singleton, created lazily by that generation's
+    first ``draft_block`` call; the round-final report still flushes it.
+    """
     if os.environ.get(ENV_ROUNDS, "") != "1":
         return None
+    reset_head_profiler()
     return MTPRoundProfiler()
 
 

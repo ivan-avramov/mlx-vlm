@@ -697,14 +697,22 @@ def _mtp_rounds(
             )
             _record_speculative_round(draft_model, accepted, bs - 1)
 
-            for tok in new_tokens:
+            for i, tok in enumerate(new_tokens):
                 yield tok, None
                 emitted += 1
                 if emitted >= max_tokens:
-                    # Early return: this round's rollback mark + end_unit are
-                    # skipped (there is no "after" to mark); the outer
-                    # finally still reports what was accumulated so far.
+                    # Early return: attribute this partial round's own yield
+                    # time and close it out with end_unit (using the tokens
+                    # actually yielded so far), rather than silently dropping
+                    # it from "rounds" while its draft/verify/walk time stays
+                    # in totals -- that skew biased every ms/rd by 1/N.
+                    if prof is not None:
+                        prof.mark("yield")
+                        prof.end_unit(accepted=accepted, n_draft=bs - 1, emitted=i + 1)
                     return
+
+            if prof is not None:
+                prof.mark("yield")
 
             accept_verified = getattr(draft_model, "accept_verified_tokens", None)
             if callable(accept_verified):
@@ -721,6 +729,8 @@ def _mtp_rounds(
 
             # Hidden for next round: pick the slot of the newly accepted bonus.
             hidden = _mtp_draft_hidden(lm, verify.hidden[:, accepted : accepted + 1, :])
+            if prof is not None:
+                prof.mark("accept", hidden)
             b = new_tokens[-1] if new_tokens else b
 
             rollback = getattr(lm, "rollback_speculative_cache", None)
