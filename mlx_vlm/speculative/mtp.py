@@ -5,6 +5,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..models import cache
+from . import mtp_profile
 from .common import (
     _batch_cache_left_padding,
     _dflash_block_total,
@@ -596,127 +597,160 @@ def _mtp_rounds(
     b = first_bonus
     emitted = 1  # caller already yielded the first bonus
 
-    while emitted < max_tokens:
-        # Fork (O40): thinking budget, ported verbatim in contract from
-        # run_suffix_decoding_rounds — the caller (stream_generate) drives the
-        # criteria's __call__ per yielded token; this loop only checks
-        # ``budget_exceeded`` at the round top and forces the model's real
-        # end-of-thinking token so generation leaves the block and answers.
-        # Block granularity (<= one draft block of overshoot); never fires
-        # without a criteria. The pending bonus is committed with a width-1
-        # verify forward FIRST — it was yielded but is not yet in the target
-        # cache, and the forced token must land after it, not instead of it.
-        if thinking_budget_criteria is not None and getattr(
-            thinking_budget_criteria, "budget_exceeded", False
-        ):
-            with mx.stream(generation_stream):
-                verify = _mtp_verify_target(
-                    lm,
-                    mx.array([[b]], dtype=token_dtype),
-                    prompt_cache,
-                    sampler,
-                    sample_target_tokens=False,
+    # M29 H1: env-gated round profiler (MLX_VLM_MTP_PROFILE). ``prof`` is
+    # None unless the env var is set, so every profiler call below is a
+    # single ``if prof is not None:`` guard on the hot path -- zero extra
+    # calls when unset. See mtp_profile.py for the eval-then-synchronize
+    # fence rationale.
+    prof = mtp_profile.round_profiler_from_env()
+    if prof is not None:
+        prof.begin()
+
+    try:
+        while emitted < max_tokens:
+            # Fork (O40): thinking budget, ported verbatim in contract from
+            # run_suffix_decoding_rounds — the caller (stream_generate) drives the
+            # criteria's __call__ per yielded token; this loop only checks
+            # ``budget_exceeded`` at the round top and forces the model's real
+            # end-of-thinking token so generation leaves the block and answers.
+            # Block granularity (<= one draft block of overshoot); never fires
+            # without a criteria. The pending bonus is committed with a width-1
+            # verify forward FIRST — it was yielded but is not yet in the target
+            # cache, and the forced token must land after it, not instead of it.
+            # (No profiler marks in this branch; its cost lands in the next
+            # normal round's ``other`` phase.)
+            if thinking_budget_criteria is not None and getattr(
+                thinking_budget_criteria, "budget_exceeded", False
+            ):
+                with mx.stream(generation_stream):
+                    verify = _mtp_verify_target(
+                        lm,
+                        mx.array([[b]], dtype=token_dtype),
+                        prompt_cache,
+                        sampler,
+                        sample_target_tokens=False,
+                    )
+                hidden = _mtp_draft_hidden(lm, verify.hidden[:, -1:, :])
+                kv_offset += 1
+                draft_model.set_shared_kv(
+                    _slice_shared_kv_after_reject(verify.shared_kv_states, 0),
+                    kv_offset,
+                    position=_mtp_draft_position(kv_offset),
+                    kv_valid_len=kv_offset,
                 )
-            hidden = _mtp_draft_hidden(lm, verify.hidden[:, -1:, :])
-            kv_offset += 1
-            draft_model.set_shared_kv(
-                _slice_shared_kv_after_reject(verify.shared_kv_states, 0),
-                kv_offset,
-                position=_mtp_draft_position(kv_offset),
-                kv_valid_len=kv_offset,
+                end_id = int(thinking_budget_criteria.thinking_end_token_id)
+                yield end_id, None
+                emitted += 1
+                b = end_id
+                continue
+
+            bs = _mtp_next_block_size(
+                draft_model,
+                block_total,
+                configured_block_total,
+                max_tokens - emitted + 1,
             )
-            end_id = int(thinking_budget_criteria.thinking_end_token_id)
-            yield end_id, None
-            emitted += 1
-            b = end_id
-            continue
+            if bs <= 1:
+                break
 
-        bs = _mtp_next_block_size(
-            draft_model,
-            block_total,
-            configured_block_total,
-            max_tokens - emitted + 1,
-        )
-        if bs <= 1:
-            break
-
-        draft_tokens = sampler_rng.draft_tokens(
-            draft_model.draft_block,
-            b,
-            hidden,
-            None,
-            bs,
-            sampler,
-            token_dtype,
-            **_mtp_draft_kwargs(draft_model, greedy_sampling, sampler),
-        )
-
-        with mx.stream(generation_stream):
-            verify_input = mx.concatenate(
-                [mx.array([[b]], dtype=token_dtype), draft_tokens], axis=1
-            )
-            verify = _mtp_verify_target(
-                lm,
-                verify_input,
-                prompt_cache,
-                sampler,
-                sample_target_tokens=greedy_sampling,
-            )
-        accepted, new_tokens = _mtp_acceptance_walk(
-            lm,
-            verify,
-            draft_tokens,
-            sampler,
-            max_tokens - emitted,
-            row_id=0,
-            base_position=emitted,
-        )
-        sampler_rng.target_sampled(
-            sync_draft=not _sampler_supports_positioned_target(sampler)
-        )
-        _record_speculative_round(draft_model, accepted, bs - 1)
-
-        for tok in new_tokens:
-            yield tok, None
-            emitted += 1
-            if emitted >= max_tokens:
-                return
-
-        accept_verified = getattr(draft_model, "accept_verified_tokens", None)
-        if callable(accept_verified):
-            sampler_rng.draft_call(
-                accept_verified,
-                verify.hidden,
-                draft_tokens,
-                accepted,
-                new_tokens,
+            if prof is not None:
+                prof.mark("other")
+            draft_tokens = sampler_rng.draft_tokens(
+                draft_model.draft_block,
+                b,
+                hidden,
+                None,
+                bs,
                 sampler,
                 token_dtype,
                 **_mtp_draft_kwargs(draft_model, greedy_sampling, sampler),
             )
+            if prof is not None:
+                prof.mark("draft", draft_tokens)
 
-        # Hidden for next round: pick the slot of the newly accepted bonus.
-        hidden = _mtp_draft_hidden(lm, verify.hidden[:, accepted : accepted + 1, :])
-        b = new_tokens[-1] if new_tokens else b
-
-        rollback = getattr(lm, "rollback_speculative_cache", None)
-        if accepted < bs - 1 and callable(rollback):
             with mx.stream(generation_stream):
-                rollback(prompt_cache, verify.gdn_states, accepted, bs)
+                verify_input = mx.concatenate(
+                    [mx.array([[b]], dtype=token_dtype), draft_tokens], axis=1
+                )
+                verify = _mtp_verify_target(
+                    lm,
+                    verify_input,
+                    prompt_cache,
+                    sampler,
+                    sample_target_tokens=greedy_sampling,
+                )
+            if prof is not None:
+                prof.mark("verify", verify)
+            accepted, new_tokens = _mtp_acceptance_walk(
+                lm,
+                verify,
+                draft_tokens,
+                sampler,
+                max_tokens - emitted,
+                row_id=0,
+                base_position=emitted,
+            )
+            if prof is not None:
+                prof.mark("walk")
+            sampler_rng.target_sampled(
+                sync_draft=not _sampler_supports_positioned_target(sampler)
+            )
+            _record_speculative_round(draft_model, accepted, bs - 1)
 
-        next_shared_kv = _slice_shared_kv_after_reject(
-            verify.shared_kv_states, bs - (accepted + 1)
-        )
-        kv_offset += accepted + 1
-        draft_model.set_shared_kv(
-            next_shared_kv,
-            kv_offset,
-            position=_mtp_draft_position(kv_offset),
-            kv_valid_len=kv_offset,
-        )
+            for tok in new_tokens:
+                yield tok, None
+                emitted += 1
+                if emitted >= max_tokens:
+                    # Early return: this round's rollback mark + end_unit are
+                    # skipped (there is no "after" to mark); the outer
+                    # finally still reports what was accumulated so far.
+                    return
 
-        if emitted % 256 == 0:
-            mx.clear_cache()
+            accept_verified = getattr(draft_model, "accept_verified_tokens", None)
+            if callable(accept_verified):
+                sampler_rng.draft_call(
+                    accept_verified,
+                    verify.hidden,
+                    draft_tokens,
+                    accepted,
+                    new_tokens,
+                    sampler,
+                    token_dtype,
+                    **_mtp_draft_kwargs(draft_model, greedy_sampling, sampler),
+                )
+
+            # Hidden for next round: pick the slot of the newly accepted bonus.
+            hidden = _mtp_draft_hidden(lm, verify.hidden[:, accepted : accepted + 1, :])
+            b = new_tokens[-1] if new_tokens else b
+
+            rollback = getattr(lm, "rollback_speculative_cache", None)
+            if accepted < bs - 1 and callable(rollback):
+                with mx.stream(generation_stream):
+                    rollback(prompt_cache, verify.gdn_states, accepted, bs)
+                if prof is not None:
+                    prof.mark("rollback", mtp_profile.cache_state_arrays(prompt_cache))
+
+            next_shared_kv = _slice_shared_kv_after_reject(
+                verify.shared_kv_states, bs - (accepted + 1)
+            )
+            kv_offset += accepted + 1
+            draft_model.set_shared_kv(
+                next_shared_kv,
+                kv_offset,
+                position=_mtp_draft_position(kv_offset),
+                kv_valid_len=kv_offset,
+            )
+
+            if prof is not None:
+                prof.end_unit(
+                    accepted=accepted, n_draft=bs - 1, emitted=len(new_tokens)
+                )
+
+            if emitted % 256 == 0:
+                mx.clear_cache()
+    finally:
+        if prof is not None:
+            prof.report(final=True)
 
 
 def _mtp_cache_offset(prompt_cache: List[Any]) -> Any:

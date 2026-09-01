@@ -6,6 +6,7 @@ import mlx.nn as nn
 from ....models.base import create_attention_mask
 from ....models.cache import KVCache
 from ....models.nemotron_h.language import NemotronHBlock
+from ... import mtp_profile
 from .config import NemotronHMTPConfig
 
 
@@ -369,6 +370,15 @@ class NemotronHMTPDraftModel(nn.Module):
                 "so the drafter can use the target embeddings and LM head."
             )
 
+        # M29 H1: env-gated per-draft-token profiler (MLX_VLM_MTP_PROFILE_HEAD).
+        # ``hp`` is None unless the env var is set -- zero extra calls when
+        # unset. draft_block has no end-of-generation signal to report from,
+        # so the profiler is a module singleton the round loop's final report
+        # flushes (mtp_profile.MTPRoundProfiler._after_report).
+        hp = mtp_profile.head_profiler_from_env()
+        if hp is not None:
+            hp.begin()
+
         if isinstance(last_bonus, int):
             tok = mx.array([[last_bonus]], dtype=token_dtype)
         else:
@@ -387,10 +397,19 @@ class NemotronHMTPDraftModel(nn.Module):
 
         while len(tokens) < block_size - 1:
             h_prev = self._forward_token(tok, h_prev, token_dtype)
+            if hp is not None:
+                hp.mark("proj_layers", h_prev)
             self._round_appended += 1
             logits = self._lm_head_fn(h_prev)
+            if hp is not None:
+                hp.mark("lm_head", logits)
             tok = mx.argmax(logits, axis=-1) if greedy else sampler(logits)
+            if hp is not None:
+                hp.mark("sampler")
             tokens.append(tok)
+            if hp is not None:
+                hp.mark("eval", tok)
+                hp.end_unit()
 
         self._draft_round += 1
         return mx.concatenate(tokens, axis=1)
