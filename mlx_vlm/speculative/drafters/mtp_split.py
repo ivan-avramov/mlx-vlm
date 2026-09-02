@@ -207,8 +207,16 @@ class MTPSplitter:
     ) -> Dict[str, mx.array]:
         tensors = self.rename(tensors, text_config)
         if source_is_mlx and self.supports_mlx_source:
-            return self.on_mlx_source(tensors, text_config)
-        tensors = self.run_sanitize(tensors, text_config)
+            tensors = self.on_mlx_source(tensors, text_config)
+        else:
+            tensors = self.run_sanitize(tensors, text_config)
+        # Fork: postprocess runs on BOTH branches (C45). Upstream returned
+        # straight from on_mlx_source, so an MLX-format source shipping separate
+        # per-expert tensors was never stacked and tripped the C41 loose-key
+        # guard in split(). Every family that supports_mlx_source either has a
+        # no-op postprocess or an idempotent one (expert stacking matches
+        # nothing on already-stacked tensors), so fused/quantized MLX sources
+        # are unchanged.
         self.postprocess(tensors, text_config)
         return tensors
 

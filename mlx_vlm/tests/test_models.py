@@ -15592,6 +15592,18 @@ class TestMTPSplit(unittest.TestCase):
         mx.save_safetensors(str(path / "model.safetensors"), tensors)
         return str(path)
 
+    def _write_mlx_source(self, tmp, config, tensors):
+        import json
+        from pathlib import Path
+
+        path = Path(tmp)
+        (path / "config.json").write_text(json.dumps(config))
+        # ``format: mlx`` metadata -> splitter takes the on_mlx_source branch
+        mx.save_safetensors(
+            str(path / "model.safetensors"), tensors, metadata={"format": "mlx"}
+        )
+        return str(path)
+
     def test_registry_resolves_all_families(self):
         from mlx_vlm.speculative.drafters.mtp_split import get_mtp_splitter
 
@@ -15785,6 +15797,13 @@ class TestMTPSplit(unittest.TestCase):
         # separate up/down/gate experts collapse into a stacked switch_mlp
         self.assertEqual(
             weights["layers.0.mlp.switch_mlp.gate_proj.weight"].shape, (2, 8, 8)
+        )
+        # expert order is preserved: stacked[e] is expert e (C45 N3b)
+        self.assertTrue(
+            mx.array_equal(
+                weights["layers.0.mlp.switch_mlp.gate_proj.weight"][1],
+                tensors["mtp.layers.0.mlp.experts.1.gate_proj.weight"],
+            ).item()
         )
         self.assertNotIn("layers.0.mlp.experts.0.gate_proj.weight", weights)
         self.assertEqual(config["model_type"], "qwen3_5_mtp")
@@ -15992,3 +16011,89 @@ class TestMTPSplit(unittest.TestCase):
             with self.assertRaises(ValueError):
                 split_mtp(src, out, model_type="qwen3_5_moe")
             self.assertFalse((Path(out) / "model.safetensors").exists())
+
+    def test_qwen3_5_moe_mlx_source_stacks_separate_experts(self):
+        # Fork (C45 N1): an already-MLX Qwen3.5-MoE source with SEPARATE
+        # per-expert tensors takes the on_mlx_source branch of transform, which
+        # returned BEFORE postprocess -- experts were never stacked and the C41
+        # loose-key guard then rejected a legitimate source.
+        import re
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.split_mtp import split_mtp
+
+        norm = mx.random.normal((8,))
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as out:
+            tensors = {
+                "mtp.norm.weight": norm,
+                "mtp.layers.0.mlp.gate.weight": mx.random.normal((2, 8)),
+            }
+            for e in range(2):
+                for proj in ("gate_proj", "up_proj", "down_proj"):
+                    tensors[f"mtp.layers.0.mlp.experts.{e}.{proj}.weight"] = (
+                        mx.random.normal((8, 8))
+                    )
+            src = self._write_mlx_source(
+                tmp,
+                {
+                    "model_type": "qwen3_5_moe",
+                    "text_config": {
+                        "model_type": "qwen3_5_moe",
+                        "num_experts": 2,
+                        "mtp_num_hidden_layers": 1,
+                    },
+                },
+                tensors,
+            )
+            split_mtp(src, out, model_type="qwen3_5_moe")  # must not raise
+            weights = mx.load(str(Path(out) / "model.safetensors"))
+
+        self.assertTrue(all(not k.startswith("mtp.") for k in weights))
+        # the MLX branch was really taken: no +1.0 norm shift on an MLX source
+        self.assertTrue(mx.array_equal(weights["norm.weight"], norm).item())
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            stacked = weights[f"layers.0.mlp.switch_mlp.{proj}.weight"]
+            self.assertEqual(stacked.shape, (2, 8, 8))
+            # expert order is preserved: stacked[e] is expert e
+            for e in range(2):
+                self.assertTrue(
+                    mx.array_equal(
+                        stacked[e],
+                        tensors[f"mtp.layers.0.mlp.experts.{e}.{proj}.weight"],
+                    ).item()
+                )
+        loose = [k for k in weights if re.search(r"\.experts\.\d+\.", k)]
+        self.assertEqual(loose, [])
+
+    def test_stack_separate_experts_infers_num_experts(self):
+        # Fork (C45 N3a): with ``num_experts`` absent from the config the count
+        # is inferred as max expert index + 1, and order is preserved.
+        import re
+
+        from mlx_vlm.speculative.drafters.qwen3_5_mtp.split import (
+            _stack_separate_experts,
+        )
+
+        tensors = {"layers.0.mlp.gate.weight": mx.random.normal((3, 8))}
+        for e in range(3):
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                tensors[f"layers.0.mlp.experts.{e}.{proj}.weight"] = mx.random.normal(
+                    (8, 8)
+                )
+        originals = dict(tensors)
+        _stack_separate_experts(tensors, {})
+
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            stacked = tensors[f"layers.0.mlp.switch_mlp.{proj}.weight"]
+            self.assertEqual(stacked.shape, (3, 8, 8))
+            for e in range(3):
+                self.assertTrue(
+                    mx.array_equal(
+                        stacked[e],
+                        originals[f"layers.0.mlp.experts.{e}.{proj}.weight"],
+                    ).item()
+                )
+        loose = [k for k in tensors if re.search(r"\.experts\.\d+\.", k)]
+        self.assertEqual(loose, [])
+        self.assertIn("layers.0.mlp.gate.weight", tensors)
