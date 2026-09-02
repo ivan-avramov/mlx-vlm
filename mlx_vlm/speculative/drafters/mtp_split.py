@@ -12,6 +12,7 @@ dispatch on a source checkpoint.
 import glob
 import importlib
 import json
+import re  # Fork: loose per-expert-key guard in MTPSplitter.split (C41)
 import shutil
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -241,6 +242,17 @@ class MTPSplitter:
             raise ValueError(f"No MTP tensors found in {source_path}.")
 
         weights = self.transform(selected, text_config, source_is_mlx)
+        # Fork: refuse to write a drafter with loose per-expert keys (C41). They
+        # survive when expert stacking could not fire (e.g. num_experts disagrees
+        # with the shipped tensors); the runtime cannot load them, so fail here
+        # rather than emit a checkpoint that breaks at load time.
+        loose = sorted(k for k in weights if re.search(r"\.experts\.\d+\.", k))
+        if loose:
+            raise ValueError(
+                f"{len(loose)} per-expert tensor(s) were not stacked into switch_mlp "
+                f"(first: {loose[0]!r}); check num_experts against the shipped "
+                "expert tensors."
+            )
         quantization = self.quantization(
             weights, source_config, text_config, quant_opts
         )
@@ -310,8 +322,16 @@ def detect_mtp_splitter(model_path: Path) -> Optional[MTPSplitter]:
     with open(config_path) as f:
         source_config = json.load(f)
     text_config = source_config.get("text_config") or source_config
-    base_model_type = text_config.get("model_type") or source_config.get("model_type")
-    splitter = get_mtp_splitter(base_model_type)
+    # Fork: try the text model_type THEN the root one; the first REGISTERED wins.
+    # Upstream's ``text or root`` only falls back when the text model_type is
+    # missing, so an HF Qwen3.5-MoE config (text_config.model_type
+    # "qwen3_5_moe_text", root "qwen3_5_moe") was never detected (C41).
+    splitter = None
+    for candidate in (text_config.get("model_type"), source_config.get("model_type")):
+        if candidate:
+            splitter = get_mtp_splitter(candidate)
+        if splitter is not None:
+            break
     if splitter is None:
         return None
     tc = splitter.read_text_config(source_config)

@@ -15598,6 +15598,7 @@ class TestMTPSplit(unittest.TestCase):
         expected = {
             "qwen3_5": "qwen3_5_mtp",
             "qwen3_5_moe": "qwen3_5_mtp",
+            "qwen3_next": "qwen3_5_mtp",
             "deepseek_v4": "deepseek_v4_mtp",
             "glm4_moe_lite": "glm4_moe_lite_mtp",
             "inkling_mm_model": "inkling_mtp",
@@ -15821,3 +15822,173 @@ class TestMTPSplit(unittest.TestCase):
         self.assertNotIn("norm.scales", weights)
         self.assertEqual(config["quantization"]["mode"], "affine")
         self.assertEqual(config["quantization"]["bits"], 4)
+
+    def test_qwen3_5_moe_fused_layout_unchanged(self):
+        # Fork (C41 regression pin): the fused ``experts.gate_up_proj`` /
+        # ``experts.down_proj`` layout that Qwen3.5-MoE HF checkpoints ship must
+        # keep splitting exactly as before the separate-expert stacking landed.
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.split_mtp import split_mtp
+
+        norm = mx.random.normal((8,))
+        gate_up = mx.random.normal((2, 16, 8))
+        down = mx.random.normal((2, 8, 8))
+        gate = mx.random.normal((2, 8))
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as out:
+            src = self._write_source(
+                tmp,
+                {
+                    "model_type": "qwen3_5_moe",
+                    "text_config": {
+                        "model_type": "qwen3_5_moe",
+                        "num_experts": 2,
+                        "mtp_num_hidden_layers": 1,
+                    },
+                },
+                {
+                    "mtp.norm.weight": norm,
+                    "mtp.layers.0.mlp.experts.gate_up_proj": gate_up,
+                    "mtp.layers.0.mlp.experts.down_proj": down,
+                    "mtp.layers.0.mlp.gate.weight": gate,
+                },
+            )
+            split_mtp(src, out, model_type="qwen3_5_moe")
+            weights = mx.load(str(Path(out) / "model.safetensors"))
+
+        self.assertEqual(
+            set(weights),
+            {
+                "norm.weight",
+                "layers.0.mlp.switch_mlp.gate_proj.weight",
+                "layers.0.mlp.switch_mlp.up_proj.weight",
+                "layers.0.mlp.switch_mlp.down_proj.weight",
+                "layers.0.mlp.gate.weight",
+            },
+        )
+        self.assertTrue(
+            mx.array_equal(
+                weights["layers.0.mlp.switch_mlp.gate_proj.weight"], gate_up[:, :8]
+            ).item()
+        )
+        self.assertTrue(
+            mx.array_equal(
+                weights["layers.0.mlp.switch_mlp.up_proj.weight"], gate_up[:, 8:]
+            ).item()
+        )
+        self.assertTrue(
+            mx.array_equal(
+                weights["layers.0.mlp.switch_mlp.down_proj.weight"], down
+            ).item()
+        )
+        self.assertTrue(mx.allclose(weights["norm.weight"], norm + 1.0).item())
+
+    def test_qwen3_5_moe_split_stacks_separate_experts(self):
+        # Fork (C41 defect 1): Qwen3.5-MoE sources that ship SEPARATE per-expert
+        # gate/up/down tensors (the Qwen3-Next layout) must collapse into the
+        # stacked switch_mlp the qwen3_5_mtp drafter loads, not pass through loose.
+        import re
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.split_mtp import split_mtp
+
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as out:
+            tensors = {
+                "mtp.norm.weight": mx.random.normal((8,)),
+                "mtp.layers.0.input_layernorm.weight": mx.random.normal((8,)),
+                "mtp.layers.0.mlp.gate.weight": mx.random.normal((2, 8)),
+            }
+            for e in range(2):
+                for proj in ("gate_proj", "up_proj", "down_proj"):
+                    tensors[f"mtp.layers.0.mlp.experts.{e}.{proj}.weight"] = (
+                        mx.random.normal((8, 8))
+                    )
+            src = self._write_source(
+                tmp,
+                {
+                    "model_type": "qwen3_5_moe",
+                    "text_config": {
+                        "model_type": "qwen3_5_moe",
+                        "num_experts": 2,
+                        "mtp_num_hidden_layers": 1,
+                    },
+                },
+                tensors,
+            )
+            split_mtp(src, out, model_type="qwen3_5_moe")
+            weights = mx.load(str(Path(out) / "model.safetensors"))
+
+        stacked = weights["layers.0.mlp.switch_mlp.gate_proj.weight"]
+        self.assertEqual(stacked.shape, (2, 8, 8))
+        # expert order is preserved: stacked[e] is expert e
+        self.assertTrue(
+            mx.array_equal(
+                stacked[1], tensors["mtp.layers.0.mlp.experts.1.gate_proj.weight"]
+            ).item()
+        )
+        self.assertIn("layers.0.mlp.switch_mlp.up_proj.weight", weights)
+        self.assertIn("layers.0.mlp.switch_mlp.down_proj.weight", weights)
+        loose = [k for k in weights if re.search(r"\.experts\.\d+\.", k)]
+        self.assertEqual(loose, [])
+
+    def test_detect_falls_back_to_root_model_type(self):
+        # Fork (C41 defect 2): HF Qwen3.5-MoE configs carry
+        # text_config.model_type == "qwen3_5_moe_text" (unregistered) while the
+        # root model_type is the registered base; detect must try both, first
+        # REGISTERED wins -- not "first present".
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.speculative.drafters.mtp_split import detect_mtp_splitter
+        from mlx_vlm.speculative.drafters.qwen3_5_mtp.split import Qwen3_5MTPSplitter
+
+        cfg = {
+            "model_type": "qwen3_5_moe",
+            "text_config": {
+                "model_type": "qwen3_5_moe_text",
+                "mtp_num_hidden_layers": 1,
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            src = self._write_source(
+                tmp, cfg, {"mtp.norm.weight": mx.random.normal((8,))}
+            )
+            splitter = detect_mtp_splitter(Path(src))
+        self.assertIsInstance(splitter, Qwen3_5MTPSplitter)
+
+    def test_split_raises_on_loose_per_expert_keys(self):
+        # Fork (C41 defect 3): if expert stacking cannot fire (here num_experts=3
+        # but only experts 0..1 ship) the drafter would be written with loose
+        # per-expert keys the runtime cannot load. Fail loudly, write nothing.
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.split_mtp import split_mtp
+
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as out:
+            tensors = {
+                "mtp.norm.weight": mx.random.normal((8,)),
+                "mtp.layers.0.mlp.gate.weight": mx.random.normal((3, 8)),
+            }
+            for e in range(2):
+                for proj in ("gate_proj", "up_proj", "down_proj"):
+                    tensors[f"mtp.layers.0.mlp.experts.{e}.{proj}.weight"] = (
+                        mx.random.normal((8, 8))
+                    )
+            src = self._write_source(
+                tmp,
+                {
+                    "model_type": "qwen3_5_moe",
+                    "text_config": {
+                        "model_type": "qwen3_5_moe",
+                        "num_experts": 3,
+                        "mtp_num_hidden_layers": 1,
+                    },
+                },
+                tensors,
+            )
+            with self.assertRaises(ValueError):
+                split_mtp(src, out, model_type="qwen3_5_moe")
+            self.assertFalse((Path(out) / "model.safetensors").exists())

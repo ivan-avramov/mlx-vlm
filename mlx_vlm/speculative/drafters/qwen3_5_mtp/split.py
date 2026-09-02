@@ -21,6 +21,38 @@ _QWEN_MTP_NORM_SUFFIXES = (
     "pre_fc_norm_hidden.weight",
 )
 
+_SEPARATE_EXPERT_RE = re.compile(  # Fork: C41 shared expert-stacking (see below)
+    r"(.*\.experts)\.(\d+)\.(?:gate_proj|up_proj|down_proj)\.weight$"
+)
+
+
+def _stack_separate_experts(tensors: Dict[str, mx.array], text_config: dict) -> None:
+    """Collapse separate per-expert ``experts.{e}.{proj}.weight`` tensors into the
+    stacked ``switch_mlp.{proj}.weight`` the qwen3_5_mtp drafter loads.
+
+    Fork: hoisted out of ``Qwen3NextMTPSplitter.postprocess`` (C41) so
+    ``Qwen3_5MTPSplitter`` applies it too -- Qwen3.5-MoE sources can ship the
+    separate-expert layout as well as the fused ``gate_up_proj`` one, and the
+    fused path (``Qwen3_5MTPDraftModel.sanitize``) leaves separate experts loose.
+    Operates in place on already-``mtp.``-stripped keys. When ``num_experts`` is
+    absent from the config the count is inferred as max expert index + 1.
+    """
+    matches = [(k, m) for k in tensors if (m := _SEPARATE_EXPERT_RE.match(k))]
+    if not matches:
+        return
+    n_experts = int(text_config.get("num_experts", 0) or 0)
+    if not n_experts:
+        n_experts = max(int(m.group(2)) for _, m in matches) + 1
+    prefixes = {m.group(1) for _, m in matches}
+    for prefix in sorted(prefixes):
+        base = prefix[: -len(".experts")]
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            keys = [f"{prefix}.{e}.{proj}.weight" for e in range(n_experts)]
+            if all(k in tensors for k in keys):
+                tensors[f"{base}.switch_mlp.{proj}.weight"] = mx.stack(
+                    [tensors.pop(k) for k in keys]
+                )
+
 
 class Qwen3_5MTPSplitter(MTPSplitter):
     output_model_type = "qwen3_5_mtp"
@@ -40,6 +72,11 @@ class Qwen3_5MTPSplitter(MTPSplitter):
             (key[len("mtp.") :] if key.startswith("mtp.") else key): value
             for key, value in tensors.items()
         }
+
+    def postprocess(self, tensors: Dict[str, mx.array], text_config: dict) -> None:
+        # Fork: Qwen3.5-MoE sources may ship separate per-expert tensors (the
+        # Qwen3-Next layout); stack them like Qwen3NextMTPSplitter does (C41).
+        _stack_separate_experts(tensors, text_config)
 
     def quantization_from_source(self, tensors, source_config):
         if not any(key.endswith(".scales") for key in tensors):
@@ -89,21 +126,9 @@ class Qwen3NextMTPSplitter(MTPSplitter):
         return out
 
     def postprocess(self, tensors: Dict[str, mx.array], text_config: dict) -> None:
-        n_experts = int(text_config.get("num_experts", 0) or 0)
-        if not n_experts:
-            return
-        pattern = re.compile(
-            r"(.*\.experts)\.\d+\.(?:gate_proj|up_proj|down_proj)\.weight$"
-        )
-        prefixes = {m.group(1) for k in tensors if (m := pattern.match(k))}
-        for prefix in prefixes:
-            base = prefix[: -len(".experts")]
-            for proj in ("gate_proj", "up_proj", "down_proj"):
-                keys = [f"{prefix}.{e}.{proj}.weight" for e in range(n_experts)]
-                if all(k in tensors for k in keys):
-                    tensors[f"{base}.switch_mlp.{proj}.weight"] = mx.stack(
-                        [tensors.pop(k) for k in keys]
-                    )
+        # Fork: body hoisted to _stack_separate_experts so Qwen3_5MTPSplitter
+        # can share it (C41).
+        _stack_separate_experts(tensors, text_config)
 
     def quantization_from_source(self, tensors, source_config):
         if not any(key.endswith(".scales") for key in tensors):
