@@ -11,6 +11,7 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import ArraysCache, KVCache
+from ..moe_expand import MoeExpansion, expand_route_with_weight_base
 from ..recurrent_rollback import (
     RecurrentStateRollbackMixin,
 )  # Fork: MTP speculative-verify rollback contract (see recurrent_rollback.py docstring)
@@ -338,7 +339,16 @@ def group_expert_select(
     topk_group,
     routed_scaling_factor,
     norm_topk_prob,
+    expand_n=0,
+    expand_t=0.0,
+    expand_d=1.0,
 ):
+    # M34: `expand_n <= top_k` (the default, 0) is the ORIGINAL code path --
+    # unchanged below, not re-implemented. `expand_n > top_k` is the
+    # layer-scoped expert-budget expansion (see ../moe_expand.py): selection
+    # still runs on the bias-corrected, group-masked score (`scores`), but the
+    # weight numerator is the plain sigmoid score (`orig_scores`), matching
+    # native's `orig_scores`/`scores` split.
 
     orig_scores = scores = mx.sigmoid(gates.astype(mx.float32))
     scores = scores + e_score_correction_bias
@@ -353,14 +363,25 @@ def group_expert_select(
         scores = mx.flatten(scores, -2, -1)
 
     k = top_k
-    inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
-    scores = mx.take_along_axis(orig_scores, inds, axis=-1)
-    if top_k > 1 and norm_topk_prob:
-        denominator = scores.sum(axis=-1, keepdims=True)
-        scores = scores / (denominator + 1e-20)
-    scores = scores * routed_scaling_factor
+    if expand_n > top_k:
+        inds, out_scores = expand_route_with_weight_base(
+            scores,
+            orig_scores,
+            k,
+            expand_n,
+            expand_t,
+            expand_d,
+            normalize=(top_k > 1 and norm_topk_prob),
+        )
+    else:
+        inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+        out_scores = mx.take_along_axis(orig_scores, inds, axis=-1)
+        if top_k > 1 and norm_topk_prob:
+            denominator = out_scores.sum(axis=-1, keepdims=True)
+            out_scores = out_scores / (denominator + 1e-20)
+    out_scores = out_scores * routed_scaling_factor
 
-    return inds, scores
+    return inds, out_scores
 
 
 class MoEGate(nn.Module):
@@ -376,7 +397,13 @@ class MoEGate(nn.Module):
         self.weight = mx.zeros((self.n_routed_experts, config.hidden_size))
         self.e_score_correction_bias = mx.zeros((self.n_routed_experts,))
 
-    def __call__(self, x):
+    def __call__(
+        self,
+        x,
+        expand_n: int = 0,
+        expand_t: float = 0.0,
+        expand_d: float = 1.0,
+    ):
         return group_expert_select(
             x @ self.weight.T,
             self.e_score_correction_bias,
@@ -385,15 +412,23 @@ class MoEGate(nn.Module):
             self.topk_group,
             self.routed_scaling_factor,
             self.norm_topk_prob,
+            expand_n,
+            expand_t,
+            expand_d,
         )
 
 
 class NemotronHMoE(nn.Module):
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig, layer_idx: int = 0):
         super().__init__()
         self.config = config
         self.num_experts_per_tok = config.num_experts_per_tok
         self.moe_latent_size = config.moe_latent_size
+        self.layer_idx = layer_idx
+        # M34: layer-scoped expert-budget expansion. None == native top-K
+        # everywhere (byte-identical to upstream); set via
+        # `LanguageModel.set_moe_expansion`, never touched otherwise.
+        self.moe_expand: Optional[MoeExpansion] = None
 
         expert_input_dim = (
             config.moe_latent_size
@@ -424,7 +459,15 @@ class NemotronHMoE(nn.Module):
 
     def __call__(self, x):
         residuals = x
-        inds, scores = self.gate(x)
+        exp = self.moe_expand
+        if (
+            exp is not None
+            and exp.n > self.num_experts_per_tok
+            and exp.in_range(self.layer_idx)
+        ):
+            inds, scores = self.gate(x, exp.n, exp.t, exp.d)
+        else:
+            inds, scores = self.gate(x)
 
         if self.moe_latent_size is not None:
             x = self.fc1_latent_proj(x)
@@ -442,7 +485,7 @@ class NemotronHMoE(nn.Module):
 
 
 class NemotronHBlock(nn.Module):
-    def __init__(self, args: ModelConfig, block_type: str):
+    def __init__(self, args: ModelConfig, block_type: str, layer_idx: int = 0):
         super().__init__()
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.layer_norm_epsilon)
 
@@ -455,7 +498,7 @@ class NemotronHBlock(nn.Module):
         elif self.block_type == "-":
             self.mixer = NemotronHMLP(args)
         elif self.block_type == "E":
-            self.mixer = NemotronHMoE(args)
+            self.mixer = NemotronHMoE(args, layer_idx)
 
     def __call__(
         self,
@@ -484,8 +527,8 @@ class NemotronHModel(nn.Module):
         if with_embeddings:
             self.embeddings = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
-            NemotronHBlock(args, block_type)
-            for block_type in args.hybrid_override_pattern
+            NemotronHBlock(args, block_type, layer_idx=i)
+            for i, block_type in enumerate(args.hybrid_override_pattern)
         ]
         self.norm_f = nn.RMSNorm(args.hidden_size, eps=args.layer_norm_epsilon)
         self.fa_idx = 0
@@ -745,3 +788,18 @@ class LanguageModel(RecurrentStateRollbackMixin, nn.Module):
 
     def make_cache(self):
         return Model.make_cache(self)
+
+    def set_moe_expansion(self, exp: Optional[MoeExpansion]) -> int:
+        """Set (or clear, with `None`) M34 expert-budget expansion on every
+        `NemotronHMoE` block ("E" layers). Returns the number of MoE layers
+        whose absolute index falls inside `exp`'s layer range (0 if `exp` is
+        None). Only ever touches `self`'s own layers -- a bound MTP drafter is
+        a separate `nn.Module`, never reachable from here."""
+        count = 0
+        for layer in self.backbone.layers:
+            if layer.block_type != "E":
+                continue
+            layer.mixer.moe_expand = exp
+            if exp is not None and exp.in_range(layer.mixer.layer_idx):
+                count += 1
+        return count

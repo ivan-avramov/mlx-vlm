@@ -1400,6 +1400,17 @@ class ResponseGenerator:
             self.model_path, self.adapter_path
         )
 
+        # M34: layer-scoped expert-budget expansion, applied to the TARGET
+        # model only -- read here (after load, before any drafter is loaded
+        # below) so a speculative drafter, loaded as a wholly separate
+        # nn.Module further down, is never touched.
+        moe_expand_spec = os.environ.get("MLX_VLM_MOE_EXPAND")
+        if moe_expand_spec:
+            from ..models.moe_expand import apply_moe_expansion
+
+            n_layers = apply_moe_expansion(model, moe_expand_spec)
+            logger.info("moe_expand=%s layers=%d", moe_expand_spec, n_layers)
+
         stop_tokens = set()
         if hasattr(config, "eos_token_id"):
             if isinstance(config.eos_token_id, list):

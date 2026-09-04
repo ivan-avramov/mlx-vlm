@@ -35,6 +35,7 @@ class MLXVisionChat:
         temperature: float = 0.7,
         max_tokens: int = 1000,
         verbose: bool = False,
+        moe_expand: str = None,
         **kwargs,
     ):
         self.console = Console()
@@ -58,6 +59,17 @@ class MLXVisionChat:
 
         with self.console.status("[bold green]Loading model..."):
             self.model, self.processor = load(model_path)
+
+        if moe_expand is not None:
+            # M34: layer-scoped expert-budget expansion, applied to the
+            # loaded model only -- chat.py has no drafter, so there is
+            # nothing else to accidentally reach.
+            from mlx_vlm.models.moe_expand import apply_moe_expansion
+
+            n_layers = apply_moe_expansion(self.model, moe_expand)
+            rprint(
+                f"[bold green]moe_expand={moe_expand} layers={n_layers}[/bold green]"
+            )
 
         rprint("[bold green]Model loaded successfully![/bold green]")
         self.print_help()
@@ -226,6 +238,17 @@ def main():
         help="Number of tokens to process per prefill step.",
     )
     parser.add_argument(
+        "--moe-expand",
+        type=str,
+        default=None,
+        help=(
+            "M34 layer-scoped expert-budget expansion for the loaded MoE "
+            "language model, as 'LS-LE:N:T:D' (absolute 0-based decoder-layer "
+            "range inclusive, expanded expert budget, keep-threshold in "
+            "[0,1], decay floor in (0,1]), e.g. '27-39:20:0.8:0.5'."
+        ),
+    )
+    parser.add_argument(
         "--max-kv-size",
         type=int,
         default=None,
@@ -382,6 +405,7 @@ def main():
             temperature=args.temperature,
             max_tokens=args.max_tokens,
             verbose=args.verbose,
+            moe_expand=args.moe_expand,
             **kwargs,
         )
         chat.chat_loop()

@@ -3,6 +3,7 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..moe_expand import MoeExpansion, expand_route
 from ..qwen3_5.language import LanguageModel as Qwen3_5LanguageModel
 from ..qwen3_5.language import Qwen3_5Attention as Qwen3_5MoeAttention
 from ..qwen3_5.language import Qwen3_5GatedDeltaNet as Qwen3_5MoeGatedDeltaNet
@@ -33,7 +34,7 @@ def _target_verify_switch_glu(switch_mlp: SwitchGLU, x, indices, target_verify: 
 
 
 class Qwen3_5MoeSparseMoeBlock(nn.Module):
-    def __init__(self, args: TextConfig):
+    def __init__(self, args: TextConfig, layer_idx: int = 0):
         super().__init__()
         dim = args.hidden_size
         intermediate_size = args.moe_intermediate_size
@@ -41,6 +42,11 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
 
         self.num_experts = num_experts = args.num_experts
         self.top_k = args.num_experts_per_tok
+        self.layer_idx = layer_idx
+        # M34: layer-scoped expert-budget expansion. None == native top-K
+        # everywhere (byte-identical to upstream); set via
+        # `LanguageModel.set_moe_expansion`, never touched otherwise.
+        self.moe_expand: Optional[MoeExpansion] = None
 
         self.gate = nn.Linear(dim, num_experts, bias=False)
         self.switch_mlp = SwitchGLU(dim, intermediate_size, num_experts)
@@ -57,9 +63,13 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         gates = mx.softmax(gates, axis=-1, precise=True)
 
         k = self.top_k
-        inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
-        scores = mx.take_along_axis(gates, inds, axis=-1)
-        scores = scores / scores.sum(axis=-1, keepdims=True)
+        exp = self.moe_expand
+        if exp is not None and exp.n > k and exp.in_range(self.layer_idx):
+            inds, scores = expand_route(gates, k, exp.n, exp.t, exp.d)
+        else:
+            inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+            scores = mx.take_along_axis(gates, inds, axis=-1)
+            scores = scores / scores.sum(axis=-1, keepdims=True)
 
         y = _target_verify_switch_glu(self.switch_mlp, x, inds, target_verify)
         y = (y * scores[..., None]).sum(axis=-2)
@@ -86,7 +96,7 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
         self.post_attention_layernorm = nn.RMSNorm(
             args.hidden_size, eps=args.rms_norm_eps
         )
-        self.mlp = Qwen3_5MoeSparseMoeBlock(args)
+        self.mlp = Qwen3_5MoeSparseMoeBlock(args, layer_idx)
 
     def __call__(
         self,
@@ -148,3 +158,16 @@ class LanguageModel(Qwen3_5LanguageModel):
 
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+
+    def set_moe_expansion(self, exp: Optional[MoeExpansion]) -> int:
+        """Set (or clear, with `None`) M34 expert-budget expansion on every MoE
+        block. Returns the number of layers whose absolute index falls inside
+        `exp`'s layer range (0 if `exp` is None). Only ever touches `self`'s
+        own layers -- a bound MTP drafter is a separate `nn.Module`, never
+        reachable from here."""
+        count = 0
+        for layer in self.model.layers:
+            layer.mlp.moe_expand = exp
+            if exp is not None and exp.in_range(layer.mlp.layer_idx):
+                count += 1
+        return count

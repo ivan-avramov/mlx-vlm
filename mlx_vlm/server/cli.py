@@ -225,6 +225,18 @@ def main():
         help="Tokens per prefill step (default: %(default)s).",
     )
     parser.add_argument(
+        "--moe-expand",
+        type=str,
+        default=None,
+        help=(
+            "M34 layer-scoped expert-budget expansion for the loaded MoE "
+            "language model, as 'LS-LE:N:T:D' (absolute 0-based decoder-layer "
+            "range inclusive, expanded expert budget, keep-threshold in "
+            "[0,1], decay floor in (0,1]), e.g. '27-39:20:0.8:0.5'. Applied to "
+            "the TARGET model only; a speculative drafter is never expanded."
+        ),
+    )
+    parser.add_argument(
         "--log-progress-interval",
         type=int,
         default=get_log_progress_interval(),
@@ -624,6 +636,12 @@ def main():
         os.environ["MLX_VLM_MAX_NUM_SEQS"] = str(args.max_num_seqs)
     if args.prefill_step_size:
         os.environ["PREFILL_STEP_SIZE"] = str(args.prefill_step_size)
+    if args.moe_expand is not None:
+        # Fail loud and fast at startup (not per-request) on a malformed string.
+        from ..models.moe_expand import parse_moe_expand
+
+        parse_moe_expand(args.moe_expand)
+        os.environ["MLX_VLM_MOE_EXPAND"] = args.moe_expand
     os.environ["MLX_VLM_LOG_PROGRESS_INTERVAL"] = str(args.log_progress_interval)
     os.environ["MLX_VLM_MAX_TOKENS"] = str(args.max_tokens)
     os.environ["MLX_VLM_ENABLE_THINKING"] = "1" if args.enable_thinking else "0"
