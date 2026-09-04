@@ -36,6 +36,26 @@ _LOG_NAME = os.environ.get("MLX_VLM_LOG_NAME", "mlx_vlm")
 logger = logging.getLogger(f"{_LOG_NAME}.server")
 
 
+def _configure_moe_expand(moe_expand_arg):
+    """Validate `--moe-expand` and forward it via the env var
+    `server/generation.py`'s generation thread reads.
+
+    ALWAYS writes the var -- including clearing it to `""` when the flag is
+    omitted -- rather than only setting it when given. mlx-serve spawns the
+    worker without an explicit `env=`, inheriting the router process's full
+    environment; a stale `MLX_VLM_MOE_EXPAND` export left over from an
+    earlier invocation in the same shell/session would otherwise silently
+    enable expansion on a run whose cmdline (and provenance fingerprint) say
+    native. `generation.py` already treats `""` the same as unset (falsy).
+    """
+    if moe_expand_arg:
+        # Fail loud and fast at startup (not per-request) on a malformed string.
+        from ..models.moe_expand import parse_moe_expand
+
+        parse_moe_expand(moe_expand_arg)
+    os.environ["MLX_VLM_MOE_EXPAND"] = moe_expand_arg or ""
+
+
 def _model_num_attention_heads(model_path):
     """Read the language model's query-head count from config.json (cheap: only the
     config file is fetched, not weights). Returns None if it can't be determined."""
@@ -636,12 +656,7 @@ def main():
         os.environ["MLX_VLM_MAX_NUM_SEQS"] = str(args.max_num_seqs)
     if args.prefill_step_size:
         os.environ["PREFILL_STEP_SIZE"] = str(args.prefill_step_size)
-    if args.moe_expand is not None:
-        # Fail loud and fast at startup (not per-request) on a malformed string.
-        from ..models.moe_expand import parse_moe_expand
-
-        parse_moe_expand(args.moe_expand)
-        os.environ["MLX_VLM_MOE_EXPAND"] = args.moe_expand
+    _configure_moe_expand(args.moe_expand)
     os.environ["MLX_VLM_LOG_PROGRESS_INTERVAL"] = str(args.log_progress_interval)
     os.environ["MLX_VLM_MAX_TOKENS"] = str(args.max_tokens)
     os.environ["MLX_VLM_ENABLE_THINKING"] = "1" if args.enable_thinking else "0"

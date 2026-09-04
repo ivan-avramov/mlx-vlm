@@ -3,6 +3,7 @@ import gc
 import json  # Fork: --generation-defaults JSON payload (see get_server_generation_defaults)
 import logging
 import os
+import sys
 import time
 from collections import deque
 from contextlib import nullcontext
@@ -168,6 +169,23 @@ def _notify_queues(queues, *items):
 
 def get_prefill_step_size():
     return int(os.environ.get("PREFILL_STEP_SIZE", DEFAULT_PREFILL_STEP_SIZE))
+
+
+def _apply_moe_expand_and_log(model, spec: str) -> int:
+    """Apply M34 `--moe-expand` to `model` (the TARGET model only -- see
+    `models/moe_expand.apply_moe_expansion`) and announce it on BOTH the
+    logger and stderr directly.
+
+    mlx-serve sends the worker's stdout to `DEVNULL`; only stderr reaches
+    `$TMPDIR/mlx-manager-logs`, so `logger.info` alone (which this fork
+    normally routes to stdout) would make the startup line invisible there.
+    """
+    from ..models.moe_expand import apply_moe_expansion
+
+    n_layers = apply_moe_expansion(model, spec)
+    logger.info("moe_expand=%s layers=%d", spec, n_layers)
+    print(f"moe_expand={spec} layers={n_layers}", file=sys.stderr, flush=True)
+    return n_layers
 
 
 def get_max_num_seqs():
@@ -1403,13 +1421,12 @@ class ResponseGenerator:
         # M34: layer-scoped expert-budget expansion, applied to the TARGET
         # model only -- read here (after load, before any drafter is loaded
         # below) so a speculative drafter, loaded as a wholly separate
-        # nn.Module further down, is never touched.
+        # nn.Module further down, is never touched. "" (as well as unset) is
+        # off -- cli.py always writes this var so a stale ambient export can
+        # never silently leak through.
         moe_expand_spec = os.environ.get("MLX_VLM_MOE_EXPAND")
         if moe_expand_spec:
-            from ..models.moe_expand import apply_moe_expansion
-
-            n_layers = apply_moe_expansion(model, moe_expand_spec)
-            logger.info("moe_expand=%s layers=%d", moe_expand_spec, n_layers)
+            _apply_moe_expand_and_log(model, moe_expand_spec)
 
         stop_tokens = set()
         if hasattr(config, "eos_token_id"):

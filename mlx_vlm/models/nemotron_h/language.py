@@ -789,17 +789,39 @@ class LanguageModel(RecurrentStateRollbackMixin, nn.Module):
     def make_cache(self):
         return Model.make_cache(self)
 
-    def set_moe_expansion(self, exp: Optional[MoeExpansion]) -> int:
+    def set_moe_expansion(
+        self, exp: Optional[MoeExpansion], strict: bool = False
+    ) -> int:
         """Set (or clear, with `None`) M34 expert-budget expansion on every
         `NemotronHMoE` block ("E" layers). Returns the number of MoE layers
-        whose absolute index falls inside `exp`'s layer range (0 if `exp` is
-        None). Only ever touches `self`'s own layers -- a bound MTP drafter is
-        a separate `nn.Module`, never reachable from here."""
+        that ACTUALLY get expanded -- absolute index inside `exp`'s layer
+        range AND `exp.n > that layer's num_experts_per_tok` (0 if `exp` is
+        None). A layer in range with `exp.n <= num_experts_per_tok` is a
+        native-path no-op (see `NemotronHMoE.__call__`) and is not counted.
+        Only ever touches `self`'s own layers -- a bound MTP drafter is a
+        separate `nn.Module`, never reachable from here.
+
+        `strict=True` (used by `apply_moe_expansion`, the CLI/chat entry
+        point) raises `ValueError` if the range contains MoE blocks but none
+        of them get expanded -- every one would be a silent no-op. Direct
+        callers (e.g. tests exercising the deliberate `N == K` native
+        passthrough) default to `strict=False` and never raise for this."""
         count = 0
+        in_range_total = 0
+        top_k_seen = None
         for layer in self.backbone.layers:
             if layer.block_type != "E":
                 continue
             layer.mixer.moe_expand = exp
             if exp is not None and exp.in_range(layer.mixer.layer_idx):
-                count += 1
+                in_range_total += 1
+                top_k_seen = layer.mixer.num_experts_per_tok
+                if exp.n > layer.mixer.num_experts_per_tok:
+                    count += 1
+        if strict and exp is not None and in_range_total > 0 and count == 0:
+            raise ValueError(
+                f"moe_expand n={exp.n} does not exceed native top_k="
+                f"{top_k_seen} on any layer in range "
+                f"{exp.layers[0]}-{exp.layers[1]}"
+            )
         return count

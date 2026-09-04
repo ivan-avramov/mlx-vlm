@@ -117,7 +117,14 @@ def _rank_and_factor(
 def _normalized_weights(
     weight_base: mx.array, factor: mx.array, kept: mx.array, normalize: bool
 ) -> mx.array:
-    raw = weight_base * factor * kept.astype(weight_base.dtype)
+    # `factor` is always built as float32 (see `_rank_and_factor`); on a bf16
+    # model, `weight_base * factor` would otherwise silently promote the
+    # result -- and with it the residual stream and every downstream KV cache
+    # -- to float32. Casting both non-weight_base operands to weight_base's
+    # dtype keeps this a same-dtype multiply.
+    factor = factor.astype(weight_base.dtype)
+    kept = kept.astype(weight_base.dtype)
+    raw = weight_base * factor * kept
     if not normalize:
         return raw
     denom = raw.sum(axis=-1, keepdims=True)
@@ -227,9 +234,21 @@ def apply_moe_expansion(model, spec: str) -> int:
     `speculative/drafters/qwen3_5_mtp/qwen3_5_mtp.py`) -- it is never an
     attribute of the target model, so this can never reach it. Returns the
     number of MoE layers whose absolute layer index falls inside `spec`'s
-    range (0 if the model has no MoE blocks in range, or none at all).
-    Raises `ValueError` if the model has no `set_moe_expansion` (not an
-    MoE-capable language model).
+    range AND actually get expanded (`exp.n > that layer's native top_k`) --
+    0 only if the model has no MoE blocks in range at all.
+
+    Raises `ValueError`:
+    - if the model has no `set_moe_expansion` (not an MoE-capable language
+      model);
+    - at CLI/apply time (not the first request) if `N` exceeds the model's
+      total expert count;
+    - (via `set_moe_expansion(exp, strict=True)`) if the range contains MoE
+      blocks but `N` does not exceed native top_k on any of them -- every
+      block would be a silent no-op. `set_moe_expansion` called directly
+      (e.g. by tests exercising the deliberate, spec-required `N == K`
+      native-passthrough case) does NOT raise for this -- only this CLI/chat
+      entry point does, since a `--moe-expand` value like that is virtually
+      always a typo, not an intentional native probe.
     """
     exp = parse_moe_expand(spec)
     language_model = getattr(model, "language_model", model)
@@ -239,4 +258,14 @@ def apply_moe_expansion(model, spec: str) -> int:
             "--moe-expand is not supported by model type "
             f"{type(language_model).__name__!r} (no MoE blocks)"
         )
-    return set_fn(exp)
+
+    num_experts = getattr(language_model.args, "num_experts", None)
+    if num_experts is None:
+        num_experts = getattr(language_model.args, "n_routed_experts", None)
+    if num_experts is not None and exp.n > num_experts:
+        raise ValueError(
+            f"--moe-expand N={exp.n} exceeds this model's total expert count "
+            f"({num_experts})"
+        )
+
+    return set_fn(exp, strict=True)

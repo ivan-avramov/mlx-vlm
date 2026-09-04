@@ -4,6 +4,8 @@ Fork-only. Tiny synthetic configs only; never loads a real checkpoint. Spec:
 `docs/specs/m34-moe-expert-expansion.md` in the mlx_local_stack repo.
 """
 
+import os
+
 import mlx.core as mx
 import pytest
 
@@ -586,3 +588,278 @@ def test_apply_moe_expansion_raises_for_non_moe_model():
 
     with pytest.raises(ValueError):
         apply_moe_expansion(_Dense(), "0-3:6:0.5:0.5")
+
+
+# ---------------------------------------------------------------------------
+# Verifier fixes on b95130c9
+# ---------------------------------------------------------------------------
+
+
+def _to_bf16(model):
+    from mlx.utils import tree_map
+
+    model.update(tree_map(lambda p: p.astype(mx.bfloat16), model.parameters()))
+    return model
+
+
+class TestFix1Bf16DtypePreservation:
+    """FIX-1 (blocker): `factor` in `_normalized_weights` was always float32,
+    so on a bf16 model `weight_base * factor` promoted the qwen3_5_moe
+    residual stream -- and every downstream KV cache -- to float32.
+    nemotron_h was already protected by its own `.astype(y.dtype)` at the end
+    of `NemotronHMoE.__call__`; its case here is a regression guard, not a
+    blocker reproduction.
+    """
+
+    def test_qwen_expanded_forward_stays_bf16(self):
+        from mlx_vlm.models.cache import KVCache
+        from mlx_vlm.models.qwen3_5_moe.language import (
+            LanguageModel,
+            Qwen3_5MoeSparseMoeBlock,
+        )
+
+        config = _qwen_config()
+        model = _to_bf16(LanguageModel(config, config=_qwen_model_config()))
+        prompt = mx.array([[1, 2, 3, 4, 5]])
+
+        captured = {}
+        orig_call = Qwen3_5MoeSparseMoeBlock.__call__
+
+        def wrapped(self, x, target_verify=False):
+            out = orig_call(self, x, target_verify)
+            captured.setdefault(self.layer_idx, []).append(out.dtype)
+            return out
+
+        Qwen3_5MoeSparseMoeBlock.__call__ = wrapped
+        try:
+            baseline_cache = model.make_cache()
+            model.set_moe_expansion(None)
+            baseline = model(prompt, cache=baseline_cache).logits
+            mx.eval(baseline)
+
+            expanded_cache = model.make_cache()
+            model.set_moe_expansion(MoeExpansion(layers=(0, 3), n=6, t=0.5, d=0.5))
+            out = model(prompt, cache=expanded_cache).logits
+            mx.eval(out)
+        finally:
+            Qwen3_5MoeSparseMoeBlock.__call__ = orig_call
+
+        assert baseline.dtype == mx.bfloat16
+        assert out.dtype == baseline.dtype
+        for dtypes in captured.values():
+            for dt in dtypes:
+                assert dt == mx.bfloat16
+
+        # The full-attention layer's KVCache must also stay bf16 -- if the
+        # routing weight promoted the residual stream to float32, the K/V
+        # projections (and every cache built from them) would silently
+        # double in size.
+        kv_dtypes = [
+            c.keys.dtype
+            for c in expanded_cache
+            if isinstance(c, KVCache) and c.keys is not None
+        ]
+        assert kv_dtypes, "expected at least one populated KVCache"
+        assert all(dt == mx.bfloat16 for dt in kv_dtypes)
+
+    def test_nemotron_expanded_forward_stays_bf16(self):
+        from mlx_vlm.models import nemotron_h
+        from mlx_vlm.models.cache import KVCache
+
+        config = _nemotron_config()
+        model = _to_bf16(nemotron_h.Model(config))
+        prompt = mx.array([[1, 2, 3, 4, 5]])
+
+        captured = {}
+        orig_call = NemotronHMoE.__call__
+
+        def wrapped(self, x):
+            out = orig_call(self, x)
+            captured.setdefault(self.layer_idx, []).append(out.dtype)
+            return out
+
+        NemotronHMoE.__call__ = wrapped
+        try:
+            baseline_cache = model.make_cache()
+            model.language_model.set_moe_expansion(None)
+            baseline = model(prompt, cache=baseline_cache).logits
+            mx.eval(baseline)
+
+            expanded_cache = model.make_cache()
+            model.language_model.set_moe_expansion(
+                MoeExpansion(layers=(3, 4), n=6, t=0.5, d=0.5)
+            )
+            out = model(prompt, cache=expanded_cache).logits
+            mx.eval(out)
+        finally:
+            NemotronHMoE.__call__ = orig_call
+
+        assert baseline.dtype == mx.bfloat16
+        assert out.dtype == baseline.dtype
+        for dtypes in captured.values():
+            for dt in dtypes:
+                assert dt == mx.bfloat16
+
+        kv_dtypes = [
+            c.keys.dtype
+            for c in expanded_cache
+            if isinstance(c, KVCache) and c.keys is not None
+        ]
+        assert kv_dtypes, "expected at least one populated KVCache"
+        assert all(dt == mx.bfloat16 for dt in kv_dtypes)
+
+
+class TestFix2NoAmbientEnvLeak:
+    """FIX-2 (blocker, project rule): mlx-serve spawns the worker without
+    `env=`, inheriting the router's full environment. cli.py must always
+    write `MLX_VLM_MOE_EXPAND` (clearing it to "" when the flag is omitted),
+    never merely set-when-given, or a stale export from an earlier invocation
+    silently enables expansion while the cmdline/fingerprint say native.
+    """
+
+    def test_a_stale_ambient_export_is_cleared_when_the_flag_is_omitted(
+        self, monkeypatch
+    ):
+        from mlx_vlm.server.cli import _configure_moe_expand
+
+        monkeypatch.setenv("MLX_VLM_MOE_EXPAND", "27-39:20:0.8:0.5")
+        _configure_moe_expand(None)  # --moe-expand not passed on THIS invocation
+        assert os.environ["MLX_VLM_MOE_EXPAND"] == ""
+
+    def test_an_empty_string_flag_also_clears_it(self, monkeypatch):
+        from mlx_vlm.server.cli import _configure_moe_expand
+
+        monkeypatch.setenv("MLX_VLM_MOE_EXPAND", "27-39:20:0.8:0.5")
+        _configure_moe_expand("")
+        assert os.environ["MLX_VLM_MOE_EXPAND"] == ""
+
+    def test_a_given_value_is_forwarded(self, monkeypatch):
+        from mlx_vlm.server.cli import _configure_moe_expand
+
+        monkeypatch.delenv("MLX_VLM_MOE_EXPAND", raising=False)
+        _configure_moe_expand("27-39:20:0.8:0.5")
+        assert os.environ["MLX_VLM_MOE_EXPAND"] == "27-39:20:0.8:0.5"
+
+    def test_a_malformed_value_raises_before_touching_the_env(self, monkeypatch):
+        from mlx_vlm.server.cli import _configure_moe_expand
+
+        monkeypatch.delenv("MLX_VLM_MOE_EXPAND", raising=False)
+        with pytest.raises(ValueError):
+            _configure_moe_expand("not-a-valid-spec")
+
+    def test_generation_py_treats_the_cleared_env_as_off(self, monkeypatch):
+        # Mirrors the exact read site in server/generation.py's
+        # _initialize_model: `if moe_expand_spec:` must skip on "".
+        monkeypatch.setenv("MLX_VLM_MOE_EXPAND", "")
+        moe_expand_spec = os.environ.get("MLX_VLM_MOE_EXPAND")
+        assert not moe_expand_spec
+
+
+def test_fix3_apply_moe_expand_and_log_writes_to_stderr(capsys):
+    """FIX-3: mlx-serve sends the worker's stdout to DEVNULL -- only stderr
+    reaches $TMPDIR/mlx-manager-logs -- so the startup line must also be
+    printed there directly, not just via `logger.info` (which this fork
+    routes to stdout)."""
+    from mlx_vlm.models.qwen3_5_moe.language import LanguageModel
+    from mlx_vlm.server.generation import _apply_moe_expand_and_log
+
+    config = _qwen_config()
+    model = LanguageModel(config, config=_qwen_model_config())
+
+    n_layers = _apply_moe_expand_and_log(model, "2-3:6:0.5:0.5")
+
+    captured = capsys.readouterr()
+    assert n_layers == 2
+    assert "moe_expand=2-3:6:0.5:0.5 layers=2" in captured.err
+
+
+class TestFix4NoOpCounting:
+    """FIX-4: `set_moe_expansion` counted layers by `in_range` alone, so
+    `n <= k` reported `layers=N` while every one of them was a silent
+    native-path no-op. Counting now additionally requires `exp.n >
+    that layer's top_k`; `apply_moe_expansion` (the CLI/chat entry point)
+    raises when the count comes back 0 but the range does contain MoE
+    blocks. Direct `set_moe_expansion` calls stay non-raising (`strict=False`
+    default) so the spec-required N==K native-passthrough tests above keep
+    working."""
+
+    def test_qwen_set_moe_expansion_does_not_count_n_equals_k_layers(self):
+        from mlx_vlm.models.qwen3_5_moe.language import LanguageModel
+
+        config = _qwen_config()  # num_experts_per_tok=2
+        model = LanguageModel(config, config=_qwen_model_config())
+        count = model.set_moe_expansion(MoeExpansion(layers=(0, 3), n=2, t=0.5, d=0.5))
+        assert count == 0
+
+    def test_qwen_set_moe_expansion_direct_call_does_not_raise_for_n_equals_k(self):
+        from mlx_vlm.models.qwen3_5_moe.language import LanguageModel
+
+        config = _qwen_config()
+        model = LanguageModel(config, config=_qwen_model_config())
+        # strict=False (the default) must NOT raise -- N == K is the
+        # spec-required native-passthrough probe, not a misconfiguration.
+        count = model.set_moe_expansion(MoeExpansion(layers=(0, 3), n=2, t=0.5, d=0.5))
+        assert count == 0
+
+    def test_apply_moe_expansion_raises_when_n_never_exceeds_top_k_in_range(self):
+        from mlx_vlm.models.qwen3_5_moe.language import LanguageModel
+
+        config = _qwen_config()
+        model = LanguageModel(config, config=_qwen_model_config())
+        with pytest.raises(ValueError, match="does not exceed native top_k"):
+            apply_moe_expansion(model, "0-3:2:0.5:0.5")
+
+    def test_apply_moe_expansion_does_not_raise_when_some_layers_do_expand(self):
+        from mlx_vlm.models.qwen3_5_moe.language import LanguageModel
+
+        config = _qwen_config()
+        model = LanguageModel(config, config=_qwen_model_config())
+        count = apply_moe_expansion(model, "2-3:6:0.5:0.5")
+        assert count == 2
+
+    def test_nemotron_set_moe_expansion_does_not_count_n_equals_k_layers(self):
+        from mlx_vlm.models import nemotron_h
+
+        config = _nemotron_config()  # num_experts_per_tok=2
+        model = nemotron_h.Model(config)
+        count = model.language_model.set_moe_expansion(
+            MoeExpansion(layers=(3, 4), n=2, t=0.5, d=0.5)
+        )
+        assert count == 0
+
+    def test_apply_moe_expansion_raises_for_nemotron_n_equals_k(self):
+        from mlx_vlm.models import nemotron_h
+
+        config = _nemotron_config()
+        model = nemotron_h.Model(config)
+        with pytest.raises(ValueError, match="does not exceed native top_k"):
+            apply_moe_expansion(model, "3-4:2:0.5:0.5")
+
+
+class TestFix5NumExpertsValidation:
+    """FIX-5: `N > num_experts` used to fail deep inside the first request
+    (an out-of-bounds gather) instead of at startup/apply time."""
+
+    def test_apply_moe_expansion_raises_when_n_exceeds_num_experts_qwen(self):
+        from mlx_vlm.models.qwen3_5_moe.language import LanguageModel
+
+        config = _qwen_config()  # num_experts=8
+        model = LanguageModel(config, config=_qwen_model_config())
+        with pytest.raises(ValueError, match="exceeds this model's total expert count"):
+            apply_moe_expansion(model, "0-3:9:0.5:0.5")
+
+    def test_apply_moe_expansion_raises_when_n_exceeds_num_experts_nemotron(self):
+        from mlx_vlm.models import nemotron_h
+
+        config = _nemotron_config()  # n_routed_experts=8
+        model = nemotron_h.Model(config)
+        with pytest.raises(ValueError, match="exceeds this model's total expert count"):
+            apply_moe_expansion(model, "3-4:9:0.5:0.5")
+
+    def test_apply_moe_expansion_allows_n_equal_to_num_experts(self):
+        from mlx_vlm.models.qwen3_5_moe.language import LanguageModel
+
+        config = _qwen_config()  # num_experts=8
+        model = LanguageModel(config, config=_qwen_model_config())
+        count = apply_moe_expansion(model, "0-3:8:0.5:0.5")
+        assert count == 4
