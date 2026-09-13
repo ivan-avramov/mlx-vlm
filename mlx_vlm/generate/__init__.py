@@ -8,6 +8,12 @@ from .ar import (
     batch_generate,
     generate_step,
 )
+from .audio import (
+    AudioGenerationResult,
+    generate_audio,
+    is_audio_generation_model,
+    save_audio,
+)
 from .cli import main, parse_arguments
 from .common import (  # Fork: the 5e9b9503 engine port's own helpers
     GenerationResult,
@@ -29,8 +35,8 @@ from .common import (  # Fork: the 5e9b9503 engine port's own helpers
     _restore_rotating_layers_from_snapshots,
     _rotating_post_gen_trim_safe,
     _rotating_rewind_safe,
-    _shrink_cache_entries,
     _should_capture_anchor_pre_prefill,
+    _shrink_cache_entries,
     _trim_cache,
     maybe_preallocate_kv_cache,
     maybe_quantize_kv_cache,
@@ -76,6 +82,7 @@ from .video_generation import (
 )
 
 __all__ = [
+    "AudioGenerationResult",
     "BatchGenerator",
     "BatchResponse",
     "BatchStats",
@@ -100,6 +107,7 @@ __all__ = [
     "batch_generate",
     "edit_image",
     "generate",
+    "generate_audio",
     "generate_image",
     "generate_step",
     "generate_video",
@@ -109,6 +117,7 @@ __all__ = [
     "image_to_b64_json",
     "image_to_png_bytes",
     "is_image_edit_model",
+    "is_audio_generation_model",
     "is_image_generation_model",
     "is_video_generation_model",
     "load_image_edit_model",
@@ -120,6 +129,7 @@ __all__ = [
     "maybe_preallocate_kv_cache",
     "maybe_quantize_kv_cache",
     "parse_arguments",
+    "save_audio",
     "save_video",
     # Fork: D6 session-cache shrink-on-retire toggle.
     "set_session_shrink_on_retire",

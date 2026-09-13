@@ -377,20 +377,11 @@ class TestTheResponseBody:
 
 
 class TestEveryStreamingTokenSiteIsAccountedFor:
-    """The structural guard. The bug was one construction site out of six
-    omitting one field, and no test could see it because the omission is a
-    default rather than an error. Any NEW site must either pass
-    ``cached_tokens`` or be listed here with a reason.
-    """
+    """Every producer must report reuse explicitly, including speculation.
 
-    # Sites that legitimately pass no ``cached_tokens``, by enclosing function.
-    # ``_run_speculative`` builds a fresh ``make_speculative_prompt_cache`` per
-    # batch and never consults ``request.prompt_cache_state``, so no prefix reuse
-    # can occur on it -- its own "Prefill completed" line hardcodes
-    # ``cached_tokens=0`` for the same reason. Reporting 0 there is truthful, not
-    # a dropped field. (That the path cannot reuse a prefix at all is a separate,
-    # pre-existing limitation; see the module docstring in ``generation.py``.)
-    EXEMPT_FUNCTIONS = {"_run_speculative"}
+    Upstream unified speculative batching with the ordinary BatchGenerator
+    loop. Its former three zero-reuse construction sites and exemption are gone.
+    """
 
     @staticmethod
     def _streaming_token_sites():
@@ -433,15 +424,17 @@ class TestEveryStreamingTokenSiteIsAccountedFor:
         """Pin the count so a new construction site cannot be added without
         this file being updated."""
         sites = self._streaming_token_sites()
-        assert len(sites) == 6, [(s.lineno, s.function) for s in sites]
+        assert sorted(s.function for s in sites) == [
+            "_process_cached_request",
+            "_step",
+            "feed",
+        ], [(s.lineno, s.function) for s in sites]
 
     def test_every_reuse_capable_site_passes_cached_tokens(self):
         missing = [
             (s.lineno, s.function)
             for s in self._streaming_token_sites()
-            if s.function not in self.EXEMPT_FUNCTIONS
-            and not s.starstar
-            and "cached_tokens" not in s.keywords
+            if not s.starstar and "cached_tokens" not in s.keywords
         ]
         assert not missing, (
             "StreamingToken built without cached_tokens on a path that can "
@@ -459,33 +452,24 @@ class TestEveryStreamingTokenSiteIsAccountedFor:
         ]
         assert not missing, f"StreamingToken built without prompt_tps: {missing}"
 
-    def test_the_exempt_path_is_still_exempt_for_the_stated_reason(self):
-        """If ``_run_speculative`` ever gains prefix reuse, this fails and the
-        exemption above has to be re-earned rather than silently inherited."""
+    def test_speculative_requests_use_the_reported_batching_path(self):
+        """No speculative bypass may silently inherit the old zero-reuse default."""
         source = Path(server_generation.__file__).read_text()
         tree = ast.parse(source)
-        func = next(
+        methods = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+        assert "_run_speculative" not in methods
+        calls = [n for n in ast.walk(methods["_run_impl"]) if isinstance(n, ast.Call)]
+        batch_calls = [
             n
-            for n in ast.walk(tree)
-            if isinstance(n, ast.FunctionDef) and n.name == "_run_speculative"
-        )
-        # AST, not text: a comment mentioning the name must not satisfy or trip
-        # this. What matters is whether the loop READS the field.
-        reads_cache_state = any(
-            (isinstance(n, ast.Attribute) and n.attr == "prompt_cache_state")
-            or (isinstance(n, ast.Name) and n.id == "prompt_cache_state")
-            or (isinstance(n, ast.Constant) and n.value == "prompt_cache_state")
-            for n in ast.walk(func)
-        )
-        assert not reads_cache_state, (
-            "_run_speculative now looks at prompt_cache_state; it may be able to "
-            "reuse a prefix, so its StreamingToken sites can no longer default "
-            "cached_tokens to 0."
-        )
-        body = ast.get_source_segment(source, func) or ""
-        assert "cached_tokens=0" in body, (
-            "the hardcoded cached_tokens=0 in _run_speculative's prefill log is "
-            "the in-tree statement that this path reuses nothing"
+            for n in calls
+            if isinstance(n.func, ast.Name) and n.func.id == "BatchGenerator"
+        ]
+        assert len(batch_calls) == 1
+        assert {"draft_model", "draft_kind"} <= {
+            kw.arg for kw in batch_calls[0].keywords
+        }
+        assert any(
+            isinstance(n.func, ast.Attribute) and n.func.attr == "_step" for n in calls
         )
 
 

@@ -88,6 +88,43 @@ class EpiCacheKVCache:
     def state(self, v):
         self.inner.state = v
 
+    def prefix_cache_snapshot(self):
+        """Snapshot the plain-KV wrapper through upstream's checkpoint protocol."""
+        from .cache import KVCache
+
+        if type(self.inner) is not KVCache:
+            raise TypeError("EpiCache checkpoints require a plain KVCache inner cache")
+        state = None if self.inner.empty() else self.inner.state
+        return {
+            "inner_state": state,
+            "budget": self.budget,
+            "block_size": self.block_size,
+            "sink": self.sink,
+            "recent": self.recent,
+            "evicted": self.evicted,
+            "scores": self._scores,
+        }
+
+    def prefix_cache_restore(self, snapshot):
+        """Restore storage and absolute-position/eviction bookkeeping together."""
+        from .cache import KVCache
+
+        inner = KVCache()
+        if snapshot["inner_state"] is not None:
+            inner.state = snapshot["inner_state"]
+        self.__init__(
+            inner,
+            budget=snapshot["budget"],
+            block_size=snapshot["block_size"],
+            sink=snapshot["sink"],
+            recent=snapshot["recent"],
+        )
+        self.evicted = snapshot["evicted"]
+        self._scores = snapshot["scores"]
+
+    def prefix_cache_reserve(self, min_capacity_tokens):
+        return self.inner.prefix_cache_reserve(min_capacity_tokens)
+
     def make_mask(self, *args, **kwargs):
         return self.inner.make_mask(*args, **kwargs)
 

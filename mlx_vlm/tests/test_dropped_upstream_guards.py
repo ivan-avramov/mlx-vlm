@@ -314,64 +314,27 @@ class TestSamplerModesAreReachable:
         assert GenerationArguments().diffusion_kwargs() == {}
 
 
+# Retired 2026-09-13: upstream 388df60c unshadowed the tokenization test.
+# Coverage: test_processors.py::TestLagunaSpecialTokens::
+# test_chat_template_owns_laguna_special_tokens.
+
+
 class TestLagunaTokenizationContract:
-    """`53052569` — fix(laguna): preserve provider tokenization contract.
+    """Retain fallback and generation wiring beyond upstream's template test."""
 
-    Upstream *does* ship a test for this
-    (`test_processors.py::TestLagunaProcessor::test_chat_template_owns_laguna_special_tokens`),
-    but `TestLagunaProcessor` is defined **twice** in that file, so the earlier
-    definition — the one holding this test — is shadowed by the later one and is
-    never collected. That is why a missing `utils.should_add_special_tokens`
-    failed nothing here despite a test for it sitting in the tree. Our
-    `test_processors.py` is byte-identical to upstream, so the shadowing is an
-    upstream bug too; the guard lives here instead of being duplicated there.
-    """
-
-    def test_laguna_chat_template_owns_its_special_tokens(self):
+    def test_processor_without_template_adds_special_tokens(self):
         from types import SimpleNamespace
 
         from mlx_vlm.utils import should_add_special_tokens
 
-        processor = SimpleNamespace(chat_template="{{ messages }}")
-
-        assert should_add_special_tokens("laguna", processor) is False
-        assert should_add_special_tokens("llama", processor) is True
-        # A model whose template owns the markers but that has no template must
-        # fall back to adding them.
         assert should_add_special_tokens("laguna", SimpleNamespace()) is True
 
     def test_generate_paths_use_the_shared_helper(self):
-        """Both generate paths must go through the helper, not an inline gemma list.
-
-        The inline conditional they replaced listed only the gemma variants, so
-        Laguna fell through to `True` and the provider's markers were duplicated.
-        """
         from mlx_vlm.generate import ar, dispatch
         from mlx_vlm.utils import should_add_special_tokens
 
         assert ar.should_add_special_tokens is should_add_special_tokens
         assert dispatch.should_add_special_tokens is should_add_special_tokens
-
-    def test_upstreams_own_laguna_test_is_still_shadowed(self):
-        """Tripwire: if upstream ever de-duplicates the class, drop this guard.
-
-        Asserts the shadowing that makes the guard above necessary. When this
-        starts failing, upstream's test is collected and this class is redundant.
-        """
-        import ast
-        from pathlib import Path
-
-        source = Path(__file__).with_name("test_processors.py").read_text()
-        names = [
-            node.name
-            for node in ast.parse(source).body
-            if isinstance(node, ast.ClassDef) and node.name == "TestLagunaProcessor"
-        ]
-        assert len(names) == 2, (
-            "TestLagunaProcessor is no longer duplicated in test_processors.py — "
-            "upstream's own laguna test now collects, so TestLagunaTokenizationContract "
-            "can be removed."
-        )
 
 
 class TestGenArgsUnion:
@@ -814,9 +777,11 @@ class TestDiffusionUnification:
             peak_memory=1.0,
             prompt_tps=10.0,
             generation_tps=4.0,
+            cached_tokens=37,
         )
         (chunk,) = list(_DiffusionBlockEmitter().feed(result))
         assert chunk.generation_tps == 4.0
+        assert chunk.cached_tokens == 37
         assert chunk.text == "hello"
 
     def test_library_diffusion_dispatch_forwards_skip_special_tokens_and_verbose(
@@ -997,45 +962,61 @@ class TestApcCallSitesFromTheAdapterRefactor:
         ), "the precedence ladder is inlined again instead of delegating"
 
     def test_single_sequence_block_commit_handles_quantized_caches(self):
-        """dispatch.py hand-rolled the harvest instead of calling commit_prefix_blocks.
+        """The current coordinator harvests quantized KV and releases all leases.
 
-        Its inline snapshot did `c.keys[..., :offset, :]`, which raises TypeError on a
-        quantized cache because those store keys as a tuple — swallowed by the
-        surrounding `except Exception` into an "APC store failed" warning. So block-mode
-        APC harvesting silently stored nothing whenever `--kv-bits` was in use.
-        `layer_kv_for_apc` is the helper that exists precisely for this, and its
-        docstring says so.
+        Upstream d8e6195f moved generation's block commit behind APCCoordinator.
+        The adapter must still dequantize tuple-backed caches before storage.
         """
+        import ast
         import inspect
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
 
         import mlx.core as mx
 
         from mlx_vlm import apc as _apc
         from mlx_vlm.generate import dispatch
+        from mlx_vlm.models.cache import KVCache, QuantizedKVCache
 
-        assert "commit_prefix_blocks" in inspect.getsource(dispatch)
+        calls = [
+            node
+            for node in ast.walk(ast.parse(inspect.getsource(dispatch.stream_generate)))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "commit"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "apc_coordinator"
+        ]
+        assert len(calls) == 1
 
-        class _QuantishCache:
-            def __init__(self):
-                self.offset = 3
-                self._k = mx.zeros((1, 2, 4, 4))
-                self._v = mx.ones((1, 2, 4, 4))
-                self.keys = (self._k, self._k, self._k)
-                self.values = (self._v, self._v, self._v)
+        cache = QuantizedKVCache(group_size=32, bits=4)
+        keys = mx.arange(96, dtype=mx.float32).reshape(1, 1, 3, 32)
+        values = keys + 100
+        cache.update_and_fetch(keys, values)
+        assert isinstance(cache.keys, tuple)
+        expected_keys, expected_values = _apc.layer_kv_for_apc(cache, batch_idx=None)
+        new_block, old_block = object(), object()
+        manager = MagicMock()
+        manager.store_kv_blocks.return_value = [new_block]
+        coordinator = _apc.APCCoordinator(
+            manager, SimpleNamespace(make_cache=lambda: [KVCache()])
+        )
+        assert coordinator.enabled and not coordinator.is_checkpoint
+        assert (
+            coordinator.commit(
+                [cache], [1, 2, 3], extra_hash=17, blocks_in_use=[old_block]
+            )
+            is True
+        )
 
-            def dequantize_for_apc(self):
-                return self._k[..., : self.offset, :], self._v[..., : self.offset, :]
-
-        cache = _QuantishCache()
-        # The old inline approach is what must not come back.
-        try:
-            cache.keys[..., : cache.offset, :]
-            raise AssertionError("expected tuple slicing to fail")
-        except TypeError:
-            pass
-        keys, values = _apc.layer_kv_for_apc(cache, batch_idx=None)
-        assert keys is not None and values is not None
-        assert keys.shape[-2] == 3
+        manager.store_kv_blocks.assert_called_once()
+        token_ids, stored_keys, stored_values = manager.store_kv_blocks.call_args.args
+        assert token_ids == [1, 2, 3]
+        assert stored_keys[0].shape[-2] == 3
+        assert bool(mx.array_equal(stored_keys[0], expected_keys))
+        assert bool(mx.array_equal(stored_values[0], expected_values))
+        assert manager.store_kv_blocks.call_args.kwargs["extra_hash"] == 17
+        manager.release.assert_called_once_with([old_block, new_block])
 
 
 class TestStoppingCriteriaDoesNotAliasCallerLists:
@@ -1063,7 +1044,9 @@ class TestStoppingCriteriaDoesNotAliasCallerLists:
         criteria.reset(caller)
         criteria.add_eos_token_ids(555)
         assert caller == [7, 8], "reset() aliased the caller's list"
-        assert criteria.eos_token_ids == [7, 8, 555]
+        # Upstream 6c301536 unions request stops with the tokenizer's EOS.
+        assert criteria.eos_token_ids == [7, 8, 1, 555]
+        assert criteria(1) is True
 
 
 class TestModelLoadFailureIsABadRequest:
@@ -1457,19 +1440,10 @@ class TestThinkingBudgetDoesNotSynchronizeDecode:
 
 
 class TestQwen35MetalOnlyFastPathsAreGuarded:
-    """`16cf6140` (#1423) — Qwen3.5 on CUDA: fix Metal-only crashes.
+    """16cf6140 restored portable fallback when Metal kernels are unavailable.
 
-    A two-file commit whose `gated_delta.py` half landed byte-identical while all
-    three of its `language.py` hunks were dropped, so the file read as ordinary fork
-    divergence. Both surviving hunks reach `mx.fast.metal_kernel` unconditionally:
-    `_TARGET_VERIFY_GEMV` is built at import time, and
-    `_qwen3_5_ragged_decode_attention` launches its SDPA kernels with no backend
-    check. On a non-Metal backend that is an import-time or decode-time crash rather
-    than the intended fall-through to portable `scaled_dot_product_attention`.
-
-    Not reproducible on Apple Silicon, where `mx.metal.is_available()` is always
-    True — which is exactly why the drop survived. These guards patch the predicate
-    the upstream hunks consult, so they fail against the pre-restore file here.
+    Ragged attention remains model-local. Upstream 332873ff moved dense verifier
+    selection into speculative.ops.linear; test its fallback at that shared seam.
     """
 
     def test_ragged_decode_attention_declines_without_metal(self, monkeypatch):
@@ -1495,53 +1469,29 @@ class TestQwen35MetalOnlyFastPathsAreGuarded:
         )
 
     def test_use_target_verify_dense_declines_when_kernel_is_none(self, monkeypatch):
+        """The shared verifier declines and uses ordinary linear math without Metal."""
         import mlx.core as mx
 
         from mlx_vlm.models import exact_speculative_verify
-        from mlx_vlm.models.qwen3_5 import language as qwen35_language
+        from mlx_vlm.speculative.ops import linear as verifier_linear
 
         linear = nn.Linear(64, 64)
-        x = mx.zeros((1, 4, 64), dtype=mx.float16)
+        x = mx.arange(256, dtype=mx.float16).reshape(1, 4, 64) / 256
+        assert verifier_linear._use_target_verify_dense(linear, x) is True
 
-        assert qwen35_language._use_target_verify_dense(linear, x, True) is True
-
-        # What the module global becomes on a non-Metal backend once the
-        # `if mx.metal.is_available() else None` guard is in place. Upstream's
-        # ea4f1179 (#1987) moved the kernel global from qwen3_5.language's
-        # _TARGET_VERIFY_GEMV into models/exact_speculative_verify.py, which
-        # _use_target_verify_dense now consults via
-        # exact_speculative_verify_dense_available().
+        # Upstream 332873ff moved the predicate from the model to shared ops.
         monkeypatch.setattr(
             exact_speculative_verify, "_EXACT_SPECULATIVE_VERIFY_GEMV", None
         )
-        assert qwen35_language._use_target_verify_dense(linear, x, True) is False
+        assert verifier_linear._use_target_verify_dense(linear, x) is False
+        expected = linear(x)
+        actual = verifier_linear._target_verify_linear(linear, x)
+        assert bool(mx.array_equal(actual, expected))
 
 
-class TestQwen35QuantizedVerifyPredicateIsFactored:
-    """`7fbc7bc9` (#1598) — split `_can_target_verify_quantized`.
-
-    Upstream extracted the weight-only half as `_can_target_verify_quantized_head`
-    so `fused_greedy_decode` could reuse it. The extraction landed and the *rewrite*
-    of the original function was dropped, so this tree kept the pre-split body: two
-    copies of the same predicate, one of which no longer had a reason to exist.
-
-    The two forms are provably equivalent (`x.dtype in (bf16, f16)` +
-    `scales.dtype == x.dtype` + `biases.dtype == x.dtype` is the same constraint as
-    upstream's `scales.dtype in (bf16, f16)` + `biases.dtype == scales.dtype` +
-    `x.dtype == scales.dtype`, and both derive the same `K`), so there is no
-    behavioural repro to write — only the duplication to keep from coming back.
-    """
-
-    def test_predicate_delegates_rather_than_duplicating(self):
-        import inspect
-
-        from mlx_vlm.models.qwen3_5.language import _can_target_verify_quantized
-
-        source = inspect.getsource(_can_target_verify_quantized)
-        assert "_can_target_verify_quantized_head(linear)" in source
-        assert (
-            'linear.mode != "affine"' not in source
-        ), "the pre-split body is back; the head predicate is duplicated again"
+# Retired 2026-09-13: 332873ff replaced the model-local quantized predicate.
+# Coverage: test_speculative.py::test_qwen_fused_greedy_decode_support_matches_lm_head
+# and test_qwen_target_verify_4bit_linear_matches_singleton_path_exactly.
 
 
 class TestCompressedTensorsMxfp4FormatIsHonored:
@@ -2142,3 +2092,25 @@ class TestUniformKvQuantSkipsRotatingCaches:
 
         assert isinstance(prompt_cache[0], cache.RotatingKVCache)
         assert isinstance(prompt_cache[1], cache.QuantizedKVCache)
+
+
+def test_server_and_ar_share_the_positioned_sampler():
+    """C26: importing the sampler avoids divergent seeded filtering paths."""
+    from mlx_vlm.server import generation
+
+    assert generation._PositionedTargetSampler is ar._PositionedTargetSampler
+    assert generation._position_keys is ar._position_keys
+    assert generation._position_seed is ar._position_seed
+    assert (
+        generation._PositionedTargetSampler.sample_proposal
+        is ar._PositionedTargetSampler.sample_proposal
+    )
+
+
+def test_sampler_helper_import_compatibility():
+    from mlx_vlm import sample_utils
+    from mlx_vlm.server import generation
+
+    assert ar.top_p_sampling is sample_utils.top_p_sampling
+    assert generation.apply_top_k is sample_utils.apply_top_k
+    assert generation.top_p_sampling is sample_utils.top_p_sampling

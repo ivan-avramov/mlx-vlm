@@ -31,7 +31,7 @@
 # `Gemma4VideoProcessor` re-export and a `ModelConfig.index_keep` dataclass field.
 # Runs in ~13s over 1149 shared files.
 #
-# Baseline: 5 entries, all re-exports, all reviewed below. Every one is a fork
+# Baseline: 4 entries, all re-exports, all reviewed below. Every one is a fork
 # replacement that already carries a `# Fork:` marker at its import site.
 
 # --- The lazy per-thread generation stream (5e9b9503) ---
@@ -56,9 +56,7 @@ mlx_vlm/generate/dispatch.py::generation_stream  # REVIEWED: replaced by _get_ge
 # supersession is already recorded in .symbol-exclusions.
 mlx_vlm/server/__init__.py::_check_configured_context_budget  # REVIEWED: superseded by _resolve_generation_budget's clamp-instead-of-reject policy (02e8046d); see .symbol-exclusions for the same event
 
-# --- Sampler filtering (_PositionedTargetSampler) ---
-# Upstream imports `top_p_sampling` and applies top_p only. The fork imports
-# `apply_top_p` + `apply_min_p` + `apply_top_k` and applies all three in
-# `sample_utils.make_sampler`'s chain order, because the ragged-verification path was
-# silently dropping min_p and top_k. Marked inline on the import block.
-mlx_vlm/server/generation.py::top_p_sampling  # REVIEWED: superseded by _PositionedTargetSampler._filter, which applies apply_top_p/min_p/top_k in make_sampler's chain order; upstream's copy dropped min_p and top_k on the ragged-verification path
+# RESOLVED 2026-09-13: sampler helpers remain import-compatible aliases;
+# the server uses the shared generate/ar.py sampler implementation.
+
+mlx_vlm/turboquant.py::_TurboQuantAttentionMixin::cache_step  # REVIEWED: Storage stride belongs to concrete TurboQuantKVCache; both concrete caches own allocation. Retired with shadowed mixin storage methods; live storage-contract tests verify capacities.

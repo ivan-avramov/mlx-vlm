@@ -15,8 +15,13 @@ from ..generate import (
     stream_generate,
 )
 from ..prompt_utils import apply_chat_template, extract_text_from_content
+from ..speculative.utils import run_speculative_server_rounds
 from ..structured import build_json_schema_logits_processor
-from ..tool_parsers import _infer_tool_parser_from_processor, load_tool_module
+from ..tools import (
+    _infer_tool_parser_from_processor,
+    load_tool_module,
+    process_tool_calls,
+)
 from ..version import __version__
 from ..vision_cache import VisionFeatureCache
 from . import app as _app_module
@@ -51,6 +56,7 @@ from .audio import (
     audio_transcriptions_endpoint,
     audio_translations_endpoint,
 )
+from .generation import resolve_backend_label  # Fork: selected execution-path label
 from .generation import (  # Fork: adds the fork's KV/session/APC getters, the BACKEND_* path labels and resolve_backend_label
     BACKEND_CACHED_SESSION,
     BACKEND_CONTINUOUS_BATCHING,
@@ -97,8 +103,6 @@ from .generation import (  # Fork: adds the fork's KV/session/APC getters, the B
     get_top_logprobs_k,
     load_model_resources,
     make_streaming_detokenizer,
-    resolve_backend_label,
-    run_speculative_server_rounds,
 )
 from .openai import (  # Fork: adds the fork's thinking-format helpers
     _PREFILL_FLAG_CACHE,
@@ -123,6 +127,7 @@ from .responses_state import (  # Fork: adds the THINKING_FORMATS helpers; Fork:
     StoredResponse,
     ThinkingStreamDelta,
     ThinkingStreamState,
+    ToolCallStreamState,
     _normalize_response_input,
     _partial_tag_start_pos,
     _response_chain_items,
@@ -136,12 +141,10 @@ from .responses_state import (  # Fork: adds the THINKING_FORMATS helpers; Fork:
     _step_thinking_state,
     _store_response,
     make_response_stream_state,
-    process_tool_calls,
     prompt_has_open_thinking,
     response_store,
     response_store_lock,
     response_store_order,
-    suppress_tool_call_content,
 )
 from .runtime import ModelCacheRegistry, runtime
 from .runtime_config import DEFAULT_TOKEN_QUEUE_TIMEOUT

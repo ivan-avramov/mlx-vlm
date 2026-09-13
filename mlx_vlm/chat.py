@@ -29,6 +29,7 @@ from mlx_vlm.vision_cache import VisionFeatureCache
 
 
 class MLXVisionChat:
+    # Fork (b95130c9): optional model-only expert expansion after loading.
     def __init__(
         self,
         model_path: str = "mlx-community/idefics2-8b-chatty-4bit",
@@ -200,6 +201,7 @@ class MLXVisionChat:
 
 
 def main():
+    # Fork (b95130c9): forward --moe-expand to the chat model loader.
     parser = argparse.ArgumentParser(description="MLX Vision Chat CLI")
     parser.add_argument(
         "--model",

@@ -1,4 +1,4 @@
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Tuple  # Fork: captured recurrent state tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -11,13 +11,19 @@ from ..base import (
     scaled_dot_product_attention,
 )
 from ..cache import ArraysCache, KVCache
-from ..moe_expand import MoeExpansion, expand_route_with_weight_base
-from ..recurrent_rollback import (
+from ..moe_expand import (  # Fork: M34 opt-in routing
+    MoeExpansion,
+    expand_route_with_weight_base,
+)
+from ..recurrent_rollback import (  # Fork: MTP speculative-verify rollback contract (see recurrent_rollback.py docstring)
     RecurrentStateRollbackMixin,
-)  # Fork: MTP speculative-verify rollback contract (see recurrent_rollback.py docstring)
+)
 from ..ssm import ssm_update, ssm_update_with_states
 from ..switch_layers import SwitchMLP
 from .config import ModelConfig
+from .speculative_verifier import NemotronHExactSpeculativeVerifier
+
+_EXACT_SPECULATIVE_VERIFIER = NemotronHExactSpeculativeVerifier()
 
 
 class MambaRMSNormGated(nn.Module):
@@ -331,6 +337,7 @@ class NemotronHMLP(nn.Module):
 
 
 @mx.compile
+# Fork: M34 layer-scoped expert expansion; default route remains native.
 def group_expert_select(
     gates,
     e_score_correction_bias,
@@ -385,6 +392,7 @@ def group_expert_select(
 
 
 class MoEGate(nn.Module):
+    # Fork: M34 layer-scoped expert expansion; default route remains native.
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
@@ -419,6 +427,7 @@ class MoEGate(nn.Module):
 
 
 class NemotronHMoE(nn.Module):
+    # Fork: M34 layer-scoped expert expansion; default route remains native.
     def __init__(self, config: ModelConfig, layer_idx: int = 0):
         super().__init__()
         self.config = config
@@ -485,6 +494,7 @@ class NemotronHMoE(nn.Module):
 
 
 class NemotronHBlock(nn.Module):
+    # Fork: M34 layer-scoped expert expansion; default route remains native.
     def __init__(self, args: ModelConfig, block_type: str, layer_idx: int = 0):
         super().__init__()
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.layer_norm_epsilon)
@@ -549,23 +559,14 @@ class NemotronHModel(nn.Module):
         inputs=None,
         cache: Optional[Any] = None,
         inputs_embeds: Optional[mx.array] = None,
+        capture_layer_ids: Optional[list[int]] = None,
         hidden_sink: Optional[list] = None,
         skip_final_norm: bool = False,
         recurrent_sink: Optional[list] = None,
+        final_hidden_sink: Optional[list] = None,
     ):
-        # Fork: upstream rejects both-supplied as well as neither-supplied
-        # (`if (inputs is None) == (inputs_embeds is None)`). Only neither is
-        # unserviceable -- the branch immediately below already handles
-        # both-supplied by preferring inputs_embeds. Rejecting it broke the
-        # shared AR loop, which passes both: generate/ar.py calls
-        # `model.language_model(y, inputs_embeds=inputs_embeds, ...)` because
-        # for a VLM inputs_embeds is the vision-merged embedding while the
-        # token ids are still carried alongside. That made `mlx_vlm.generate`
-        # raise on every nemotron_h model while the server path (which passes
-        # inputs_embeds only) worked, so the AR loop is right and this guard
-        # was the outlier.
         if inputs is None and inputs_embeds is None:
-            raise ValueError("Provide inputs or inputs_embeds")
+            raise ValueError("Provide either inputs or inputs_embeds")
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         elif self.with_embeddings:
@@ -585,7 +586,9 @@ class NemotronHModel(nn.Module):
         # `hidden_sink`/`skip_final_norm` contract other MTP-capable
         # backbones (deepseek_v4, qwen3_5) already expose.
         def _finish(hidden_states):
-            if hidden_sink is not None:
+            if final_hidden_sink is not None:
+                final_hidden_sink.append(hidden_states)
+            if hidden_sink is not None and capture_layer_ids is None:
                 hidden_sink.append(hidden_states)
             if skip_final_norm:
                 return hidden_states
@@ -612,8 +615,9 @@ class NemotronHModel(nn.Module):
         attn_mask = create_attention_mask(hidden_states, attn_cache)
         ssm_mask = create_ssm_mask(hidden_states, ssm_cache)
 
+        capture_set = set(capture_layer_ids) if capture_layer_ids else set()
         cache_counter = 0
-        for layer in self.layers:
+        for index, layer in enumerate(self.layers):
             if layer.block_type == "M" or layer.block_type == "*":
                 c = cache[cache_counter]
                 cache_counter += 1
@@ -631,6 +635,8 @@ class NemotronHModel(nn.Module):
             hidden_states = layer(
                 hidden_states, mask=mask, cache=c, capture_sink=capture_sink_for_layer
             )
+            if hidden_sink is not None and index in capture_set:
+                hidden_sink.append(hidden_states)
             if capture_sink_for_layer is not None:
                 recurrent_sink[cache_counter - 1] = capture_sink_for_layer
 
@@ -675,12 +681,15 @@ class Model(nn.Module):
         for layer_idx in range(self.args.num_hidden_layers):
             prefix = f"backbone.layers.{layer_idx}.mixer"
             for m, n in [("down_proj", "fc2"), ("up_proj", "fc1")]:
-                if f"{prefix}.experts.0.{m}.weight" in weights:
+                for suffix in ("weight", "scales", "biases"):
+                    first_key = f"{prefix}.experts.0.{m}.{suffix}"
+                    if first_key not in weights:
+                        continue
                     to_join = [
-                        weights.pop(f"{prefix}.experts.{e}.{m}.weight")
+                        weights.pop(f"{prefix}.experts.{e}.{m}.{suffix}")
                         for e in range(self.args.n_routed_experts)
                     ]
-                    weights[f"{prefix}.switch_mlp.{n}.weight"] = mx.stack(to_join)
+                    weights[f"{prefix}.switch_mlp.{n}.{suffix}"] = mx.stack(to_join)
 
         return weights
 
@@ -698,6 +707,8 @@ class Model(nn.Module):
 # speculative_argmax_from_hidden); see recurrent_rollback.py's module
 # docstring for why that logic lives outside this file.
 class LanguageModel(RecurrentStateRollbackMixin, nn.Module):
+    requires_uniform_batch_acceptance = True
+
     def __init__(self, args: ModelConfig):
         super().__init__()
         self.args = args
@@ -724,6 +735,8 @@ class LanguageModel(RecurrentStateRollbackMixin, nn.Module):
         # the drafter's `set_shared_kv` ignores its contents regardless.
         if inputs is None:
             inputs = kwargs.get("input_ids")
+        capture_layer_ids = kwargs.pop("capture_layer_ids", None)
+        speculative_verify = bool(kwargs.pop("speculative_verify", False))
         return_hidden = kwargs.pop("return_hidden", False)
         return_shared_kv = kwargs.pop("return_shared_kv", False)
         skip_logits = kwargs.pop("skip_logits", False)
@@ -749,14 +762,50 @@ class LanguageModel(RecurrentStateRollbackMixin, nn.Module):
                 )
             recurrent_sink = [None] * len(cache)
 
+        if speculative_verify:
+            # Fork: expose pre-norm final hidden to the repaired MTP contract.
+            # Upstream's verifier returns post-norm final hidden; capture the
+            # final block separately, preserving requested intermediate taps.
+            requested = list(capture_layer_ids or [])
+            final_layer = len(self.backbone.layers) - 1
+            captures = sorted(set(requested + ([final_layer] if return_hidden else [])))
+            result = _EXACT_SPECULATIVE_VERIFIER(
+                self,
+                inputs,
+                cache=cache,
+                inputs_embeds=inputs_embeds,
+                capture_layer_ids=captures,
+                return_hidden=return_hidden,
+                return_shared_kv=return_shared_kv,
+                skip_logits=skip_logits,
+            )
+            if result.hidden_states is not None:
+                taps = dict(zip(captures, result.hidden_states))
+                result.hidden_states = [taps[i] for i in sorted(set(requested))]
+                if return_hidden:
+                    result.hidden_states.append(taps[final_layer])
+            result.gdn_states = {"upstream_mamba_states": result.gdn_states}
+            return result
+
+        if capture_layer_ids is not None and hidden_sink is None:
+            hidden_sink = []
+        final_hidden_sink = (
+            [] if capture_layer_ids is not None and return_hidden else None
+        )
         out = self.backbone(
             inputs,
             cache=cache,
             inputs_embeds=inputs_embeds,
+            final_hidden_sink=final_hidden_sink,
             hidden_sink=hidden_sink,
             skip_final_norm=skip_final_norm,
             recurrent_sink=recurrent_sink,
+            capture_layer_ids=capture_layer_ids,
         )
+        if capture_layer_ids is not None and return_hidden:
+            # Capture raw final hidden in a second sink without re-running layers.
+            # Backbone's final tap is supplied below via final_hidden_sink.
+            hidden_sink.append(final_hidden_sink[-1])
         logits = None if skip_logits else self.lm_head(out)
         return LanguageModelOutput(
             logits=logits,
@@ -774,6 +823,134 @@ class LanguageModel(RecurrentStateRollbackMixin, nn.Module):
     # and corrupting MTP's target-token sampling and acceptance comparison.
     def speculative_final_norm(self, hidden: mx.array) -> mx.array:
         return self.backbone.norm_f(hidden)
+
+    def chunked_prefill_policy(
+        self,
+        *,
+        input_ids=None,
+        inputs_embeds=None,
+        prompt_cache=None,
+        draft_model=None,
+        draft_kind=None,
+        prefill_kwargs=None,
+    ) -> bool:
+        del input_ids, inputs_embeds, prompt_cache
+        if draft_model is None:
+            return True
+        prefill_kwargs = prefill_kwargs or {}
+        if draft_kind == "mtp":
+            return bool(prefill_kwargs.get("return_hidden")) and bool(
+                prefill_kwargs.get("return_shared_kv")
+            )
+        if draft_kind in ("dflash", "dspark"):
+            return prefill_kwargs.get("capture_layer_ids") is not None
+        return False
+
+    def speculative_draft_hidden(self, hidden: mx.array) -> mx.array:
+        return hidden
+
+    def speculative_logits_from_hidden(self, hidden: mx.array) -> mx.array:
+        return RecurrentStateRollbackMixin.speculative_logits_from_hidden(self, hidden)
+
+    def speculative_argmax_from_hidden(self, hidden: mx.array) -> mx.array:
+        return RecurrentStateRollbackMixin.speculative_argmax_from_hidden(self, hidden)
+
+    def speculative_verify_hidden(self, inputs: mx.array, cache):
+        return RecurrentStateRollbackMixin.speculative_verify_hidden(
+            self, inputs, cache
+        )
+
+    def speculative_verify_dflash_hidden(
+        self, inputs: mx.array, cache, capture_layer_ids: list[int]
+    ):
+        out = self(
+            inputs,
+            cache=cache,
+            capture_layer_ids=capture_layer_ids,
+            speculative_verify=True,
+            return_hidden=True,
+            return_shared_kv=True,
+            skip_logits=True,
+        )
+        return out.hidden_states[:-1], out.hidden_states[-1], out.gdn_states
+
+    def speculative_verify_logits(self, inputs: mx.array, cache, sampler):
+        return RecurrentStateRollbackMixin.speculative_verify_logits(
+            self, inputs, cache, sampler
+        )
+
+    def rollback_speculative_cache(self, caches, gdn_states, accepted, block_size):
+        # Fork: distinguish upstream verifier history from cache-aligned
+        # one-pass MTP snapshots; neither layout can be read as the other.
+        if isinstance(gdn_states, dict) and "upstream_mamba_states" in gdn_states:
+            return self._rollback_upstream_speculative_cache(
+                caches, gdn_states["upstream_mamba_states"], accepted, block_size
+            )
+        return RecurrentStateRollbackMixin.rollback_speculative_cache(
+            self, caches, gdn_states, accepted, block_size
+        )
+
+    def _rollback_upstream_speculative_cache(
+        self,
+        caches: list[Any],
+        gdn_states: Any,
+        accepted: Any,
+        block_size: int,
+    ) -> int:
+        if isinstance(accepted, int):
+            accepted_values = [accepted]
+        elif isinstance(accepted, mx.array):
+            accepted_values = [int(value) for value in accepted.reshape(-1).tolist()]
+        else:
+            accepted_values = [int(value) for value in accepted]
+        if len(set(accepted_values)) != 1:
+            raise ValueError(
+                "Nemotron-H speculative rollback requires uniform acceptance."
+            )
+        if gdn_states is None:
+            raise RuntimeError(
+                "Nemotron-H speculative rollback requires verifier Mamba states."
+            )
+
+        max_accepted = accepted_values[0]
+        if max_accepted < 0:
+            raise ValueError("Accepted tokens must be non-negative.")
+        retained = max_accepted + 1
+        if retained > int(block_size):
+            raise ValueError("Accepted tokens exceed the speculative block size.")
+        trim = int(block_size) - retained
+        state_index = 0
+        for cache in caches:
+            if cache is None:
+                continue
+            if isinstance(cache, ArraysCache):
+                if state_index >= len(gdn_states):
+                    raise RuntimeError(
+                        "Nemotron-H verifier did not return every Mamba state."
+                    )
+                state_history, conv_input, kernel_size = gdn_states[state_index]
+                state_index += 1
+                if isinstance(state_history, dict):
+                    from .speculative_verifier import replay_mamba_state
+
+                    cache[1] = replay_mamba_state(state_history, retained)
+                else:
+                    cache[1] = state_history[:, max_accepted]
+                cache[0] = conv_input[:, retained : retained + int(kernel_size) - 1]
+                if cache._lengths is not None:
+                    cache._lengths_advance -= trim
+                if cache._left_padding is not None:
+                    cache._left_padding_advance -= trim
+                continue
+            if not cache.is_trimmable():
+                raise NotImplementedError(
+                    "Nemotron-H speculative rollback requires trimmable attention caches."
+                )
+            if trim:
+                cache.trim(trim)
+        if state_index != len(gdn_states):
+            raise RuntimeError("Nemotron-H verifier returned extra Mamba states.")
+        return max_accepted
 
     def sanitize(self, weights):
         return Model.sanitize(self, weights)

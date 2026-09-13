@@ -5,7 +5,7 @@ from typing import Dict, Optional
 
 import mlx.core as mx
 
-from ....models.qwen3_5.fp8 import make_quantization_config
+from ....fp8 import make_quantization_config
 from ..mtp_split import MTPSplitter
 from .qwen3_5_mtp import Qwen3_5MTPDraftModel
 
@@ -21,37 +21,31 @@ _QWEN_MTP_NORM_SUFFIXES = (
     "pre_fc_norm_hidden.weight",
 )
 
-_SEPARATE_EXPERT_RE = re.compile(  # Fork: C41 shared expert-stacking (see below)
-    r"(.*\.experts)\.(\d+)\.(?:gate_proj|up_proj|down_proj)\.weight$"
-)
 
-
+# Fork: delegate packing upstream and reject configured expert-count mismatches.
 def _stack_separate_experts(tensors: Dict[str, mx.array], text_config: dict) -> None:
-    """Collapse separate per-expert ``experts.{e}.{proj}.weight`` tensors into the
-    stacked ``switch_mlp.{proj}.weight`` the qwen3_5_mtp drafter loads.
+    """Use upstream expert packing, then validate the configured expert count.
 
-    Fork: hoisted out of ``Qwen3NextMTPSplitter.postprocess`` (C41) so
-    ``Qwen3_5MTPSplitter`` applies it too -- Qwen3.5-MoE sources can ship the
-    separate-expert layout as well as the fused ``gate_up_proj`` one, and the
-    fused path (``Qwen3_5MTPDraftModel.sanitize``) leaves separate experts loose.
-    Operates in place on already-``mtp.``-stripped keys. When ``num_experts`` is
-    absent from the config the count is inferred as max expert index + 1.
+    Fork: both splitter branches supply already-``mtp.``-stripped keys, so
+    upstream sanitization preserves their norms while packing weights and
+    quantization sidecars. Validate after packing because contiguous experts
+    can still be incomplete relative to the checkpoint configuration.
     """
-    matches = [(k, m) for k in tensors if (m := _SEPARATE_EXPERT_RE.match(k))]
-    if not matches:
-        return
+    packed = Qwen3_5MTPDraftModel.sanitize(None, tensors)
     n_experts = int(text_config.get("num_experts", 0) or 0)
-    if not n_experts:
-        n_experts = max(int(m.group(2)) for _, m in matches) + 1
-    prefixes = {m.group(1) for _, m in matches}
-    for prefix in sorted(prefixes):
-        base = prefix[: -len(".experts")]
-        for proj in ("gate_proj", "up_proj", "down_proj"):
-            keys = [f"{prefix}.{e}.{proj}.weight" for e in range(n_experts)]
-            if all(k in tensors for k in keys):
-                tensors[f"{base}.switch_mlp.{proj}.weight"] = mx.stack(
-                    [tensors.pop(k) for k in keys]
-                )
+    if n_experts:
+        for key, value in packed.items():
+            if re.search(
+                r"\.switch_mlp\.(gate_proj|up_proj|down_proj)\.(weight|scales|biases)$",
+                key,
+            ):
+                if value.ndim != 3 or value.shape[0] != n_experts:
+                    raise ValueError(
+                        f"{key} has shape {value.shape}; expected {n_experts} "
+                        "stacked experts from num_experts."
+                    )
+    tensors.clear()
+    tensors.update(packed)
 
 
 class Qwen3_5MTPSplitter(MTPSplitter):
@@ -74,8 +68,7 @@ class Qwen3_5MTPSplitter(MTPSplitter):
         }
 
     def postprocess(self, tensors: Dict[str, mx.array], text_config: dict) -> None:
-        # Fork: Qwen3.5-MoE sources may ship separate per-expert tensors (the
-        # Qwen3-Next layout); stack them like Qwen3NextMTPSplitter does (C41).
+        # Fork: preserve packing on the MLX-source branch and validate counts.
         _stack_separate_experts(tensors, text_config)
 
     def quantization_from_source(self, tensors, source_config):
@@ -126,8 +119,7 @@ class Qwen3NextMTPSplitter(MTPSplitter):
         return out
 
     def postprocess(self, tensors: Dict[str, mx.array], text_config: dict) -> None:
-        # Fork: body hoisted to _stack_separate_experts so Qwen3_5MTPSplitter
-        # can share it (C41).
+        # Fork: share upstream packing and configured-count validation.
         _stack_separate_experts(tensors, text_config)
 
     def quantization_from_source(self, tensors, source_config):

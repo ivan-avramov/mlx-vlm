@@ -98,6 +98,7 @@ def ssm_update_kernel(
 
 
 def make_ssm_with_states_kernel(has_mask: bool = False):
+    # Fork (0f4f6c98): capture each recurrent state for one-pass MTP rollback.
     """Same recurrence as `make_ssm_kernel`'s single-step body, looped over
     `T` positions inside one thread (state carried in a register across the
     loop) instead of one launch per position -- mirrors

@@ -31,7 +31,7 @@ git fetch upstream && git log --oneline HEAD..upstream/main   # MUST be empty; m
 grep -cE '^mlx_vlm' .symbol-exclusions .deletion-exclusions .fork-marker-allowlist \
     .dead-helper-exclusions .body-divergence-exclusions .registry-exclusions \
     .call-argument-exclusions
-# expect 14, 0, 0, 0, 0, 5, 2 — see "Exclusion baselines" below
+# expect 23, 0, 0, 0, 0, 5, 4 — see "Exclusion baselines" below
 grep -cE '^mlx_vlm.*# baseline: pre-existing divergence, unreviewed' .symbol-exclusions
 # expect 0 — every remaining exclusion carries a real reason
 ```
@@ -46,13 +46,13 @@ signal, not any report's count.**
 
 | file | baseline | meaning |
 |---|---|---|
-| `.symbol-exclusions` | **14** | upstream symbols we deliberately lack; zero unreviewed |
+| `.symbol-exclusions` | **23** | upstream symbols we deliberately lack; zero unreviewed |
 | `.deletion-exclusions` | **0** | upstream deletions we deliberately kept |
 | `.fork-marker-allowlist` | **0** | files not yet under the `# Fork:` convention |
 | `.dead-helper-exclusions` | **0** | upstream-called helpers unreachable here |
 | `.body-divergence-exclusions` | **0** | misalignments claimed deliberate |
-| `.registry-exclusions` | **5** | re-exports the fork replaced, all reviewed |
-| `.call-argument-exclusions` | **2** | calls passing fewer args, reviewed (one `[**]`, one `[arity]`) |
+| `.registry-exclusions` | **5** | four API replacements and one retired mixin storage attribute, all reviewed |
+| `.call-argument-exclusions` | **4** | calls passing fewer args, reviewed (one `[**]`, one `[arity]`) |
 
 An empty file is **not** a reason to delete it — each keeps its header and RESOLVED
 notes, and the next merge that adds a fork hunk to a shared file will need an entry.
@@ -71,6 +71,14 @@ makes the commit that introduced it start reporting. Five of the 22 joined that 
 and none was a gap; see the 2026-08-14 and 2026-08-22 rows in `upstream-gaps.md`.
 Expect a new entry
 after any merge in which you convert an upstream call to a fork helper.
+
+## Upstream integration quality
+
+- Use every upstream sync to reduce fork divergence; prioritize correctness and long-term maintainability over execution speed.
+- Classify each substantial customization as retired, adapted to upstream, or retained; record its disposition and evidence in the merge review.
+- Prefer upstream implementations and narrow extension points. Remove superseded code and duplicate paths; isolate necessary overrides from shared code.
+- Preserve required behavior and regression coverage. Prove equivalence before retiring a customization; passing tests alone does not establish upstream parity.
+- Review architecture, future merge burden, and behavioral correctness before landing. Do not minimize conflicts by blindly retaining either side.
 
 ## Fork & branches
 
@@ -804,8 +812,7 @@ positives. Every hit still needs `git log -S` and a read.
 cd mlx_vlm/ && pytest -s ./tests --ignore=tests/test_smoke.py
 ```
 
-The suite is **green: 3592 passed, 8 skipped, 0 failed** (2026-08-22, mlx 0.32.1 —
-upstream's tests now target 0.32.1; on 0.32.0 expect Metal aborts). Keep it that
+The suite is **green: 5357 passed, 10 skipped, 149 passing subtests, 0 failed** (2026-09-13, MLX/MLX-Metal 0.32.2). Scope CPU-only test device changes to restoring fixtures; do not change the default device during collection. Keep it that
 way. (This
 line goes stale on every restore that adds a guard — trust the run, not the number.)
 

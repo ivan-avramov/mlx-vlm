@@ -1337,3 +1337,23 @@ Two notes for whoever runs this next:
 `docs/report_issues.md` is four lines of upstream boilerplate pointing at
 Blaizzy's issue tracker. It contains no fork-specific content and is
 intentionally left untouched to avoid merge friction.
+
+
+## 2026-09-13 sync — reviewed residual leads through 45d6e125
+
+The wide report has 30 attribution leads. Six concern incoming commits; four older leads needed an explicit closure entry. These are reviewed adaptations, not an assertion that a zero text-diff is required. Eight gating audits pass. See [integration disposition and validation](upstream-sync-2026-09-13.md).
+
+| Commit | Disposition and evidence |
+|---|---|
+| `2a73dc2d` | Keep upstream verifier and intermediate captures; adapt final hidden to the certified pre-normalization contract. Upstream rollback body remains under `_rollback_upstream_speculative_cache`; tagged histories select it. Model/rollback tests cover capture, acceptance and one-pass snapshots. |
+| `332873ff` | Server sampler implementation moved to the shared AR sampler; exact import-identity guards and DSpark tests preserve sampling/compatibility contracts. |
+| `2b31570b` | Independent proposal RNG survives in shared `sample_proposal`; DFlash2 tests cover independence from target filters. |
+| `36db0bc0` | Top-k applies through the deployed filter chain. Seeded sampler test also verifies nonzero min-p; no duplicate server sampler is restored. |
+| `89baff42` | Snapshot-aware prefix handling replaces blanket refusal. Actual extracted prefix branch cold-prefills untrimmable caches without a ring, usable snapshot, or enabled rewind; recursive trimmability checks and rewind guards remain. This does not certify arbitrary external composite caches. |
+| `d8e6195f` | Residual line is import-comment spelling. Manual APC storage operations now use the upstream coordinator, exercised by actual quantized-cache commit/storage/release tests. |
+| `13d4a808` | Native model implementation retained; routing variable/layer-index adaptations support optional expansion and recurrent-state verification. |
+| `98bd1526` | Expert packing delegates to upstream sanitizer; configured-count validation and both source-layout postprocess paths remain tested. |
+| `8c53f5e3` | Compatibility validation remains. Fork deliberately raises by default instead of silently demoting; explicit fallback has regression coverage. |
+| `f4a5a67f` | Both reported exports are present; inline comments prevent exact line-content attribution. |
+
+The untested-fork report lists 23 definitions with no literal test mention. This is not a coverage measurement. Indirect tests exercise seed resolution, recurrent rollback, splitter helpers and MTP profiling. Direct proof that `_kv_prealloc_floor` affects APC admission sizing remains limited; APC stays disabled.

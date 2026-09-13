@@ -1,7 +1,8 @@
 """Generic MTP speculative-verify rollback for hybrid recurrent language models.
 
-Fork-only module -- upstream has no MTP speculative decoding at all, so there is
-no upstream counterpart to diverge from or stay in sync with.
+Fork-only module for one-pass recurrent snapshots. Upstream also provides
+speculative verification, but its Mamba history has a different layout; the
+nemotron_h language-model adapter routes each layout to its matching rollback.
 
 Why this lives here and not in ``models/nemotron_h/language.py``
 ------------------------------------------------------------------
@@ -206,8 +207,12 @@ class RecurrentStateRollbackMixin:
         silently-wrong state, that case raises.
         """
         accepted_list = _to_accepted_list(accepted)
+        if not accepted_list:
+            raise ValueError("Accepted tokens must not be empty.")
+        if any(value < 0 for value in accepted_list):
+            raise ValueError("Accepted tokens must be non-negative.")
         if len(set(accepted_list)) > 1:
-            raise NotImplementedError(
+            raise ValueError(
                 "rollback_speculative_cache: nemotron_h's plain KVCache has no "
                 "per-row valid-length tracking (no prepare()/right_padding/"
                 "zero_row_tail), so a batch whose rows accepted different "

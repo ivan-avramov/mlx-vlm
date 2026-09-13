@@ -3,7 +3,7 @@ import gc
 import json  # Fork: --generation-defaults JSON payload (see get_server_generation_defaults)
 import logging
 import os
-import sys
+import sys  # Fork: M34 startup evidence must reach worker stderr.
 import time
 from collections import deque
 from contextlib import nullcontext
@@ -25,7 +25,8 @@ from fastapi import HTTPException
 
 from .. import apc as _apc
 from .._stream_cleanup import clear_mlx_streams
-from ..generate import (  # Fork: the fork's generation-engine re-exports (5e9b9503)
+from ..generate import PromptCacheState  # Fork: cached-session state
+from ..generate import (  # Fork: the fork's generation-engine re-exports (5e9b9503)  # noqa: F401
     DEFAULT_KV_GROUP_SIZE,
     DEFAULT_KV_QUANT_SCHEME,
     DEFAULT_MAX_TOKENS,
@@ -38,10 +39,7 @@ from ..generate import (  # Fork: the fork's generation-engine re-exports (5e9b9
     DEFAULT_THINKING_START_TOKEN,
     DEFAULT_TOP_P,
     BatchGenerator,
-    PromptCacheState,
-    _chunked_prefill_enabled,
     _make_cache,
-    _merge_prefill_prompt_kwargs,
 )
 from ..generate.diffusion import (
     is_diffusion_model,
@@ -53,21 +51,17 @@ from ..prompt_utils import (  # Fork: fork-only, the THINKING_FORMATS registry (
     prewarm_special_token_encodes,
     prompt_is_inside_thinking,
 )
-from ..sample_utils import (  # Fork (C26): apply_* moved with _PositionedTargetSampler to generate/ar.py
-    make_logits_processors,
-    make_sampler,
+from ..sample_utils import (
+    apply_top_k as apply_top_k,  # Fork: explicit compatibility re-export.
 )
-from ..speculative.utils import (
-    make_speculative_prompt_cache,
-    run_speculative_server_rounds,
-    speculative_hidden_state,
-    speculative_prefill_kwargs,
-    speculative_stats_since,
-    speculative_stats_snapshot,
+from ..sample_utils import make_logits_processors, make_sampler
+from ..sample_utils import (
+    top_p_sampling as top_p_sampling,  # Fork: explicit compatibility re-export.
 )
+from ..speculative.utils import speculative_stats_since, speculative_stats_snapshot
 from ..structured import ThinkingAwareLogitsProcessor
 from ..tokenizer_utils import _ServerTokenStreamer, make_streaming_detokenizer
-from ..utils import ThinkingBudgetCriteria, load, prepare_inputs
+from ..utils import ThinkingBudgetCriteria, load, prepare_inputs, resolve_eos_token_ids
 from .runtime import runtime
 
 # Fork: MLX_VLM_LOG_NAME (5e9b9503) so an embedding host can re-root the logger
@@ -172,6 +166,7 @@ def get_prefill_step_size():
 
 
 def _apply_moe_expand_and_log(model, spec: str) -> int:
+    # Fork: M34 target-only expert expansion and stderr startup evidence (420c01e1).
     """Apply M34 `--moe-expand` to `model` (the TARGET model only -- see
     `models/moe_expand.apply_moe_expansion`) and announce it on BOTH the
     logger and stderr directly.
@@ -273,93 +268,6 @@ def get_log_progress_interval():
         return DEFAULT_LOG_PROGRESS_INTERVAL
 
 
-def _sequence_aligned_prefill_keys(
-    prompt_kwargs: dict, *, batch_size: int, sequence_length: int
-) -> List[str]:
-    return [
-        k
-        for k, v in (prompt_kwargs or {}).items()
-        if isinstance(v, mx.array)
-        and v.ndim >= 2
-        and v.shape[0] == batch_size
-        and v.shape[1] == sequence_length
-    ]
-
-
-def _slice_prefill_kwargs(prompt_kwargs: dict, keys: List[str], n: int) -> dict:
-    if not keys:
-        return prompt_kwargs
-    out = dict(prompt_kwargs)
-    for key in keys:
-        if key in out:
-            out[key] = out[key][:, :n, ...]
-    return out
-
-
-def _drop_prefill_kwargs(prompt_kwargs: dict, keys: List[str], n: int) -> dict:
-    if not keys:
-        return prompt_kwargs
-    out = dict(prompt_kwargs)
-    for key in keys:
-        if key in out:
-            out[key] = out[key][:, n:, ...]
-    return out
-
-
-def _run_chunked_speculative_prefill(
-    lm,
-    input_ids: mx.array,
-    inputs_embeds: mx.array,
-    prompt_cache,
-    prompt_kwargs: dict,
-    speculative_kwargs: dict,
-    *,
-    prefill_step_size: Optional[int],
-    generation_stream,
-) -> Tuple[object, mx.array]:
-    """Prefill target cache in chunks, capturing speculative state only at end."""
-    remaining_input_ids = input_ids
-    remaining_embeds = inputs_embeds
-    remaining_kwargs = dict(prompt_kwargs or {})
-    sequence_keys = _sequence_aligned_prefill_keys(
-        remaining_kwargs,
-        batch_size=input_ids.shape[0],
-        sequence_length=inputs_embeds.shape[1],
-    )
-
-    if (
-        prefill_step_size is not None
-        and prefill_step_size > 0
-        and remaining_embeds.shape[1] > prefill_step_size
-    ):
-        while remaining_embeds.shape[1] > 1:
-            n_to_process = min(prefill_step_size, remaining_embeds.shape[1] - 1)
-            chunk_kwargs = _slice_prefill_kwargs(
-                remaining_kwargs, sequence_keys, n_to_process
-            )
-            with mx.stream(generation_stream):
-                lm(
-                    remaining_input_ids[:, :n_to_process],
-                    cache=prompt_cache,
-                    inputs_embeds=remaining_embeds[:, :n_to_process],
-                    n_to_process=n_to_process,
-                    **chunk_kwargs,
-                )
-            mx.eval([c.state for c in prompt_cache])
-            remaining_input_ids = remaining_input_ids[:, n_to_process:]
-            remaining_embeds = remaining_embeds[:, n_to_process:]
-            remaining_kwargs = _drop_prefill_kwargs(
-                remaining_kwargs, sequence_keys, n_to_process
-            )
-            mx.clear_cache()
-
-    final_kwargs = {**remaining_kwargs, **speculative_kwargs}
-    final_kwargs["inputs_embeds"] = remaining_embeds
-    with mx.stream(generation_stream):
-        out = lm(remaining_input_ids, cache=prompt_cache, **final_kwargs)
-    return out, remaining_input_ids
-
-
 # Fork (C26): _position_seed/_position_keys/_PositionedTargetSampler are
 # DE-DUPLICATED into generate/ar.py — this module carried a drifted twin of the
 # ar copy, and the drift (ar's twin lacking top_k/min_p) is what made
@@ -368,25 +276,10 @@ def _run_chunked_speculative_prefill(
 # serving paths distributionally identical by construction. The names stay
 # bound in this module for existing importers and the dropped-upstream guard.
 from ..generate.ar import (  # noqa: E402  Fork (C26): see de-duplication note above
-    _PositionedTargetSampler,
     _position_keys,
     _position_seed,
+    _PositionedTargetSampler,
 )
-
-
-def _sample_last_token(
-    logits: mx.array,
-    sampler: Callable[[mx.array], mx.array],
-    *,
-    row_ids: Optional[List[int]] = None,
-    positions: Optional[List[int]] = None,
-):
-    logits = logits[:, -1, :]
-    logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
-    sample_target = getattr(sampler, "sample_target", None)
-    if callable(sample_target) and row_ids is not None and positions is not None:
-        return sample_target(logprobs, row_ids=row_ids, positions=positions)
-    return sampler(logprobs)
 
 
 def get_server_enable_thinking():
@@ -438,6 +331,17 @@ def get_server_generation_defaults() -> dict:
             f"{sorted(known)}"
         )
     return defaults
+
+
+def get_expert_cache_gb():
+    raw = os.environ.get("EXPERT_CACHE_GB", "")
+    if raw == "":
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Invalid EXPERT_CACHE_GB=%r; ignoring.", raw)
+        return None
 
 
 def get_quantized_kv_bits():
@@ -891,7 +795,11 @@ def load_model_resources(model_path: str, adapter_path: Optional[str]):
             os.environ.get("MLX_TRUST_REMOTE_CODE", "false").lower() == "true"
         )
         model, processor = load(
-            model_path, adapter_path, trust_remote_code=trust_remote_code
+            model_path,
+            adapter_path,
+            trust_remote_code=trust_remote_code,
+            expert_cache_gb=get_expert_cache_gb(),
+            max_kv_size=get_configured_context_limit(),
         )
         config = model.config
         logger.info("Model and processor loaded successfully.")
@@ -1214,12 +1122,7 @@ class _DiffusionBlockEmitter:
                 peak_memory=result.peak_memory,
                 prompt_tps=result.prompt_tps,
                 generation_tps=result.generation_tps,
-                # Fork: 0 at the source today -- the diffusion engine has no
-                # prefix reuse, so nothing sets this on its results. Copied
-                # across anyway so the conversion is total: the cached-session
-                # path shipped ``cached_tokens=0`` to clients for months
-                # precisely because one field was left to its default here.
-                cached_tokens=getattr(result, "cached_tokens", 0) or 0,
+                cached_tokens=result.cached_tokens,
                 token_count=token_count,
             )
             self.block_text = []
@@ -1428,12 +1331,12 @@ class ResponseGenerator:
         if moe_expand_spec:
             _apply_moe_expand_and_log(model, moe_expand_spec)
 
-        stop_tokens = set()
-        if hasattr(config, "eos_token_id"):
-            if isinstance(config.eos_token_id, list):
-                stop_tokens.update(config.eos_token_id)
-            elif config.eos_token_id is not None:
-                stop_tokens.add(config.eos_token_id)
+        stop_tokens = set(
+            resolve_eos_token_ids(
+                getattr(config, "eos_token_id", None),
+                getattr(processor, "tokenizer", processor),
+            )
+        )
         stop_tokens.update(getattr(processor, "additional_eos_token_ids", ()))
 
         # Some model configs only list <eos> but omit chat-template stop
@@ -2432,7 +2335,16 @@ class ResponseGenerator:
         try:
             self._run_impl()
         finally:
-            clear_mlx_streams()
+            try:
+                # The worker can outlive stop_and_join's timeout. Retire its
+                # disk writer only after its final request/store has finished.
+                manager = getattr(self, "apc_manager", None)
+                if manager is not None:
+                    manager.close()
+            except Exception:
+                logger.exception("Error closing APC after generation worker shutdown")
+            finally:
+                clear_mlx_streams()
 
     def _run_impl(self):
         """Single GPU thread: owns BatchGenerator, runs tight next() loop."""
@@ -2451,12 +2363,6 @@ class ResponseGenerator:
             self._run_diffusion()
             return
 
-        # 'suffix' is single-sequence (B==1) and runs through the cached/inline
-        # stream_generate path, not the batched _run_speculative loop.
-        if self.draft_model is not None and self.draft_kind not in ("mtp", "suffix"):
-            self._run_speculative()
-            return
-
         generation_stream = mx.default_stream(mx.default_device())
 
         batch_gen = None
@@ -2472,11 +2378,7 @@ class ResponseGenerator:
                 active_batch = bool(active)
                 coalesce_s = (
                     get_speculative_batch_coalesce_s()
-                    if (
-                        not active_batch
-                        and self.draft_model is not None
-                        and self.draft_kind == "mtp"
-                    )
+                    if not active_batch and self.draft_model is not None
                     else 0.0
                 )
                 capacity = (
@@ -2562,6 +2464,8 @@ class ResponseGenerator:
                             kv_group_size=self.kv_group_size,
                             kv_quant_scheme=self.kv_quant_scheme,
                             quantized_kv_start=self.quantized_kv_start,
+                            # Fork: retain full-cap preallocation on unified batching.
+                            kv_prealloc_tokens=get_kv_prealloc_tokens(),
                             compute_logprobs=bool(args.logprobs),
                             top_logprobs_k=self.top_logprobs_k if args.logprobs else 0,
                             stream=generation_stream,
@@ -2584,6 +2488,8 @@ class ResponseGenerator:
 
                     # Vision encoder runs on the GPU thread; text tokenization
                     # already happened on the caller thread.
+                    if self.apc_manager is not None:
+                        self.apc_manager.prepare_prefill(prompt_tokens)
                     input_ids, gen_kwargs = self._gpu_embed(
                         raw_inputs,
                         images,
@@ -2716,7 +2622,13 @@ class ResponseGenerator:
                     )
                     try:
                         self._generate_diffusion(
-                            uid, rqueue, raw_inputs, args, cancelled, log_state
+                            uid,
+                            rqueue,
+                            raw_inputs,
+                            args,
+                            cancelled,
+                            log_state,
+                            apc_semantic_hash=request.apc_semantic_hash,
                         )
                         rqueue.put(None)
                     except Exception as e:
@@ -2733,7 +2645,14 @@ class ResponseGenerator:
                 gc.collect()
 
     def _generate_diffusion(
-        self, uid, rqueue, raw_inputs, args, cancelled, log_state=None
+        self,
+        uid,
+        rqueue,
+        raw_inputs,
+        args,
+        cancelled,
+        log_state=None,
+        apc_semantic_hash=None,
     ):
         log_state = log_state or {"request_id": uid, "generated_tokens": 0}
         input_ids = raw_inputs.get("input_ids")
@@ -2763,6 +2682,9 @@ class ResponseGenerator:
         if args.logits_processors is not None:
             stream_kwargs["logits_processors"] = args.logits_processors
         stream_kwargs.update(args.diffusion_kwargs())
+        if self.apc_manager is not None and self.apc_mode is not None:
+            stream_kwargs["_apc_manager"] = self.apc_manager
+            stream_kwargs["_apc_semantic_hash"] = int(apc_semantic_hash or 0)
 
         emitter = _DiffusionBlockEmitter()
         prefill_logged = False
@@ -2817,358 +2739,6 @@ class ResponseGenerator:
                 pass
         finally:
             results.close()
-
-    def _run_speculative(self):
-        """GPU thread loop with DFlash, EAGLE-3, or MTP speculative decoding.
-
-        Collects incoming requests, prefills them as a batch with the
-        per-family hooks, then runs the matching round-loop for decode.
-        Finished sequences are filtered out automatically by the round-loop's
-        ``stop_check`` callback.
-        """
-        generation_stream = mx.default_stream(mx.default_device())
-
-        lm = self.model.language_model
-        drafter = self.draft_model
-        draft_kind = self.draft_kind
-        is_mtp = draft_kind == "mtp"
-        prefill_kwargs = speculative_prefill_kwargs(draft_kind, drafter)
-        eos_set = set(self.stop_tokens) if is_mtp else None
-        sampler = make_sampler(temp=0)
-        draft_block_size = _get_draft_block_size_from_env()
-
-        while not self._stop:
-            pending = []
-            rqueues = {}
-            try:
-                # --- Phase 1: collect pending requests ---
-                pending, should_stop = self._collect_pending_requests(
-                    active=False,
-                    coalesce_s=get_speculative_batch_coalesce_s(),
-                )
-                if should_stop:
-                    break
-
-                if not pending:
-                    continue
-                # --- Phase 2: prefill new batch ---
-                uids = []
-                rqueues = {}
-                token_lists = {}
-                stream_infos = {}
-                max_tokens_map = {}
-                prompt_tokens_map = {}
-                prompt_tps_map = {}
-                all_input_ids = []
-                prompt_kwargs_list = []
-
-                if hasattr(lm, "_position_ids"):
-                    lm._position_ids = None
-                if hasattr(lm, "_rope_deltas"):
-                    lm._rope_deltas = None
-
-                for request in pending:
-                    rqueue = request.rqueue
-                    raw_inputs = request.raw_inputs
-                    prompt_tokens = request.prompt_tokens
-                    args = request.args
-                    images = request.images
-                    backend_label = f"speculative_{draft_kind}"
-                    log_state = self._log_prefill_started(
-                        request, backend=backend_label
-                    )
-                    input_ids, gen_kwargs = self._gpu_embed(
-                        raw_inputs,
-                        images,
-                        apc_semantic_hash=request.apc_semantic_hash,
-                    )
-                    uid = id(rqueue)
-                    uids.append(uid)
-                    rqueues[uid] = rqueue
-                    token_lists[uid] = []
-                    stream_infos[uid] = {
-                        "streamer": _ServerTokenStreamer(
-                            self.tokenizer,
-                            make_streaming_detokenizer(self.processor),
-                        ),
-                        **log_state,
-                    }
-                    max_tokens_map[uid] = args.max_tokens
-                    prompt_tokens_map[uid] = prompt_tokens
-                    all_input_ids.append(input_ids.squeeze(0).tolist())
-                    prompt_kwargs_list.append(gen_kwargs)
-                    # Fork: backend= is a fork addition; see GenerationContext.
-                    rqueue.put(
-                        GenerationContext(
-                            uid=uid,
-                            prompt_tokens=prompt_tokens,
-                            backend=backend_label,
-                        )
-                    )
-                    sampler = self._make_sampler(args) or make_sampler(temp=0)
-
-                B = len(uids)
-                max_len = max(len(ids) for ids in all_input_ids)
-                left_padding = [max_len - len(ids) for ids in all_input_ids]
-                padded = [
-                    [0] * left_padding[i] + ids for i, ids in enumerate(all_input_ids)
-                ]
-                input_mx = mx.array(padded, dtype=mx.int32)
-
-                inputs_embeds_mx, prompt_kwargs = _merge_prefill_prompt_kwargs(
-                    prompt_kwargs_list, all_input_ids
-                )
-
-                prompt_cache = make_speculative_prompt_cache(
-                    lm,
-                    draft_kind=draft_kind,
-                    batch_size=B,
-                    left_padding=left_padding,
-                    make_cache=functools.partial(
-                        _make_cache, kv_prealloc_tokens=(get_kv_prealloc_tokens() or 0)
-                    ),
-                )
-
-                prefill_step_size = self._effective_prefill_step_size()
-                policy_kwargs = {**prompt_kwargs, **prefill_kwargs}
-                if not _chunked_prefill_enabled(
-                    self.model,
-                    input_ids=input_mx,
-                    inputs_embeds=inputs_embeds_mx,
-                    prompt_cache=prompt_cache,
-                    draft_model=drafter,
-                    draft_kind=draft_kind,
-                    prefill_kwargs=policy_kwargs,
-                ):
-                    prefill_step_size = None
-
-                prompt_started = time.perf_counter()
-                out, input_mx = _run_chunked_speculative_prefill(
-                    lm,
-                    input_mx,
-                    inputs_embeds_mx,
-                    prompt_cache,
-                    prompt_kwargs,
-                    prefill_kwargs,
-                    prefill_step_size=prefill_step_size,
-                    generation_stream=generation_stream,
-                )
-                hidden = speculative_hidden_state(draft_kind, out)
-                shared_kv_states = out.shared_kv_states if is_mtp else None
-                sample_row_ids = [0] * B
-                first_bonus = _sample_last_token(
-                    out.logits,
-                    sampler,
-                    row_ids=sample_row_ids,
-                    positions=[0] * B,
-                )
-                mx.eval(first_bonus, hidden, out.logits)
-                prompt_elapsed = time.perf_counter() - prompt_started
-                for uid in uids:
-                    prompt_tokens = prompt_tokens_map[uid]
-                    prompt_tps_map[uid] = (
-                        prompt_tokens / prompt_elapsed
-                        if prompt_tokens > 0 and prompt_elapsed > 0
-                        else None
-                    )
-                    # cached_tokens is hardcoded 0, and the StreamingToken sites
-                    # below likewise leave it at its default, DELIBERATELY: this
-                    # loop builds a fresh cache per batch via
-                    # make_speculative_prompt_cache and never consults
-                    # request.prompt_cache_state, so no prefix reuse can occur
-                    # here and 0 is the truthful figure rather than a dropped
-                    # measurement. (That a chat-id'd request routed here reuses
-                    # nothing AT ALL is a separate pre-existing limitation of the
-                    # non-suffix drafter paths, not a reporting bug.)
-                    # tests/test_cached_tokens_reporting.py pins this exemption
-                    # and fails if the loop ever gains prompt_cache_state.
-                    logger.info(
-                        "Prefill completed: request=%s prompt_tokens=%d "
-                        "cached_tokens=0 elapsed=%.3fs rate=%.1f tok/s",
-                        stream_infos[uid].get("request_id", uid),
-                        prompt_tokens,
-                        prompt_elapsed,
-                        float(prompt_tps_map[uid] or 0.0),
-                    )
-
-                finished_uids = set()
-
-                # Send first bonus tokens to clients
-                fb_list = first_bonus.tolist()
-                for j, uid in enumerate(uids):
-                    tok = int(fb_list[j])
-                    token_lists[uid].append(tok)
-                    is_stop = tok in self.stop_tokens
-                    is_max = len(token_lists[uid]) >= max_tokens_map[uid]
-                    finish = "stop" if is_stop else "length" if is_max else None
-                    text = self._stream_text(stream_infos[uid], tok, finish)
-                    emitted_at = self._log_decode_progress(
-                        uid,
-                        stream_infos[uid],
-                        token=tok,
-                        text=text,
-                        finish_reason=finish,
-                    )
-                    rqueues[uid].put(
-                        StreamingToken(
-                            text=text,
-                            token=tok,
-                            logprobs=0.0,
-                            finish_reason=finish,
-                            peak_memory=mx.get_peak_memory() / 1e9 if finish else 0,
-                            prompt_tps=prompt_tps_map.get(uid),
-                            emitted_at=emitted_at,
-                        )
-                    )
-                    if finish is not None:
-                        rqueues[uid].put(None)
-                        finished_uids.add(uid)
-
-                if len(finished_uids) == len(uids):
-                    continue
-
-                # --- Phase 3: speculative decode rounds ---
-                max_tok = max(max_tokens_map[u] for u in uids)
-
-                def stop_check(seq_idx, token_id):
-                    uid = uids[seq_idx]
-                    if uid in finished_uids:
-                        return True
-                    if token_id in self.stop_tokens:
-                        return True
-                    if len(token_lists[uid]) >= max_tokens_map[uid]:
-                        return True
-                    return False
-
-                spec_snapshot = speculative_stats_snapshot(drafter)
-
-                def spec_summary():
-                    return speculative_stats_since(drafter, spec_snapshot)
-
-                rounds_iter = run_speculative_server_rounds(
-                    self.model,
-                    drafter,
-                    prompt_cache,
-                    hidden,
-                    draft_kind=draft_kind,
-                    first_bonus=first_bonus,
-                    max_tokens=max_tok,
-                    sampler=sampler,
-                    draft_block_size=draft_block_size,
-                    token_dtype=mx.int32,
-                    stop_check=stop_check,
-                    greedy_sampling=all(
-                        request.args.temperature == 0 for request in pending
-                    ),
-                    shared_kv_states=shared_kv_states,
-                    eos_token_ids=eos_set,
-                    prompt_tokens=input_mx,
-                    row_ids=sample_row_ids,
-                )
-                for tok_list, _ in rounds_iter:
-                    for j, tok in enumerate(tok_list):
-                        if tok is None:
-                            continue
-                        uid = uids[j]
-                        if uid in finished_uids:
-                            continue
-
-                        token_lists[uid].append(tok)
-                        tokens = token_lists[uid]
-
-                        is_stop = tok in self.stop_tokens
-                        is_max = len(tokens) >= max_tokens_map[uid]
-                        finish = "stop" if is_stop else "length" if is_max else None
-                        text = self._stream_text(stream_infos[uid], tok, finish)
-
-                        emitted_at = self._log_decode_progress(
-                            uid,
-                            stream_infos[uid],
-                            token=tok,
-                            text=text,
-                            finish_reason=finish,
-                        )
-
-                        rounds, accepted, drafted = (
-                            spec_summary() if finish else (None, None, None)
-                        )
-                        rqueues[uid].put(
-                            StreamingToken(
-                                text=text,
-                                token=tok,
-                                logprobs=0.0,
-                                finish_reason=finish,
-                                peak_memory=mx.get_peak_memory() / 1e9 if finish else 0,
-                                prompt_tps=prompt_tps_map.get(uid),
-                                draft_kind=draft_kind if finish else None,
-                                draft_rounds=rounds,
-                                draft_n_accepted=accepted,
-                                draft_n=drafted,
-                                emitted_at=emitted_at,
-                            )
-                        )
-
-                        if finish is not None:
-                            rqueues[uid].put(None)
-                            finished_uids.add(uid)
-                    if len(finished_uids) == len(uids):
-                        break
-
-                # Log acceptance stats for this batch only, not the drafter's
-                # lifetime history.
-                rounds, accepted, drafted = spec_summary()
-                if rounds:
-                    mean_a = (accepted + rounds) / rounds
-                    logger.info(
-                        "Speculative decode: kind=%s batch=%d tokens=%d "
-                        "accept=%.2f rounds=%d drafted=%s",
-                        draft_kind,
-                        B,
-                        sum(len(token_lists[u]) for u in uids),
-                        mean_a,
-                        rounds,
-                        drafted,
-                    )
-
-                # Finalize any remaining
-                for uid in uids:
-                    if uid not in finished_uids:
-                        text = stream_infos[uid]["streamer"].finalize()
-                        emitted_at = self._log_decode_progress(
-                            uid,
-                            stream_infos[uid],
-                            token=0,
-                            text=text,
-                            finish_reason="length",
-                            token_count=0,
-                        )
-                        rqueues[uid].put(
-                            StreamingToken(
-                                text=text,
-                                token=0,
-                                logprobs=0.0,
-                                finish_reason="length",
-                                peak_memory=mx.get_peak_memory() / 1e9,
-                                prompt_tps=prompt_tps_map.get(uid),
-                                token_count=0,
-                                emitted_at=emitted_at,
-                                draft_kind=(draft_kind if rounds is not None else None),
-                                draft_rounds=rounds,
-                                draft_n_accepted=accepted,
-                                draft_n=drafted,
-                            )
-                        )
-                        rqueues[uid].put(None)
-
-            except Exception as e:
-                logger.exception("Error in speculative generation thread: %s", e)
-                error_queues = {id(rqueue): rqueue for rqueue in rqueues.values()}
-                error_queues.update(
-                    {id(request.rqueue): request.rqueue for request in pending}
-                )
-                _notify_queues(error_queues.values(), e, None)
-                mx.clear_cache()
-                gc.collect()
 
     def _step(self, batch_gen, active, gen_kwargs=None):
         """One batch generation step: prefill + decode."""

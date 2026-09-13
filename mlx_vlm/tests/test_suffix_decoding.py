@@ -965,8 +965,11 @@ def test_qwen_gdn_state_restored_to_clean_after_rejected_verify():
 def test_suffix_verify_kwargs_hook_per_model():
     # gemma4: KV-only -> no capture kwargs.
     assert _tiny_gemma4(seed=0).suffix_verify_kwargs() == {}
-    # qwen3_5: GDN -> capture_layer_ids=[] (gdn_sink without hidden capture).
-    assert _tiny_qwen3_5(seed=0).suffix_verify_kwargs() == {"capture_layer_ids": []}
+    # Hybrid verification starts a rollback transaction without hidden captures.
+    assert _tiny_qwen3_5(seed=0).suffix_verify_kwargs() == {
+        "capture_layer_ids": [],
+        "speculative_verify": True,
+    }
 
 
 def test_gemma4_chunks_prefill_under_suffix_decoding():
@@ -1090,8 +1093,9 @@ def test_suffix_no_hook_passes_no_extra_kwargs():
 
 
 def test_qwen_capture_layer_ids_is_load_bearing_for_gdn_states():
-    # Direct proof that the hook's kwarg — not the model by itself — is what makes
-    # gdn_states non-None. A disabled/None capture leaves rollback nothing to restore.
+    # Explicit verification starts a transaction; ordinary forward does not.
+    from mlx_vlm.speculative.cache_state import SpeculativeCacheTransaction
+
     lm = _tiny_qwen3_5(seed=0)
     c = cache_mod.make_prompt_cache(lm)
     lm(mx.array([[3, 4, 5]]), cache=c)
@@ -1101,9 +1105,20 @@ def test_qwen_capture_layer_ids_is_load_bearing_for_gdn_states():
 
     c2 = cache_mod.make_prompt_cache(lm)
     lm(mx.array([[3, 4, 5]]), cache=c2)
+    initial_gdn = _gdn_state(c2)
     captured = lm(mx.array([[6, 7, 8]]), cache=c2, **lm.suffix_verify_kwargs())
-    assert captured.gdn_states is not None and len(captured.gdn_states) >= 1
+    transaction = captured.gdn_states
+    assert isinstance(transaction, SpeculativeCacheTransaction)
+    assert transaction.active and transaction.length == 3
+    assert transaction.caches
     assert captured.hidden_states == []  # capture_layer_ids=[] adds no hidden overhead
+    transaction.abort()
+    assert not transaction.active
+    assert _cache_offset(c2) == 3
+    restored_gdn = _gdn_state(c2)
+    assert len(initial_gdn) == len(restored_gdn) and initial_gdn
+    for initial, restored in zip(initial_gdn, restored_gdn):
+        assert bool(mx.array_equal(initial, restored))
 
 
 def test_suffix_decoding_matches_greedy_on_real_tiny_qwen3_5():
@@ -1167,7 +1182,14 @@ def test_qwen_suffix_verify_supports_quantized_kv_cache():
     ver = lm(mx.array([block]), cache=cver, **lm.suffix_verify_kwargs())
     mx.eval(plain.logits, ver.logits)
 
-    assert ver.gdn_states is not None and len(ver.gdn_states) >= 1
+    from mlx_vlm.speculative.cache_state import SpeculativeCacheTransaction
+
+    transaction = ver.gdn_states
+    assert isinstance(transaction, SpeculativeCacheTransaction)
+    assert transaction.active and transaction.length == len(block)
+    transaction.commit(len(block))
+    assert not transaction.active
+    assert _cache_offset(cver) == len(prompt) + len(block)
     assert ver.logits.shape == plain.logits.shape
     # The verify path selects the same per-position tokens a plain forward would.
     assert mx.array_equal(

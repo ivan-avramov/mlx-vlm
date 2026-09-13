@@ -24,6 +24,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import mlx.core as mx
+import pytest
 
 import mlx_vlm.speculative.mtp as mtp_utils
 from mlx_vlm.speculative import utils as speculative_utils
@@ -76,7 +77,7 @@ def _verify(width):
     return speculative_utils._MTPVerifyResult(
         hidden=mx.zeros((1, width, 2), dtype=mx.float32),
         shared_kv_states={},
-        gdn_states=None,
+        rollback_state=None,
     )
 
 
@@ -117,14 +118,16 @@ def test_tripped_budget_forces_the_end_token_first():
     toks, verify_widths, draft = _run(_Criteria(trip_reads=1))
     assert toks[0] == END_ID, (
         "with the budget already exceeded at the round top, the end-of-thinking token "
-        "must be forced before any further drafting")
+        "must be forced before any further drafting"
+    )
 
 
 def test_tripped_budget_commits_the_pending_bonus_with_a_single_token_forward():
     _toks, verify_widths, _draft = _run(_Criteria(trip_reads=1))
     assert verify_widths[0] == 1, (
         "the pending bonus must be committed into the target cache (width-1 forward) "
-        "before the forced end token, or the cache desyncs from the emitted stream")
+        "before the forced end token, or the cache desyncs from the emitted stream"
+    )
 
 
 def test_drafting_resumes_after_the_forced_close():
@@ -212,11 +215,12 @@ def _run_batch(criteria, B=1, max_tokens=4):
             hidden=mx.zeros((verify_input.shape[0], w, 2), dtype=mx.float32),
             shared_kv_states={},
             target_tokens=mx.zeros((verify_input.shape[0], w), dtype=mx.int32) + 9,
-            gdn_states=None,
+            rollback_state=None,
         )
 
-    def fake_draft_block_active(draft_model, b_active, hidden, bs, sampler, dtype,
-                                positions, **kw):
+    def fake_draft_block_active(
+        draft_model, b_active, hidden, bs, sampler, dtype, positions, **kw
+    ):
         return mx.array([[7, 8]] * len(b_active), dtype=mx.int32)
 
     def fake_walk(draft_tokens, target_tokens, budgets):
@@ -253,7 +257,8 @@ def test_batch_tripped_budget_forces_end_token_at_b1():
     rounds, verify_widths = _run_batch([_Criteria(trip_reads=1)])
     assert rounds[0] == [END_ID], (
         "with the budget exceeded at the round top, the forced end token must be the "
-        "next emission for the row")
+        "next emission for the row"
+    )
     assert verify_widths[0] == 1, "pending bonus committed with a width-1 forward first"
 
 
@@ -334,10 +339,76 @@ def test_speculative_generation_batch_drives_and_forwards_criteria():
         prompt_tokens=mx.array([[1, 2]], dtype=mx.int32),
         thinking_budget_criteria=[crit],
     )
-    with patch.object(ar, "run_speculative_server_rounds", side_effect=fake_server_rounds):
-        first = batch.next()   # first-bonus send
+    with patch.object(
+        ar, "run_speculative_server_rounds", side_effect=fake_server_rounds
+    ):
+        first = batch.next()  # first-bonus send
         second = batch.next()  # one round
     assert [r.token for r in first] == [5]
     assert [r.token for r in second] == [7]
     assert calls == [5, 7], "every emitted token must drive the criteria"
     assert seen.get("criteria") == [crit]
+
+
+@pytest.mark.parametrize("batched", [False, True])
+def test_forced_close_commits_transaction_before_yield(batched):
+    """A consumer can stop at the forced close without leaving pending state."""
+    from mlx_vlm.speculative.cache_state import start_speculative_cache
+
+    class PositionCache:
+        def __init__(self):
+            self.offset = 0
+
+        def trim(self, count):
+            self.offset -= count
+            return count
+
+    entry = PositionCache()
+    caches = [entry]
+    transactions = []
+    widths = []
+
+    def fake_verify(lm, inputs, prompt_cache, sampler, **kwargs):
+        width = int(inputs.shape[1])
+        widths.append(width)
+        assert inputs.tolist() == [[1]]
+        assert kwargs["sample_target_tokens"] is False
+        transaction = start_speculative_cache(prompt_cache, width)
+        entry.offset += width
+        transactions.append(transaction)
+        return mtp_utils._MTPVerifyResult(
+            hidden=mx.zeros((1, width, 2)),
+            shared_kv_states={},
+            rollback_state=transaction,
+        )
+
+    draft = _Draft()
+    criteria = _Criteria(trip_reads=1)
+    kwargs = dict(
+        max_tokens=2,
+        sampler=lambda logits: mx.argmax(logits, axis=-1),
+        draft_block_size=3,
+        greedy_sampling=True,
+    )
+    loop = _mtp_rounds_batch if batched else _mtp_rounds
+    with patch.object(mtp_utils, "_mtp_verify_target", side_effect=fake_verify):
+        stream = loop(
+            SimpleNamespace(language_model=_LM()),
+            draft,
+            caches,
+            mx.zeros((1, 1, 2)),
+            {},
+            first_bonus=mx.array([1]) if batched else 1,
+            thinking_budget_criteria=[criteria] if batched else criteria,
+            **kwargs,
+        )
+        try:
+            token, _ = next(stream)
+            assert token == ([END_ID] if batched else END_ID)
+            assert widths == [1]
+            assert entry.offset == 1
+            assert len(transactions) == 1 and not transactions[0].active
+            assert draft.draft_block_calls == 0
+        finally:
+            stream.close()
+    assert entry.offset == 1, "closing the consumer must preserve committed bonus"

@@ -103,7 +103,7 @@ class TestBackboneInputContract:
         assert not mx.allclose(both, ids_only).item()
 
     def test_neither_supplied_still_raises(self, backbone):
-        with pytest.raises(ValueError, match="Provide inputs or inputs_embeds"):
+        with pytest.raises(ValueError, match="Provide either inputs or inputs_embeds"):
             backbone()
 
     def test_a_backbone_without_embeddings_rejects_bare_input_ids(self, input_ids):

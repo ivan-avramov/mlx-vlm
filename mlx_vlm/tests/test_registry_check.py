@@ -361,12 +361,12 @@ class TestExclusionsFileParsing:
         with pytest.raises(SystemExit):
             cur.load_exclusions()
 
-    def test_the_repo_baseline_is_the_five_reviewed_re_exports(self, cur):
+    def test_the_repo_baseline_is_the_five_reviewed_divergences(self, cur):
         """Pins the baseline, like the other audits' tests do.
 
-        All five are fork replacements that already carry a `# Fork:` marker at their
-        import site. A sixth appearing means either a new deliberate replacement or a
-        dropped re-export, and it should require editing this test to say which.
+        Four entries cover fork API replacements; one retires the attention
+        mixin's storage constant now owned by concrete cache classes. Restored
+        top_p_sampling is no longer excluded. Any new entry requires review.
         """
         parsed = cur.load_exclusions()
 
@@ -374,9 +374,9 @@ class TestExclusionsFileParsing:
         assert all(reason.startswith("REVIEWED:") for _p, _s, reason in parsed)
         symbols = sorted(symbol for _p, symbol, _r in parsed)
         assert symbols == [
+            "_TurboQuantAttentionMixin::cache_step",
             "_check_configured_context_budget",
             "generation_stream",
             "generation_stream",
             "generation_stream",
-            "top_p_sampling",
         ]

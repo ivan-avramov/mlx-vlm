@@ -10,17 +10,9 @@ sanitize only reads self.config.text_config.{num_hidden_layers, num_experts,
 tie_word_embeddings}, so we duck-type `self` and call the method unbound — no need
 to instantiate the (heavy) full multimodal Model.
 
-This file is fork-only, and after 6be3f881 it is the *only* thing carrying the fork's
-knowledge about these two layouts: `qwen3_5_moe.py` itself is now byte-identical to
-upstream. The fork had its own unfused branch (`f0d50c90`) four days before upstream's
-`b590c747` (#1472) added an equivalent one; the fork's differed only in probing
-`experts.0.gate_proj.weight` where upstream probes `experts.0.up_proj.weight`, and
-carrying it made the file a permanent conflict site for no behavioural gain. The
-probes were shown identical on every layout that can exist — all three projections
-present, none present, and the fused `gate_up_proj` tensor — and exact mirror images
-on the two that cannot: each raises KeyError for the partial layout that omits its own
-probe key and passes the other through unstacked. `test_a_partial_expert_layout_raises`
-below pins that, so nobody reintroduces the fork probe to "fix" it.
+The upstream packing implementation is retained. Required expert weights must
+still fail loudly when missing; upstream's optional scales/biases handling must
+not make a missing gate weight look like a loadable checkpoint.
 """
 
 from types import SimpleNamespace
@@ -89,15 +81,7 @@ def test_sanitize_fused_experts_still_supported():
 
 
 def test_a_partial_expert_layout_raises():
-    """Pins which projection upstream's probe keys on, and that it fails loudly.
-
-    A SwiGLU expert without a gate projection is not SwiGLU, so this layout cannot
-    ship — but WHICH partial layout raises is the whole (and only) difference between
-    upstream's probe and the fork's, so it is worth a test rather than a comment. With
-    `up_proj` as the probe, up+down raises inside the branch and gate+down skips it;
-    the fork's `gate_proj` probe mirrored that exactly. Neither is safer, which is why
-    the fork's was retired in favour of staying byte-identical to upstream.
-    """
+    """Optional quantization suffixes must not hide a missing gate weight."""
     E, H, I = 3, 8, 6
     prefix = "model.language_model.layers.0.mlp"
     w = {}
@@ -107,3 +91,58 @@ def test_a_partial_expert_layout_raises():
 
     with pytest.raises(KeyError, match="gate_proj"):
         Model.sanitize(_fake_self(1, E), dict(w))
+
+
+@pytest.mark.parametrize("suffix", ["scales", "biases"])
+def test_sanitize_stacks_optional_quantization_sidecars(suffix):
+    prefix = "model.language_model.layers.0.mlp"
+    weights = {}
+    for projection in ("gate_proj", "up_proj", "down_proj"):
+        for expert in range(3):
+            weights[f"{prefix}.experts.{expert}.{projection}.weight"] = mx.ones((8, 8))
+            weights[f"{prefix}.experts.{expert}.{projection}.{suffix}"] = mx.full(
+                (8, 1), float(expert)
+            )
+    result = Model.sanitize(_fake_self(1, 3), weights)
+    for projection in ("gate_proj", "up_proj", "down_proj"):
+        sidecar = result[_sw(projection).removesuffix("weight") + suffix]
+        assert sidecar.shape == (3, 8, 1)
+        assert sidecar[:, 0, 0].tolist() == [0.0, 1.0, 2.0]
+    assert not any(".experts." in key for key in result)
+
+
+def test_mtp_postprocess_uses_upstream_packing_without_shifting_native_norms():
+    from mlx_vlm.speculative.drafters.qwen3_5_mtp.split import _stack_separate_experts
+
+    norm = mx.full((8,), 0.25)
+    tensors = {"norm.weight": norm}
+    for projection in ("gate_proj", "up_proj", "down_proj"):
+        for expert in range(2):
+            for suffix in ("weight", "scales", "biases"):
+                tensors[f"layers.0.mlp.experts.{expert}.{projection}.{suffix}"] = (
+                    mx.full((8, 8 if suffix == "weight" else 1), float(expert))
+                )
+    _stack_separate_experts(tensors, {"num_experts": 2})
+    assert mx.array_equal(tensors["norm.weight"], norm).item()
+    assert not any(".experts." in key for key in tensors)
+    for projection in ("gate_proj", "up_proj", "down_proj"):
+        for suffix in ("weight", "scales", "biases"):
+            stacked = tensors[f"layers.0.mlp.switch_mlp.{projection}.{suffix}"]
+            assert stacked[:, 0, 0].tolist() == [0.0, 1.0]
+
+
+@pytest.mark.parametrize("already_stacked", [False, True])
+def test_mtp_postprocess_rejects_incomplete_configured_expert_count(already_stacked):
+    from mlx_vlm.speculative.drafters.qwen3_5_mtp.split import _stack_separate_experts
+
+    tensors = {}
+    for projection in ("gate_proj", "up_proj", "down_proj"):
+        if already_stacked:
+            tensors[f"layers.0.mlp.switch_mlp.{projection}.weight"] = mx.ones((2, 8, 8))
+        else:
+            for expert in range(2):
+                tensors[f"layers.0.mlp.experts.{expert}.{projection}.weight"] = mx.ones(
+                    (8, 8)
+                )
+    with pytest.raises(ValueError, match="expected 3 stacked experts"):
+        _stack_separate_experts(tensors, {"num_experts": 3})

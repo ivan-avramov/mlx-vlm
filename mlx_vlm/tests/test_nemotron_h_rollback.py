@@ -24,11 +24,6 @@ never load a real checkpoint.
 """
 
 import mlx.core as mx
-
-# Fork: this benchmark host may have a live GPU benchmark running; every test
-# in this module must stay off it.
-mx.set_default_device(mx.cpu)
-
 import pytest
 
 from mlx_vlm.models.cache import ArraysCache, KVCache
@@ -37,6 +32,17 @@ from mlx_vlm.models.nemotron_h.language import LanguageModel, NemotronHMamba2Mix
 
 HIDDEN_SIZE = 16
 VOCAB_SIZE = 32
+
+
+@pytest.fixture(autouse=True)
+def _cpu_device():
+    """Keep synthetic tests on CPU without affecting collection or other tests."""
+    previous_device = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        yield
+    finally:
+        mx.set_default_device(previous_device)
 
 
 def _config(**overrides) -> ModelConfig:
@@ -139,7 +145,11 @@ def _decode_sequential(model, prefix, tokens):
     return cache, last_out
 
 
-PREFIX = mx.array([[3, 5, 7]], dtype=mx.int32)
+def _prefix():
+    """Allocate only when the test's CPU device fixture is active."""
+    return mx.array([[3, 5, 7]], dtype=mx.int32)
+
+
 BLOCK = [11, 12, 13, 14]  # 4-token verify block
 BLOCK_SIZE = len(BLOCK)
 
@@ -150,13 +160,13 @@ class TestKnownPositiveRollback:
 
         # Path A: sequential decode through the first 2 block tokens
         # (accepted=1 -> n=2 tokens kept). This is the ground truth.
-        cache_seq, _ = _decode_sequential(model, PREFIX, BLOCK[:2])
+        cache_seq, _ = _decode_sequential(model, _prefix(), BLOCK[:2])
         seq_snapshot = _snapshot(cache_seq)
 
         # Path B: verify the whole 4-token block in one call (capturing
         # per-position recurrent state), then roll back to accepted=1.
         cache_verify = model.make_cache()
-        model(PREFIX, cache=cache_verify)
+        model(_prefix(), cache=cache_verify)
         block_input = mx.array([BLOCK], dtype=mx.int32)
         hidden, shared_kv, states = model.speculative_verify_hidden(
             block_input, cache_verify
@@ -185,11 +195,11 @@ class TestKnownPositiveRollback:
     def test_accepted_zero(self):
         model = _model()
 
-        cache_seq, _ = _decode_sequential(model, PREFIX, BLOCK[:1])
+        cache_seq, _ = _decode_sequential(model, _prefix(), BLOCK[:1])
         seq_snapshot = _snapshot(cache_seq)
 
         cache_verify = model.make_cache()
-        model(PREFIX, cache=cache_verify)
+        model(_prefix(), cache=cache_verify)
         block_input = mx.array([BLOCK], dtype=mx.int32)
         hidden, _, states = model.speculative_verify_hidden(block_input, cache_verify)
         mx.eval(hidden)
@@ -205,11 +215,11 @@ class TestKnownPositiveRollback:
         """accepted == block_size - 1: nothing is rejected."""
         model = _model()
 
-        cache_seq, _ = _decode_sequential(model, PREFIX, BLOCK)
+        cache_seq, _ = _decode_sequential(model, _prefix(), BLOCK)
         seq_snapshot = _snapshot(cache_seq)
 
         cache_verify = model.make_cache()
-        model(PREFIX, cache=cache_verify)
+        model(_prefix(), cache=cache_verify)
         block_input = mx.array([BLOCK], dtype=mx.int32)
         hidden, _, states = model.speculative_verify_hidden(block_input, cache_verify)
         mx.eval(hidden)
@@ -276,7 +286,7 @@ class TestVerifyReturnContract:
     def test_speculative_verify_hidden_returns_three_tuple(self):
         model = _model()
         cache = model.make_cache()
-        model(PREFIX, cache=cache)
+        model(_prefix(), cache=cache)
 
         result = model.speculative_verify_hidden(
             mx.array([BLOCK], dtype=mx.int32), cache
@@ -306,7 +316,7 @@ class TestVerifyReturnContract:
     def test_speculative_verify_logits_returns_four_tuple(self):
         model = _model()
         cache = model.make_cache()
-        model(PREFIX, cache=cache)
+        model(_prefix(), cache=cache)
 
         result = model.speculative_verify_logits(
             mx.array([BLOCK], dtype=mx.int32), cache, _greedy_sampler
@@ -341,7 +351,7 @@ class TestVerifyReturnContract:
             low=0.5, high=2.0, shape=(HIDDEN_SIZE,)
         )
         cache = model.make_cache()
-        out = model(PREFIX, cache=cache, return_hidden=True)
+        out = model(_prefix(), cache=cache, return_hidden=True)
         mx.eval(out.logits)
 
         actual = model.speculative_logits_from_hidden(out.hidden_states[-1])
@@ -363,7 +373,7 @@ class TestVerifyReturnContract:
             low=0.5, high=2.0, shape=(HIDDEN_SIZE,)
         )
         cache = model.make_cache()
-        out = model(PREFIX, cache=cache, return_hidden=True)
+        out = model(_prefix(), cache=cache, return_hidden=True)
         mx.eval(out.logits)
         expected = mx.argmax(out.logits, axis=-1)
 
@@ -378,7 +388,7 @@ class TestRollbackErrorHandling:
         silently no-op -- it must fail loud."""
         model = _model()
         cache = model.make_cache()
-        model(PREFIX, cache=cache)
+        model(_prefix(), cache=cache)
         states = [None] * len(cache)
 
         with pytest.raises(RuntimeError, match="missing recurrent-state"):
@@ -398,7 +408,7 @@ class TestRollbackErrorHandling:
         iteration."""
         model = _model()
         cache = model.make_cache()
-        model(PREFIX, cache=cache)
+        model(_prefix(), cache=cache)
 
         # Matched on wording unique to the early, dedicated check -- the
         # generic per-cache "missing recurrent-state snapshot" message (hit
@@ -417,7 +427,7 @@ class TestRollbackErrorHandling:
         model = _model()
         cache = model.make_cache()
 
-        with pytest.raises(NotImplementedError, match="uniform acceptance"):
+        with pytest.raises(ValueError, match="uniform acceptance"):
             model.rollback_speculative_cache(
                 cache, [None] * len(cache), accepted=[0, 2], block_size=BLOCK_SIZE
             )
@@ -453,7 +463,7 @@ class TestOnePassVerifyNoReplay:
         mx.random.seed(0)
         model = LanguageModel(_config(hybrid_override_pattern="MM*-"))
         cache = model.make_cache()
-        model(PREFIX, cache=cache)
+        model(_prefix(), cache=cache)
 
         num_mamba_layers = sum(
             1 for layer in model.backbone.layers if layer.block_type == "M"

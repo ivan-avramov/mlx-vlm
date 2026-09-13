@@ -13,7 +13,12 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..generate import generate, stream_generate
 from ..prompt_utils import apply_chat_template
-from ..tool_parsers import _infer_tool_parser_from_processor, load_tool_module
+from ..tools import (
+    _infer_tool_parser_from_processor,
+    _prepare_chat_tool_choice,
+    load_tool_module,
+    process_tool_calls,
+)
 from ..utils import prepare_inputs
 from .generation import (  # Fork: resolve_backend_label is fork-only — it reports the generation path that RAN
     GenerationMetrics,
@@ -22,12 +27,10 @@ from .generation import (  # Fork: resolve_backend_label is fork-only — it rep
     _count_prompt_tokens,
     resolve_backend_label,
 )
-from .openai import _prepare_chat_tool_choice
 from .responses_state import (
+    ToolCallStreamState,
     make_response_stream_state,
-    process_tool_calls,
     prompt_has_open_thinking,
-    suppress_tool_call_content,
 )
 from .runtime import runtime
 from .schemas import AnthropicMessageResponse, AnthropicRequest, AnthropicUsage
@@ -117,13 +120,18 @@ def _normalize_anthropic_system_messages(body: Any) -> Any:
     normalized_messages = []
     system_parts = []
     saw_system_message = False
+    saw_conversation = False
     for message in messages:
         if isinstance(message, dict) and message.get("role") == "system":
             saw_system_message = True
-            text = _anthropic_system_text(message.get("content"))
-            if text:
-                system_parts.append(text)
-            continue
+            if not saw_conversation:
+                text = _anthropic_system_text(message.get("content"))
+                if text:
+                    system_parts.append(text)
+                continue
+            message = {**message, "role": "user"}
+        else:
+            saw_conversation = True
         normalized_messages.append(message)
 
     if not saw_system_message:
@@ -482,7 +490,9 @@ async def anthropic_messages_endpoint(http_request: Request):
             )
         except HTTPException as e:
             return _anthropic_error_response(e.status_code, str(e.detail))
-        tool_parser_type = _infer_tool_parser_from_processor(processor)
+        tool_parser_type = _infer_tool_parser_from_processor(
+            processor, override=request.tool_parser
+        )
         tool_module = load_tool_module(tool_parser_type) if tool_parser_type else None
 
         try:
@@ -557,8 +567,9 @@ async def anthropic_messages_endpoint(http_request: Request):
                     gen_args.thinking_start_token,
                     gen_args.thinking_end_token,
                 )
-                in_tool_call = False
                 tc_start = tool_module.tool_call_start if tool_module else None
+                tc_end = tool_module.tool_call_end if tool_module else None
+                tool_call_state = ToolCallStreamState(tc_start, tc_end)
                 message_started = False
 
                 def close_open_block():
@@ -688,8 +699,9 @@ async def anthropic_messages_endpoint(http_request: Request):
                         delta_reasoning = thinking_delta.reasoning
                         delta_content = thinking_delta.content
 
-                        in_tool_call, delta_content = suppress_tool_call_content(
-                            full_output, in_tool_call, tc_start, delta_content
+                        delta_content = tool_call_state.feed(
+                            delta_content,
+                            last=bool(getattr(token, "finish_reason", None)),
                         )
 
                         if delta_reasoning is not None and gen_args.enable_thinking:
@@ -747,8 +759,8 @@ async def anthropic_messages_endpoint(http_request: Request):
                     parsed_tool_calls = None
                     if tool_module is not None and tools:
                         tc = process_tool_calls(full_output, tool_module, tools)
-                        if tc["calls"]:
-                            parsed_tool_calls = tc["calls"]
+                        if tc.calls:
+                            parsed_tool_calls = tc.calls
 
                     if parsed_tool_calls:
                         for call in parsed_tool_calls:
@@ -978,10 +990,10 @@ async def anthropic_messages_endpoint(http_request: Request):
             parsed_tool_calls = None
             if tool_module is not None and tools:
                 tc = process_tool_calls(full_text, tool_module, tools)
-                if tc["calls"]:
-                    parsed_tool_calls = tc["calls"]
+                if tc.calls:
+                    parsed_tool_calls = tc.calls
                     _, content = _split_thinking(
-                        tc["remaining_text"] or "",
+                        tc.remaining_text or "",
                         gen_args.thinking_start_token,
                         gen_args.thinking_end_token,
                         processor=processor,

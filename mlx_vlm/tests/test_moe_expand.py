@@ -22,6 +22,13 @@ from mlx_vlm.models.moe_expand import (
 from mlx_vlm.models.nemotron_h.language import NemotronHMoE
 
 
+@pytest.fixture(autouse=True)
+def _restore_moe_expansion_env(monkeypatch):
+    # CLI tests write os.environ directly; register its original value for undo.
+    key = "MLX_VLM_MOE_EXPAND"
+    monkeypatch.setenv(key, os.environ.get(key, ""))
+
+
 def _to_dense(inds: mx.array, weights: mx.array, e: int) -> mx.array:
     """Scatter (inds, weights) -- both shape (..., n) -- into a dense (..., e)
     array. Lets tests compare kept-sets/weights permutation-invariantly."""
@@ -313,8 +320,8 @@ class TestQwenModelIntegration:
         captured = {}
         orig_call = Qwen3_5MoeSparseMoeBlock.__call__
 
-        def wrapped(self, x, target_verify=False):
-            out = orig_call(self, x, target_verify)
+        def wrapped(self, x):
+            out = orig_call(self, x)
             captured.setdefault(self.layer_idx, []).append(out)
             return out
 
@@ -509,7 +516,6 @@ class TestNemotronModelIntegration:
         assert not mx.array_equal(captured[4][0], captured[4][1])
 
     def test_routed_scaling_and_norm_topk_prob_still_applied(self):
-        from mlx_vlm.models.moe_expand import MoeExpansion
         from mlx_vlm.models.nemotron_h.language import group_expert_select
 
         gates = mx.array([[0.1, 2.0, -0.3, 0.4, 0.05, -0.2, 0.15, 0.02]])
@@ -625,8 +631,8 @@ class TestFix1Bf16DtypePreservation:
         captured = {}
         orig_call = Qwen3_5MoeSparseMoeBlock.__call__
 
-        def wrapped(self, x, target_verify=False):
-            out = orig_call(self, x, target_verify)
+        def wrapped(self, x):
+            out = orig_call(self, x)
             captured.setdefault(self.layer_idx, []).append(out.dtype)
             return out
 

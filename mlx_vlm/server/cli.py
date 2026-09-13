@@ -21,6 +21,7 @@ from .generation import (  # Fork: generation_defaults + thinking getters are fo
     get_server_thinking_end_token,
     get_server_thinking_start_token,
 )
+from .runtime import MODEL_DISCOVERY_ENV, MODEL_DISCOVERY_MODES
 from .session_manager import (  # Fork: session manager is fork
     _env_choice,
     _env_float,
@@ -227,6 +228,16 @@ def main():
         help="Pre-load a supported reranker model at startup.",
     )
     parser.add_argument(
+        "--model-discovery",
+        choices=MODEL_DISCOVERY_MODES,
+        default=None,
+        help=(
+            "Models exposed by /v1/models: 'served' lists only models loaded by "
+            "this process (default); 'hf-cache' also scans the shared Hugging "
+            "Face cache. Maps to MLX_VLM_MODEL_DISCOVERY."
+        ),
+    )
+    parser.add_argument(
         "--adapter-path",
         type=str,
         default=None,
@@ -416,6 +427,14 @@ def main():
             "the Metal recommended working-set size). MLX evicts the buffer pool before "
             "crossing it, preventing OS swap. e.g. 0.85. Default: unset."
         ),
+    )
+    parser.add_argument(
+        "--expert-cache-gb",
+        type=float,
+        default=None,
+        help="For an mlx_vlm.moe_offload checkpoint, bound the resident routed-"
+        "expert set to this many GB (default: 70%% of the GPU's recommended "
+        "working set). Ignored for a normal, non-offloaded checkpoint.",
     )
     parser.add_argument(
         "--draft-model",
@@ -638,6 +657,8 @@ def main():
         os.environ["MLX_VLM_PRELOAD_EMBEDDING_MODEL"] = args.embedding_model
     if args.reranker_model:
         os.environ["MLX_VLM_PRELOAD_RERANKER_MODEL"] = args.reranker_model
+    if args.model_discovery:
+        os.environ[MODEL_DISCOVERY_ENV] = args.model_discovery
     os.environ["MLX_VLM_VISION_CACHE_SIZE"] = str(args.vision_cache_size)
     if args.draft_model:
         os.environ["MLX_VLM_DRAFT_MODEL"] = args.draft_model
@@ -689,6 +710,8 @@ def main():
     if args.kv_prealloc_tokens is not None:
         os.environ["KV_PREALLOC_TOKENS"] = str(args.kv_prealloc_tokens)
     os.environ["QUANTIZED_KV_START"] = str(args.quantized_kv_start)
+    if args.expert_cache_gb is not None:
+        os.environ["EXPERT_CACHE_GB"] = str(args.expert_cache_gb)
     if args.top_logprobs_k is not None:
         os.environ["TOP_LOGPROBS_K"] = str(args.top_logprobs_k)
     if args.api_key:

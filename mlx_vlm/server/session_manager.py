@@ -132,9 +132,7 @@ def _evict_for_headroom(protect_id: str) -> None:
         active, budget = signal
         if budget <= 0 or active < _session_evict_headroom_frac * budget:
             return
-        victim_id = next(
-            (sid for sid in _session_caches if sid != protect_id), None
-        )
+        victim_id = next((sid for sid in _session_caches if sid != protect_id), None)
         if victim_id is None:
             return  # nothing left to evict but the protected session
         _session_caches.pop(victim_id, None)

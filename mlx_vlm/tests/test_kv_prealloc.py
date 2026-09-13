@@ -238,7 +238,12 @@ def test_generate_step_forwards_kv_prealloc_tokens():
         seen["prealloc"].append(kv_prealloc_tokens)
 
     def spy_make(model, *a, **kw):
-        return [kvc.KVCache() for _ in range(2)]
+        # Fork: MockModel does not populate KV; supply valid materialized state
+        # for upstream's post-prefill cache evaluation while spying on the floor.
+        caches = [kvc.KVCache() for _ in range(2)]
+        for cache in caches:
+            cache.update_and_fetch(*_fake(1))
+        return caches
 
     gen_mod = sys.modules["mlx_vlm.generate"]
     with (

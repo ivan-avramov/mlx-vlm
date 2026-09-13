@@ -17,11 +17,6 @@ this suite never sets itself.
 import os
 
 import mlx.core as mx
-
-# Fork: this benchmark host may have a live GPU benchmark running; every test
-# in this module (other than the explicitly gated GPU one) must stay off it.
-mx.set_default_device(mx.cpu)
-
 import pytest
 
 from mlx_vlm.models.ssm import (
@@ -33,6 +28,17 @@ from mlx_vlm.models.ssm import (
 )
 
 TIME_STEP_LIMIT = (0.001, 100.0)
+
+
+@pytest.fixture(autouse=True)
+def _cpu_device():
+    """Keep synthetic tests on CPU without affecting collection or other tests."""
+    previous_device = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        yield
+    finally:
+        mx.set_default_device(previous_device)
 
 
 def _random_inputs(b, t, h, dh, g, ds, seed):

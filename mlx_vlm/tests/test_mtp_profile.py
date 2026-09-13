@@ -28,12 +28,9 @@ from unittest.mock import patch
 import mlx.core as mx
 import pytest
 
-mx.set_default_device(mx.cpu)
-
 import mlx_vlm.speculative.mtp as mtp_utils
 from mlx_vlm.speculative import mtp_profile
 from mlx_vlm.speculative.mtp_profile import (
-    MTPHeadProfiler,
     MTPRoundProfiler,
     _PhaseTimer,
     cache_state_arrays,
@@ -77,6 +74,17 @@ HEAD_LINE_RE = re.compile(
 ROUNDS_MAX_TOKENS = 7
 
 
+@pytest.fixture(autouse=True)
+def _cpu_device():
+    """Keep synthetic tests on CPU without affecting collection or other tests."""
+    previous_device = mx.default_device()
+    mx.set_default_device(mx.cpu)
+    try:
+        yield
+    finally:
+        mx.set_default_device(previous_device)
+
+
 class _CacheEntry:
     """Fake prompt-cache entry: ``.state`` is a tuple of mx arrays, matching
     the real cache classes' ``state`` property shape."""
@@ -113,7 +121,7 @@ def _verify(width):
     return mtp_utils._MTPVerifyResult(
         hidden=mx.zeros((1, width, 2), dtype=mx.float32),
         shared_kv_states={},
-        gdn_states=None,
+        rollback_state=None,
     )
 
 
@@ -260,19 +268,11 @@ class TestRoundProfilerEnv:
         """F4a: pin the EXACT sync count so a neutered mark() (or one that
         drops its sync) cannot pass silently.
 
-        Arithmetic for ROUNDS_MAX_TOKENS=7, block_size=3 (bs=3, n_draft=2
-        every round), walk fake fixed at (1, [9, 10]):
-          begin()                                          -> 1 sync
-          round 1 (full):   other,draft,verify,walk,
-                             yield,accept,rollback           -> 7 marks -> 7 syncs
-          round 2 (full):   same 7 marks                     -> 7 syncs
-          round 3 (early return at the 2nd yielded token,
-                   i.e. i=1): other,draft,verify,walk,
-                   yield (early-return branch)                -> 5 marks -> 5 syncs
-                   (no accept/rollback -- the early return
-                   happens before that code)
-          report(final=True): no sync of its own
-          total = 1 + 7 + 7 + 5 = 20
+        For ROUNDS_MAX_TOKENS=7, block_size=3 and walk=(1, [9, 10]):
+        begin() synchronizes once; each of three rounds marks other, draft,
+        verify, walk, accept, rollback, yield. Upstream commits before emission,
+        including the final round. report(final=True) adds no synchronization.
+        The exact count is 1 + 3 * 7 = 22.
         """
         monkeypatch.setenv(mtp_profile.ENV_ROUNDS, "1")
         real_sync = mx.synchronize
@@ -284,7 +284,7 @@ class TestRoundProfilerEnv:
 
         monkeypatch.setattr(mx, "synchronize", counting_sync)
         _run_rounds()
-        assert calls["n"] == 20
+        assert calls["n"] == 22
 
     def test_every_2_emits_a_non_final_line_before_the_final_line(
         self, monkeypatch, capsys
@@ -311,9 +311,8 @@ class TestRoundProfilerEnv:
         monkeypatch.setenv(mtp_profile.ENV_ROUNDS, "1")
         cache = [_CacheEntry()]
         # bs=3 (block_size) and accepted=1 (fixed by the walk fake) => accepted
-        # < bs - 1 on every FULL round (1 and 2; round 3 early-returns before
-        # reaching the rollback check), so rollback_speculative_cache is
-        # reached and cache_state_arrays(prompt_cache) sees the fake state.
+        # < bs - 1 on all three rounds, including the final round: transaction
+        # commit and its rollback profiling now precede emission.
         calls = {"n": 0}
         real_rollback = _LM.rollback_speculative_cache
 
@@ -323,7 +322,7 @@ class TestRoundProfilerEnv:
 
         with patch.object(_LM, "rollback_speculative_cache", counting_rollback):
             _run_rounds(prompt_cache=cache)
-        assert calls["n"] == 2
+        assert calls["n"] == 3
 
         err = capsys.readouterr().err
         final_line = [
@@ -334,29 +333,36 @@ class TestRoundProfilerEnv:
         m = ROUND_LINE_RE.match(final_line)
         assert float(m.group("rollback")) >= 0.0
 
-    def test_rollback_mark_fires_vs_accept_all_run(self, monkeypatch):
-        """F4e: rollback only fires when accepted < bs - 1. Compare a real
-        rollback-path run (calls ``cache_state_arrays``, accepted=1 < bs-1=2)
-        against an accept-all run (accepted=2 == bs-1=2, rollback never
-        called) -- the accept-all run must call ``cache_state_arrays`` zero
-        times, and the rollback-path run must call it exactly on the 2 full
-        rounds (see the exact-count test above)."""
+    def test_commit_phase_covers_partial_and_full_acceptance(self, monkeypatch):
+        """The rollback phase fences transaction commit, even with no rejection.
+
+        Full acceptance still finalizes recurrent transactions. Partial acceptance
+        additionally calls the legacy model rollback adapter. Both must complete
+        before emission, including the last round.
+        """
         monkeypatch.setenv(mtp_profile.ENV_ROUNDS, "1")
-        calls = {"n": 0}
+        calls = {"collect": 0, "rollback": 0}
         real_collect = mtp_profile.cache_state_arrays
+        real_rollback = _LM.rollback_speculative_cache
 
         def counting_collect(prompt_cache):
-            calls["n"] += 1
+            calls["collect"] += 1
             return real_collect(prompt_cache)
 
-        with patch.object(mtp_profile, "cache_state_arrays", counting_collect):
-            _run_rounds(walk_return=(1, [9, 10]))  # accepted=1 < bs-1=2
-        assert calls["n"] == 2
+        def counting_rollback(self, *args):
+            calls["rollback"] += 1
+            return real_rollback(self, *args)
 
-        calls["n"] = 0
-        with patch.object(mtp_profile, "cache_state_arrays", counting_collect):
-            _run_rounds(walk_return=(2, [9, 10]))  # accepted=2 == bs-1=2: accept-all
-        assert calls["n"] == 0
+        with (
+            patch.object(mtp_profile, "cache_state_arrays", counting_collect),
+            patch.object(_LM, "rollback_speculative_cache", counting_rollback),
+        ):
+            _run_rounds(walk_return=(1, [9, 10]))
+            assert calls == {"collect": 3, "rollback": 3}
+            calls.update(collect=0, rollback=0)
+            # Two drafts plus a bonus per round: six emitted tokens in two rounds.
+            _run_rounds(walk_return=(2, [9, 10, 11]))
+            assert calls == {"collect": 2, "rollback": 0}
 
 
 class TestHeadProfilerEnv:

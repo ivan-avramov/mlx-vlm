@@ -5077,29 +5077,65 @@ def _select_outlier_indices(
 
 class _SplitCodec:
     def __init__(self, tensor: mx.array, bits: float, mode: str, seed: int):
+        low_idx, high_idx = _select_outlier_indices(tensor, bits)
+        self._init_from_indices(tensor.shape[-1], bits, mode, seed, low_idx, high_idx)
+
+    @classmethod
+    def from_indices(
+        cls,
+        dim: int,
+        bits: float,
+        mode: str,
+        seed: int,
+        low_idx,
+        high_idx,
+    ):
+        obj = cls.__new__(cls)
+        obj._init_from_indices(dim, bits, mode, seed, low_idx, high_idx)
+        return obj
+
+    def _init_from_indices(
+        self,
+        dim: int,
+        bits: float,
+        mode: str,
+        seed: int,
+        low_idx,
+        high_idx,
+    ) -> None:
         self.bits = bits
         self.mode = mode
-        self.dim = tensor.shape[-1]
+        self.dim = int(dim)
         self.lower_bits = math.floor(bits)
         self.upper_bits = math.ceil(bits)
-        low_idx, high_idx = _select_outlier_indices(tensor, bits)
-        self.low_idx = mx.array(low_idx, dtype=mx.int32)
-        self.high_idx = mx.array(high_idx, dtype=mx.int32)
+        # APC restores detached index arrays that are materialized on the producer
+        # thread. Reuse them: wrapping them in mx.array would create a lazy graph
+        # that the asynchronous disk writer cannot evaluate on its own stream.
+        self.low_idx = (
+            low_idx
+            if isinstance(low_idx, mx.array) and low_idx.dtype == mx.int32
+            else mx.array(low_idx, dtype=mx.int32)
+        )
+        self.high_idx = (
+            high_idx
+            if isinstance(high_idx, mx.array) and high_idx.dtype == mx.int32
+            else mx.array(high_idx, dtype=mx.int32)
+        )
+        self.restore_order = mx.argsort(
+            mx.concatenate([self.low_idx, self.high_idx])
+        ).astype(mx.int32)
 
-        concat_order = np.concatenate([low_idx, high_idx])
-        self.restore_order = mx.array(np.argsort(concat_order), dtype=mx.int32)
+        dl = self.low_idx.shape[0]
+        dh = self.high_idx.shape[0]
 
         codec_cls = _TurboQuantProdCodec if mode == "prod" else _TurboQuantMSECodec
-        self.low_codec = codec_cls(len(low_idx), self.lower_bits, seed)
-        self.high_codec = codec_cls(len(high_idx), self.upper_bits, seed + 97)
+        self.low_codec = codec_cls(dl, self.lower_bits, seed)
+        self.high_codec = codec_cls(dh, self.upper_bits, seed + 97)
 
         # Pre-build combined query transform for fused decode:
         # single (D, 2*dim_low + 2*dim_high) matrix replaces 2 takes + 2 matmuls
         if mode == "prod" and isinstance(self.low_codec, _TurboQuantProdCodec):
-            dim = tensor.shape[-1]
-            dl = len(low_idx)
-            dh = len(high_idx)
-            combined = mx.zeros((dim, 2 * dl + 2 * dh), dtype=mx.float32)
+            combined = mx.zeros((self.dim, 2 * dl + 2 * dh), dtype=mx.float32)
             combined[self.low_idx, :dl] = self.low_codec.query_transform_t[:, :dl]
             combined[self.low_idx, dl : 2 * dl] = self.low_codec.query_transform_t[
                 :, dl:
@@ -5175,6 +5211,64 @@ class _SplitCodec:
         return mx.take(merged, self.restore_order, axis=-1), denom, max_scores
 
 
+def _snapshot_kv_codec(codec):
+    if codec is None:
+        return None
+    if isinstance(codec, _SplitCodec):
+        return codec.dim, codec.low_idx, codec.high_idx
+    if isinstance(codec, _TurboQuantMSECodec):
+        return codec.dim, None, None
+    raise TypeError(f"Unsupported TurboQuant KV codec: {type(codec)!r}")
+
+
+def _restore_kv_codec(snapshot, bits: float, seed: int):
+    if snapshot is None:
+        return None
+    dim, low_idx, high_idx = snapshot
+    if low_idx is None and high_idx is None:
+        return _TurboQuantMSECodec(dim, int(bits), seed)
+    if low_idx is not None and high_idx is not None:
+        return _SplitCodec.from_indices(
+            dim,
+            float(bits),
+            "mse",
+            seed,
+            low_idx,
+            high_idx,
+        )
+    raise ValueError("incomplete TurboQuant split-codec snapshot")
+
+
+def _restore_kv_state(state, codec):
+    """Restore NamedTuple types erased by the generic checkpoint serializer."""
+    if state is None:
+        return None
+    if isinstance(codec, _SplitCodec):
+        return TurboQuantSplitState(
+            _restore_kv_state(state[0], codec.low_codec),
+            _restore_kv_state(state[1], codec.high_codec),
+        )
+    if isinstance(codec, _TurboQuantMSECodec):
+        return TurboQuantMSEState(*state)
+    raise TypeError(f"Unsupported TurboQuant KV codec: {type(codec)!r}")
+
+
+def _codecs_compatible(lhs, rhs) -> bool:
+    """Whether two rows use the same packed coordinate system."""
+    if type(lhs) is not type(rhs):
+        return False
+    if isinstance(lhs, _SplitCodec):
+        return (
+            lhs.bits == rhs.bits
+            and lhs.dim == rhs.dim
+            and bool(mx.array_equal(lhs.low_idx, rhs.low_idx).item())
+            and bool(mx.array_equal(lhs.high_idx, rhs.high_idx).item())
+        )
+    return getattr(lhs, "bits", None) == getattr(rhs, "bits", None) and getattr(
+        lhs, "dim", None
+    ) == getattr(rhs, "dim", None)
+
+
 def _build_codec(tensor: mx.array, bits: float, mode: str, seed: int):
     bits = _validate_bits(bits)
     if math.isclose(bits, round(bits), abs_tol=1e-6):
@@ -5203,8 +5297,49 @@ class _QuantizedStateProxy:
     def __iter__(self):
         return iter(self._state)
 
+    def __getitem__(self, key):
+        # Speculative target verification narrows the cache one draft token at
+        # a time (`keys[:, :, : prefix_len + i + 1, :]`). Serve that by
+        # slicing the quantized state, so verification never has to
+        # materialize the cache in float.
+        if not isinstance(key, tuple):
+            raise TypeError(
+                "TurboQuant state supports only (batch, head, time, dim) indexing"
+            )
+        time_index = key[2] if len(key) > 2 else slice(None)
+        if not isinstance(time_index, slice) or time_index.step is not None:
+            raise TypeError(
+                "TurboQuant state supports only contiguous slices along time"
+            )
+        for axis, index in enumerate(key):
+            if axis == 2:
+                continue
+            if index != slice(None):
+                raise TypeError(
+                    "TurboQuant state can only be narrowed along the time axis"
+                )
 
-class TurboQuantKVCache(_BaseCache):
+        n_tokens = self.shape[2]
+        start, stop, _ = time_index.indices(n_tokens)
+        if start != 0:
+            raise TypeError("TurboQuant state slices must start at 0")
+        return _QuantizedStateProxy(
+            _slice_state(self._state, stop), stop, self.shape[1]
+        )
+
+
+class _TurboQuantAttentionMixin:
+    # Fork: 256-query tiling, opt-in fused prefill and legacy decode control.
+    """Quantized-state attention shared by the single-sequence and batch caches.
+
+    The fused Metal kernels below read only the codecs and the explicitly
+    passed ``keys_state``/``values_state``; they never touch the owning
+    cache's storage layout. Both states carry a leading batch dimension, so
+    the same kernels serve ``TurboQuantKVCache`` and, for a single row,
+    ``BatchTurboQuantKVCache``.
+    """
+
+    # Chunking thresholds for the attention kernels below.
     decode_key_chunk_size = 1 << 30
     prefill_key_chunk_size = 2048
     # 256 (was 16): the flash-style online softmax is independent of query
@@ -5213,147 +5348,6 @@ class TurboQuantKVCache(_BaseCache):
     # Bumping to 256 is ~15x faster prefill attention with no numerics change
     # (see test_turboquant_quantized_attention_invariant_to_query_block_size).
     prefill_query_block_size = 256
-    cache_step = 256
-
-    def __init__(
-        self,
-        bits: float,
-        seed: int = DEFAULT_TURBOQUANT_SEED,
-        max_kv_size: Optional[int] = None,
-        fused_prefill: Optional[bool] = None,
-        kv_quant_mode: Optional[str] = None,
-        prealloc_tokens: Optional[int] = None,
-        key_bits: Optional[float] = None,
-        value_bits: Optional[float] = None,
-        decode_2pass_use_legacy: Optional[bool] = None,
-    ):
-        import os as _os
-
-        self.bits, self.key_bits, self.value_bits = resolve_kv_bits(
-            bits, key_bits, value_bits
-        )
-        self.seed = seed
-        self.max_kv_size = max_kv_size
-        self.prealloc_tokens = prealloc_tokens
-        # Fused MSE prefill kernel: OFF by default (opt-in). Real-model 16K
-        # validation showed the decomposed path ties the qb-256 quantized_attention
-        # loop on speed while costing ~+4GB (score materialization) and risking OOM
-        # at 200K, and prefill attention is a minority of prefill cost anyway. The
-        # memory-safe loop stays the default; enable via TQ_FUSED_PREFILL=1 or the
-        # constructor flag (for A/B measurement / future T-tiled kernel).
-        self._fused_prefill_enabled = (
-            fused_prefill
-            if fused_prefill is not None
-            else _os.environ.get("TQ_FUSED_PREFILL", "0").lower()
-            in ("1", "true", "yes")
-        )
-        # Prefill implementation selector for A/B measurement (spec §10):
-        # "decomposed" = dequant + mx.matmul (steel-GEMM on M2-M4, Neural
-        # Accelerators on M5); "fused" = hand-written flash kernel.
-        self._prefill_impl = _os.environ.get("TQ_PREFILL_IMPL", "decomposed").lower()
-        # Codec mode: "mse" (default) or "prod" — Prod adds a 1-bit QJL residual
-        # sketch on keys for higher-fidelity reconstruction at equal storage
-        # (value stays MSE, mirroring the prefill_attention Prod-key contract).
-        # Threaded from the kv_quant_mode arg / TQ_KV_QUANT_MODE env.
-        self._kv_quant_mode = (
-            kv_quant_mode or _os.environ.get("TQ_KV_QUANT_MODE", "mse")
-        ).lower()
-        # Decode pass-1 selector for A/B measurement: False (default) = the fused GQA tile-reuse
-        # kernel, True = the R-redundant legacy kernel that is its apples-to-apples baseline.
-        #
-        # This was previously reachable ONLY by setting the private attribute by hand, and NOTHING in
-        # the fork set it — the flag appeared in exactly one place, the `getattr` that reads it. It
-        # served a one-off micro-bench and then became dead code, which left the kernel's recorded
-        # win ("lossless, ~1.3x over legacy TQ, +2-7% end-to-end") impossible to re-measure at
-        # runtime. The same 2026-08-13 re-verification pass found APC — another shipped Phase-2 win —
-        # completely inert in production, provable only because APC exposes /metrics counters; this
-        # kernel had no equivalent. A perf lever with no runtime toggle is unauditable by
-        # construction, so it now follows the TQ_FUSED_PREFILL idiom. Default is UNCHANGED.
-        self._decode_2pass_use_legacy = (
-            decode_2pass_use_legacy
-            if decode_2pass_use_legacy is not None
-            else _os.environ.get("TQ_DECODE_2PASS_LEGACY", "0").lower()
-            in ("1", "true", "yes")
-        )
-        self.offset = 0
-        self.keys = None
-        self.values = None
-        self.key_codec = None
-        self.value_codec = None
-        self._cached_state = None
-        self._cached_state_offset = -1
-        self._shadow_keys = None
-        self._shadow_values = None
-        # Fork: D6 shrink-on-retire re-floor flag — mirrors
-        # PreallocKVCache._needs_refloor (models/cache.py). Set by
-        # shrink_to_offset() after it releases the prealloc/max_kv_size
-        # floor; the next update_and_fetch() must re-establish the full
-        # floor in one clean allocation instead of silently falling
-        # through to _reserve_state_capacity's incremental growth.
-        self._needs_refloor = False
-
-    @classmethod
-    def from_cache(
-        cls,
-        cache,
-        bits: float,
-        seed: int = DEFAULT_TURBOQUANT_SEED,
-        max_kv_size: Optional[int] = None,
-        prealloc_tokens: Optional[int] = None,
-        key_bits: Optional[float] = None,
-        value_bits: Optional[float] = None,
-    ) -> "TurboQuantKVCache":
-        turbo_cache = cls(
-            bits=bits,
-            seed=seed,
-            max_kv_size=max_kv_size,
-            prealloc_tokens=prealloc_tokens,
-            key_bits=key_bits,
-            value_bits=value_bits,
-        )
-
-        # Handle ChunkedKVCache (list-based KV) by merging into continuous array
-        keys, values = cache.state
-        cache_offset = getattr(cache, "offset", 0)
-
-        if keys is not None:
-            if isinstance(keys, list):
-                keys = mx.concatenate(keys, axis=2)
-                values = mx.concatenate(values, axis=2)
-
-            # Strip step-padding: slice to actual offset
-            if cache_offset > 0 and keys.shape[2] > cache_offset:
-                keys = keys[:, :, :cache_offset, :]
-                values = values[:, :, :cache_offset, :]
-
-            mx.eval(keys, values)
-
-            # Numerical validation
-            k_max = mx.max(mx.abs(keys)).item()
-            v_max = mx.max(mx.abs(values)).item()
-            logging.debug(
-                "TurboQuantKVCache.from_cache | offset=%d shape=%s "
-                "k_max=%.4f v_max=%.4f",
-                cache_offset,
-                keys.shape,
-                k_max,
-                v_max,
-            )
-
-            turbo_cache.update_and_fetch(keys, values)
-        return turbo_cache
-
-    def _ensure_codecs(self, keys: mx.array, values: mx.array):
-        if self.key_codec is None:
-            # Fork: `mode=self._kv_quant_mode` ("mse" default, "prod" adds a 1-bit
-            # QJL residual sketch on keys). Upstream hardcodes "mse" here.
-            self.key_codec = _build_codec(
-                keys, self.key_bits, mode=self._kv_quant_mode, seed=self.seed
-            )
-        if self.value_codec is None:
-            self.value_codec = _build_codec(
-                values, self.value_bits, mode="mse", seed=self.seed + 1
-            )
 
     def _try_fused_kv_quantize(self, keys, values):
         """Fused key+value quantize in 1 dispatch. Returns (key_state, val_state) or (None, None)."""
@@ -5412,109 +5406,18 @@ class TurboQuantKVCache(_BaseCache):
             TurboQuantMSEState(v_norms.reshape(orig), v_packed.reshape(*orig, v_pw)),
         )
 
-    def update_and_fetch(self, keys: mx.array, values: mx.array):
-        self._ensure_codecs(keys, values)
-
-        # Try fused key+value quantize (1 dispatch instead of 2)
-        new_keys, new_values = self._try_fused_kv_quantize(keys, values)
-        if new_keys is None:
-            new_keys = self.key_codec.quantize(keys)
-            new_values = self.value_codec.quantize(values)
-
-        new_end = self.offset + keys.shape[2]
-        if self.keys is None or self._needs_refloor:
-            _trigger_allocation_hooks()
-            # Pre-allocate to the largest of new_end, kv_prealloc_tokens, and
-            # max_kv_size (if set), to avoid late-stage double-buffer
-            # reallocation spikes
-            initial_alloc = max(
-                new_end, self.prealloc_tokens or 0, self.max_kv_size or 0
-            )
-            old_keys, old_values, old_offset = self.keys, self.values, self.offset
-            self.keys = _allocate_state_like(new_keys, initial_alloc)
-            self.values = _allocate_state_like(new_values, initial_alloc)
-            self._needs_refloor = False
-            if old_keys is not None and old_offset > 0:
-                # Re-floor after a prior shrink_to_offset(): copy the
-                # shrunk buffer's valid prefix into the freshly (fully)
-                # floored allocation before writing the new increment.
-                _write_state(self.keys, _slice_state(old_keys, old_offset), 0)
-                _write_state(self.values, _slice_state(old_values, old_offset), 0)
-        else:
-            self.keys = _reserve_state_capacity(
-                self.keys, self.offset, new_end, self.cache_step
-            )
-            self.values = _reserve_state_capacity(
-                self.values, self.offset, new_end, self.cache_step
-            )
-
-        _write_state(self.keys, new_keys, self.offset)
-        _write_state(self.values, new_values, self.offset)
-
-        B, n_heads = keys.shape[0], keys.shape[1]
-        D = keys.shape[-1]
-        n_new = keys.shape[2]
-
-        self.offset = new_end
-        self._cached_state = None
-        self._cached_state_offset = -1
-        if n_new > 1 or (self.offset % 50 == 0):
-            mx.eval(self.keys, self.values)
-        ks, vs = self.state
-        return (
-            _QuantizedStateProxy(ks, self.offset, n_heads),
-            _QuantizedStateProxy(vs, self.offset, n_heads),
-        )
-
-    def shrink_to_offset(self):
-        """Reallocate the TurboQuant K/V state down to a step-rounded fit
-        for the current ``offset``, releasing any prealloc/growth-floor
-        padding beyond what's actually in use. Returns
-        ``(bytes_before, bytes_after)``; a no-op (equal before/after) when
-        the cache is empty or already tight. Mirrors
-        ``PreallocKVCache.shrink_to_offset`` (models/cache.py) for the
-        D6 session-cache shrink-on-retire path — see that docstring for
-        the rationale. The valid prefix is preserved exactly via the same
-        ``_allocate_state_like`` / ``_slice_state`` / ``_write_state``
-        helpers ``_reserve_state_capacity`` uses to grow.
-        """
-        if self.keys is None:
-            return 0, 0
-        capacity = _state_length(self.keys)
-        target = max(
-            self.cache_step,
-            ((self.offset + self.cache_step - 1) // self.cache_step) * self.cache_step,
-        )
-        before = _state_nbytes(self.keys) + _state_nbytes(self.values)
-        if target >= capacity:
-            return before, before
-        new_keys = _allocate_state_like(self.keys, target)
-        new_values = _allocate_state_like(self.values, target)
-        if self.offset > 0:
-            _write_state(new_keys, _slice_state(self.keys, self.offset), 0)
-            _write_state(new_values, _slice_state(self.values, self.offset), 0)
-        self.keys, self.values = new_keys, new_values
-        self._cached_state = None
-        self._cached_state_offset = -1
-        if (self.prealloc_tokens or 0) > 0 or (self.max_kv_size or 0) > 0:
-            # Only a cache that actually carried a floor needs to
-            # re-establish one on next use.
-            self._needs_refloor = True
-        after = _state_nbytes(self.keys) + _state_nbytes(self.values)
-        return before, after
-
     @staticmethod
     def _unwrap(state):
         return state._state if isinstance(state, _QuantizedStateProxy) else state
 
-    def dequantize(self, keys_state=None, values_state=None):
-        if keys_state is None or values_state is None:
-            keys_state, values_state = self.state
-        keys_state = self._unwrap(keys_state)
-        values_state = self._unwrap(values_state)
-        keys = self.key_codec.dequantize(keys_state).astype(mx.float32)
-        values = self.value_codec.dequantize(values_state).astype(mx.float32)
-        return keys, values
+    def _attention_states(self):
+        """(keys_state, values_state) for callers that omit them.
+
+        ``state`` carries extra batch bookkeeping on the batch cache, so the
+        first two entries are taken rather than unpacked.
+        """
+        state = self.state
+        return state[0], state[1]
 
     def _apply_attention_mask(
         self,
@@ -5556,7 +5459,7 @@ class TurboQuantKVCache(_BaseCache):
         mask: Optional[mx.array] = None,
     ) -> mx.array:
         if keys_state is None or values_state is None:
-            keys_state, values_state = self.state
+            keys_state, values_state = self._attention_states()
         keys_state = self._unwrap(keys_state)
         values_state = self._unwrap(values_state)
 
@@ -5741,7 +5644,7 @@ class TurboQuantKVCache(_BaseCache):
         """Fast prefill: fold L queries into R dimension, reuse decode kernels.
         Avoids the expensive O(T×D²) dequantize rotation matmul."""
         if keys_state is None or values_state is None:
-            keys_state, values_state = self.state
+            keys_state, values_state = self._attention_states()
         keys_state = self._unwrap(keys_state)
         values_state = self._unwrap(values_state)
 
@@ -6318,7 +6221,7 @@ class TurboQuantKVCache(_BaseCache):
         mask: Optional[mx.array] = None,
     ) -> mx.array:
         if keys_state is None or values_state is None:
-            keys_state, values_state = self.state
+            keys_state, values_state = self._attention_states()
         keys_state = self._unwrap(keys_state)
         values_state = self._unwrap(values_state)
 
@@ -6562,6 +6465,250 @@ class TurboQuantKVCache(_BaseCache):
         output = output.reshape(B, n_q_heads, L, value_dim)
         return output.astype(queries.dtype)
 
+
+class TurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
+    cache_step = 256
+
+    def __init__(
+        self,
+        bits: float,
+        seed: int = DEFAULT_TURBOQUANT_SEED,
+        max_kv_size: Optional[int] = None,
+        fused_prefill: Optional[bool] = None,
+        kv_quant_mode: Optional[str] = None,
+        prealloc_tokens: Optional[int] = None,
+        key_bits: Optional[float] = None,
+        value_bits: Optional[float] = None,
+        decode_2pass_use_legacy: Optional[bool] = None,
+    ):
+        import os as _os
+
+        self.bits, self.key_bits, self.value_bits = resolve_kv_bits(
+            bits, key_bits, value_bits
+        )
+        self.seed = seed
+        self.max_kv_size = max_kv_size
+        self.prealloc_tokens = prealloc_tokens
+        # Fused MSE prefill kernel: OFF by default (opt-in). Real-model 16K
+        # validation showed the decomposed path ties the qb-256 quantized_attention
+        # loop on speed while costing ~+4GB (score materialization) and risking OOM
+        # at 200K, and prefill attention is a minority of prefill cost anyway. The
+        # memory-safe loop stays the default; enable via TQ_FUSED_PREFILL=1 or the
+        # constructor flag (for A/B measurement / future T-tiled kernel).
+        self._fused_prefill_enabled = (
+            fused_prefill
+            if fused_prefill is not None
+            else _os.environ.get("TQ_FUSED_PREFILL", "0").lower()
+            in ("1", "true", "yes")
+        )
+        # Prefill implementation selector for A/B measurement (spec §10):
+        # "decomposed" = dequant + mx.matmul (steel-GEMM on M2-M4, Neural
+        # Accelerators on M5); "fused" = hand-written flash kernel.
+        self._prefill_impl = _os.environ.get("TQ_PREFILL_IMPL", "decomposed").lower()
+        # Codec mode: "mse" (default) or "prod" — Prod adds a 1-bit QJL residual
+        # sketch on keys for higher-fidelity reconstruction at equal storage
+        # (value stays MSE, mirroring the prefill_attention Prod-key contract).
+        # Threaded from the kv_quant_mode arg / TQ_KV_QUANT_MODE env.
+        self._kv_quant_mode = (
+            kv_quant_mode or _os.environ.get("TQ_KV_QUANT_MODE", "mse")
+        ).lower()
+        # Decode pass-1 selector for A/B measurement: False (default) = the fused GQA tile-reuse
+        # kernel, True = the R-redundant legacy kernel that is its apples-to-apples baseline.
+        #
+        # This was previously reachable ONLY by setting the private attribute by hand, and NOTHING in
+        # the fork set it — the flag appeared in exactly one place, the `getattr` that reads it. It
+        # served a one-off micro-bench and then became dead code, which left the kernel's recorded
+        # win ("lossless, ~1.3x over legacy TQ, +2-7% end-to-end") impossible to re-measure at
+        # runtime. The same 2026-08-13 re-verification pass found APC — another shipped Phase-2 win —
+        # completely inert in production, provable only because APC exposes /metrics counters; this
+        # kernel had no equivalent. A perf lever with no runtime toggle is unauditable by
+        # construction, so it now follows the TQ_FUSED_PREFILL idiom. Default is UNCHANGED.
+        self._decode_2pass_use_legacy = (
+            decode_2pass_use_legacy
+            if decode_2pass_use_legacy is not None
+            else _os.environ.get("TQ_DECODE_2PASS_LEGACY", "0").lower()
+            in ("1", "true", "yes")
+        )
+        self.offset = 0
+        self.keys = None
+        self.values = None
+        self.key_codec = None
+        self.value_codec = None
+        self._cached_state = None
+        self._cached_state_offset = -1
+        self._shadow_keys = None
+        self._shadow_values = None
+        # Fork: D6 shrink-on-retire re-floor flag — mirrors
+        # PreallocKVCache._needs_refloor (models/cache.py). Set by
+        # shrink_to_offset() after it releases the prealloc/max_kv_size
+        # floor; the next update_and_fetch() must re-establish the full
+        # floor in one clean allocation instead of silently falling
+        # through to _reserve_state_capacity's incremental growth.
+        self._needs_refloor = False
+
+    @classmethod
+    def from_cache(
+        cls,
+        cache,
+        bits: float,
+        seed: int = DEFAULT_TURBOQUANT_SEED,
+        max_kv_size: Optional[int] = None,
+        prealloc_tokens: Optional[int] = None,
+        key_bits: Optional[float] = None,
+        value_bits: Optional[float] = None,
+    ) -> "TurboQuantKVCache":
+        turbo_cache = cls(
+            bits=bits,
+            seed=seed,
+            max_kv_size=max_kv_size,
+            prealloc_tokens=prealloc_tokens,
+            key_bits=key_bits,
+            value_bits=value_bits,
+        )
+
+        # Handle ChunkedKVCache (list-based KV) by merging into continuous array
+        keys, values = cache.state
+        cache_offset = getattr(cache, "offset", 0)
+
+        if keys is not None:
+            if isinstance(keys, list):
+                keys = mx.concatenate(keys, axis=2)
+                values = mx.concatenate(values, axis=2)
+
+            # Strip step-padding: slice to actual offset
+            if cache_offset > 0 and keys.shape[2] > cache_offset:
+                keys = keys[:, :, :cache_offset, :]
+                values = values[:, :, :cache_offset, :]
+
+            mx.eval(keys, values)
+
+            # Numerical validation
+            k_max = mx.max(mx.abs(keys)).item()
+            v_max = mx.max(mx.abs(values)).item()
+            logging.debug(
+                "TurboQuantKVCache.from_cache | offset=%d shape=%s "
+                "k_max=%.4f v_max=%.4f",
+                cache_offset,
+                keys.shape,
+                k_max,
+                v_max,
+            )
+
+            turbo_cache.update_and_fetch(keys, values)
+        return turbo_cache
+
+    def _ensure_codecs(self, keys: mx.array, values: mx.array):
+        if self.key_codec is None:
+            # Fork: `mode=self._kv_quant_mode` ("mse" default, "prod" adds a 1-bit
+            # QJL residual sketch on keys). Upstream hardcodes "mse" here.
+            self.key_codec = _build_codec(
+                keys, self.key_bits, mode=self._kv_quant_mode, seed=self.seed
+            )
+        if self.value_codec is None:
+            self.value_codec = _build_codec(
+                values, self.value_bits, mode="mse", seed=self.seed + 1
+            )
+
+    def update_and_fetch(self, keys: mx.array, values: mx.array):
+        self._ensure_codecs(keys, values)
+
+        # Try fused key+value quantize (1 dispatch instead of 2)
+        new_keys, new_values = self._try_fused_kv_quantize(keys, values)
+        if new_keys is None:
+            new_keys = self.key_codec.quantize(keys)
+            new_values = self.value_codec.quantize(values)
+
+        new_end = self.offset + keys.shape[2]
+        if self.keys is None or self._needs_refloor:
+            _trigger_allocation_hooks()
+            # Pre-allocate to the largest of new_end, kv_prealloc_tokens, and
+            # max_kv_size (if set), to avoid late-stage double-buffer
+            # reallocation spikes
+            initial_alloc = max(
+                new_end, self.prealloc_tokens or 0, self.max_kv_size or 0
+            )
+            old_keys, old_values, old_offset = self.keys, self.values, self.offset
+            self.keys = _allocate_state_like(new_keys, initial_alloc)
+            self.values = _allocate_state_like(new_values, initial_alloc)
+            self._needs_refloor = False
+            if old_keys is not None and old_offset > 0:
+                # Re-floor after a prior shrink_to_offset(): copy the
+                # shrunk buffer's valid prefix into the freshly (fully)
+                # floored allocation before writing the new increment.
+                _write_state(self.keys, _slice_state(old_keys, old_offset), 0)
+                _write_state(self.values, _slice_state(old_values, old_offset), 0)
+        else:
+            self.keys = _reserve_state_capacity(
+                self.keys, self.offset, new_end, self.cache_step
+            )
+            self.values = _reserve_state_capacity(
+                self.values, self.offset, new_end, self.cache_step
+            )
+
+        _write_state(self.keys, new_keys, self.offset)
+        _write_state(self.values, new_values, self.offset)
+
+        B, n_heads = keys.shape[0], keys.shape[1]
+        D = keys.shape[-1]
+        n_new = keys.shape[2]
+
+        self.offset = new_end
+        self._cached_state = None
+        self._cached_state_offset = -1
+        if n_new > 1 or (self.offset % 50 == 0):
+            mx.eval(self.keys, self.values)
+        ks, vs = self.state
+        return (
+            _QuantizedStateProxy(ks, self.offset, n_heads),
+            _QuantizedStateProxy(vs, self.offset, n_heads),
+        )
+
+    def shrink_to_offset(self):
+        """Reallocate the TurboQuant K/V state down to a step-rounded fit
+        for the current ``offset``, releasing any prealloc/growth-floor
+        padding beyond what's actually in use. Returns
+        ``(bytes_before, bytes_after)``; a no-op (equal before/after) when
+        the cache is empty or already tight. Mirrors
+        ``PreallocKVCache.shrink_to_offset`` (models/cache.py) for the
+        D6 session-cache shrink-on-retire path — see that docstring for
+        the rationale. The valid prefix is preserved exactly via the same
+        ``_allocate_state_like`` / ``_slice_state`` / ``_write_state``
+        helpers ``_reserve_state_capacity`` uses to grow.
+        """
+        if self.keys is None:
+            return 0, 0
+        capacity = _state_length(self.keys)
+        target = max(
+            self.cache_step,
+            ((self.offset + self.cache_step - 1) // self.cache_step) * self.cache_step,
+        )
+        before = _state_nbytes(self.keys) + _state_nbytes(self.values)
+        if target >= capacity:
+            return before, before
+        new_keys = _allocate_state_like(self.keys, target)
+        new_values = _allocate_state_like(self.values, target)
+        if self.offset > 0:
+            _write_state(new_keys, _slice_state(self.keys, self.offset), 0)
+            _write_state(new_values, _slice_state(self.values, self.offset), 0)
+        self.keys, self.values = new_keys, new_values
+        self._cached_state = None
+        self._cached_state_offset = -1
+        if (self.prealloc_tokens or 0) > 0 or (self.max_kv_size or 0) > 0:
+            # Only a cache that actually carried a floor needs to
+            # re-establish one on next use.
+            self._needs_refloor = True
+        after = _state_nbytes(self.keys) + _state_nbytes(self.values)
+        return before, after
+
+    def dequantize(self, keys_state=None, values_state=None):
+        if keys_state is None or values_state is None:
+            keys_state, values_state = self._attention_states()
+        keys_state = self._unwrap(keys_state)
+        values_state = self._unwrap(values_state)
+        keys = self.key_codec.dequantize(keys_state).astype(mx.float32)
+        values = self.value_codec.dequantize(values_state).astype(mx.float32)
+        return keys, values
+
     def size(self):
         return self.offset
 
@@ -6588,13 +6735,22 @@ class TurboQuantKVCache(_BaseCache):
             return
         self.keys, self.values = value
         self.offset = _state_length(self.keys)
+        self.prefix_cache_reserve(self.offset)
 
     @property
     def meta_state(self):
         return tuple(
             map(
                 str,
-                (self.offset, self.bits, self.seed, self.key_bits, self.value_bits),
+                (
+                    self.offset,
+                    self.bits,
+                    self.seed,
+                    self.key_bits,
+                    self.value_bits,
+                    self.prealloc_tokens or 0,
+                    self.max_kv_size or 0,
+                ),
             )
         )
 
@@ -6608,6 +6764,19 @@ class TurboQuantKVCache(_BaseCache):
             float(value[3]) if len(value) > 3 else None,
             float(value[4]) if len(value) > 4 else None,
         )
+        # Fork: restore metadata without reducing a configured destination floor.
+        self.prealloc_tokens = max(
+            int(getattr(self, "prealloc_tokens", 0) or 0),
+            int(value[5]) if len(value) > 5 else 0,
+        )
+        self.max_kv_size = (
+            max(
+                int(getattr(self, "max_kv_size", 0) or 0),
+                int(value[6]) if len(value) > 6 else 0,
+            )
+            or None
+        )
+        self.prefix_cache_reserve(self.offset)
 
     def is_trimmable(self):
         return True
@@ -6644,11 +6813,161 @@ class TurboQuantKVCache(_BaseCache):
     def nbytes(self):
         return _state_nbytes(self.state)
 
+    def prefix_cache_snapshot(self):
+        """Capture packed state and the codec coordinates needed to decode it."""
+        return {
+            "meta_state": self.meta_state,
+            "keys": _slice_state(self.keys, self.offset),
+            "values": _slice_state(self.values, self.offset),
+            "key_codec": _snapshot_kv_codec(self.key_codec),
+            "value_codec": _snapshot_kv_codec(self.value_codec),
+            # Fork: packed snapshots retain the storage floor and attention flags.
+            "capacity": _state_length(self.keys),
+            "options": {
+                "fused_prefill": self._fused_prefill_enabled,
+                "kv_quant_mode": self._kv_quant_mode,
+                "decode_2pass_use_legacy": self._decode_2pass_use_legacy,
+            },
+            "prefill_impl": self._prefill_impl,
+        }
+
+    def prefix_cache_restore(self, snapshot):
+        """Restore packed state without dequantizing and re-quantizing it."""
+        meta = snapshot["meta_state"]
+        prealloc_tokens = getattr(self, "prealloc_tokens", 0) or 0
+        max_kv_size = getattr(self, "max_kv_size", 0) or 0
+        self.__init__(
+            bits=float(meta[1]),
+            prealloc_tokens=prealloc_tokens,
+            max_kv_size=max_kv_size,
+            **snapshot.get("options", {}),
+        )
+        self.meta_state = meta
+        self.prealloc_tokens = max(self.prealloc_tokens or 0, prealloc_tokens)
+        self.max_kv_size = max(self.max_kv_size or 0, max_kv_size)
+        self._prefill_impl = snapshot.get("prefill_impl", self._prefill_impl)
+        self.key_codec = _restore_kv_codec(
+            snapshot.get("key_codec"), self.key_bits, self.seed
+        )
+        self.value_codec = _restore_kv_codec(
+            snapshot.get("value_codec"), self.value_bits, self.seed + 1
+        )
+        if snapshot["keys"] is not None and (
+            self.key_codec is None or self.value_codec is None
+        ):
+            raise ValueError("packed TurboQuant snapshot is missing codec metadata")
+        self.keys = _restore_kv_state(snapshot["keys"], self.key_codec)
+        self.values = _restore_kv_state(snapshot["values"], self.value_codec)
+        self.prefix_cache_reserve(snapshot.get("capacity", self.offset))
+
+    def prefix_cache_reserve(self, min_capacity_tokens):
+        """Reserve packed capacity for the first post-restore update."""
+        if self.keys is None or self.values is None:
+            return ()
+        needed = max(
+            int(min_capacity_tokens),
+            getattr(self, "prealloc_tokens", 0) or 0,
+            getattr(self, "max_kv_size", 0) or 0,
+        )
+        self.keys = _reserve_state_capacity(
+            self.keys, self.offset, needed, self.cache_step
+        )
+        self.values = _reserve_state_capacity(
+            self.values, self.offset, needed, self.cache_step
+        )
+        return self.keys, self.values
+
+    def prefix_cache_merge(self, rows, prefix_lens):
+        """Merge compatible packed rows into ``BatchTurboQuantKVCache``."""
+        from .models.cache import KVCache
+
+        if not rows or len(rows) != len(prefix_lens):
+            return None
+
+        def is_cold_empty(row):
+            return type(row) is KVCache and row.keys is None and row.values is None
+
+        populated = []
+        for row in rows:
+            if isinstance(row, TurboQuantKVCache):
+                if (
+                    row.bits != self.bits
+                    or row.key_bits != self.key_bits
+                    or row.value_bits != self.value_bits
+                    or row.seed != self.seed
+                ):
+                    return None
+                if row.keys is not None:
+                    populated.append(row)
+            elif not is_cold_empty(row):
+                return None
+
+        prefix_lens = [int(length) for length in prefix_lens]
+        max_prefix = max(prefix_lens, default=0)
+        left_padding = [max_prefix - length for length in prefix_lens]
+        out = BatchTurboQuantKVCache(
+            left_padding,
+            bits=self.bits,
+            seed=self.seed,
+            key_bits=self.key_bits,
+            value_bits=self.value_bits,
+            prealloc_tokens=max(
+                max(
+                    getattr(row, "prealloc_tokens", 0) or 0,
+                    getattr(row, "max_kv_size", 0) or 0,
+                )
+                for row in rows
+            ),
+        )
+        out._fused_prefill_enabled = self._fused_prefill_enabled
+        out._prefill_impl = self._prefill_impl
+        out._decode_2pass_use_legacy = self._decode_2pass_use_legacy
+        if not populated:
+            out.offset = mx.array(prefix_lens)
+            return out
+        if any(
+            int(row.offset) != length
+            for row, length in zip(rows, prefix_lens)
+            if isinstance(row, TurboQuantKVCache) and row.keys is not None
+        ):
+            return None
+
+        reference = populated[0]
+        for row in populated[1:]:
+            if not _codecs_compatible(reference.key_codec, row.key_codec):
+                return None
+            if not _codecs_compatible(reference.value_codec, row.value_codec):
+                return None
+
+        def merge_states(attr):
+            reference_state = getattr(reference, attr)
+            merged = None
+            for row, left in zip(rows, left_padding):
+                if isinstance(row, TurboQuantKVCache) and row.keys is not None:
+                    state = _slice_state(getattr(row, attr), row.offset)
+                    state = _pad_state_tokens(
+                        state, left, max_prefix - left - _state_length(state)
+                    )
+                else:
+                    state = _allocate_state_like(reference_state, max_prefix)
+                merged = state if merged is None else _concat_state_batch(merged, state)
+            return merged
+
+        out.keys = merge_states("keys")
+        out.values = merge_states("values")
+        out.key_codec = reference.key_codec
+        out.value_codec = reference.value_codec
+        out.offset = mx.array(prefix_lens)
+        out.left_padding = mx.array(left_padding)
+        out._idx = max_prefix
+        out._reserve_capacity(max(_state_length(row.keys) for row in populated))
+        return out
+
 
 # ── Batch-aware TurboQuant cache for continuous batching ────────────────
 
 
-class BatchTurboQuantKVCache(_BaseCache):
+class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
     """Batch-aware TurboQuant KV cache for continuous batching.
 
     Wraps TurboQuant's quantization codecs with per-sequence offsets and
@@ -6659,15 +6978,8 @@ class BatchTurboQuantKVCache(_BaseCache):
     TurboQuant's MSE/Prod codecs for higher quality at the same bit-rate.
     """
 
-    # Fork: every member of this class is upstream's, with ONE structural
-    # difference — upstream defines `zero_row_tail` TWICE (a `_map_state` /
-    # nested-`_z` version, then a `_zero_state_row_tail` version that shadows it),
-    # so upstream's first copy is dead code. This tree carries only the second, and
-    # it is byte-identical to upstream's live copy. The audit therefore reports the
-    # shadowed dead one as "missing", which it is, deliberately; the remaining
-    # reported divergence in this class is position (`state` / `meta_state` sit
-    # where the duplicate used to be). Worth reporting upstream — same shape as the
-    # doubly-defined `TestLagunaProcessor` in tests/test_processors.py.
+    # Fork: preallocation and shared attention opt-in flags. Retain only the
+    # live upstream zero_row_tail definition; its earlier copy is shadowed.
     cache_step = 256
 
     def __init__(
@@ -6687,10 +6999,41 @@ class BatchTurboQuantKVCache(_BaseCache):
         self.values = None
         self.key_codec = None
         self.value_codec = None
+        # Fork: shared attention methods use the same opt-in flags as the
+        # single-sequence cache; batch storage itself stays upstream's.
+        options = TurboQuantKVCache(
+            bits=bits, seed=seed, key_bits=key_bits, value_bits=value_bits
+        )
+        self._fused_prefill_enabled = options._fused_prefill_enabled
+        self._prefill_impl = options._prefill_impl
+        self._decode_2pass_use_legacy = options._decode_2pass_use_legacy
         self.left_padding = mx.array(left_padding)
         self.offset = mx.array([-lp for lp in left_padding])
+        self._fused_attention_eligible = len(left_padding) == 1 and left_padding[0] == 0
         self._idx = 0
         self.prealloc_tokens = int(prealloc_tokens or 0)
+
+    def _reserve_capacity(self, needed=0):
+        # Fork: lifecycle operations preserve the configured packed-storage floor.
+        if self.keys is None:
+            return
+        needed = max(int(needed), self._idx, getattr(self, "prealloc_tokens", 0))
+        self.keys = _reserve_state_capacity(
+            self.keys, self._idx, needed, self.cache_step
+        )
+        self.values = _reserve_state_capacity(
+            self.values, self._idx, needed, self.cache_step
+        )
+
+    def _refresh_fused_attention_eligibility(self):
+        """Refresh the host-side fused-kernel guard after batch mutation.
+
+        Reading MLX state synchronizes the device, so lifecycle operations do
+        it once and decode only reads the cached Python boolean.
+        """
+        self._fused_attention_eligible = self.batch_size == 1 and bool(
+            (self.left_padding == 0).all().item()
+        )
 
     # ------------------------------------------------------------------
     # Codec initialisation (deferred until first update)
@@ -6728,10 +7071,10 @@ class BatchTurboQuantKVCache(_BaseCache):
             self.values = _allocate_state_like(new_values, _cap)
         else:
             self.keys = _reserve_state_capacity(
-                self.keys, prev, new_end, self.cache_step
+                self.keys, prev, max(new_end, self.prealloc_tokens), self.cache_step
             )
             self.values = _reserve_state_capacity(
-                self.values, prev, new_end, self.cache_step
+                self.values, prev, max(new_end, self.prealloc_tokens), self.cache_step
             )
 
         _write_state(self.keys, new_keys, prev)
@@ -6756,6 +7099,7 @@ class BatchTurboQuantKVCache(_BaseCache):
     # ------------------------------------------------------------------
 
     def filter(self, batch_indices: mx.array):
+        capacity = _state_length(self.keys) if self.prealloc_tokens else 0
         if self.keys is not None:
             self.keys = _filter_state(self.keys, batch_indices)
             self.values = _filter_state(self.values, batch_indices)
@@ -6765,21 +7109,29 @@ class BatchTurboQuantKVCache(_BaseCache):
         min_lp = self.left_padding.min().item()
         if min_lp > 0:
             if self.keys is not None:
-                # Trim leading padding tokens
+                # Fork: trim the live prefix before restoring the floor, avoiding
+                # geometric growth from an almost-full allocation after unpadding.
+                end = self._idx if self.prealloc_tokens else None
+
                 def _trim(a, ndim):
                     if ndim == 3:
-                        return a[..., min_lp:]
-                    return a[..., min_lp:, :]
+                        return a[..., min_lp:end]
+                    return a[..., min_lp:end, :]
 
                 self.keys = _map_state(self.keys, _trim)
                 self.values = _map_state(self.values, _trim)
             self._idx -= min_lp
             self.left_padding -= min_lp
+        self._reserve_capacity(capacity)
+        self._refresh_fused_attention_eligibility()
 
     def extend(self, other: "BatchTurboQuantKVCache"):
+        self.prealloc_tokens = max(self.prealloc_tokens, other.prealloc_tokens)
         if self.keys is None and other.keys is None:
             self.left_padding = mx.concatenate([self.left_padding, other.left_padding])
             self.offset = mx.concatenate([self.offset, other.offset])
+            self._reserve_capacity()
+            self._refresh_fused_attention_eligibility()
             return
 
         max_idx = max(self._idx, other._idx)
@@ -6804,18 +7156,24 @@ class BatchTurboQuantKVCache(_BaseCache):
         if r_self is None and r_other is None:
             self.left_padding = mx.concatenate([self.left_padding, other.left_padding])
             self.offset = mx.concatenate([self.offset, other.offset])
+            self._reserve_capacity()
+            self._refresh_fused_attention_eligibility()
             return
         if r_self is None:
             self.keys, self.values, so, slp = r_other
             self.offset = mx.concatenate([self.offset, so])
             self.left_padding = mx.concatenate([self.left_padding + max_idx, slp])
             self._idx = max_idx
+            self._reserve_capacity()
+            self._refresh_fused_attention_eligibility()
             return
         if r_other is None:
             self.keys, self.values, so, slp = r_self
             self.offset = mx.concatenate([so, other.offset])
             self.left_padding = mx.concatenate([slp, other.left_padding + max_idx])
             self._idx = max_idx
+            self._reserve_capacity()
+            self._refresh_fused_attention_eligibility()
             return
 
         sk, sv, so, slp = r_self
@@ -6826,6 +7184,8 @@ class BatchTurboQuantKVCache(_BaseCache):
         self.offset = mx.concatenate([so, oo])
         self.left_padding = mx.concatenate([slp, olp])
         self._idx = max_idx
+        self._reserve_capacity()
+        self._refresh_fused_attention_eligibility()
 
     # ------------------------------------------------------------------
     # Dequantize (for attention fallback)
@@ -6858,15 +7218,23 @@ class BatchTurboQuantKVCache(_BaseCache):
     @state.setter
     def state(self, val):
         self.keys, self.values, self.offset, self.left_padding = val
-        if self.keys is not None:
-            self._idx = _state_length(self.keys)
+        self._idx = _state_length(self.keys)
+        self._reserve_capacity()
+        self._refresh_fused_attention_eligibility()
 
     @property
     def meta_state(self):
         return tuple(
             map(
                 str,
-                (self._idx, self.bits, self.seed, self.key_bits, self.value_bits),
+                (
+                    self._idx,
+                    self.bits,
+                    self.seed,
+                    self.key_bits,
+                    self.value_bits,
+                    self.prealloc_tokens,
+                ),
             )
         )
 
@@ -6880,6 +7248,12 @@ class BatchTurboQuantKVCache(_BaseCache):
             float(v[3]) if len(v) > 3 else None,
             float(v[4]) if len(v) > 4 else None,
         )
+        # Fork: a source snapshot cannot relax the destination allocation floor.
+        self.prealloc_tokens = max(
+            int(getattr(self, "prealloc_tokens", 0) or 0),
+            int(v[5]) if len(v) > 5 else 0,
+        )
+        self._reserve_capacity()
 
     def is_trimmable(self):
         return True
@@ -6913,7 +7287,11 @@ class BatchTurboQuantKVCache(_BaseCache):
             seed=self.seed,
             key_bits=self.key_bits,
             value_bits=self.value_bits,
+            prealloc_tokens=self.prealloc_tokens,
+            fused_prefill=self._fused_prefill_enabled,
+            decode_2pass_use_legacy=self._decode_2pass_use_legacy,
         )
+        cache._prefill_impl = self._prefill_impl
         if self.keys is None or self._idx == 0:
             return cache
         cache.key_codec = self.key_codec
@@ -6932,11 +7310,16 @@ class BatchTurboQuantKVCache(_BaseCache):
         cache.keys = _map_state(keys, _contiguous)
         cache.values = _map_state(values, _contiguous)
         cache.offset = _state_length(cache.keys)
+        cache.prefix_cache_reserve(_state_length(self.keys))
         return cache
 
     @property
     def batch_size(self):
         return int(self.left_padding.shape[0])
+
+    @property
+    def fused_attention_eligible(self):
+        return self._fused_attention_eligible
 
     def is_single_row(self):
         return self.batch_size == 1
