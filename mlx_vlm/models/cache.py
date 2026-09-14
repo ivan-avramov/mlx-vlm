@@ -3708,7 +3708,9 @@ class PreallocKVCache(KVCache):
         current ``offset``, releasing any prealloc-floor padding beyond
         what's actually in use. Returns ``(bytes_before, bytes_after)``; a
         no-op (equal before/after) when the cache is empty or already
-        tight. The valid prefix (``[:offset]``) is preserved exactly.
+        tight. The valid prefix (``[:offset]``) is preserved exactly. New
+        buffers are evaluated before return; byte counts describe this cache's
+        buffers, not memory still held by external aliases.
 
         Used by the D6 session-cache shrink-on-retire path (fork-only):
         a session sitting idle in the server's LRU pool holds its KV
@@ -3736,6 +3738,11 @@ class PreallocKVCache(KVCache):
         if self.offset > 0:
             new_keys[..., : self.offset, :] = self.keys[..., : self.offset, :]
             new_values[..., : self.offset, :] = self.values[..., : self.offset, :]
+        # Evaluate copies before publishing them: lazy copies retain the old
+        # full-cap buffers. Synchronization retires their command-buffer refs;
+        # either failure must leave the original cache intact.
+        mx.eval(new_keys, new_values)
+        mx.synchronize()
         self.keys, self.values = new_keys, new_values
         if self.prealloc_tokens > 0:
             # Only a cache actually carrying a floor needs to re-establish
@@ -3851,8 +3858,11 @@ class PreallocQuantizedKVCache(QuantizedKVCache):
                 out.append(buf)
             return tuple(out)
 
-        self.keys = _shrink_triple(self.keys)
-        self.values = _shrink_triple(self.values)
+        new_keys = _shrink_triple(self.keys)
+        new_values = _shrink_triple(self.values)
+        mx.eval(new_keys, new_values)
+        mx.synchronize()
+        self.keys, self.values = new_keys, new_values
         if self.prealloc_tokens > 0:
             self._needs_refloor = True
         after = sum(a.nbytes for a in self.keys) + sum(a.nbytes for a in self.values)

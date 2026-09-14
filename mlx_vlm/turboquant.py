@@ -6690,6 +6690,8 @@ class TurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
         if self.offset > 0:
             _write_state(new_keys, _slice_state(self.keys, self.offset), 0)
             _write_state(new_values, _slice_state(self.values, self.offset), 0)
+        mx.eval(new_keys, new_values)
+        mx.synchronize()
         self.keys, self.values = new_keys, new_values
         self._cached_state = None
         self._cached_state_offset = -1

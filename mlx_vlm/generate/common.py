@@ -652,8 +652,8 @@ def _shrink_cache_entries(entries) -> None:
     before, after = shrink()
     if after < before:
         logger.info(
-            "Session cache shrink-on-retire: %s offset=%s freed %.2f MiB "
-            "(%.2f -> %.2f MiB)",
+            "Session cache shrink-on-retire: %s offset=%s reduced owned "
+            "buffers by %.2f MiB (%.2f -> %.2f MiB)",
             type(entries).__name__,
             getattr(entries, "offset", "?"),
             (before - after) / (1024**2),
