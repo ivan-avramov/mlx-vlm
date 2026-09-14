@@ -1,6 +1,6 @@
 # Upstream sync — 2026-09-13
 
-Status: unit and static validation complete; real-model validation pending. Not activated or published.
+Status: merge `c5a6f97b` landed on local main after unit/static/cold review, compatibility screens and both shipped-state KV4 capacity ladders passed. Production activation and publication remain pending.
 
 Baseline `420c01e1`; merged upstream target `45d6e125` (0.7.0). Both isolated test and serving-pinned runtime environments pass the full suite with MLX/MLX-Metal 0.32.2; the latter retains serving Transformers/audio/NumPy pins. The original runtime and stack M40/M41 artifacts remain unchanged.
 
@@ -28,7 +28,11 @@ Baseline `420c01e1`; merged upstream target `45d6e125` (0.7.0). Both isolated te
 - Cache refactor: nine initial live-class failures plus later floor-loss regressions reproduced before repairs. Focused tests and final full-suite results are recorded in the integration evidence directory.
 - Legacy guard adaptation: 73 tests pass; unique assertions retained where upstream coverage was incomplete.
 - Full suite: 5357 passed, 10 skipped, 149 passing subtests (MLX/MLX-Metal 0.32.2). All eight static audits pass after the final provenance annotation; both supplementary reports reviewed. Independent cold review identified destination-floor overwrite; live regression and full suite verify its repair.
-- Next acceptance: matched real-model screens and capacity checks; expanded quality evidence remains separately gated.
+- Matched old/new five-case screens (six requests per arm) pass for `Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed` and `Qwen3.8-27B-mlx-uniform-4bit`, including native tools, vision, convergence and positive MTP counters. JSON reasoning differs while final answers match. Old-source/new-MLX controls reproduce original responses; a source-associated numerical change remains under assessment.
+- Third-turn session probe reuses 1839 tokens with a correct answer and MTP active; old/new anchoring and persistence logic match.
+- Both shipped-state KV4 capacity ladders pass at nominal 131072/196608/262144 with actual prompts 130783/196115/261449. Largest-rung MLX peaks: 41.1029 GB for `Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed`, 37.7970 GB for `Qwen3.8-27B-mlx-uniform-4bit`. Full cap/preallocation262144 preserved; these bounded memory probes are not quality recertification.
+- Source static lead reviews closed 30 dropped-hunk leads and 23 untested-fork leads; lead counts are not proof of exhaustive behavior coverage.
+- Matched quality/timing diagnostic proposals remain pending in the stack's C77/C78 decisions. Historical timing differences are not causal runtime estimates. Original stack submodules/environment remain on the prior runtime.
 - Smoke success is not statistical recertification. Any numerical behavior change requires scoped assessment of affected certification evidence before activation.
 
-Local logs and inventories: `$STACK_WORKDIR/upstream/2026-09-13/{logs,evidence}/`. Final counts and runtime outcomes will be added before landing.
+Local logs and inventories: `$STACK_WORKDIR/upstream/2026-09-13/{logs,evidence}/`. Stack result tag `m43on-20260913` preserves the validated capacity records and redacted provenance. The experiment worktree remains frozen at the tested source commit; this checkpoint updates documentation only.
