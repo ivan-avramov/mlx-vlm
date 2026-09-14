@@ -117,11 +117,11 @@ def _cache_kind_names(c) -> frozenset:
 
 def _trim_cache(c, target_len):
     """Recursively trim a KV cache (or nested container of caches) so its
-    sequence dimension is exactly ``target_len``.
+    logical sequence length is exactly ``target_len``.
 
     Handles list / tuple containers, hybrid wrappers exposing ``.caches``,
-    and the common per-layer cache shapes. Static caches (TurboQuant,
-    Rotating SWA) manage their own internal structure via ``.trim()`` /
+    and the common per-layer cache shapes. Preallocated and static caches
+    (TurboQuant, Rotating SWA) manage their internal structure via ``.trim()`` /
     ``.truncate()``; standard caches additionally need a physical slice
     on the K/V tensors so ghost tokens / step-padding don't desync RoPE
     on the next forward pass.
@@ -157,6 +157,8 @@ def _trim_cache(c, target_len):
 
     # Caches that own their internal storage layout — leave the K/V
     # structure alone after the trim/truncate above moved the offset.
+    #   - PreallocKVCache: retain the allocation floor; a short view still owns
+    #     the full buffer but hides its capacity from shrink_to_offset().
     #   - TurboQuantKVCache, RotatingKVCache, BatchRotatingKVCache:
     #     ring/static-sized buffers; physical slicing would corrupt
     #     them.
@@ -174,6 +176,7 @@ def _trim_cache(c, target_len):
     #   index desynced from ``offset`` -- silent wrong output, or a broadcast
     #   crash on the next update.
     if _cache_kind_names(c) & {
+        "PreallocKVCache",
         "TurboQuantKVCache",
         "RotatingKVCache",
         "BatchRotatingKVCache",
