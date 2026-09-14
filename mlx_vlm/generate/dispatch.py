@@ -1044,6 +1044,9 @@ def stream_generate(
                     # trim+prefill below advances both KV and DeltaNet state
                     # from the restored snapshot.
                     prefix_len = snap.offset
+                    # Fork: the ring/cache own restored state; do not pin this
+                    # snapshot if media or RoPE checks reject reuse below.
+                    del snap
 
         if prefix_len > 0 and prefix_len < input_ids.shape[1]:
             if _apc_suffix_is_text_only(prefix_len) and _prime_cached_prefix_rope_state(
@@ -1071,6 +1074,11 @@ def stream_generate(
                 for c in kv_cache:
                     _trim_cache(c, prefix_len)
                 kwargs["prompt_cache"] = kv_cache
+
+    # Fork: discard an unusable session cache before APC materialization or
+    # fresh full-cap allocation; retaining it until update doubles residency.
+    if prompt_cache_state is not None and reused_prefix_len == 0:
+        prompt_cache_state.clear()
 
     if prompt_cache_state is not None:
         logger.info(

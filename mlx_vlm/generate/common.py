@@ -703,6 +703,13 @@ class PromptCacheState:
             snapshot_ring = DeltaNetSnapshotRing()
         self.snapshot_ring = snapshot_ring
 
+    def clear(self) -> None:
+        """Retire cache ownership and rewind history while keeping session options."""
+        self.cache = None
+        self.token_ids = None
+        if self.snapshot_ring is not None:
+            self.snapshot_ring.clear()
+
     def find_prefix_length(self, new_ids: list) -> int:
         """Return the number of leading tokens that match the cached ids."""
         if self.token_ids is None:
