@@ -1724,6 +1724,13 @@ class ResponseGenerator:
         tel_last_time = tel_start
         tel_last_at = 0
         tel_n = 0
+        # C91: dispatch's chunks carry a CUMULATIVE ``generation_tokens``; its
+        # finalization chunk (detokenizer flush) repeats the last count on
+        # length termination and reports a real +1 on EOS/stop. Each
+        # StreamingToken must carry the INCREMENT, exactly as
+        # ``_DiffusionBlockEmitter`` does, or the endpoint's per-chunk sum
+        # over-counts length-terminated requests by one.
+        counted_tokens = 0
 
         try:
             for chunk in _stream_generate(
@@ -1801,6 +1808,13 @@ class ResponseGenerator:
                     if draft_rounds is not None:
                         request_draft_kind = _draft_kwargs["draft_kind"]
 
+                cumulative = getattr(chunk, "generation_tokens", None)
+                if cumulative is None:
+                    token_count = 1  # stand-ins without a cumulative count
+                else:
+                    token_count = max(int(cumulative) - counted_tokens, 0)
+                    counted_tokens = max(counted_tokens, int(cumulative))
+
                 rqueue.put(
                     StreamingToken(
                         text=chunk.text,
@@ -1815,6 +1829,7 @@ class ResponseGenerator:
                         draft_rounds=draft_rounds,
                         draft_n_accepted=draft_accepted,
                         draft_n=draft_total,
+                        token_count=token_count,
                         emitted_at=time.perf_counter(),
                     )
                 )
