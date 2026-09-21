@@ -1810,7 +1810,11 @@ class ResponseGenerator:
 
                 cumulative = getattr(chunk, "generation_tokens", None)
                 if cumulative is None:
-                    token_count = 1  # stand-ins without a cumulative count
+                    # Stand-ins without a cumulative count: charge one token AND
+                    # advance the counter, so a later chunk that does carry a
+                    # cumulative count cannot re-charge it (C99 finding 2).
+                    token_count = 1
+                    counted_tokens += 1
                 else:
                     token_count = max(int(cumulative) - counted_tokens, 0)
                     counted_tokens = max(counted_tokens, int(cumulative))
@@ -1835,7 +1839,7 @@ class ResponseGenerator:
                 )
 
                 if STREAM_TELEMETRY_INTERVAL > 0 and chunk.finish_reason is None:
-                    tel_n += 1
+                    tel_n += token_count  # tokens, not chunks (C99 finding 4)
                     if tel_n - tel_last_at >= STREAM_TELEMETRY_INTERVAL:
                         now = time.perf_counter()
                         window_n = tel_n - tel_last_at

@@ -933,7 +933,7 @@ async def anthropic_messages_endpoint(http_request: Request):
                     )
                     for tok in token_iter:
                         text += tok.text
-                        ot += 1
+                        ot += getattr(tok, "token_count", 1)
                         metrics.record_chunk(tok)
                         if tok.finish_reason:
                             fr = tok.finish_reason

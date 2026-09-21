@@ -1719,7 +1719,7 @@ async def responses_endpoint(request: Request):
                         fr = None
                         for tok in ti:
                             text += tok.text
-                            ot += 1
+                            ot += getattr(tok, "token_count", 1)
                             metrics.record_chunk(tok)
                             if tok.finish_reason:
                                 fr = tok.finish_reason
@@ -2647,11 +2647,16 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     processor=processor,
                 )
 
-                # Count raw generated tokens minus thinking tag tokens
-                completion_tokens = output_tokens - _count_thinking_tag_tokens(
-                    full_text,
-                    gen_args.thinking_start_token,
-                    gen_args.thinking_end_token,
+                # Count raw generated tokens minus thinking tag tokens (clamped,
+                # like the streaming sibling and both Anthropic sites)
+                completion_tokens = max(
+                    0,
+                    output_tokens
+                    - _count_thinking_tag_tokens(
+                        full_text,
+                        gen_args.thinking_start_token,
+                        gen_args.thinking_end_token,
+                    ),
                 )
 
                 usage_stats = UsageStats.from_metrics(

@@ -121,3 +121,17 @@ class TestCachedPathTokenCount:
         for t in tokens:
             metrics.record_chunk(t)
         assert metrics.generated_tokens == 1
+
+    def test_mixed_stand_in_and_cumulative_chunks_do_not_double_count(self, monkeypatch):
+        """C99 finding 2: a stand-in chunk (no cumulative count) is charged one token,
+        so the NEXT cumulative chunk must not charge that token again."""
+        stand_in = SimpleNamespace(text="b", token=2, logprobs=None, finish_reason=None, peak_memory=0.0)
+        chunks = [_chunk("a", 1, 1), stand_in, _chunk("c", 3, 3), _chunk("", 3, 3, "length")]
+        tokens = _drive(monkeypatch, chunks)
+        assert [t.token_count for t in tokens] == [1, 1, 1, 0]
+        assert sum(t.token_count for t in tokens) == 3
+
+    def test_stand_in_first_then_cumulative_stop(self, monkeypatch):
+        stand_in = SimpleNamespace(text="a", token=1, logprobs=None, finish_reason=None, peak_memory=0.0)
+        tokens = _drive(monkeypatch, [stand_in, _chunk("", 2, 2, "stop")])
+        assert [t.token_count for t in tokens] == [1, 1]
