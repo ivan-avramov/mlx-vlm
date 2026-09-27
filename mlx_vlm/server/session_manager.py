@@ -183,29 +183,111 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+# Client-side conversation identifiers accepted as chat_id aliases (C102(a), 2026-09-27),
+# in precedence order after the configurable ``_chat_id_header``. Sources (verified
+# 2026-09-24): opencode sends ``x-session-id`` + ``x-session-affinity`` on every request
+# to a non-opencode provider; Claude Code ``x-claude-code-session-id`` (and ``session_id``
+# inside its JSON ``metadata.user_id``); Codex CLI ``session-id`` (+ body
+# ``prompt_cache_key``); pi/OpenClaw ``session_id``/``x-session-affinity``; OpenWebUI
+# ``X-OpenWebUI-Chat-Id`` when ENABLE_FORWARD_USER_INFO_HEADERS is on; Switchyard
+# ``x-switchyard-session-id``; Zed body ``prompt_cache_key``. Deliberately NOT accepted:
+# per-USER fields (``user``, ``safety_identifier``, an opaque ``metadata.user_id``) —
+# they would make two parallel chats of one user trim each other's cache — and
+# per-REQUEST ids (``x-request-id``, ``x-client-request-id``, ``x-interaction-id``).
+_CHAT_ID_HEADER_ALIASES: Tuple[str, ...] = (
+    "x-session-id",
+    "x-session-affinity",
+    "x-claude-code-session-id",
+    "x-openwebui-chat-id",
+    "session-id",
+    "session_id",
+    "x-switchyard-session-id",
+)
+
+
+_MAX_CHAT_ID_LEN = 256
+
+
+def _clean_id(value) -> Optional[str]:
+    """A usable conversation key: a non-blank str (or int) of printable characters, at most
+    ``_MAX_CHAT_ID_LEN`` long. Containers, booleans, control characters and oversized values
+    are rejected rather than stringified — ``str({})`` would otherwise become a shared cache
+    key for every malformed client (cold review P5, 2026-09-27)."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        value = str(value)
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or len(text) > _MAX_CHAT_ID_LEN:
+        return None
+    if any(ch.isspace() and ch != " " for ch in text) or any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
+        return None
+    return text
+
+
+def _session_id_from_user_id(user_id) -> Optional[str]:
+    """Claude Code packs ``{"device_id", "account_uuid", "session_id"}`` as a JSON string
+    into Anthropic's ``metadata.user_id``. Only that ``session_id`` is a conversation key;
+    any other user_id shape is a per-user id and is ignored."""
+    if not isinstance(user_id, str) or not user_id.lstrip().startswith("{"):
+        return None
+    try:
+        parsed = json.loads(user_id)
+    except ValueError:
+        return None
+    if isinstance(parsed, dict):
+        return _clean_id(parsed.get("session_id"))
+    return None
+
+
 def _resolve_chat_id(raw_request, parsed_request) -> Optional[str]:
     """Pull an explicit chat_id off the request (header / body / metadata).
 
     Order of precedence:
       1. HTTP header (configurable name; default X-MLX-VLM-Chat-Id).
-      2. Top-level ``chat_id`` field on the request body.
-      3. ``metadata.chat_id`` on the body (some clients including OpenWebUI
-         send conversation metadata here).
-      4. None — caller (``_resolve_session``) falls through to anonymous
+      2. Client session headers, in ``_CHAT_ID_HEADER_ALIASES`` order
+         (header names are case-insensitive).
+      3. Top-level ``chat_id`` field on the request body.
+      4. ``metadata.chat_id`` on the body (OpenWebUI-style).
+      5. ``metadata.session_id``, then ``session_id`` inside a JSON
+         ``metadata.user_id`` (Claude Code).
+      6. Top-level ``prompt_cache_key`` on the body (OpenAI cache-routing key:
+         Codex session id, Zed thread id; last because some clients share it
+         across conversations).
+      7. None — caller (``_resolve_session``) falls through to anonymous
          hash-prefix matching when enabled.
     """
     if raw_request is not None:
-        header_val = raw_request.headers.get(_chat_id_header)
-        if header_val:
-            return str(header_val).strip()
-    direct = getattr(parsed_request, "chat_id", None)
+        headers = raw_request.headers
+        found = _clean_id(headers.get(_chat_id_header))
+        if found:
+            return found
+        for name in _CHAT_ID_HEADER_ALIASES:
+            found = _clean_id(headers.get(name))
+            if found:
+                return found
+    direct = _clean_id(getattr(parsed_request, "chat_id", None))
     if direct:
-        return str(direct).strip()
+        return direct
     metadata = getattr(parsed_request, "metadata", None)
     if isinstance(metadata, dict):
-        meta_chat_id = metadata.get("chat_id")
+        meta_chat_id = _clean_id(metadata.get("chat_id"))
         if meta_chat_id:
-            return str(meta_chat_id).strip()
+            return meta_chat_id
+    if isinstance(metadata, dict):
+        # Genuine conversation ids first (cold review P6): ``prompt_cache_key`` is a
+        # cache-affinity hint that some clients share across conversations.
+        meta_session = _clean_id(metadata.get("session_id"))
+        if meta_session:
+            return meta_session
+        from_user_id = _session_id_from_user_id(metadata.get("user_id"))
+        if from_user_id:
+            return from_user_id
+    cache_key = _clean_id(getattr(parsed_request, "prompt_cache_key", None))
+    if cache_key:
+        return cache_key
     return None
 
 
