@@ -40,6 +40,7 @@ from .common import (  # Fork: the 5e9b9503 engine port's own helpers
     _trim_cache,
     maybe_preallocate_kv_cache,
     maybe_quantize_kv_cache,
+    set_session_retain_prompt_end,
     set_session_shrink_on_retire,
     wired_limit,
 )
@@ -135,6 +136,7 @@ __all__ = [
     "save_audio",
     "save_video",
     # Fork: D6 session-cache shrink-on-retire toggle.
+    "set_session_retain_prompt_end",
     "set_session_shrink_on_retire",
     "stream_generate",
     "video_generation_model_class",

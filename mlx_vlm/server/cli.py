@@ -562,6 +562,19 @@ def main():
         ),
     )
     parser.add_argument(
+        "--cache-session-retain-prompt-end",
+        type=str,
+        default=_env_choice("MLX_VLM_SESSION_RETAIN_PROMPT_END", "on", ["on", "off"]),
+        choices=["on", "off"],
+        help=(
+            "M48: on asymmetric-rendering (thinking) sessions retire the cache at "
+            "PROMPT END plus the canonical assistant turn instead of before the "
+            "latest user message, so the next request does not re-prefill its "
+            "last user turn (pasted files, tool results). Default: on. Env "
+            "fallback: MLX_VLM_SESSION_RETAIN_PROMPT_END."
+        ),
+    )
+    parser.add_argument(
         "--cache-session-evict-headroom-frac",
         type=float,
         default=_env_float("MLX_VLM_SESSION_EVICT_HEADROOM_FRAC", 0.0),
@@ -727,6 +740,7 @@ def main():
         chat_id_header=args.cache_chat_id_header,
         cache_anon_sessions=args.cache_anon_sessions.lower() != "off",
         session_shrink_on_retire=args.cache_session_shrink.lower() != "off",
+        session_retain_prompt_end=args.cache_session_retain_prompt_end.lower() != "off",
         session_evict_headroom_frac=max(
             0.0, float(args.cache_session_evict_headroom_frac)
         ),

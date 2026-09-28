@@ -622,6 +622,33 @@ def set_session_shrink_on_retire(enabled: bool) -> None:
     _SESSION_SHRINK_ON_RETIRE = bool(enabled)
 
 
+# Fork: M48 / C102(b) — retain the latest user turn across requests.
+#
+# On asymmetric-rendering sessions the worker used to retire the cache at the
+# snapshot BEFORE the latest user message, so every request re-prefilled its own
+# last user turn once (a pasted file or a big tool result = one full prefill of
+# it). With this on, generate_step captures the cache state at PROMPT END, the
+# retire path restores it (instead of the before-user anchor), then prefills the
+# CANONICAL history rendering of the assistant turn the server predicts the
+# client will echo, and stores token_ids[:prompt_end + canonical_len]. The
+# before-user anchor is kept in the snapshot ring so an edited last user turn
+# still rewinds there; a diverging assistant echo rewinds to prompt_end.
+# ---------------------------------------------------------------------------
+_SESSION_RETAIN_PROMPT_END: bool = os.environ.get(
+    "MLX_VLM_SESSION_RETAIN_PROMPT_END", "on"
+).strip().lower() not in ("off", "0", "false", "no", "")
+
+
+def set_session_retain_prompt_end(enabled: bool) -> None:
+    """Toggle prompt-end retention (M48). Called by ``session_manager.configure()``."""
+    global _SESSION_RETAIN_PROMPT_END
+    _SESSION_RETAIN_PROMPT_END = bool(enabled)
+
+
+def session_retain_prompt_end() -> bool:
+    return _SESSION_RETAIN_PROMPT_END
+
+
 def _shrink_cache_entries(entries) -> None:
     """Recursively call ``shrink_to_offset()`` on every cache leaf that
     implements it.
@@ -822,8 +849,13 @@ def _rotating_rewind_safe(entries, target_len) -> bool:
         # reports itself trimmable even after evicting, so this has to be
         # checked explicitly rather than inferred from .is_trimmable().
         start_position = getattr(c, "start_position", None)
-        if start_position is not None and target_len < int(start_position):
-            return False
+        if start_position is not None:
+            # The WHOLE window behind the rewind point must still be buffered,
+            # not just the point itself (M48 review, P3: window 4, buffer 32,
+            # tokens 0..36, rewind to 35 left [33,34] where [31..34] is needed).
+            window = int(getattr(c, "max_size", 0) or 0)
+            if max(0, target_len - window) < int(start_position):
+                return False
 
         # Subclass-aware on purpose: a BufferedRotatingKVCache built directly
         # (rather than via .from_cache) keeps start_position at 0 while its ring
@@ -1012,8 +1044,13 @@ def _compute_anchor_before_latest_user_offset(
         return None
 
     prefix = formatted_prompt[:last_pos]
+    from ..prompt_utils import _encode_retrying_on_borrow_error
+
     try:
-        prefix_ids = tokenizer.encode(prefix, add_special_tokens=False)
+        # Retried past pyo3's transient "Already borrowed" (M48 live find,
+        # 2026-09-28: this exact call raised it on the GPU thread while the
+        # HTTP thread tokenised the next request; the request 500'd).
+        prefix_ids = _encode_retrying_on_borrow_error(tokenizer, prefix)
     except TypeError:
         # Some tokenizers (e.g. SentencePiece-only) don't accept
         # ``add_special_tokens``; fall back to plain encode.
@@ -1085,7 +1122,12 @@ def _restore_arrays_layers_from_snapshots(cache_list, snapshots) -> None:
 
     for c, s in zip(cache_list, snapshots):
         if s is not None and isinstance(c, ArraysCache):
-            c.state = s
+            # COPY: ``ArraysCache.state`` returns the live list and the model
+            # writes into it element-wise (``cache[i] = new``), so assigning the
+            # captured list itself would let the next forward mutate the
+            # snapshot (M48 review: a failed canonical prefill then restored a
+            # half-overwritten prompt-end state).
+            c.state = list(s)
 
 
 def _capture_anchor_state(
@@ -1125,6 +1167,98 @@ def _capture_anchor_state(
     if anchor_offset_list is not None:
         anchor_offset_list.clear()
         anchor_offset_list.append(offset)
+
+
+def _retire_asymmetric_session(
+    prompt_cache_state,
+    tracked_cache,
+    full_input_ids_list,
+    *,
+    anchor_rotating,
+    anchor_arrays,
+    anchor_offset,
+    prompt_end_rotating,
+    prompt_end_arrays,
+    prompt_end_offset,
+    canonical_ids,
+    canonical_prefill,
+) -> int:
+    """Fork (M48): retire an asymmetric-rendering session at prompt end, in
+    canonical form. Returns the retired offset, or None when the session had to
+    be dropped (rotating layout changed after capture).
+
+    Steps: (1) restore the prompt-end snapshot (rotating + DeltaNet) and trim the
+    KV layers to prompt_end; (2) drop ring entries past this request's divergence
+    from the previously stored ids, then record the before-user anchor states in
+    the ring (monotonic: anchor < prompt_end); (3) if ``canonical_ids`` is given,
+    ``canonical_prefill(canonical_ids)`` extends the live cache by exactly those
+    tokens — on any exception the prompt-end state is restored again and the
+    canonical part is dropped; (4) ``prompt_cache_state.update`` stores the ids
+    and captures the ring entry at the retired offset.
+    """
+    prompt_end = int(prompt_end_offset[0])
+    ids = list(full_input_ids_list)
+    if prompt_end != len(ids):
+        # The captured offset must BE the prompt length; anything else (e.g.
+        # media token expansion) means ids and cache positions no longer
+        # correspond and no consistent session can be published (P4).
+        raise ValueError(
+            f"prompt-end retention: captured offset {prompt_end} != prompt length {len(ids)}"
+        )
+
+    def _restore_prompt_end():
+        _restore_rotating_layers_from_snapshots(tracked_cache, prompt_end_rotating)
+        _restore_arrays_layers_from_snapshots(tracked_cache, prompt_end_arrays)
+        for c in tracked_cache:
+            if not _is_rotating_kv_layer(c):
+                _trim_cache(c, prompt_end)
+
+    try:
+        _restore_prompt_end()
+    except TypeError as e:
+        # Rotating layout changed after capture (MTP buffers SWA layers): the
+        # snapshot cannot describe the live layer. Drop the session rather than
+        # publish a cache whose ring metadata is wrong (P2).
+        logger.warning("Prompt-end retention: cannot restore prompt-end state (%s); "
+                       "session dropped.", e)
+        prompt_cache_state.clear()
+        return None
+
+    ring = getattr(prompt_cache_state, "snapshot_ring", None)
+    if ring is not None and ring.enabled:
+        if prompt_cache_state.token_ids is not None:
+            divergence = prompt_cache_state.find_prefix_length(ids)
+            if divergence < len(prompt_cache_state.token_ids):
+                ring.drop_after(divergence)
+            # The cache now holds exactly ``ids``; record that so the final
+            # ``update()`` sees a pure extension and keeps the entries below.
+            prompt_cache_state.token_ids = list(ids)
+        if anchor_offset and anchor_arrays:
+            ring.capture_states(int(anchor_offset[0]), anchor_arrays, pinned=True)
+        # prompt_end entry: a diverging assistant echo rewinds here (A1).
+        ring.capture_states(prompt_end, prompt_end_arrays)
+
+    retired = prompt_end
+    stored = ids
+    if canonical_ids:
+        canonical = [int(t) for t in canonical_ids]
+        try:
+            canonical_prefill(canonical)
+            retired = prompt_end + len(canonical)
+            stored = ids + canonical
+            logger.debug(
+                "Prompt-end retention: canonical assistant turn prefilled "
+                "(%d tokens); retiring at %d.", len(canonical), retired,
+            )
+        except Exception as e:  # never lose the session over the optional part
+            logger.warning(
+                "Prompt-end retention: canonical prefill failed (%s: %s); "
+                "retiring at prompt_end %d.", type(e).__name__, e, prompt_end,
+            )
+            _restore_prompt_end()
+            retired, stored = prompt_end, ids
+    prompt_cache_state.update(stored, tracked_cache)
+    return retired
 
 
 def _rotating_post_gen_trim_safe(entries, target_len) -> bool:
@@ -1229,7 +1363,10 @@ def _restore_deltanet_state(entries, snapshot_states) -> None:
 
     for c, s in zip(entries, snapshot_states):
         if s is not None and isinstance(c, ArraysCache):
-            c.state = s
+            # COPY (M48 review): the ring keeps this list; the model writes into
+            # ``c.state`` element-wise, so aliasing would corrupt the ring entry
+            # the moment generation resumes after a rewind.
+            c.state = list(s)
 
 
 def __getattr__(name):

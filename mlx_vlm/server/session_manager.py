@@ -577,6 +577,7 @@ def configure(
     cache_anon_sessions: Optional[bool] = None,
     session_shrink_on_retire: Optional[bool] = None,
     session_evict_headroom_frac: Optional[float] = None,
+    session_retain_prompt_end: Optional[bool] = None,
 ) -> None:
     """Publish CLI-resolved config to the module-level holders.
 
@@ -606,3 +607,7 @@ def configure(
         set_session_shrink_on_retire(bool(session_shrink_on_retire))
     if session_evict_headroom_frac is not None:
         _session_evict_headroom_frac = max(0.0, float(session_evict_headroom_frac))
+    if session_retain_prompt_end is not None:
+        from ..generate import set_session_retain_prompt_end
+
+        set_session_retain_prompt_end(bool(session_retain_prompt_end))

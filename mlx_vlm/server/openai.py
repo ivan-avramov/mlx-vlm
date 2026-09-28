@@ -441,6 +441,72 @@ def _strip_assistant_thinking(content: str) -> str:
     return content.strip()
 
 
+def _canonical_assistant_suffix(
+    *,
+    answer_text: str,
+    prompt_ids,
+    messages,
+    tokenizer,
+    render,
+    template_kwargs,
+    tool_calls_present: bool,
+    thinking_start_token=None,
+    thinking_end_token=None,
+    processor=None,
+):
+    """Fork (M48): token ids of the template's HISTORY rendering of the assistant
+    turn just generated — the bytes the client will echo on its next request —
+    or None when that cannot be predicted.
+
+    Renders ``messages + [assistant(content), user(dummy)]`` with the SAME
+    template kwargs as the live prompt, requires the rendering to start with the
+    live prompt's ids byte-for-byte (tokenization boundary check), and returns the
+    slice between prompt end and the start of the dummy user turn. Thinking is
+    stripped (clients echo ``content``); tool-call turns are not predicted (their
+    echoed JSON serialisation is client-specific); empty content is not cached.
+    """
+    from ..generate.common import _compute_anchor_before_latest_user_offset
+
+    if tool_calls_present:
+        return None
+    splitter = _split_thinking or _default_split_thinking
+    _reasoning, content = splitter(
+        answer_text, thinking_start_token, thinking_end_token, False, processor
+    )
+    content = (content or "").strip("\n")
+    if not content.strip():
+        return None
+    next_messages = list(messages) + [
+        {"role": "assistant", "content": content},
+        {"role": "user", "content": "."},
+    ]
+    rendered = render(next_messages, add_generation_prompt=True, **template_kwargs)
+    if not isinstance(rendered, str):
+        return None
+    from ..prompt_utils import _encode_retrying_on_borrow_error
+
+    ids = _encode_retrying_on_borrow_error(tokenizer, rendered)
+    n = len(prompt_ids)
+    if list(ids[:n]) != list(prompt_ids):
+        return None
+    end = _compute_anchor_before_latest_user_offset(rendered, tokenizer)
+    if end is None or end <= n or end > len(ids):
+        return None
+    return [int(t) for t in ids[n:end]]
+
+
+def _default_split_thinking(text, start, end, starts_in_thinking, processor):
+    from .responses_state import _split_thinking as _rs_split
+
+    return _rs_split(
+        text,
+        thinking_start_token=start,
+        thinking_end_token=end,
+        starts_in_thinking=starts_in_thinking,
+        processor=processor,
+    )
+
+
 def _is_template_thinking_asymmetric(formatted_prompt: str) -> bool:
     """Return True if this request's effective rendering will mismatch what
     was cached during generation — driving the cache-vs-prompt asymmetry that
@@ -2137,6 +2203,40 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             prompt_cache_state.is_asymmetric_rendering = (
                 _is_template_thinking_asymmetric(formatted_prompt)
             )
+            # Fork (M48): let the worker predict the client's echo of this turn.
+            # Media requests are not predicted (their prompt ids carry expanded
+            # media tokens); tool-call turns are excluded inside the hook.
+            canonical_suffix_fn = None
+            if not (images or audio or videos):
+                _tk = getattr(processor, "tokenizer", processor)
+                _msgs = list(processed_messages)
+                _tkw = dict(template_kwargs)
+                _tools, _tool_module = tools, tool_module
+                _start, _end = gen_args.thinking_start_token, gen_args.thinking_end_token
+
+                def _canonical_suffix_fn(answer_text, prompt_ids, _tk=_tk):
+                    calls_present = False
+                    if _tool_module is not None:
+                        tc = process_tool_calls(answer_text, _tool_module, _tools)
+                        calls_present = bool(tc is not None and tc.calls)
+                    return _canonical_assistant_suffix(
+                        answer_text=answer_text,
+                        prompt_ids=prompt_ids,
+                        messages=_msgs,
+                        tokenizer=_tk,
+                        render=lambda msgs, **kw: apply_chat_template(
+                            processor, config, msgs, num_images=0, num_audios=0,
+                            tools=_tools, **kw
+                        ),
+                        template_kwargs=_tkw,
+                        tool_calls_present=calls_present,
+                        thinking_start_token=_start,
+                        thinking_end_token=_end,
+                        processor=processor,
+                    )
+
+                canonical_suffix_fn = _canonical_suffix_fn
+            kwargs["canonical_suffix_fn"] = canonical_suffix_fn
 
         if request.stream:
             # Streaming response using ResponseGenerator for continuous batching
@@ -2185,6 +2285,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             if prompt_cache_state is not None
                             else {}
                         )
+                        if prompt_cache_state is not None and kwargs.get("canonical_suffix_fn") is not None:
+                            _gen_extra["canonical_suffix_fn"] = kwargs["canonical_suffix_fn"]  # Fork (M48)
                         if videos:
                             _gen_extra["videos"] = videos
                         ctx, token_iter = await asyncio.to_thread(
@@ -2677,6 +2779,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             if prompt_cache_state is not None
                             else {}
                         )
+                        if prompt_cache_state is not None and kwargs.get("canonical_suffix_fn") is not None:
+                            _gen_extra["canonical_suffix_fn"] = kwargs["canonical_suffix_fn"]  # Fork (M48)
                         if videos:
                             _gen_extra["videos"] = videos
                         ctx, token_iter = runtime.response_generator.generate(

@@ -293,6 +293,9 @@ def generate_step(
     rotating_snapshot_capture: Optional[List[Any]] = None,
     arrays_snapshot_capture: Optional[List[Optional[List[mx.array]]]] = None,
     anchor_capture_offset: Optional[List[int]] = None,
+    prompt_end_rotating_capture: Optional[List[Any]] = None,
+    prompt_end_arrays_capture: Optional[List[Optional[List[mx.array]]]] = None,
+    prompt_end_offset: Optional[List[int]] = None,
     **kwargs,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
@@ -709,6 +712,21 @@ def generate_step(
             input_ids = input_ids[:, -1:]
 
         y, logprobs = _step(input_ids, inputs_embeds=inputs_embeds)
+
+        # Fork (M48): prompt-end capture. The cache now holds exactly the prompt
+        # (the last prompt token was just written by ``_step``); nothing has been
+        # decoded yet — the speculative rounds and the decode loop below both
+        # write further tokens before their first yield, so this is the only
+        # place the prompt-end state exists for every draft kind.
+        if prompt_end_offset is not None and prompt_cache:
+            mx.eval([c.state for c in prompt_cache])
+            _capture_anchor_state(
+                prompt_cache,
+                offset=_first_kv_offset(prompt_cache),
+                rotating_capture=prompt_end_rotating_capture,
+                arrays_capture=prompt_end_arrays_capture,
+                anchor_offset_list=prompt_end_offset,
+            )
 
     mx.async_eval(y, logprobs)
 

@@ -53,6 +53,8 @@ from .common import (  # Fork: the snapshot-ring helpers (_capture/_restore_*, _
     _restore_arrays_layers_from_snapshots,
     _restore_deltanet_state,
     _restore_rotating_layers_from_snapshots,
+    _retire_asymmetric_session,
+    session_retain_prompt_end,
     _rotating_rewind_safe,
     _trim_cache,
     wired_limit,
@@ -881,6 +883,10 @@ def stream_generate(
 
     vision_cache = kwargs.pop("vision_cache", None)
     prompt_cache_state = kwargs.pop("prompt_cache_state", None)
+    # Fork (M48): per-REQUEST hook (never session state — a concurrent request
+    # on the same chat id must not replace it; review P7). Popped here so it
+    # never reaches generate_step / the model.
+    canonical_suffix_fn = kwargs.pop("canonical_suffix_fn", None)
     apc_manager: Optional[_apc.APCManager] = kwargs.pop("apc_manager", None)
     apc_tenant: Optional[str] = kwargs.pop("apc_tenant", None)
     image = image or None
@@ -1189,6 +1195,9 @@ def stream_generate(
     mid_prefill_rotating_capture: List[Any] = []
     mid_prefill_arrays_capture: List[Optional[List[mx.array]]] = []
     mid_prefill_anchor_offset: List[int] = []
+    prompt_end_rotating_capture: List[Any] = []
+    prompt_end_arrays_capture: List[Optional[List[mx.array]]] = []
+    prompt_end_offset: List[int] = []
     if is_asymmetric_rendering and prompt_cache_state is not None:
         snapshot_at_offset = _compute_anchor_before_latest_user_offset(
             prompt, tokenizer
@@ -1198,6 +1207,13 @@ def stream_generate(
             kwargs["rotating_snapshot_capture"] = mid_prefill_rotating_capture
             kwargs["arrays_snapshot_capture"] = mid_prefill_arrays_capture
             kwargs["anchor_capture_offset"] = mid_prefill_anchor_offset
+        # Fork (M48): prompt-end capture for prompt-end retention (see
+        # common._retire_asymmetric_session). Independent of the anchor lookup
+        # so a prompt without a recognised user marker still retires at its end.
+        if session_retain_prompt_end():
+            kwargs["prompt_end_rotating_capture"] = prompt_end_rotating_capture
+            kwargs["prompt_end_arrays_capture"] = prompt_end_arrays_capture
+            kwargs["prompt_end_offset"] = prompt_end_offset
 
     with wired_limit(model, [_get_generation_stream()]):
         detokenizer = make_streaming_detokenizer(processor)
@@ -1253,7 +1269,11 @@ def stream_generate(
                 # written into the cache). Capture rotating-layer state now if
                 # the chat template renders prior asst turns asymmetrically; we
                 # restore after generation so the cache anchors at end-of-user.
-                if is_asymmetric_rendering and prompt_cache_state is not None:
+                if (
+                    is_asymmetric_rendering
+                    and prompt_cache_state is not None
+                    and not prompt_end_offset  # M48: superseded by the prompt-end capture
+                ):
                     from ..snapshot import capture_rotating
 
                     rotating_snapshots = _capture_rotating_layers_for_snapshot(
@@ -1374,16 +1394,81 @@ def stream_generate(
         # end-of-asst state; the next request's prefix-match extends naturally.
         if prompt_cache_state is not None:
             prefill_len = len(full_input_ids_list)
-            if is_asymmetric_rendering:
+            if is_asymmetric_rendering and prompt_end_offset and prompt_end_offset[0] != prefill_len:
+                # P4: the capture must sit exactly at the prompt length (media
+                # token expansion can break that); publish nothing new — take
+                # the legacy anchor path below.
+                logger.warning(
+                    "Prompt-end retention: captured offset %d != prompt length %d; "
+                    "legacy retire path.", prompt_end_offset[0], prefill_len,
+                )
+                prompt_end_offset = []
+            if is_asymmetric_rendering and prompt_end_offset:
+                # Fork (M48): retain the latest user turn + the canonical
+                # assistant turn. The request's hook predicts the history form
+                # the client will echo; None => retire at prompt_end only.
+                canonical_ids = None
+                canonical_fn = canonical_suffix_fn
+                if canonical_fn is not None and any(
+                    _is_rotating_kv_layer(c) for c in tracked_cache
+                ):
+                    # P3: a mismatched echo would make buffered-window rewinds
+                    # routine on SWA models; keep them on retention only.
+                    canonical_fn = None
+                if canonical_fn is not None:
+                    try:
+                        canonical_ids = canonical_fn(
+                            detokenizer.text, full_input_ids_list
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "Prompt-end retention: canonical rendering failed "
+                            "(%s: %s); retiring at prompt end only.",
+                            type(e).__name__, e,
+                        )
+                retired = _retire_asymmetric_session(
+                    prompt_cache_state,
+                    tracked_cache,
+                    full_input_ids_list,
+                    anchor_rotating=mid_prefill_rotating_capture,
+                    anchor_arrays=mid_prefill_arrays_capture,
+                    anchor_offset=mid_prefill_anchor_offset,
+                    prompt_end_rotating=prompt_end_rotating_capture,
+                    prompt_end_arrays=prompt_end_arrays_capture,
+                    prompt_end_offset=prompt_end_offset,
+                    canonical_ids=canonical_ids,
+                    canonical_prefill=lambda ids: _prefill_canonical_suffix(
+                        model, tracked_cache, full_input_ids_list, ids, kwargs
+                    ),
+                )
+                if retired is None:
+                    logger.warning("Prompt-end retention: session dropped (see above).")
+                else:
+                    logger.info(
+                        "Prompt-end retention: retired at %d (prompt_end %d, "
+                        "canonical %d, anchor %s).",
+                        retired,
+                        prefill_len,
+                        retired - prefill_len,
+                        mid_prefill_anchor_offset[0] if mid_prefill_anchor_offset else None,
+                    )
+            elif is_asymmetric_rendering:
                 if mid_prefill_anchor_offset and snapshot_at_offset is not None:
                     # Anchor at the captured offset (authoritative; may differ
                     # from ``snapshot_at_offset`` by a few tokens when chunked
                     # prefill couldn't land exactly). Three independent restore
                     # steps, each a no-op when its snapshot list is empty.
                     anchor_offset = mid_prefill_anchor_offset[0]
-                    _restore_rotating_layers_from_snapshots(
-                        tracked_cache, mid_prefill_rotating_capture
-                    )
+                    try:
+                        _restore_rotating_layers_from_snapshots(
+                            tracked_cache, mid_prefill_rotating_capture
+                        )
+                    except TypeError as e:  # P2: layout changed after capture
+                        logger.warning("Asymmetric path: cannot restore rotating "
+                                       "snapshot (%s); session dropped.", e)
+                        prompt_cache_state.clear()
+                        mx.clear_cache()
+                        return
                     _restore_arrays_layers_from_snapshots(
                         tracked_cache, mid_prefill_arrays_capture
                     )
@@ -1422,6 +1507,43 @@ def stream_generate(
 
         # Cleanup after generation
         mx.clear_cache()
+
+
+_CANONICAL_PREFILL_KWARGS = (
+    "max_kv_size", "kv_bits", "kv_key_bits", "kv_value_bits", "kv_key_scheme",
+    "kv_value_scheme", "kv_group_size", "kv_quant_scheme", "quantized_kv_start",
+    "kv_prealloc_tokens", "prefill_step_size", "serialize_kv_quantization",
+)
+
+
+def _prefill_canonical_suffix(
+    model, tracked_cache, prefix_ids, canonical_ids, gen_kwargs
+) -> None:
+    """Fork (M48): extend the retired session cache by the canonical assistant
+    tokens — a prompt-only ``generate_step`` (``max_tokens=0``, no drafter, no
+    sampling) on the live cache, with the request's cache-shaping kwargs only.
+
+    Positions are ABSOLUTE (review P1): the embedding helpers of RoPE-index
+    models derive positions from the tokens they see, which here is the suffix
+    alone, so the metadata is primed from the FULL sequence exactly as the
+    cached-prefix reuse path does (``_prime_cached_prefix_rope_state``); the
+    language model then slices it at the cache offset."""
+    ck = {k: gen_kwargs[k] for k in _CANONICAL_PREFILL_KWARGS if k in gen_kwargs}
+    full_ids = mx.array([[int(t) for t in prefix_ids] + [int(t) for t in canonical_ids]])
+    if not _prime_cached_prefix_rope_state(model, full_ids, None, ck):
+        raise RuntimeError("could not prime absolute RoPE positions for the canonical prefill")
+    for _ in generate_step(
+        mx.array([list(canonical_ids)]),
+        model,
+        None,
+        None,
+        prompt_cache=tracked_cache,
+        max_tokens=0,
+        temperature=0.0,
+        **ck,
+    ):
+        pass
+    mx.eval([c.state for c in tracked_cache])
 
 
 def generate(

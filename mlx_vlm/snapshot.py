@@ -49,6 +49,8 @@ class DeltaNetSnapshot:
 
     captured_at: float
     """time.time() — telemetry only."""
+    pinned: bool = False
+    """Fork (M48): the latest before-user anchor is pinned so FIFO eviction keeps it."""
 
 
 class DeltaNetSnapshotRing:
@@ -106,9 +108,43 @@ class DeltaNetSnapshotRing:
             captured_at=time.time(),
         )
         self._snapshots.append(snap)
-        while len(self._snapshots) > self.max_size:
-            self._snapshots.pop(0)
+        self._evict()
         return snap
+
+    def capture_states(
+        self, offset: int, states: List[Optional[List[mx.array]]], pinned: bool = False
+    ) -> Optional[DeltaNetSnapshot]:
+        """Fork (M48): ingest an ALREADY-captured per-layer state list (the shape
+        ``_capture_arrays_layers_for_snapshot`` / ``_capture_anchor_state`` produce)
+        under the same monotonic rule as ``capture``. Returns None when disabled,
+        not strictly newer than the latest entry, or when no layer has state
+        (pure-attention model)."""
+        if not self.enabled:
+            return None
+        if self._snapshots and self._snapshots[-1].offset >= offset:
+            return None
+        if not states or not any(st is not None for st in states):
+            return None
+        if pinned:
+            self._snapshots = [
+                DeltaNetSnapshot(s.offset, s.states, s.captured_at, False) if s.pinned else s
+                for s in self._snapshots
+            ]
+        snap = DeltaNetSnapshot(
+            offset=offset, states=[list(st) if st is not None else None for st in states],
+            captured_at=time.time(), pinned=pinned,
+        )
+        self._snapshots.append(snap)
+        self._evict()
+        return snap
+
+    def _evict(self) -> None:
+        # FIFO, but a pinned entry (the latest before-user anchor) survives while
+        # any unpinned entry exists — repeated continuations must not push the
+        # anchor out (M48 review, P6).
+        while len(self._snapshots) > self.max_size:
+            victim = next((i for i, s in enumerate(self._snapshots) if not s.pinned), 0)
+            self._snapshots.pop(victim)
 
     def find_nearest(self, target_offset: int) -> Optional[DeltaNetSnapshot]:
         """Return the latest snapshot with offset <= target_offset, or None
@@ -192,6 +228,9 @@ class RotatingKVSnapshot:
     # retain tokens the restored buffer no longer holds. Defaults to 0 so
     # plain RotatingKVCache layers, which have no such attribute, are unchanged.
     start_position: int = 0
+    layer_type: Optional[str] = None
+    """Fork (M48): class name at capture; restore refuses a different layout (MTP swaps
+    RotatingKVCache for BufferedRotatingKVCache after prefill)."""
 
 
 def capture_rotating(layer, layer_index: int) -> RotatingKVSnapshot:
@@ -223,6 +262,7 @@ def capture_rotating(layer, layer_index: int) -> RotatingKVSnapshot:
         max_size=int(layer.max_size),
         keep=int(getattr(layer, "keep", 0)),
         start_position=int(getattr(layer, "start_position", 0) or 0),
+        layer_type=type(layer).__name__,
     )
 
 
@@ -234,6 +274,11 @@ def restore_rotating(layer, snapshot: RotatingKVSnapshot) -> None:
     pointer, same ring metadata. Any writes generation made are
     discarded.
     """
+    if snapshot.layer_type is not None and snapshot.layer_type != type(layer).__name__:
+        raise TypeError(
+            f"rotating snapshot captured on {snapshot.layer_type} cannot be restored "
+            f"into {type(layer).__name__} (layout changed after capture)"
+        )
     layer.keys = snapshot.keys
     layer.values = snapshot.values
     layer.offset = snapshot.offset

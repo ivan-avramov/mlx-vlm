@@ -11,7 +11,8 @@ from dataclasses import dataclass, field
 from queue import Empty as QueueEmpty
 from queue import Queue
 from threading import Event, Lock, Thread
-from typing import (  # Fork: Union for the fork-only annotations below
+from typing import (
+    Any,  # Fork: Union for the fork-only annotations below
     Callable,
     Generator,
     List,
@@ -995,6 +996,8 @@ class QueuedGenerationRequest:
     # Fork: the per-chat cached-request path (see ``ResponseGenerator.generate``).
     prompt_cache_state: Optional["PromptCacheState"] = None
     prompt: Optional[str] = None
+    # Fork (M48): per-request canonical-echo predictor (never on the session).
+    canonical_suffix_fn: Optional[Any] = None
 
 
 @dataclass
@@ -1450,6 +1453,7 @@ class ResponseGenerator:
         args: Optional[GenerationArguments] = None,
         videos: Optional[List] = None,
         prompt_cache_state: Optional["PromptCacheState"] = None,
+        canonical_suffix_fn: Optional[Any] = None,
     ) -> Tuple[GenerationContext, "_TokenIterator"]:
         """Submit a generation request to the GPU thread.
 
@@ -1529,6 +1533,7 @@ class ResponseGenerator:
             queued_at=request_started_at,
             prompt_cache_state=prompt_cache_state,
             prompt=prompt,
+            canonical_suffix_fn=canonical_suffix_fn,
         )
         logger.info(
             "Generation queued: request=%s prompt_tokens=%d max_tokens=%d "
@@ -1622,6 +1627,7 @@ class ResponseGenerator:
         args: GenerationArguments,
         prompt_tokens: int,
         prompt_cache_state: "PromptCacheState",
+        canonical_suffix_fn=None,
     ) -> None:
         """Run a chat_id'd request inline on the daemon thread.
 
@@ -1660,6 +1666,8 @@ class ResponseGenerator:
         # in chat_completions_endpoint, plus prompt_cache_state.
         gen_kwargs = args.to_generate_kwargs()
         gen_kwargs["prompt_cache_state"] = prompt_cache_state
+        if canonical_suffix_fn is not None:
+            gen_kwargs["canonical_suffix_fn"] = canonical_suffix_fn  # Fork (M48)
         # L1: thread the server-configured prefill step (--prefill-step-size, e.g.
         # 512) into the cached path. Without it, generate_step falls back to
         # DEFAULT_PREFILL_STEP_SIZE (2048), 4x-ing the QK^2 prefill scratch and
@@ -2470,6 +2478,7 @@ class ResponseGenerator:
                             args=args,
                             prompt_tokens=prompt_tokens,
                             prompt_cache_state=prompt_cache_state,
+                            canonical_suffix_fn=request.canonical_suffix_fn,
                         )
                         continue
 
