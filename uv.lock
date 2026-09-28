@@ -1159,7 +1159,7 @@ wheels = [
 
 [[package]]
 name = "mlx-audio"
-version = "0.5.5"
+version = "0.5.6"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "huggingface-hub" },
@@ -1173,9 +1173,9 @@ dependencies = [
     { name = "tqdm" },
     { name = "transformers" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/2e/d5/e4619fac04c1896751ae9ac1d32b06228e2bb10447e9ead4d7fbb85eef72/mlx_audio-0.5.5.tar.gz", hash = "sha256:214071620d92f05522466210fb3c59e9d43d2292d75cb9f0f18ae7cd47ed832b", size = 1733890, upload-time = "2026-09-21T16:09:14.112Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/93/cb/6368465c16ee8b63025a6ce0cc65555ccd74b2f56020853875b07fedc3f1/mlx_audio-0.5.6.tar.gz", hash = "sha256:6f6fb5107bf4647dd3ed079c48ee9f0db90a443803c75bcfd2a396b392d33fdd", size = 1760679, upload-time = "2026-09-24T16:01:15.312Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/19/ad/3d2a011c1187412c12916ef3c1805e2df1c33820b835066be1d355da71d0/mlx_audio-0.5.5-py3-none-any.whl", hash = "sha256:73d35d4285da909723ff52c3724d3c8ff70a7fdbc7acdbe073bc5fbb3307cbc4", size = 2085980, upload-time = "2026-09-21T16:09:12.229Z" },
+    { url = "https://files.pythonhosted.org/packages/8c/4b/2e159880193f53956bfce47b37c6cb1d242d0c62942963158469a5f732cc/mlx_audio-0.5.6-py3-none-any.whl", hash = "sha256:7cf7b49135f6f681988a9e0b9d2fbfdd2e9be783b0a3204d0c4028e0cf2d8b4c", size = 2119154, upload-time = "2026-09-24T16:01:13.749Z" },
 ]
 
 [[package]]
@@ -1216,6 +1216,7 @@ name = "mlx-vlm"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
+    { name = "jinja2" },
     { name = "json-repair" },
     { name = "llguidance" },
     { name = "miniaudio" },
@@ -1258,6 +1259,7 @@ requires-dist = [
     { name = "datasets", marker = "extra == 'train'", specifier = ">=2.19.1" },
     { name = "fastapi", specifier = ">=0.95.1" },
     { name = "gradio", marker = "extra == 'ui'", specifier = ">=5.19.0" },
+    { name = "jinja2", specifier = ">=3.1.0" },
     { name = "json-repair" },
     { name = "llguidance", specifier = ">=1.7.0" },
     { name = "miniaudio", specifier = ">=1.59" },
