@@ -8,7 +8,13 @@ from typing import NamedTuple, Optional, Tuple
 import mlx.core as mx
 import numpy as np
 
-from .models.cache import _BaseCache, create_attention_mask, create_causal_mask
+from .models.cache import (
+    CacheMemory,
+    _BaseCache,
+    cache_nbytes,
+    create_attention_mask,
+    create_causal_mask,
+)
 
 # Fork: registry for the allocation hooks below (2f5e01dd). Upstream has no
 # reallocation observability hook; `_reserve_state_capacity` fires these so a caller
@@ -6466,7 +6472,21 @@ class _TurboQuantAttentionMixin:
         return output.astype(queries.dtype)
 
 
+def _packed_memory_profile(keys, values, capacity, step=1):
+    size = cache_nbytes((keys, values))
+    return CacheMemory(
+        source_bytes=size,
+        bytes_per_token=size / capacity if capacity else 0,
+        step=step,
+    )
+
+
+def _turboquant_memory_profile(c, token_count):
+    return _packed_memory_profile(c.keys, c.values, _state_length(c.keys), c.cache_step)
+
+
 class TurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
+    memory_profile = _turboquant_memory_profile
     cache_step = 256
 
     def __init__(
@@ -6982,6 +7002,7 @@ class BatchTurboQuantKVCache(_TurboQuantAttentionMixin, _BaseCache):
 
     # Fork: preallocation and shared attention opt-in flags. Retain only the
     # live upstream zero_row_tail definition; its earlier copy is shadowed.
+    memory_profile = _turboquant_memory_profile
     cache_step = 256
 
     def __init__(
@@ -7414,6 +7435,11 @@ def _make_tensor_quantizer(spec, seed: int):
 
 
 class HybridQuantKVCache(_BaseCache):
+    def memory_profile(self, token_count):
+        return _packed_memory_profile(
+            self.keys, self.values, self.key_quantizer.length(self.keys)
+        )
+
     def __init__(self, policy, seed: int = DEFAULT_TURBOQUANT_SEED):
         self.policy = policy
         self.seed = seed

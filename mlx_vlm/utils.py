@@ -43,6 +43,7 @@ ACTIVATION_QUANTIZATION_MODES = {"nvfp4", "mxfp8"}
 
 # Constants
 MODEL_REMAPPING = {
+    "moondream1": "moondream2",
     "llava_qwen2": "fastvlm",  # Apple's FastVLM, note it's different to the one below
     "llava-qwen2": "llava_bunny",
     "bunny-llama": "llava_bunny",
@@ -762,7 +763,9 @@ def get_model_and_args(config: dict, model_path: Optional[Path] = None):
 
     architectures = set(config.get("architectures") or ())
     dflash_config = config.get("dflash_config")
-    if "BoundaryExtractor" in architectures:
+    if "Lfm2BidirectionalForMaskedLM" in architectures:
+        model_type = "lfm2_encoder"
+    elif "BoundaryExtractor" in architectures:
         model_type = "gliner2_5"
     elif "DFlash2DraftModel" in architectures:
         model_type = "dflash2"
@@ -2014,10 +2017,15 @@ def load_audio(
     else:
         audio, sample_rate = read_audio(file, dtype="float32")
 
+    # Downmix before resampling: read_audio returns (samples, channels), and
+    # resample_audio works on the last axis, so resampling stereo first would
+    # resample the channel axis and leave the samples at the source rate.
+    audio = np.asarray(audio, dtype=np.float32)
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
     if sample_rate != sr:
         audio = resample_audio(audio, sample_rate, sr)
-    audio = np.asarray(audio, dtype=np.float32)
-    return audio.mean(axis=1) if audio.ndim > 1 else audio
+    return np.asarray(audio, dtype=np.float32)
 
 
 @dataclass(frozen=True)
@@ -2452,7 +2460,14 @@ def prepare_inputs(
     if has_videos:
         if not isinstance(videos, list):
             videos = [videos]
-        sampling = resolve_video_sampling(processor, kwargs)
+        sampling_overrides = {
+            name: kwargs.pop(name) for name in _VIDEO_SAMPLING_FIELDS if name in kwargs
+        }
+        fps_values = sampling_overrides.get("fps")
+        if isinstance(fps_values, (list, tuple)) and len(fps_values) != len(videos):
+            raise ValueError(
+                f"Received {len(fps_values)} fps values for {len(videos)} videos"
+            )
         if supplied_video_metadata is not None and len(supplied_video_metadata) != len(
             videos
         ):
@@ -2465,6 +2480,10 @@ def prepare_inputs(
         )
         loaded, video_fps, video_metadata = [], [], []
         for video_index, v in enumerate(videos):
+            video_sampling_overrides = dict(sampling_overrides)
+            if isinstance(fps_values, (list, tuple)):
+                video_sampling_overrides["fps"] = fps_values[video_index]
+            sampling = resolve_video_sampling(processor, video_sampling_overrides)
             if isinstance(v, (str, bytes, Path)):
                 arr, metadata = load_video(
                     str(v), sampling, frame_sampler=frame_sampler

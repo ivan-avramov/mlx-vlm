@@ -1382,7 +1382,7 @@ class TestBatchGenerate:
             patch.object(
                 ar_module,
                 "apply_chat_template",
-                side_effect=lambda processor, config, prompt, num_images=0: prompt,
+                side_effect=lambda processor, config, prompt, **kwargs: prompt,
             ),
             patch.object(
                 ar_module,
@@ -3055,53 +3055,6 @@ class TestPrefixCacheReuseTrim:
         assert int(c.offset) == 8
 
 
-class TestGemma4LogitsToKeep:
-    class _FakeTextModel:
-        def __init__(self, hidden):
-            self.hidden = hidden
-
-        def __call__(
-            self, inputs=None, inputs_embeds=None, input_embeddings=None, **kwargs
-        ):
-            seq = next(
-                t for t in (inputs, inputs_embeds, input_embeddings) if t is not None
-            )
-            return mx.zeros((1, seq.shape[1], self.hidden))
-
-    def _gemma4_lm(self, hidden):
-        from mlx_vlm.models.gemma4.language import LanguageModel
-
-        lm = LanguageModel.__new__(LanguageModel)
-        lm.model = self._FakeTextModel(hidden)
-        lm.logits_from_hidden = lambda h: h
-        return LanguageModel, lm
-
-    def _gemma4_text_lm(self, hidden):
-        from mlx_vlm.models.gemma4_text.language import LanguageModel
-
-        lm = LanguageModel.__new__(LanguageModel)
-        lm.model = self._FakeTextModel(hidden)
-        lm.tie_word_embeddings = False
-        lm.lm_head = lambda h: h
-        lm.final_logit_softcapping = None
-        return LanguageModel, lm
-
-    def test_gemma4_slices_before_lm_head(self):
-        cls, lm = self._gemma4_lm(hidden=8)
-        ids = mx.zeros((1, 6), dtype=mx.int32)
-        assert cls.supports_logits_to_keep is True
-        assert lm(ids).logits.shape == (1, 6, 8)
-        assert lm(ids, logits_to_keep=1).logits.shape == (1, 1, 8)
-        assert lm(ids, logits_to_keep=3).logits.shape == (1, 3, 8)
-
-    def test_gemma4_text_slices_before_lm_head(self):
-        cls, lm = self._gemma4_text_lm(hidden=8)
-        ids = mx.zeros((1, 6), dtype=mx.int32)
-        assert cls.supports_logits_to_keep is True
-        assert lm(ids).logits.shape == (1, 6, 8)
-        assert lm(ids, logits_to_keep=1).logits.shape == (1, 1, 8)
-
-
 def test_batch_apc_extra_hash_uses_precomputed_image_hash():
     batch_generator = SimpleNamespace(apc_manager=object())
 
@@ -3721,3 +3674,107 @@ def test_custom_batch_cache_preallocation(native_floor):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# Ported from upstream ece7a9dd (#2271, 2026-09-27 sync): single-request decoding
+# evaluates the cache state every DEFAULT_CACHE_EVAL_INTERVAL tokens so unused
+# cache graphs stay bounded. The fork's generate_step issues extra evals of its
+# own (anchor capture, y at n == 0), so count the periodic cache evals directly
+# instead of asserting the total call count.
+@pytest.mark.parametrize(("max_tokens", "cache_evals"), [(49, 0), (50, 1), (100, 2)])
+def test_generate_step_evaluates_cache_periodically(max_tokens, cache_evals):
+    from mlx_vlm.models.base import InputEmbeddingsFeatures, LanguageModelOutput
+
+    model = MagicMock()
+    model.language_model.return_value = LanguageModelOutput(logits=mx.zeros((1, 1, 4)))
+    model.get_input_embeddings.return_value = InputEmbeddingsFeatures(
+        inputs_embeds=mx.zeros((1, 1, 4))
+    )
+    cache_state = mx.array([1])
+
+    with patch.object(ar_module.mx, "eval", wraps=mx.eval) as eval_mock:
+        list(
+            generate_module.generate_step(
+                mx.array([[1]]),
+                model,
+                pixel_values=None,
+                mask=None,
+                prompt_cache=[SimpleNamespace(state=cache_state)],
+                max_tokens=max_tokens,
+                temperature=0,
+            )
+        )
+
+    periodic = [
+        c
+        for c in eval_mock.call_args_list
+        if len(c.args) == 1 and c.args[0] == [cache_state]
+    ]
+    assert len(periodic) == cache_evals
+
+
+# Ported from upstream a8715d52 (2026-09-27 sync): logits_to_keep is requested
+# unconditionally; the batch path asks only for the trailing logits it needs.
+
+
+@pytest.mark.parametrize("honors_hint", [False, True])
+@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("right_padded", [False, True])
+@pytest.mark.parametrize(
+    "prefill_step_size,chunks", [(None, 0), (2, 0), (2, 1), (2, None)]
+)
+def test_prompt_processing_requests_only_required_trailing_logits(
+    right_padded, batch_size, prefill_step_size, chunks, honors_hint
+):
+    import mlx.nn as nn
+
+    calls = []
+
+    class Model(nn.Module):
+        def make_cache(self):
+            return [KVCache()]
+
+        def __call__(self, input_ids, cache=None, **kwargs):
+            calls.append((input_ids.shape[1], kwargs))
+            kv = mx.zeros((input_ids.shape[0], 1, input_ids.shape[1], 4))
+            cache[0].update_and_fetch(kv, kv)
+            logits = (input_ids[..., None] == mx.arange(16)).astype(mx.float32)
+            if honors_hint:
+                logits = logits[:, -kwargs.get("logits_to_keep", input_ids.shape[1]) :]
+            return SimpleNamespace(logits=logits)
+
+    input_ids = [[1, 2, 3, 4, 5], [6, 7, 8]][:batch_size]
+    right_padding = [0, 2][:batch_size] if right_padded else None
+    batch = PromptProcessingBatch(
+        model=Model(),
+        uids=list(range(batch_size)),
+        input_ids=input_ids,
+        max_tokens=[1] * batch_size,
+        inputs_embeds=mx.zeros((batch_size, 5, 4)),
+        prompt_kwargs={},
+        prefill_step_size=prefill_step_size,
+        right_pad_per_row=right_padding,
+        greedy_sampling=True,
+    )
+
+    if chunks is None:
+        while batch.needs_processing():
+            assert batch.prompt_step() > 0
+    else:
+        for _ in range(chunks):
+            assert batch.prompt_step() > 0
+
+    expected_input_width = 1 if chunks is None else 5 - 2 * chunks
+    assert batch._input_ids.shape[1] == expected_input_width
+
+    gen_batch = batch.generate(
+        sampler=lambda logits: mx.argmax(logits, axis=-1),
+        stop_criteria=[lambda _: False] * batch_size,
+        compute_logprobs=False,
+    )
+
+    final_input_width, final_kwargs = calls[-1]
+    assert final_input_width == expected_input_width
+    expected_keep = 1 if not right_padded or batch_size == 1 or chunks is None else 3
+    assert final_kwargs["logits_to_keep"] == expected_keep
+    assert gen_batch._next_tokens.tolist() == [row[-1] for row in input_ids]

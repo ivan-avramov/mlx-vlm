@@ -140,6 +140,13 @@ class EpiCacheKVCache:
     def empty(self):
         return self.inner.empty()
 
+    def memory_profile(self, token_count):
+        # Fork: upstream's cache-memory contract (APC planning, 2026-09 sync)
+        # asks every model cache for a profile. Delegate to the inner KVCache —
+        # eviction only ever shrinks the footprint below the inner profile.
+        profile = getattr(self.inner, "memory_profile", None)
+        return profile(token_count) if callable(profile) else None
+
     @property
     def nbytes(self):
         return self.inner.nbytes

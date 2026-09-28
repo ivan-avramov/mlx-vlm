@@ -57,12 +57,7 @@ from .common import (  # Fork: the snapshot-ring helpers (_capture/_restore_*, _
     _trim_cache,
     wired_limit,
 )
-from .image import (
-    DEFAULT_IMAGE_SIZE,
-    DEFAULT_IMAGE_STEPS,
-    DEFAULT_IMAGE_TASK,
-    run_image_generation_cli,
-)
+from .image import DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_TASK, run_image_generation_cli
 from .video_generation import DEFAULT_VIDEO_STEPS, run_video_generation_cli
 
 # Fork: MLX_VLM_LOG_NAME (5e9b9503) so an embedding host can re-root the logger
@@ -172,8 +167,8 @@ def parse_arguments():
         type=int,
         default=None,
         help=(
-            "Number of inference steps. Defaults to "
-            f"{DEFAULT_IMAGE_STEPS} for images and {DEFAULT_VIDEO_STEPS} for videos."
+            "Number of inference steps. Uses the model default for images "
+            f"and {DEFAULT_VIDEO_STEPS} for videos when omitted."
         ),
     )
     parser.add_argument(
@@ -416,7 +411,7 @@ def parse_arguments():
         "--temperature",
         type=float,
         default=DEFAULT_TEMPERATURE,
-        help="Temperature for sampling.",
+        help="Temperature for sampling. Zero is greedy; positive values below 0.01 are clamped to 0.01.",
     )
     parser.add_argument(
         "--top-p",
@@ -1067,6 +1062,7 @@ def stream_generate(
                 if not has_image_in_new:
                     pixel_values = None
                     kwargs.pop("cached_image_features", None)
+                    kwargs.pop("pixel_values_videos", None)
                 # Reuse the saved KV cache (recursively trimmed to prefix_len;
                 # handles hybrid/rotating/quantized layouts correctly, unlike a
                 # blind physical slice).
@@ -1110,6 +1106,7 @@ def stream_generate(
                 reused_prefix_len = plen
                 input_ids = input_ids[:, plen:]
                 pixel_values = None
+                kwargs.pop("pixel_values_videos", None)
                 kwargs.pop("cached_image_features", None)
                 apc_blocks_in_use = matched_blocks
                 _quant_policy = kv_quant_from_legacy(

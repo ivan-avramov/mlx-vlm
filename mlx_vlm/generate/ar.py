@@ -24,6 +24,7 @@ from ..sample_utils import apply_min_p  # Fork: deployed seeded sampler filter c
 from ..sample_utils import apply_top_p  # Fork: deployed seeded sampler filter chain
 from ..sample_utils import apply_top_k, make_logits_processors, make_sampler
 from ..sample_utils import (
+    clamp_temperature,
     top_p_sampling as top_p_sampling,  # Fork: explicit compatibility re-export
 )
 from ..speculative.utils import (
@@ -68,18 +69,18 @@ from .types import GenerateKwargs, ProcessorLike, Unpack
 logger = logging.getLogger(f"{os.environ.get('MLX_VLM_LOG_NAME', 'mlx_vlm')}.generate")
 
 DEFAULT_TOP_N_SIGMA = 0.0
-DEFAULT_BATCH_CACHE_EVAL_INTERVAL = 50
+DEFAULT_CACHE_EVAL_INTERVAL = 50
 
 
 def _get_batch_cache_eval_interval() -> int:
     raw = os.environ.get("MLX_VLM_BATCH_CACHE_EVAL_INTERVAL")
     if raw is None:
-        return DEFAULT_BATCH_CACHE_EVAL_INTERVAL
+        return DEFAULT_CACHE_EVAL_INTERVAL
     try:
         return max(0, int(raw))
     except ValueError:
         logger.warning("Ignoring invalid MLX_VLM_BATCH_CACHE_EVAL_INTERVAL=%r", raw)
-        return DEFAULT_BATCH_CACHE_EVAL_INTERVAL
+        return DEFAULT_CACHE_EVAL_INTERVAL
 
 
 def _position_seed(seed: int, row_id: int, position: int) -> int:
@@ -128,7 +129,7 @@ class _PositionedTargetSampler:
         top_k: int = 0,
         min_p: float = 0.0,
     ):
-        self.temperature = float(temperature)
+        self.temperature = clamp_temperature(float(temperature))
         self.top_p = float(top_p)
         self.top_k = int(top_k)
         self.min_p = float(min_p)
@@ -382,6 +383,7 @@ def generate_step(
         kv_prealloc_tokens=kv_prealloc_tokens,
     )
 
+    temperature = clamp_temperature(temperature)
     sampler_is_greedy = sampler is None and temperature == 0
     if sampler is None:
         # Fork (C26): the guard once also required min_p/top_k at defaults —
@@ -479,11 +481,11 @@ def generate_step(
     def _step(y, inputs_embeds=None):
         nonlocal tokens, kwargs, last_outputs, target_sample_position
 
-        step_kwargs = kwargs
-        if speculative_prefill_capture_kwargs:
-            step_kwargs = {**kwargs, **speculative_prefill_capture_kwargs}
-        if getattr(model.language_model, "supports_logits_to_keep", False):
-            step_kwargs = {**step_kwargs, "logits_to_keep": 1}
+        step_kwargs = {
+            **kwargs,
+            **speculative_prefill_capture_kwargs,
+            "logits_to_keep": 1,
+        }
 
         with mx.stream(_get_generation_stream()):
             if "decoder_input_ids" in step_kwargs:
@@ -645,9 +647,11 @@ def generate_step(
                         snapshot_at_offset,
                         snapshot_done,
                     )
-                    chunk_kwargs = {**kwargs, **speculative_prefill.kwargs}
-                    if getattr(model.language_model, "supports_logits_to_keep", False):
-                        chunk_kwargs = {**chunk_kwargs, "logits_to_keep": 1}
+                    chunk_kwargs = {
+                        **kwargs,
+                        **speculative_prefill.kwargs,
+                        "logits_to_keep": 1,
+                    }
                     chunk_output = model.language_model(
                         inputs=input_ids[:, :n_to_process],
                         inputs_embeds=inputs_embeds[:, :n_to_process],
@@ -741,6 +745,9 @@ def generate_step(
             mx.eval(y)
         if n == max_tokens:
             break
+
+        if (n + 1) % DEFAULT_CACHE_EVAL_INTERVAL == 0:
+            mx.eval([c.state for c in prompt_cache])
 
         yield y.item(), logprobs
         if n % 256 == 0:
@@ -1061,6 +1068,9 @@ def _extend_cache(cache_a, cache_b):
             ca = ca.__class__.merge([ca])
         if not _is_batch_cache_entry(cb) and hasattr(cb.__class__, "merge"):
             cb = cb.__class__.merge([cb])
+        for entry in (ca, cb):
+            if not callable(getattr(entry, "extend", None)):
+                raise ValueError(f"{type(entry)} does not yet support batching")
         ca.extend(cb)
         extended.append(ca)
     return extended
@@ -1550,30 +1560,28 @@ class GenerationBatch:
     def _eval_pending_state(self):
         """Materialize lazy decode outputs before mutating batch-owned state."""
         targets = []
+        stack = [
+            self._current_tokens,
+            self._current_lps,
+            self._next_tokens,
+            self._next_lps,
+            self._next_top_idx,
+            self._next_top_lp,
+            self._rope_deltas,
+        ]
+        for c in self.prompt_cache:
+            try:
+                stack.append(c.state)
+            except (AttributeError, TypeError):
+                pass
 
-        def append_arrays(value):
+        # Recursing through a local closure would retain targets in a cycle.
+        while stack:
+            value = stack.pop()
             if isinstance(value, mx.array):
                 targets.append(value)
             elif isinstance(value, (list, tuple)):
-                for item in value:
-                    append_arrays(item)
-
-        append_arrays(
-            (
-                self._current_tokens,
-                self._current_lps,
-                self._next_tokens,
-                self._next_lps,
-                self._next_top_idx,
-                self._next_top_lp,
-                self._rope_deltas,
-            )
-        )
-        for c in self.prompt_cache:
-            try:
-                append_arrays(c.state)
-            except (AttributeError, TypeError):
-                pass
+                stack.extend(value)
 
         if targets:
             mx.eval(*targets)
@@ -2219,6 +2227,13 @@ class PromptProcessingBatch:
             ):
                 self.prefill_step_size = None
 
+        if self._apc_coordinator is not None:
+            self._apc_coordinator.prepare_prefill(
+                self._prompt_tokens_per_row,
+                prefix_lengths=self._cached_tokens_per_row,
+                prefill_step_size=self.prefill_step_size,
+            )
+
     def __len__(self):
         return len(self.uids)
 
@@ -2402,6 +2417,12 @@ class PromptProcessingBatch:
         eval_targets.extend(self._finished_prompt_logits[i] for i in finished_rows)
         mx.async_eval(eval_targets)
         self._processed_prompt_columns += n
+        if self._apc_coordinator is not None:
+            self._apc_coordinator.observe_cache(
+                self.prompt_cache,
+                max(self._cached_tokens_per_row) + self._processed_prompt_columns,
+                batch_size=len(self.uids),
+            )
         self._store_apc_exact_checkpoints()
         self._inputs_embeds = self._inputs_embeds[:, n:]
         self._input_ids = self._input_ids[:, n:]
@@ -2442,6 +2463,15 @@ class PromptProcessingBatch:
             call_kwargs.update(
                 speculative_prefill_kwargs(self.draft_kind, self.draft_model)
             )
+
+        call_kwargs["logits_to_keep"] = 1 + max(
+            (
+                padding
+                for i, padding in enumerate(self._right_pad_per_row or [])
+                if i not in self._finished_prompt_logits
+            ),
+            default=0,
+        )
 
         output = self.model(
             self._input_ids,
@@ -2958,7 +2988,7 @@ class BatchGenerator:
         prompt_kwargs_list = [s[3] for s in sequences]
         logits_processors = [s[4] for s in sequences]
         thinking_budget_criteria = [s[5] for s in sequences]
-        seeds_list = [s[6] for s in sequences]
+        seeds_list = [s[6] if len(s) > 6 else None for s in sequences]  # Fork (O30): seed slot
 
         # Per-row prefix length and suffix tokens
         prefix_lens = [p["prefix_len"] if p else 0 for p in picks]
@@ -3374,7 +3404,10 @@ class BatchGenerator:
             sequences = self._unprocessed_sequences[:n]
             coordinator = getattr(self, "apc", None)
             if coordinator is not None:
-                coordinator.prepare_prefill(sum(len(s[1]) for s in sequences))
+                coordinator.prepare_prefill(
+                    [len(s[1]) for s in sequences],
+                    prefill_step_size=self.prefill_step_size,
+                )
             if logger.isEnabledFor(logging.DEBUG) and os.environ.get("APC_DEBUG"):
                 logger.warning(
                     "APC admit n=%d (pending=%d)",
@@ -3417,7 +3450,7 @@ class BatchGenerator:
             prompt_kwargs_list = [s[3] for s in sequences]
             logits_processors = [s[4] for s in sequences]
             thinking_budget_criteria = [s[5] for s in sequences]
-            seeds_list = [s[6] for s in sequences]
+            seeds_list = [s[6] if len(s) > 6 else None for s in sequences]  # Fork (O30): seed slot
 
             inputs_embeds, merged_kwargs = _merge_prefill_prompt_kwargs(
                 prompt_kwargs_list, input_ids
@@ -3503,6 +3536,7 @@ def batch_generate(
     verbose: bool = False,
     group_by_shape: bool = True,
     track_image_sizes: bool = True,
+    videos: Union[str, List[str], None] = None,
     **kwargs: Unpack[GenerateKwargs],
 ) -> BatchResponse:
     """
@@ -3522,7 +3556,8 @@ def batch_generate(
        model (nn.Module): The language model.
        processor (PreTrainedTokenizer): The tokenizer/processor.
        images (Union[str, List[str]]): Images (paths, URLs, or PIL images).
-       audios (Union[str, List[str]]): Audio files (not yet supported for batching).
+       audios (Union[str, List[str]]): Audio files.
+       videos (Union[str, List[str]]): Video files.
        prompts (List[str]): The input prompts.
        max_tokens (Union[int, List[int]]): Maximum number of output tokens. This
           can be per prompt if a list is provided.
@@ -3542,6 +3577,36 @@ def batch_generate(
 
     processor.detokenizer.reset()
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+
+    if audios is not None or videos is not None:
+        images = [images] if isinstance(images, str) else images
+        audios = [audios] if isinstance(audios, str) else audios
+        videos = [videos] if isinstance(videos, str) else videos
+        for name, media in (("images", images), ("audios", audios), ("videos", videos)):
+            if media is not None and len(media) > len(prompts):
+                raise ValueError(
+                    f"Received {len(media)} {name} for {len(prompts)} prompts"
+                )
+        if (
+            audios is not None
+            and len(audios) > 1
+            and not getattr(processor, "supports_multiple_audio", False)
+        ):
+            raise ValueError(
+                f"{type(processor).__name__} does not support batched audio inputs"
+            )
+        texts, stats = _generate_batch(
+            model,
+            processor,
+            prompts,
+            images=images,
+            audios=audios,
+            videos=videos,
+            max_tokens=max_tokens,
+            verbose=verbose,
+            **kwargs,
+        )
+        return BatchResponse(texts, stats)
 
     # Handle single image case
     if isinstance(images, str):
@@ -3722,12 +3787,21 @@ def _generate_batch(
     images: List = None,
     max_tokens: Union[int, List[int]] = 100,
     verbose: bool = False,
+    audios: List = None,
+    videos: List = None,
     **kwargs,
 ) -> Tuple[List[str], BatchStats]:
 
     tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
     batch_size = len(prompts)
     logits_processors = kwargs.pop("logits_processors", None)
+
+    video_sampling_kwargs = {
+        name: kwargs.pop(name)
+        for name in ("fps", "nframes", "min_frames", "max_frames", "frame_factor")
+        if name in kwargs
+    }
+    fps = video_sampling_kwargs.setdefault("fps", 1)
 
     num_images_list = [
         1 if i < (len(images) if images is not None else 0) else 0
@@ -3737,10 +3811,18 @@ def _generate_batch(
         apply_chat_template(
             processor,
             model.config,
-            p,
+            prompt,
             num_images=num_images_list[i],
+            num_audios=1 if audios is not None and i < len(audios) else 0,
+            video=videos[i] if videos is not None and i < len(videos) else None,
+            fps=(
+                fps[i]
+                if isinstance(fps, (list, tuple))
+                and i < min(len(videos or []), len(fps))
+                else 1 if isinstance(fps, (list, tuple)) else fps
+            ),
         )
-        for i, p in enumerate(prompts)
+        for i, prompt in enumerate(prompts)
     ]
 
     add_special_tokens = should_add_special_tokens(model.config.model_type, processor)
@@ -3751,11 +3833,13 @@ def _generate_batch(
     inputs = prepare_inputs(
         processor,
         images=images,
-        audio=None,
+        audio=audios,
+        videos=videos,
         prompts=formatted_prompts,
         image_token_index=image_token_index,
         resize_shape=resize_shape,
         add_special_tokens=add_special_tokens,
+        **video_sampling_kwargs,
         pad_to_uniform_size=False,  # Since images are pre-grouped by shape, they're already uniform size
     )
     input_ids = inputs.get("input_ids", None)

@@ -39,6 +39,21 @@ from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreame
 from mlx_vlm.tools import _infer_tool_parser
 from mlx_vlm.tools.parsers import minicpm5
 
+# Fork (2026-09-27 sync): imports for the tests ported from upstream's test_server.py
+from mlx_vlm.tests.test_processors import MINICPM_MULTICALL
+from unittest.mock import Mock
+from types import SimpleNamespace as NS
+from mlx_vlm.server.responses_state import ToolCallStreamState
+import mlx_vlm.server.cli as cli
+from mlx_vlm.server.model_discovery import discover_models
+from mlx_vlm.server.model_discovery import is_model_directory
+from mlx_vlm.tools import load_tool_module
+from mlx_vlm.tools import process_tool_calls
+from huggingface_hub import scan_cache_dir
+from mlx_vlm.server.responses_state import strip_protocol_markers
+from contextlib import ExitStack
+from contextlib import contextmanager
+
 
 def test_response_generator_prefill_step_override_wins_over_environment(monkeypatch):
     class DormantThread:
@@ -1334,175 +1349,6 @@ def test_ar_thread_exception_reaches_pending_client_queue(monkeypatch):
         gen._stop = True
         gen.requests.put(None)
         worker.join(timeout=2)
-
-
-def test_models_endpoint_lists_single_file_safetensors_models(client, monkeypatch):
-    monkeypatch.setenv("MLX_VLM_MODEL_DISCOVERY", "hf-cache")
-
-    def repo(repo_id, file_names):
-        return SimpleNamespace(
-            repo_id=repo_id,
-            repo_type="model",
-            last_modified=123.0,
-            refs={
-                "main": SimpleNamespace(
-                    files=[
-                        SimpleNamespace(file_path=SimpleNamespace(name=file_name))
-                        for file_name in file_names
-                    ]
-                )
-            },
-        )
-
-    monkeypatch.setattr(
-        server,
-        "scan_cache_dir",
-        lambda: SimpleNamespace(
-            repos=[
-                repo(
-                    "local/single-file-model",
-                    ["config.json", "model.safetensors", "tokenizer_config.json"],
-                ),
-                repo(
-                    "local/sharded-model",
-                    [
-                        "config.json",
-                        "model.safetensors.index.json",
-                        "tokenizer_config.json",
-                    ],
-                ),
-                repo("missing/weights", ["config.json", "tokenizer_config.json"]),
-            ]
-        ),
-    )
-
-    response = client.get("/v1/models")
-
-    assert response.status_code == 200
-    ids = {model["id"] for model in response.json()["data"]}
-    assert "local/single-file-model" in ids
-    assert "local/sharded-model" in ids
-    assert "missing/weights" not in ids
-
-
-def test_models_endpoint_includes_loaded_local_model_without_hf_cache(
-    client, monkeypatch
-):
-    monkeypatch.delenv("MLX_VLM_MODEL_DISCOVERY", raising=False)
-    monkeypatch.setattr(
-        server,
-        "scan_cache_dir",
-        MagicMock(side_effect=server.CacheNotFound("missing cache", "/missing")),
-    )
-    monkeypatch.setitem(server.runtime.model_cache, "model_path", "/models/local-qwen")
-
-    response = client.get("/v1/models")
-
-    assert response.status_code == 200
-    assert response.json()["data"] == [
-        {
-            "id": "/models/local-qwen",
-            "object": "model",
-            "created": response.json()["data"][0]["created"],
-        }
-    ]
-
-
-def test_models_endpoint_deduplicates_loaded_model_from_hf_cache(client, monkeypatch):
-    monkeypatch.setenv("MLX_VLM_MODEL_DISCOVERY", "hf-cache")
-
-    def repo(repo_id, file_names):
-        return SimpleNamespace(
-            repo_id=repo_id,
-            repo_type="model",
-            last_modified=123.0,
-            refs={
-                "main": SimpleNamespace(
-                    files=[
-                        SimpleNamespace(file_path=SimpleNamespace(name=file_name))
-                        for file_name in file_names
-                    ]
-                )
-            },
-        )
-
-    monkeypatch.setattr(
-        server,
-        "scan_cache_dir",
-        lambda: SimpleNamespace(
-            repos=[
-                repo(
-                    "local/sharded-model",
-                    [
-                        "config.json",
-                        "model.safetensors.index.json",
-                        "tokenizer_config.json",
-                    ],
-                ),
-            ]
-        ),
-    )
-    monkeypatch.setitem(server.runtime.model_cache, "model_path", "local/sharded-model")
-
-    response = client.get("/v1/models")
-
-    assert response.status_code == 200
-    assert [model["id"] for model in response.json()["data"]].count(
-        "local/sharded-model"
-    ) == 1
-
-
-def test_models_endpoint_default_does_not_advertise_shared_hf_cache(
-    client, monkeypatch
-):
-    monkeypatch.delenv("MLX_VLM_MODEL_DISCOVERY", raising=False)
-    scan_cache = MagicMock(
-        return_value=SimpleNamespace(
-            repos=[
-                SimpleNamespace(
-                    repo_id="sentence-transformers/all-MiniLM-L6-v2",
-                    repo_type="model",
-                    last_modified=123.0,
-                    refs={
-                        "main": SimpleNamespace(
-                            files=[
-                                SimpleNamespace(
-                                    file_path=SimpleNamespace(name=file_name)
-                                )
-                                for file_name in (
-                                    "config.json",
-                                    "tokenizer_config.json",
-                                    "model.safetensors",
-                                )
-                            ]
-                        )
-                    },
-                )
-            ]
-        )
-    )
-    monkeypatch.setattr(server, "scan_cache_dir", scan_cache)
-    registry = server.ModelCacheRegistry()
-    registry.set(
-        "text_generation",
-        {
-            "model_path": "/models/loaded-chat-model",
-            "model_kind": "text_generation",
-        },
-    )
-    monkeypatch.setattr(server.runtime, "model_cache", registry)
-
-    response = client.get("/v1/models")
-
-    assert response.status_code == 200
-    assert response.json()["data"] == [
-        {
-            "id": "/models/loaded-chat-model",
-            "object": "model",
-            "created": response.json()["data"][0]["created"],
-        }
-    ]
-    scan_cache.assert_not_called()
 
 
 def test_response_generator_diffusion_forwards_generation_options(monkeypatch):
@@ -3974,73 +3820,6 @@ def test_chat_completions_endpoint_preserves_assistant_reasoning_content(client)
     }
 
 
-def test_anthropic_messages_endpoint_maps_text_and_images(client, monkeypatch):
-    monkeypatch.setattr(server.runtime, "response_generator", None)
-    model = SimpleNamespace()
-    processor = SimpleNamespace()
-    config = SimpleNamespace(model_type="qwen2_vl")
-    result = GenerationResult(
-        text="done",
-        prompt_tokens=8,
-        generation_tokens=4,
-        prompt_tps=10.0,
-        generation_tps=5.0,
-        peak_memory=0.1,
-    )
-
-    with (
-        patch.object(
-            server, "get_cached_model", return_value=(model, processor, config)
-        ),
-        patch.object(
-            server, "apply_chat_template", return_value="prompt"
-        ) as mock_template,
-        patch.object(server, "generate", return_value=result) as mock_generate,
-    ):
-        response = client.post(
-            "/v1/messages",
-            json={
-                "model": "demo",
-                "system": "You are concise.",
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": "Describe it."},
-                            {
-                                "type": "image",
-                                "source": {
-                                    "type": "url",
-                                    "url": "https://example.com/image.png",
-                                },
-                            },
-                        ],
-                    }
-                ],
-                "max_tokens": 12,
-            },
-        )
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["type"] == "message"
-    assert payload["role"] == "assistant"
-    assert payload["content"] == [{"type": "text", "text": "done"}]
-    assert payload["stop_reason"] == "end_turn"
-    assert payload["usage"] == {
-        "input_tokens": 8,
-        "cache_creation_input_tokens": 0,
-        "cache_read_input_tokens": 0,
-        "output_tokens": 4,
-    }
-    assert mock_template.call_args.args[2] == [
-        {"role": "system", "content": "You are concise."},
-        {"role": "user", "content": "Describe it."},
-    ]
-    assert mock_generate.call_args.kwargs["image"] == ["https://example.com/image.png"]
-    assert mock_generate.call_args.kwargs["max_tokens"] == 12
-
-
 def test_anthropic_messages_endpoint_accepts_system_role_in_messages(
     client, monkeypatch
 ):
@@ -4085,87 +3864,6 @@ def test_anthropic_messages_endpoint_accepts_system_role_in_messages(
     ]
 
 
-def test_anthropic_messages_endpoint_converts_tool_result_inputs(client, monkeypatch):
-    monkeypatch.setattr(server.runtime, "response_generator", None)
-    model = SimpleNamespace()
-    processor = SimpleNamespace()
-    config = SimpleNamespace(model_type="qwen2_vl")
-    result = GenerationResult(
-        text="done",
-        prompt_tokens=5,
-        generation_tokens=2,
-        prompt_tps=0.0,
-        generation_tps=0.0,
-        peak_memory=0.0,
-    )
-
-    with (
-        patch.object(
-            server, "get_cached_model", return_value=(model, processor, config)
-        ),
-        patch.object(
-            server, "apply_chat_template", return_value="prompt"
-        ) as mock_template,
-        patch.object(server, "generate", return_value=result),
-    ):
-        response = client.post(
-            "/v1/messages",
-            json={
-                "model": "demo",
-                "messages": [
-                    {
-                        "role": "assistant",
-                        "content": [
-                            {
-                                "type": "tool_use",
-                                "id": "toolu_1",
-                                "name": "get_weather",
-                                "input": {"location": "SF"},
-                            }
-                        ],
-                    },
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": "toolu_1",
-                                "content": "72F",
-                            }
-                        ],
-                    },
-                ],
-                "max_tokens": 4,
-            },
-        )
-
-    assert response.status_code == 200
-    assert mock_template.call_args.args[2] == [
-        {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [
-                {
-                    "id": "toolu_1",
-                    "type": "function",
-                    "function": {
-                        "name": "get_weather",
-                        "arguments": json.dumps({"location": "SF"}, ensure_ascii=False),
-                    },
-                }
-            ],
-        },
-        {"role": "tool", "tool_call_id": "toolu_1", "content": "72F", "name": None},
-    ]
-    normalized = apply_chat_template(
-        None,
-        config,
-        mock_template.call_args.args[2],
-        return_messages=True,
-    )
-    assert normalized[0]["content"] == ""
-
-
 def test_anthropic_messages_usage_reports_cached_tokens(client, monkeypatch):
     monkeypatch.setattr(server.runtime, "response_generator", None)
     model = SimpleNamespace()
@@ -4204,99 +3902,6 @@ def test_anthropic_messages_usage_reports_cached_tokens(client, monkeypatch):
         "cache_read_input_tokens": 6,
         "output_tokens": 4,
     }
-
-
-def test_anthropic_messages_endpoint_preserves_tool_result_images(client, monkeypatch):
-    monkeypatch.setattr(server.runtime, "response_generator", None)
-    model = SimpleNamespace()
-    processor = SimpleNamespace()
-    config = SimpleNamespace(model_type="qwen2_vl")
-    result = GenerationResult(
-        text="done",
-        prompt_tokens=5,
-        generation_tokens=2,
-        prompt_tps=0.0,
-        generation_tps=0.0,
-        peak_memory=0.0,
-    )
-
-    with (
-        patch.object(
-            server, "get_cached_model", return_value=(model, processor, config)
-        ),
-        patch.object(
-            server, "apply_chat_template", return_value="prompt"
-        ) as mock_template,
-        patch.object(server, "generate", return_value=result) as mock_generate,
-    ):
-        response = client.post(
-            "/v1/messages",
-            json={
-                "model": "demo",
-                "messages": [
-                    {
-                        "role": "assistant",
-                        "content": [
-                            {
-                                "type": "tool_use",
-                                "id": "toolu_1",
-                                "name": "render_chart",
-                                "input": {"kind": "bar"},
-                            }
-                        ],
-                    },
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": "toolu_1",
-                                "content": [
-                                    {"type": "text", "text": "Rendered chart."},
-                                    {
-                                        "type": "image",
-                                        "source": {
-                                            "type": "base64",
-                                            "media_type": "image/png",
-                                            "data": "aW1n",
-                                        },
-                                    },
-                                ],
-                            }
-                        ],
-                    },
-                ],
-                "max_tokens": 4,
-            },
-        )
-
-    assert response.status_code == 200
-    assert mock_template.call_args.args[2] == [
-        {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [
-                {
-                    "id": "toolu_1",
-                    "type": "function",
-                    "function": {
-                        "name": "render_chart",
-                        "arguments": json.dumps({"kind": "bar"}, ensure_ascii=False),
-                    },
-                }
-            ],
-        },
-        {
-            "role": "tool",
-            "tool_call_id": "toolu_1",
-            "content": [
-                {"type": "text", "text": "Rendered chart."},
-                {"type": "image"},
-            ],
-            "name": None,
-        },
-    ]
-    assert mock_generate.call_args.kwargs["image"] == ["data:image/png;base64,aW1n"]
 
 
 def test_anthropic_nonstreaming_preserves_thinking_with_tool_use(client, monkeypatch):
@@ -4539,72 +4144,6 @@ def test_anthropic_messages_streaming_uses_custom_thinking_markers(client, monke
         "Custom reasoning."
     )
     assert "".join(delta.get("text") or "" for delta in deltas) == "Custom answer."
-
-
-def test_anthropic_messages_streaming_emits_tool_use_events(client, monkeypatch):
-    model = SimpleNamespace()
-    processor = SimpleNamespace()
-    config = SimpleNamespace(model_type="qwen2_vl")
-    tool_module = SimpleNamespace(
-        tool_call_start="<tool_call>",
-        tool_call_end="</tool_call>",
-        parse_tool_call=lambda call, tools: json.loads(call),
-    )
-
-    class FakeResponseGenerator:
-        def validate_context_budget(self, prompt, images=None, audio=None, args=None):
-            return None
-
-        def generate(self, prompt, images=None, audio=None, args=None):
-            return server.GenerationContext(uid=1, prompt_tokens=3), iter(
-                [
-                    server.StreamingToken(
-                        text=(
-                            '<tool_call>{"name":"get_weather","arguments":'
-                            '{"location":"SF"}}</tool_call> After the call.'
-                        ),
-                        token=1,
-                        logprobs=0.0,
-                        finish_reason="stop",
-                    )
-                ]
-            )
-
-    monkeypatch.setattr(server.runtime, "response_generator", FakeResponseGenerator())
-
-    with (
-        patch.object(
-            server, "get_cached_model", return_value=(model, processor, config)
-        ),
-        patch.object(server, "apply_chat_template", return_value="prompt"),
-        patch.object(server, "_infer_tool_parser_from_processor", return_value="demo"),
-        patch.object(server, "load_tool_module", return_value=tool_module),
-    ):
-        response = client.post(
-            "/v1/messages",
-            json={
-                "model": "demo",
-                "messages": [{"role": "user", "content": "Weather?"}],
-                "tools": [
-                    {
-                        "name": "get_weather",
-                        "description": "Get weather",
-                        "input_schema": {"type": "object"},
-                    }
-                ],
-                "max_tokens": 4,
-                "stream": True,
-            },
-        )
-
-    assert response.status_code == 200
-    body = response.text
-    assert '"type": "tool_use"' in body
-    assert '"name": "get_weather"' in body
-    assert '"type": "input_json_delta"' in body
-    assert '"partial_json": "{\\"location\\": \\"SF\\"}"' in body
-    assert '"text": " After the call."' in body
-    assert '"stop_reason": "tool_use"' in body
 
 
 ANTHROPIC_TOOLS = [
@@ -4909,6 +4448,48 @@ def test_metrics_endpoint_records_chat_completion_metrics(client, monkeypatch):
 
 class TestResponseGenerator:
     """Tests for the ResponseGenerator continuous batching engine."""
+
+
+    # Ported from upstream (2026-09-27 sync): --model-discovery was removed upstream (53616323).
+    def test_server_cli_sets_thinking_defaults(self, monkeypatch):
+        flags = [
+            ("model", "PRELOAD_MODEL", "demo"),
+            ("image-model", "PRELOAD_IMAGE_MODEL", "image-demo"),
+            ("tts-model", "PRELOAD_TTS_MODEL", "tts-demo"),
+            ("stt-model", "PRELOAD_STT_MODEL", "stt-demo"),
+            ("reranker-model", "PRELOAD_RERANKER_MODEL", "reranker-demo"),
+            ("thinking-budget", "THINKING_BUDGET", "128"),
+            ("thinking-start-token", "THINKING_START_TOKEN", "<|START_THINKING|>"),
+            ("thinking-eos-token", "THINKING_END_TOKEN", "<|END_THINKING|>"),
+            ("api-key", "SERVER_API_KEY", "admin-token"),
+        ]
+        expected = {"MLX_VLM_" + env: value for _, env, value in flags}
+        expected["MLX_VLM_ENABLE_THINKING"] = "1"
+        argv = [
+            "mlx_vlm.server",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "8080",
+            "--enable-thinking",
+        ]
+        argv += [arg for flag, _, value in flags for arg in ("--" + flag, value)]
+        monkeypatch.setattr(sys, "argv", argv)
+        with patch.dict(os.environ), patch.object(cli.uvicorn, "run") as run:
+            for key in [
+                *expected,
+                "MLX_VLM_PRELOAD_ADAPTER",
+                "MLX_VLM_VISION_CACHE_SIZE",
+                "MLX_VLM_MAX_TOKENS",
+                "PREFILL_STEP_SIZE",
+                "KV_GROUP_SIZE",
+                "KV_QUANT_SCHEME",
+                "QUANTIZED_KV_START",
+            ]:
+                os.environ.pop(key, None)
+            cli.main()
+            _assert_fields(os.environ, **expected)
+            assert run.call_args.kwargs["host"] == "127.0.0.1"
 
     def _bare_generator(self):
         gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
@@ -5649,162 +5230,6 @@ class TestResponseGenerator:
                 (str(uid * 10), None),
                 (str(uid * 10 + 1), "length"),
             ]
-
-    @pytest.mark.parametrize("draft_kind", ["dflash", "eagle3", "mtp"])
-    def test_run_routes_speculative_decode_through_batch_generator(
-        self, monkeypatch, draft_kind
-    ):
-        batch_state = {}
-        draft_model = object()
-
-        class FakeDetokenizer:
-            def __init__(self):
-                self.last_segment = ""
-
-            def reset(self):
-                self.last_segment = ""
-
-            def add_token(self, token):
-                self.last_segment = str(token)
-
-            def finalize(self):
-                pass
-
-        class FakeBatchGenerator:
-            def __init__(self, *args, **kwargs):
-                del args
-                batch_state["kwargs"] = kwargs
-                self._next_uid = 1
-                self._active = {}
-                self.next_active_sizes = []
-                batch_state["instance"] = self
-
-            def insert(self, *args, **kwargs):
-                del args, kwargs
-                uid = self._next_uid
-                self._next_uid += 1
-                self._active[uid] = True
-                return (uid,)
-
-            def remove(self, uid):
-                return self._active.pop(uid, None) is not None
-
-            @property
-            def unprocessed_prompts(self):
-                return []
-
-            @property
-            def has_pending_prompts(self):
-                return False
-
-            def next(self, **kwargs):
-                del kwargs
-                self.next_active_sizes.append(len(self._active))
-                responses = [
-                    SimpleNamespace(
-                        uid=uid,
-                        token=uid + 100,
-                        token_logprob=0.0,
-                        finish_reason="length",
-                    )
-                    for uid in sorted(self._active)
-                ]
-                self._active.clear()
-                return [], responses
-
-        monkeypatch.setattr(server_generation, "BatchGenerator", FakeBatchGenerator)
-        monkeypatch.setattr(
-            server_generation,
-            "_get_draft_block_size_from_env",
-            lambda: 6,
-        )
-        monkeypatch.setattr(
-            server_generation,
-            "make_streaming_detokenizer",
-            lambda _: FakeDetokenizer(),
-        )
-
-        gen = server.ResponseGenerator.__new__(server.ResponseGenerator)
-        gen.model_path = "demo"
-        gen.adapter_path = None
-        gen.model = None
-        gen.processor = None
-        gen.config = None
-        gen.stop_tokens = set()
-        gen.vision_cache = None
-        gen.draft_model = None
-        gen.draft_kind = None
-        gen.kv_bits = None
-        gen.kv_group_size = server.DEFAULT_KV_GROUP_SIZE
-        gen.kv_quant_scheme = server.DEFAULT_KV_QUANT_SCHEME
-        gen.quantized_kv_start = server.DEFAULT_QUANTIZED_KV_START
-        gen.top_logprobs_k = 0
-        apc_manager = SimpleNamespace(prepare_prefill=MagicMock(), close=MagicMock())
-        gen.apc_manager = apc_manager
-        gen.prefill_step_size = 3072
-        gen.tokenizer = SimpleNamespace()
-        gen.requests = Queue()
-        gen._stop = False
-        gen._ready = Event()
-        gen._load_error = None
-        gen._cancelled = set()
-        gen._cancel_lock = Lock()
-
-        def fake_initialize_model():
-            gen.model = SimpleNamespace(language_model=object())
-            gen.processor = SimpleNamespace()
-            gen.config = SimpleNamespace()
-            gen.stop_tokens = set()
-            gen.draft_model = draft_model
-            gen.draft_kind = draft_kind
-            gen.tokenizer = SimpleNamespace()
-
-        gen._initialize_model = fake_initialize_model
-        gen._gpu_embed = lambda raw_inputs, images=None, apc_semantic_hash=None: (
-            mx.array([[raw_inputs["request_id"]]], dtype=mx.int32),
-            {},
-        )
-
-        request_queues = []
-        for request_id in range(2):
-            rqueue = Queue()
-            request_queues.append(rqueue)
-            gen.requests.put(
-                server_generation.QueuedGenerationRequest(
-                    rqueue=rqueue,
-                    raw_inputs={"request_id": request_id},
-                    prompt_tokens=1,
-                    args=server.GenerationArguments(max_tokens=1, temperature=0),
-                )
-            )
-
-        worker = Thread(target=gen._run, daemon=True)
-        worker.start()
-
-        try:
-            for rqueue in request_queues:
-                ctx = rqueue.get(timeout=1)
-                assert isinstance(ctx, server.GenerationContext)
-                item = rqueue.get(timeout=1)
-                assert item.finish_reason == "length"
-                assert rqueue.get(timeout=1) is None
-        finally:
-            gen._stop = True
-            gen.requests.put(None)
-            worker.join(timeout=2)
-
-        kwargs = batch_state["kwargs"]
-        assert kwargs["draft_model"] is draft_model
-        assert kwargs["draft_kind"] == draft_kind
-        assert kwargs["draft_block_size"] == 6
-        assert kwargs["greedy_sampling"] is True
-        assert kwargs["compute_logprobs"] is False
-        assert kwargs["prefill_step_size"] == 3072
-        assert kwargs["apc_manager"] is apc_manager
-        assert apc_manager.prepare_prefill.call_count == 2
-        apc_manager.prepare_prefill.assert_called_with(1)
-        apc_manager.close.assert_called_once_with()
-        assert batch_state["instance"].next_active_sizes == [2]
 
     @pytest.mark.parametrize("draft_kind", ["dflash", "eagle3", "mtp"])
     def test_run_coalesces_idle_speculative_batch_generator(
@@ -6635,101 +6060,6 @@ class TestResponseGenerator:
         assert args.thinking_budget == 32
         assert args.thinking_start_token == "<think>"
         assert args.thinking_end_token == "</think>"
-
-    def test_server_cli_sets_thinking_defaults(self, monkeypatch):
-        for env_var in (
-            "MLX_VLM_ENABLE_THINKING",
-            "MLX_VLM_PRELOAD_MODEL",
-            "MLX_VLM_PRELOAD_ADAPTER",
-            "MLX_VLM_PRELOAD_IMAGE_MODEL",
-            "MLX_VLM_PRELOAD_TTS_MODEL",
-            "MLX_VLM_PRELOAD_STT_MODEL",
-            "MLX_VLM_PRELOAD_RERANKER_MODEL",
-            "MLX_VLM_MODEL_DISCOVERY",
-            "MLX_VLM_VISION_CACHE_SIZE",
-            "MLX_VLM_MAX_TOKENS",
-            "MLX_VLM_THINKING_BUDGET",
-            "MLX_VLM_THINKING_START_TOKEN",
-            "MLX_VLM_THINKING_END_TOKEN",
-            "MLX_VLM_SERVER_API_KEY",
-            "PREFILL_STEP_SIZE",
-            "KV_GROUP_SIZE",
-            "KV_QUANT_SCHEME",
-            "QUANTIZED_KV_START",
-        ):
-            monkeypatch.delenv(env_var, raising=False)
-        monkeypatch.setattr(
-            sys,
-            "argv",
-            [
-                "mlx_vlm.server",
-                "--host",
-                "127.0.0.1",
-                "--port",
-                "8080",
-                "--model",
-                "demo",
-                "--image-model",
-                "image-demo",
-                "--tts-model",
-                "tts-demo",
-                "--stt-model",
-                "stt-demo",
-                "--reranker-model",
-                "reranker-demo",
-                "--model-discovery",
-                "served",
-                "--enable-thinking",
-                "--thinking-budget",
-                "128",
-                "--thinking-start-token",
-                "<|START_THINKING|>",
-                "--thinking-eos-token",
-                "<|END_THINKING|>",
-                "--api-key",
-                "admin-token",
-            ],
-        )
-        run_calls = []
-        monkeypatch.setattr(
-            server_cli.uvicorn,
-            "run",
-            lambda *args, **kwargs: run_calls.append((args, kwargs)),
-        )
-
-        try:
-            server_cli.main()
-
-            assert os.environ["MLX_VLM_ENABLE_THINKING"] == "1"
-            assert os.environ["MLX_VLM_THINKING_BUDGET"] == "128"
-            assert os.environ["MLX_VLM_THINKING_START_TOKEN"] == "<|START_THINKING|>"
-            assert os.environ["MLX_VLM_THINKING_END_TOKEN"] == "<|END_THINKING|>"
-            assert os.environ["MLX_VLM_PRELOAD_MODEL"] == "demo"
-            assert os.environ["MLX_VLM_PRELOAD_IMAGE_MODEL"] == "image-demo"
-            assert os.environ["MLX_VLM_PRELOAD_TTS_MODEL"] == "tts-demo"
-            assert os.environ["MLX_VLM_PRELOAD_STT_MODEL"] == "stt-demo"
-            assert os.environ["MLX_VLM_PRELOAD_RERANKER_MODEL"] == "reranker-demo"
-            assert os.environ["MLX_VLM_MODEL_DISCOVERY"] == "served"
-            assert os.environ["MLX_VLM_SERVER_API_KEY"] == "admin-token"
-            assert run_calls[0][1]["host"] == "127.0.0.1"
-        finally:
-            for env_var in (
-                "MLX_VLM_ENABLE_THINKING",
-                "MLX_VLM_PRELOAD_MODEL",
-                "MLX_VLM_PRELOAD_ADAPTER",
-                "MLX_VLM_PRELOAD_IMAGE_MODEL",
-                "MLX_VLM_PRELOAD_TTS_MODEL",
-                "MLX_VLM_PRELOAD_STT_MODEL",
-                "MLX_VLM_PRELOAD_RERANKER_MODEL",
-                "MLX_VLM_MODEL_DISCOVERY",
-                "MLX_VLM_VISION_CACHE_SIZE",
-                "MLX_VLM_MAX_TOKENS",
-                "MLX_VLM_THINKING_BUDGET",
-                "MLX_VLM_THINKING_START_TOKEN",
-                "MLX_VLM_THINKING_END_TOKEN",
-                "MLX_VLM_SERVER_API_KEY",
-            ):
-                os.environ.pop(env_var, None)
 
     def test_lifespan_preloads_configured_model_kinds(self, monkeypatch):
         preload_env = {
@@ -7711,13 +7041,6 @@ class TestToolCallStreamState:
         assert state.buffer == "<|tool"
         assert state.in_tool_call is False
 
-    def test_literal_less_than_is_not_suppressed(self):
-        state = server.ToolCallStreamState("<tool_call>", "</tool_call>")
-        assert state.feed("if n <") == "if n "
-        assert state.feed("x") == "<x"
-        assert state.in_tool_call is False
-
-
 class TestProcessToolCalls:
     """Tests for tool call parsing from model output."""
 
@@ -7784,24 +7107,6 @@ class TestProcessToolCalls:
                 "enabled": True,
             },
         }
-
-    def test_minicpm5_multiple_calls_and_streamed_markup(self):
-        text = f'Before{self.minicpm5_call}Between<function name="get_time"></function>After'
-        result = server.process_tool_calls(text, minicpm5, tools=None)
-
-        assert result.remaining_text == "Before Between After"
-        assert [call["function"]["name"] for call in result.calls] == [
-            "write_file",
-            "get_time",
-        ]
-        assert json.loads(result.calls[1]["function"]["arguments"]) == {}
-
-        state = server.ToolCallStreamState(
-            minicpm5.tool_call_start, minicpm5.tool_call_end
-        )
-        visible = "".join(state.feed(char) or "" for char in text)
-        visible += state.feed("", last=True) or ""
-        assert visible == "BeforeBetweenAfter"
 
     @pytest.mark.parametrize(
         "text",
@@ -10618,3 +9923,691 @@ class TestSTTSegmentSerialization:
         assert data["segments"] == [
             {"id": 0, "start": 0.0, "end": 0.5, "text": "hello"}
         ]
+
+
+# Ported from upstream c36708d3 (2026-09-27 sync): the newlines that follow the
+# thinking close marker are dropped even when they arrive in LATER stream chunks,
+# so streamed content matches the non-streamed response.
+def _feed_thinking(state, chunks, last=False):
+    return [
+        state.feed(text, last=last and i == len(chunks) - 1)
+        for i, text in enumerate(chunks)
+    ]
+
+
+def _joined(deltas, key):
+    return "".join(item.get(key) or "" for item in deltas)
+
+
+def _thoughts(deltas):
+    return tuple(
+        _joined([vars(delta) for delta in deltas], key)
+        for key in ("reasoning", "content")
+    )
+
+
+@pytest.mark.parametrize(
+    "chunks,enabled,expected",
+    [
+        (["<think>plan</think>\n\nAnswer."], False, ("plan", "Answer.")),
+        (
+            ["<think>", "plan", "</think>", "\n\n", "Answer."],
+            False,
+            ("plan", "Answer."),
+        ),
+        (["<think>plan</think>", "\n", "\n", "Answer."], False, ("plan", "Answer.")),
+        (["<think>plan</thi", "nk>\n", "\nAnswer."], False, ("plan", "Answer.")),
+        (["plan", "</think>", "\n\n", "Answer."], True, ("plan", "Answer.")),
+        (["<think>plan</think>", "\n\n"], False, ("plan", "")),
+        (
+            ["<think>plan</think>", "Answer.", "\n\nMore."],
+            False,
+            ("plan", "Answer.\n\nMore."),
+        ),
+    ],
+    ids=[
+        "same-chunk",
+        "separate-chunk",
+        "one-per-chunk",
+        "split-marker",
+        "preopened",
+        "only-newlines",
+        "keep-later-newlines",
+    ],
+)
+def test_thinking_stream_strips_newlines_after_close(chunks, enabled, expected):
+    state = server.ThinkingStreamState(enable_thinking=enabled)
+    assert _thoughts(_feed_thinking(state, chunks, last=True)) == expected
+
+
+
+_JSON_TOOLS = NS(
+    tool_call_start="<tool_call>",
+    tool_call_end="</tool_call>",
+    parse_tool_call=lambda call, tools: json.loads(call),
+)
+
+
+def _assert_fields(actual, **expected):
+    assert {key: actual[key] for key in expected} == expected
+
+
+def _sse_events_all(body):
+    """Upstream's SSE parser (2026-09-27 sync): skips the ``[DONE]`` sentinel and yields
+    event-less chat chunks too. The fork's ``_sse_events`` keeps its stricter list contract
+    for the fork's own tests."""
+    for block in body.split("\n\n"):
+        fields = dict(
+            line.split(": ", 1) for line in block.splitlines() if ": " in line
+        )
+        if "data" in fields and fields["data"] != "[DONE]":
+            yield fields.get("event"), json.loads(fields["data"])
+
+
+def _data(response):
+    assert response.status_code == 200, response.text
+    return [data for _, data in _sse_events_all(response.text)]
+
+
+def _deltas(response, api="chat"):
+    data = _data(response)
+    if api == "chat":
+        return [item["choices"][0]["delta"] for item in data if item.get("choices")]
+    if api == "messages":
+        return [
+            item["delta"] for item in data if item.get("type") == "content_block_delta"
+        ]
+    return data
+
+
+@contextmanager
+def _endpoint(
+    *,
+    model_type="qwen2_vl",
+    processor=None,
+    config=None,
+    result=None,
+    chunks=(),
+    generator=None,
+    template="prompt",
+    parser=None,
+):
+    model, processor = NS(), processor or NS()
+    config = config or NS(model_type=model_type)
+    with ExitStack() as stack:
+
+        def mock(name, **kwargs):
+            return stack.enter_context(patch.object(server, name, **kwargs))
+
+        cached = mock("get_cached_model", return_value=(model, processor, config))
+        templating = mock("apply_chat_template", return_value=template)
+        generation = mock("generate", return_value=result or _result())
+        streaming = mock("stream_generate", side_effect=lambda *a, **kw: iter(chunks))
+        stack.enter_context(
+            patch.object(server.runtime, "response_generator", generator)
+        )
+        if parser:
+            mock("_infer_tool_parser_from_processor", return_value="demo")
+            mock("load_tool_module", return_value=parser)
+        yield NS(
+            cache=cached,
+            template=templating,
+            generate=generation,
+            stream=streaming,
+            config=config,
+        )
+
+
+def _post(client, api="chat", **payload):
+    paths = dict(
+        chat="/v1/chat/completions", responses="/v1/responses", messages="/v1/messages"
+    )
+    path = paths.get(api, api)
+    body = {"model": "demo"}
+    body["input" if "responses" in path else "messages"] = (
+        "Hello" if "responses" in path else [_msg()]
+    )
+    if path == "/v1/messages":
+        body["max_tokens"] = 4
+    return client.post(path, json={**body, **payload})
+
+
+def _reset_runtime(monkeypatch, **overrides):
+    state = dict(
+        model_cache=server.ModelCacheRegistry(),
+        response_generator=None,
+        apc_manager=None,
+    )
+    for name, value in (state | overrides).items():
+        monkeypatch.setattr(server.runtime, name, value)
+
+
+def _result(text="done", **kwargs):
+    return GenerationResult(
+        **(
+            dict(
+                text=text,
+                prompt_tokens=8,
+                generation_tokens=4,
+                total_tokens=12,
+                prompt_tps=10.0,
+                generation_tps=5.0,
+                peak_memory=0.1,
+            )
+            | kwargs
+        )
+    )
+
+
+def _stream_response(
+    client,
+    tokens,
+    api="/chat/completions",
+    *,
+    prompt_tokens=3,
+    endpoint=None,
+    **payload,
+):
+    with _endpoint(generator=_streaming(tokens, prompt_tokens), **(endpoint or {})):
+        return _post(client, api, stream=True, **payload)
+
+
+def _token(text="", token=1, finish_reason=None, **kwargs):
+    return server.StreamingToken(
+        text=text, token=token, logprobs=0.0, finish_reason=finish_reason, **kwargs
+    )
+
+
+def _tool(name="get_weather", api="chat"):
+    if api == "messages":
+        return dict(
+            name=name, description="Get weather", input_schema={"type": "object"}
+        )
+    return dict(
+        type="function", function=dict(name=name, parameters={"type": "object"})
+    )
+
+
+
+def _msg(content="Hello", role="user", **extra):
+    return dict(role=role, content=content, **extra)
+
+
+def _streaming(chunks, prompt_tokens=3):
+    return NS(
+        tokenizer=NS(decode=lambda tokens: ""),
+        validate_context_budget=MagicMock(),
+        generate=MagicMock(
+            return_value=(
+                server.GenerationContext(uid=1, prompt_tokens=prompt_tokens),
+                iter(chunks),
+            )
+        ),
+    )
+
+
+
+
+
+
+
+
+
+# ---------------------------------------------------------------------------
+# Ported from upstream at the 2026-09-27 sync (behaviour changed upstream; the fork's
+# stale copies were dropped): model discovery (53616323), Anthropic tool-use streaming
+# (67599f2e/8ff71517), tool-call stream parity (f16c98f2..3c001d01).
+# ---------------------------------------------------------------------------
+
+class TestModelDiscovery:
+    @staticmethod
+    def _model_directory(path):
+        path.mkdir(parents=True)
+        (path / "config.json").write_text('{"model_type": "qwen2_vl"}')
+        (path / "model.safetensors").write_bytes(b"weights")
+        return path
+
+    @pytest.mark.parametrize(
+        "config,valid",
+        [
+            ('{"model_type": "qwen2_vl"}', True),
+            ('{"model_type": "custom", "model_file": "model.py"}', True),
+            ("not json", False),
+            ("{}", False),
+        ],
+        ids=["no-tokenizer", "custom-code", "malformed", "empty"],
+    )
+    def test_metadata(self, tmp_path, config, valid):
+        model = self._model_directory(tmp_path / "model")
+        (model / "config.json").write_text(config)
+        (model / "model.py").write_text("raise RuntimeError('must not execute')")
+        assert is_model_directory(model) is valid
+
+    @pytest.mark.parametrize(
+        "shard,valid",
+        [(None, False), (b"", False), (b"weights", True)],
+        ids=["missing", "empty", "complete"],
+    )
+    def test_shards(self, tmp_path, shard, valid):
+        model = self._model_directory(tmp_path / "model")
+        (model / "model.safetensors.index.json").write_text(
+            '{"weight_map": {"a": "model.safetensors", "b": "second.safetensors"}}'
+        )
+        if shard is not None:
+            (model / "second.safetensors").write_bytes(shard)
+        assert is_model_directory(model) is valid
+
+    def test_rejects_adapters_and_broken_links(self, tmp_path):
+        model = self._model_directory(tmp_path / "adapter")
+        (model / "model.safetensors").rename(model / "adapter_model.safetensors")
+        assert not is_model_directory(model)
+        (model / "model.safetensors").symlink_to(model / "missing.safetensors")
+        assert not is_model_directory(model)
+
+    def test_pipeline_components(self, tmp_path):
+        pipeline = tmp_path / "pipeline"
+        component = self._model_directory(pipeline / "transformer")
+        (pipeline / "model_index.json").write_text('{"_class_name": "FluxPipeline"}')
+        (pipeline / "tokenizer").mkdir()
+        assert is_model_directory(pipeline)
+        (component / "model.safetensors").unlink()
+        assert not is_model_directory(pipeline)
+        self._model_directory(pipeline / "text_encoder")
+        (component / "model.safetensors.index.json").write_text(
+            '{"weight_map": {"a": "missing.safetensors"}}'
+        )
+        assert not is_model_directory(pipeline)
+
+    @pytest.mark.parametrize("main", ["absent", "complete", "incomplete"])
+    def test_revisions_and_local_alias(self, tmp_path, main):
+        repo = tmp_path / "models--local--vision"
+        snapshots = [
+            self._model_directory(repo / "snapshots" / (revision * 40))
+            for revision in "ab"
+        ]
+        for modified, snapshot in zip((100, 200), snapshots):
+            for path in (snapshot, *snapshot.iterdir()):
+                os.utime(path, (modified, modified))
+        if main != "absent":
+            (repo / "refs").mkdir()
+            (repo / "refs" / "main").write_text("a" * 40)
+        if main == "incomplete":
+            (snapshots[0] / "model.safetensors").unlink()
+        selected = snapshots[0] if main == "complete" else snapshots[1]
+        cache = scan_cache_dir(tmp_path)
+        found = discover_models(cache)
+        assert found == [
+            dict(
+                id="local/vision" if main == "complete" else str(selected),
+                path=selected,
+                created=100 if main == "complete" else 200,
+            )
+        ]
+        assert discover_models(cache, [str(selected)]) == found
+
+    @pytest.mark.parametrize("source", ["parent", "home", "model", "alias", "combined"])
+    def test_custom_roots_and_aliases(self, tmp_path, source):
+        root = tmp_path / "models"
+        model = self._model_directory(root / "custom")
+        alias = root / "alias"
+        alias.symlink_to(model, target_is_directory=True)
+        (root / "unrelated").mkdir()
+        sources = dict(
+            parent=str(root),
+            home="~/" + os.path.relpath(root, Path.home()),
+            model=str(model),
+            alias=str(alias),
+            missing=str(root / "missing"),
+        )
+        paths = list(sources.values()) if source == "combined" else [sources[source]]
+        found = discover_models(NS(repos=[]), paths)
+        assert (
+            len(found) == 1
+            and found[0]["id"] == str(model)
+            and found[0]["path"] == model
+        )
+
+    @pytest.fixture
+    def model_listing(self, client, monkeypatch, tmp_path):
+        _reset_runtime(monkeypatch)
+        monkeypatch.delenv("MLX_VLM_MODEL_PATHS", raising=False)
+        cache_root = tmp_path / "cache"
+        model = self._model_directory(
+            cache_root / "models--local--vision" / "snapshots" / ("a" * 40)
+        )
+        refs = model.parent.parent / "refs"
+        refs.mkdir()
+        (refs / "main").write_text("a" * 40)
+        scan = Mock(side_effect=lambda: scan_cache_dir(cache_root))
+        monkeypatch.setattr(server, "scan_cache_dir", scan)
+
+        def get(endpoint="/v1/models", **kwargs):
+            response = client.get(endpoint, **kwargs)
+            assert response.status_code == 200
+            entries = response.json()["data"]
+            ids = [m["id"] for m in entries]
+            assert ids == sorted(set(ids), key=str.lower)
+            return {m["id"]: m["loaded"] for m in entries}
+
+        return NS(get=get, scan=scan, path=model, registry=server.runtime.model_cache)
+
+    def test_endpoint_cache_and_loaded_status(self, model_listing):
+        listing = model_listing
+        for kind, model in (
+            ("text_generation", "local/vision"),
+            ("embedding", "/loaded/embedding"),
+            ("tts", "/loaded/tts"),
+        ):
+            listing.registry.set(kind, {"model_path": model})
+        expected = {
+            "local/vision": True,
+            "/loaded/embedding": True,
+            "/loaded/tts": True,
+        }
+        assert listing.get("/models") == listing.get() == expected
+        listing.registry.clear()
+        assert listing.get() == {"local/vision": False}
+        (listing.path / "model.safetensors").unlink()
+        assert listing.get() == {}
+
+    @pytest.mark.parametrize("cached", [False, True], ids=["missing-cache", "cached"])
+    @pytest.mark.parametrize("source", ["environment", "query"])
+    def test_endpoint_custom_paths(self, model_listing, monkeypatch, cached, source):
+        listing = model_listing
+        path = str(listing.path)
+        if not cached:
+            listing.scan.side_effect = server.CacheNotFound("missing cache", "/missing")
+        params = {"model_dir": path} if source == "query" else {}
+        if source == "environment":
+            monkeypatch.setenv("MLX_VLM_MODEL_PATHS", path)
+        listing.registry.set("text_generation", {"model_path": path})
+        listing.registry.set("embedding", {"model_path": "/loaded/embedding"})
+        assert listing.get(params=params) == {path: True, "/loaded/embedding": True}
+        listing.registry.clear()
+        assert listing.get(params=params) == {"local/vision" if cached else path: False}
+
+    def test_endpoint_query_paths_are_additive_and_temporary(
+        self, model_listing, monkeypatch, tmp_path
+    ):
+        configured = self._model_directory(tmp_path / "configured")
+        requested = self._model_directory(
+            tmp_path / "requested" / "model with spaces & symbols"
+        )
+        another = self._model_directory(tmp_path / "another")
+        monkeypatch.setenv("MLX_VLM_MODEL_PATHS", str(configured))
+        baseline = {"local/vision": False, str(configured): False}
+        params = [("model_dir", str(path)) for path in (requested.parent, another, "")]
+        assert model_listing.get(params=params) == {
+            **baseline,
+            str(requested): False,
+            str(another): False,
+        }
+        assert os.environ["MLX_VLM_MODEL_PATHS"] == str(configured)
+        assert model_listing.get() == baseline
+
+    @pytest.mark.parametrize("use_cli_paths", [False, True])
+    def test_cli_custom_model_paths(self, monkeypatch, tmp_path, use_cli_paths):
+        monkeypatch.setattr(os, "environ", dict(os.environ))
+        monkeypatch.setenv("MLX_VLM_MODEL_PATHS", "/existing/models")
+        paths = [str(tmp_path / "model with spaces"), str(tmp_path / "other")]
+        flags = (
+            [arg for path in paths for arg in ("--model-dir", path)]
+            if use_cli_paths
+            else []
+        )
+        monkeypatch.setattr(sys, "argv", ["mlx_vlm.server", *flags])
+        with patch.object(cli.uvicorn, "run") as run:
+            cli.main()
+        assert os.environ["MLX_VLM_MODEL_PATHS"] == (
+            os.pathsep.join(paths) if use_cli_paths else "/existing/models"
+        )
+        run.assert_called_once()
+
+
+def test_anthropic_messages_streaming_emits_tool_use_events(client):
+    token = _token(
+        '<tool_call>{"name":"get_weather","arguments":{"location":"SF"}}</tool_call> After the call.',
+        finish_reason="stop",
+    )
+    response = _stream_response(
+        client,
+        [token],
+        "messages",
+        endpoint=dict(parser=_JSON_TOOLS),
+        tools=[_tool(api="messages")],
+    )
+    assert response.status_code == 200
+    for fragment in (
+        '"type": "tool_use"',
+        '"name": "get_weather"',
+        '"type": "input_json_delta"',
+        '"partial_json": "{\\"location\\": \\"SF\\"}"',
+        '"text": "After the call."',
+        '"stop_reason": "tool_use"',
+    ):
+        assert fragment in response.text
+
+
+@pytest.mark.parametrize(
+    "chunks,start_marker,end_marker,expected,inside",
+    [
+        (["text<tool_call>"], "<tool_call>", "</tool_call>", "text<tool_call>", True),
+        (
+            ["Before ", "<tool_call>", '{"name": "a"}', " trailing"],
+            "<tool_call>",
+            "",
+            "Before",
+            True,
+        ),
+        (["A literal <tool"], "<tool_call>", "</tool_call>", "A literal <tool", False),
+        (
+            [*MINICPM_MULTICALL, ""],
+            "<function",
+            "</function>",
+            "Before Between After",
+            False,
+        ),
+        (
+            ["<tool_call>a</tool_call>", "\n", "<tool_call>b</tool_call>", "\n"],
+            "<tool_call>",
+            "</tool_call>",
+            "",
+            False,
+        ),
+        (
+            list("<tool_call>a</tool_call>\n<tool_call>b</tool_call>\n"),
+            "<tool_call>",
+            "</tool_call>",
+            "",
+            False,
+        ),
+        (
+            ["<tool_call>a</tool_call>", "\n", "Done", "."],
+            "<tool_call>",
+            "</tool_call>",
+            "Done.",
+            False,
+        ),
+        (
+            list("A<tool_call>x</tool_call> \n<tool_call>y</tool_call>B"),
+            "<tool_call>",
+            "</tool_call>",
+            "A  \n B",
+            False,
+        ),
+        (
+            list("A<tool_call>x</tool"),
+            "<tool_call>",
+            "</tool_call>",
+            "A<tool_call>x</tool",
+            True,
+        ),
+        (
+            list("  <tool_call>x</tool_call>B"),
+            "<tool_call>",
+            "</tool_call>",
+            "B",
+            False,
+        ),
+        (
+            ["<tool_call>x</tool_call> B", "  "],
+            "<tool_call>",
+            "</tool_call>",
+            "B",
+            False,
+        ),
+        (
+            ["Before ", "[TOOL_CALLS]foo[ARGS]{}", "\nAfter"],
+            "[TOOL_CALLS]",
+            "",
+            "Before  After",
+            False,
+        ),
+    ],
+    ids=[
+        "start-marker",
+        "missing-end-marker",
+        "unfinished-start-marker",
+        "minicpm-character-chunks",
+        "whitespace-between-calls",
+        "whitespace-between-calls-character-chunks",
+        "text-after-call",
+        "whitespace-between-text",
+        "unfinished-call",
+        "leading-whitespace",
+        "trailing-whitespace",
+        "no-end-marker-ends-at-newline",
+    ],
+)
+def test_tool_stream_finalization(chunks, start_marker, end_marker, expected, inside):
+    state = ToolCallStreamState(start_marker, end_marker)
+    visible = [
+        state.feed(chunk, last=i == len(chunks) - 1) for i, chunk in enumerate(chunks)
+    ]
+    assert "".join(delta for delta in visible if delta) == expected
+    assert state.in_tool_call is inside
+
+
+_CALL = '<tool_call>{"name": "get_weather", "arguments": {}}</tool_call>'
+
+
+@pytest.mark.parametrize(
+    "parser,text",
+    [
+        ("json_tools", f"{_CALL}\n{_CALL}\n"),
+        ("json_tools", f"Hi {_CALL}\n{_CALL}\n bye"),
+        ("json_tools", f"{_CALL} \nDone."),
+        ("json_tools", f"A{_CALL}B"),
+        ("json_tools", f"A{_CALL}\nB<tool_call>unfinished"),
+        ("json_tools", "A <tool_call>unfinished"),
+        ("json_tools", "No calls\n\n"),
+        ("minicpm5", '<function name="get_time"></function>Use <function as a prefix.'),
+        ("mistral", 'Before [TOOL_CALLS]foo[ARGS]{"a": 1}\nAfter'),
+        ("mistral", "[TOOL_CALLS]foo[ARGS]{}\n[TOOL_CALLS]bar[ARGS]{}"),
+    ],
+)
+def test_tool_stream_matches_non_streamed_content(parser, text):
+    # Streamed content equals the non-streamed content, whatever the chunking:
+    # beside a parsed call, the text process_tool_calls leaves with protocol
+    # markers removed; otherwise the whole output. Both are stripped.
+    module = load_tool_module(parser)
+    parsed = process_tool_calls(text, module, None)
+    expected = (
+        strip_protocol_markers(parsed.remaining_text, module)
+        if parsed.calls
+        else text.strip()
+    )
+    for chunks in ([text], list(text)):
+        state = ToolCallStreamState(module.tool_call_start, module.tool_call_end)
+        streamed = "".join(
+            state.feed(chunk, last=i == len(chunks) - 1) or ""
+            for i, chunk in enumerate(chunks)
+        )
+        assert streamed == expected
+
+
+_WEATHER_CALL = '<tool_call>{"name": "get_weather", "arguments": {}}</tool_call>'
+
+
+def test_chat_fallback_stream_parses_tool_calls(client):
+    # Without a response generator the stream_generate fallback streamed the
+    # raw tool-call markup as content and never emitted tool_calls.
+    result = _result(f"Checking.{_WEATHER_CALL}", finish_reason="stop")
+    with _endpoint(chunks=[result], parser=_JSON_TOOLS):
+        response = _post(client, stream=True, tools=[_tool()])
+    deltas = _deltas(response)
+    assert _joined(deltas, "content") == "Checking."
+    calls = [call for delta in deltas for call in delta.get("tool_calls") or []]
+    assert [call["function"]["name"] for call in calls] == ["get_weather"]
+    reasons = [
+        choice["finish_reason"]
+        for chunk in _data(response)
+        for choice in chunk.get("choices") or []
+        if choice.get("finish_reason")
+    ]
+    assert reasons == ["tool_calls"]
+
+
+@pytest.mark.parametrize("api", ["chat", "responses", "messages"])
+def test_stream_without_finish_token_flushes_held_text(client, api):
+    # The iterator stops without a finish reason: the unfinished call is not a
+    # call, so its text is content, as in the non-streamed response.
+    tool = _tool(api="messages") if api == "messages" else _tool()
+    if api == "responses":
+        tool = dict(type="function", name="get_weather", parameters={"type": "object"})
+    response = _stream_response(
+        client,
+        [_token("A <tool_call>unfinished")],
+        api,
+        endpoint=dict(parser=_JSON_TOOLS),
+        tools=[tool],
+    )
+    deltas = _deltas(response, api)
+    if api == "chat":
+        text = _joined(deltas, "content")
+    elif api == "messages":
+        text = _joined(deltas, "text")
+    else:
+        text = _joined(
+            [d for d in deltas if d.get("type") == "response.output_text.delta"],
+            "delta",
+        )
+    assert text == "A <tool_call>unfinished"
+
+
+@pytest.mark.parametrize("api", ["chat", "responses", "messages"])
+def test_tool_call_content_keeps_angle_bracket_text(client, api):
+    result = _result(
+        f"<think>r</think>Use <b>bold</b>.<|im_end|></think> {_WEATHER_CALL}"
+        " </tool_call>"
+    )
+    tool = (
+        dict(type="function", name="get_weather", parameters={"type": "object"})
+        if api == "responses"
+        else _tool(api=api)
+    )
+    with _endpoint(result=result, parser=_JSON_TOOLS):
+        response = _post(client, api, tools=[tool])
+    assert response.status_code == 200, response.text
+    body = response.json()
+    if api == "chat":
+        message = body["choices"][0]["message"]
+        assert message["content"] == "Use <b>bold</b>."
+        assert message["tool_calls"][0]["function"]["name"] == "get_weather"
+    elif api == "messages":
+        assert [b["text"] for b in body["content"] if b["type"] == "text"] == [
+            "Use <b>bold</b>."
+        ]
+        assert [b["name"] for b in body["content"] if b["type"] == "tool_use"] == [
+            "get_weather"
+        ]
+    else:
+        texts = [
+            part["text"]
+            for item in body["output"]
+            if item.get("type") == "message"
+            for part in item["content"]
+        ]
+        assert (
+            "Use <b>bold</b>." in texts or body.get("output_text") == "Use <b>bold</b>."
+        )
