@@ -121,6 +121,19 @@ class DeltaNetSnapshotRing:
         (pure-attention model)."""
         if not self.enabled:
             return None
+        existing = next((s for s in self._snapshots if s.offset == offset), None)
+        if existing is not None:
+            # Same boundary already recorded (a continuation whose latest user
+            # turn starts where the previous retire ended). Promote the pin to
+            # it instead of refusing (review P9): the anchor must be the entry
+            # that actually describes the latest user turn.
+            if pinned and not existing.pinned:
+                self._snapshots = [
+                    DeltaNetSnapshot(s.offset, s.states, s.captured_at, s.offset == offset)
+                    for s in self._snapshots
+                ]
+                return next(s for s in self._snapshots if s.offset == offset)
+            return None
         if self._snapshots and self._snapshots[-1].offset >= offset:
             return None
         if not states or not any(st is not None for st in states):

@@ -996,8 +996,8 @@ class QueuedGenerationRequest:
     # Fork: the per-chat cached-request path (see ``ResponseGenerator.generate``).
     prompt_cache_state: Optional["PromptCacheState"] = None
     prompt: Optional[str] = None
-    # Fork (M48): per-request canonical-echo predictor (never on the session).
-    canonical_suffix_fn: Optional[Any] = None
+    # Fork (M48): per-request retention plan (boundary + echo predictor); never on the session.
+    session_retention: Optional[Any] = None
 
 
 @dataclass
@@ -1453,7 +1453,7 @@ class ResponseGenerator:
         args: Optional[GenerationArguments] = None,
         videos: Optional[List] = None,
         prompt_cache_state: Optional["PromptCacheState"] = None,
-        canonical_suffix_fn: Optional[Any] = None,
+        session_retention: Optional[Any] = None,
     ) -> Tuple[GenerationContext, "_TokenIterator"]:
         """Submit a generation request to the GPU thread.
 
@@ -1533,7 +1533,7 @@ class ResponseGenerator:
             queued_at=request_started_at,
             prompt_cache_state=prompt_cache_state,
             prompt=prompt,
-            canonical_suffix_fn=canonical_suffix_fn,
+            session_retention=session_retention,
         )
         logger.info(
             "Generation queued: request=%s prompt_tokens=%d max_tokens=%d "
@@ -1627,7 +1627,7 @@ class ResponseGenerator:
         args: GenerationArguments,
         prompt_tokens: int,
         prompt_cache_state: "PromptCacheState",
-        canonical_suffix_fn=None,
+        session_retention=None,
     ) -> None:
         """Run a chat_id'd request inline on the daemon thread.
 
@@ -1666,8 +1666,8 @@ class ResponseGenerator:
         # in chat_completions_endpoint, plus prompt_cache_state.
         gen_kwargs = args.to_generate_kwargs()
         gen_kwargs["prompt_cache_state"] = prompt_cache_state
-        if canonical_suffix_fn is not None:
-            gen_kwargs["canonical_suffix_fn"] = canonical_suffix_fn  # Fork (M48)
+        if session_retention is not None:
+            gen_kwargs["session_retention"] = session_retention  # Fork (M48)
         # L1: thread the server-configured prefill step (--prefill-step-size, e.g.
         # 512) into the cached path. Without it, generate_step falls back to
         # DEFAULT_PREFILL_STEP_SIZE (2048), 4x-ing the QK^2 prefill scratch and
@@ -2478,7 +2478,7 @@ class ResponseGenerator:
                             args=args,
                             prompt_tokens=prompt_tokens,
                             prompt_cache_state=prompt_cache_state,
-                            canonical_suffix_fn=request.canonical_suffix_fn,
+                            session_retention=request.session_retention,
                         )
                         continue
 

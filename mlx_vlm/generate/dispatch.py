@@ -886,7 +886,7 @@ def stream_generate(
     # Fork (M48): per-REQUEST hook (never session state — a concurrent request
     # on the same chat id must not replace it; review P7). Popped here so it
     # never reaches generate_step / the model.
-    canonical_suffix_fn = kwargs.pop("canonical_suffix_fn", None)
+    session_retention = kwargs.pop("session_retention", None)
     apc_manager: Optional[_apc.APCManager] = kwargs.pop("apc_manager", None)
     apc_tenant: Optional[str] = kwargs.pop("apc_tenant", None)
     image = image or None
@@ -1214,6 +1214,8 @@ def stream_generate(
             kwargs["prompt_end_rotating_capture"] = prompt_end_rotating_capture
             kwargs["prompt_end_arrays_capture"] = prompt_end_arrays_capture
             kwargs["prompt_end_offset"] = prompt_end_offset
+            if session_retention is not None:
+                kwargs["retain_at_offset"] = int(session_retention.boundary)
 
     with wired_limit(model, [_get_generation_stream()]):
         detokenizer = make_streaming_detokenizer(processor)
@@ -1394,21 +1396,29 @@ def stream_generate(
         # end-of-asst state; the next request's prefix-match extends naturally.
         if prompt_cache_state is not None:
             prefill_len = len(full_input_ids_list)
-            if is_asymmetric_rendering and prompt_end_offset and prompt_end_offset[0] != prefill_len:
-                # P4: the capture must sit exactly at the prompt length (media
-                # token expansion can break that); publish nothing new — take
-                # the legacy anchor path below.
+            retain_boundary = (
+                int(session_retention.boundary) if session_retention is not None else prefill_len
+            )
+            if is_asymmetric_rendering and prompt_end_offset and prompt_end_offset[0] != retain_boundary:
+                # P4: the capture must sit exactly at the planned boundary
+                # (media token expansion can break that). Nothing consistent
+                # can be published: drop the session.
                 logger.warning(
-                    "Prompt-end retention: captured offset %d != prompt length %d; "
-                    "legacy retire path.", prompt_end_offset[0], prefill_len,
+                    "Prompt-end retention: captured offset %d != boundary %d "
+                    "(prompt length %d); session dropped.",
+                    prompt_end_offset[0], retain_boundary, prefill_len,
                 )
-                prompt_end_offset = []
+                prompt_cache_state.clear()
+                mx.clear_cache()
+                return
             if is_asymmetric_rendering and prompt_end_offset:
                 # Fork (M48): retain the latest user turn + the canonical
-                # assistant turn. The request's hook predicts the history form
-                # the client will echo; None => retire at prompt_end only.
+                # assistant turn. The request's plan predicts the history form
+                # the client will echo; None => retire at the boundary only.
                 canonical_ids = None
-                canonical_fn = canonical_suffix_fn
+                canonical_fn = (
+                    session_retention.canonical_suffix_fn if session_retention is not None else None
+                )
                 if canonical_fn is not None and any(
                     _is_rotating_kv_layer(c) for c in tracked_cache
                 ):
@@ -1438,18 +1448,20 @@ def stream_generate(
                     prompt_end_offset=prompt_end_offset,
                     canonical_ids=canonical_ids,
                     canonical_prefill=lambda ids: _prefill_canonical_suffix(
-                        model, tracked_cache, full_input_ids_list, ids, kwargs
+                        model, tracked_cache, full_input_ids_list[:retain_boundary], ids, kwargs
                     ),
+                    boundary=retain_boundary,
                 )
                 if retired is None:
                     logger.warning("Prompt-end retention: session dropped (see above).")
                 else:
                     logger.info(
-                        "Prompt-end retention: retired at %d (prompt_end %d, "
+                        "Prompt-end retention: retired at %d (boundary %d, prompt_end %d, "
                         "canonical %d, anchor %s).",
                         retired,
+                        retain_boundary,
                         prefill_len,
-                        retired - prefill_len,
+                        retired - retain_boundary,
                         mid_prefill_anchor_offset[0] if mid_prefill_anchor_offset else None,
                     )
             elif is_asymmetric_rendering:

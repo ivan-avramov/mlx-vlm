@@ -296,6 +296,7 @@ def generate_step(
     prompt_end_rotating_capture: Optional[List[Any]] = None,
     prompt_end_arrays_capture: Optional[List[Optional[List[mx.array]]]] = None,
     prompt_end_offset: Optional[List[int]] = None,
+    retain_at_offset: Optional[int] = None,
     **kwargs,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
@@ -615,6 +616,29 @@ def generate_step(
                 anchor_offset_list=anchor_capture_offset,
             )
 
+        # Fork (M48): retention boundary capture target (absolute). None means
+        # prompt end (captured after the final _step below). A boundary at or
+        # before the live cache offset is captured from the start state; one
+        # inside the prompt is landed exactly by the chunk loop; anything the
+        # loop cannot reach stays uncaptured (dispatch takes the legacy path).
+        retain_done = False
+        prompt_end_abs = initial_cache_offset + int(inputs_embeds.shape[1])
+        retain_target = prompt_end_abs if retain_at_offset is None else int(retain_at_offset)
+        if (
+            prompt_end_offset is not None
+            and prompt_cache
+            and retain_target < prompt_end_abs
+            and retain_target == initial_cache_offset
+        ):
+            mx.eval([c.state for c in prompt_cache])
+            _capture_anchor_state(
+                prompt_cache, offset=initial_cache_offset,
+                rotating_capture=prompt_end_rotating_capture,
+                arrays_capture=prompt_end_arrays_capture,
+                anchor_offset_list=prompt_end_offset,
+            )
+            retain_done = True
+
         # Chunk whenever there is more than one prompt token left to process.
         # The chunk loop discards its output, so the [B, N, vocab] logits are
         # never evaluated; the unchunked path feeds the whole prompt to _step,
@@ -650,6 +674,10 @@ def generate_step(
                         snapshot_at_offset,
                         snapshot_done,
                     )
+                    if prompt_end_offset is not None and retain_target < prompt_end_abs:
+                        n_to_process = _adjust_chunk_for_snapshot_landing(
+                            cumulative_offset, n_to_process, retain_target, retain_done
+                        )
                     chunk_kwargs = {
                         **kwargs,
                         **speculative_prefill.kwargs,
@@ -703,6 +731,20 @@ def generate_step(
                         )
                         if action == "capture_and_finalize":
                             snapshot_done = True
+                    if (
+                        prompt_end_offset is not None
+                        and not retain_done
+                        and retain_target < prompt_end_abs
+                        and cumulative_offset == retain_target
+                    ):
+                        mx.eval([c.state for c in prompt_cache])
+                        _capture_anchor_state(
+                            prompt_cache, offset=cumulative_offset,
+                            rotating_capture=prompt_end_rotating_capture,
+                            arrays_capture=prompt_end_arrays_capture,
+                            anchor_offset_list=prompt_end_offset,
+                        )
+                        retain_done = True
 
                     inputs_embeds = inputs_embeds[:, n_to_process:]
                     input_ids = input_ids[:, n_to_process:]
@@ -718,7 +760,7 @@ def generate_step(
         # decoded yet — the speculative rounds and the decode loop below both
         # write further tokens before their first yield, so this is the only
         # place the prompt-end state exists for every draft kind.
-        if prompt_end_offset is not None and prompt_cache:
+        if prompt_end_offset is not None and prompt_cache and not retain_done and retain_target == prompt_end_abs:
             mx.eval([c.state for c in prompt_cache])
             _capture_anchor_state(
                 prompt_cache,

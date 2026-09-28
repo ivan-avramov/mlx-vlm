@@ -639,6 +639,27 @@ _SESSION_RETAIN_PROMPT_END: bool = os.environ.get(
 ).strip().lower() not in ("off", "0", "false", "no", "")
 
 
+class SessionRetention:
+    """Fork (M48): per-REQUEST retention plan computed by the server.
+
+    ``boundary`` — absolute token index (into the rendered prompt ids) up to which
+    the live prompt and the client's NEXT rendering are token-identical: the
+    longest common token prefix between the generation prompt and the history
+    form of the same conversation (P5: on the shipped Qwen thinking template the
+    generation tail ``<think>\n`` re-tokenises as ``\n\n`` once content follows,
+    so the boundary is one token short of prompt end). The session retires at
+    the boundary (never at a token that the next request will not reproduce).
+    ``canonical_suffix_fn(answer_text, prompt_ids)`` — ids of the history
+    rendering of the generated turn FROM the boundary, or None.
+    """
+
+    __slots__ = ("boundary", "canonical_suffix_fn")
+
+    def __init__(self, boundary: int, canonical_suffix_fn=None):
+        self.boundary = int(boundary)
+        self.canonical_suffix_fn = canonical_suffix_fn
+
+
 def set_session_retain_prompt_end(enabled: bool) -> None:
     """Toggle prompt-end retention (M48). Called by ``session_manager.configure()``."""
     global _SESSION_RETAIN_PROMPT_END
@@ -1182,6 +1203,7 @@ def _retire_asymmetric_session(
     prompt_end_offset,
     canonical_ids,
     canonical_prefill,
+    boundary=None,
 ) -> int:
     """Fork (M48): retire an asymmetric-rendering session at prompt end, in
     canonical form. Returns the retired offset, or None when the session had to
@@ -1198,13 +1220,18 @@ def _retire_asymmetric_session(
     """
     prompt_end = int(prompt_end_offset[0])
     ids = list(full_input_ids_list)
-    if prompt_end != len(ids):
-        # The captured offset must BE the prompt length; anything else (e.g.
-        # media token expansion) means ids and cache positions no longer
-        # correspond and no consistent session can be published (P4).
+    if boundary is None:
+        boundary = len(ids)
+    if prompt_end != boundary or boundary > len(ids):
+        # The captured offset must BE the planned boundary and the boundary must
+        # index the prompt ids; anything else (e.g. media token expansion) means
+        # ids and cache positions no longer correspond and no consistent session
+        # can be published (P4).
         raise ValueError(
-            f"prompt-end retention: captured offset {prompt_end} != prompt length {len(ids)}"
+            f"prompt-end retention: captured offset {prompt_end} != boundary {boundary} "
+            f"(prompt length {len(ids)})"
         )
+    ids = ids[:boundary]
 
     def _restore_prompt_end():
         _restore_rotating_layers_from_snapshots(tracked_cache, prompt_end_rotating)

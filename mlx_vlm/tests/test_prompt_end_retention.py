@@ -308,12 +308,14 @@ class TestCanonicalSuffix:
         prompt = _qwen_like_render(self.MESSAGES, add_generation_prompt=True, preserve_thinking=True)
         prompt_ids = tk.encode(prompt)
         kw = dict(
-            answer_text=answer, prompt_ids=prompt_ids, messages=self.MESSAGES,
-            tokenizer=tk, render=_qwen_like_render,
+            answer_text=answer, prompt_ids=prompt_ids, boundary=len(prompt_ids),
+            messages=self.MESSAGES, tokenizer=tk, render=_qwen_like_render,
             template_kwargs={"preserve_thinking": True},
             tool_calls_present=False,
         )
         kw.update(over)
+        if "prompt_ids" in over and "boundary" not in over:
+            kw["boundary"] = len(over["prompt_ids"])
         return _canonical_assistant_suffix(**kw), tk
 
     def test_matches_history_rendering_without_thinking(self):
@@ -334,7 +336,7 @@ class TestCanonicalSuffix:
         suffix, _ = self._call("<think>\nonly thinking\n</think>\n\n")
         assert suffix is None
 
-    def test_prefix_mismatch_disables_canonical(self):
+    def test_echo_diverging_before_the_boundary_disables_canonical(self):
         suffix, _ = self._call("Hello.", prompt_ids=[1, 2, 3])
         assert suffix is None
 
@@ -416,8 +418,8 @@ def test_canonical_suffix_retries_a_transient_borrow_error():
     msgs = TestCanonicalSuffix.MESSAGES
     prompt_ids = _CharTokenizer().encode(_qwen_like_render(msgs, add_generation_prompt=True))
     suffix = _canonical_assistant_suffix(
-        answer_text="Hello.", prompt_ids=prompt_ids, messages=msgs, tokenizer=tk,
-        render=_qwen_like_render, template_kwargs={"preserve_thinking": True},
+        answer_text="Hello.", prompt_ids=prompt_ids, boundary=len(prompt_ids), messages=msgs,
+        tokenizer=tk, render=_qwen_like_render, template_kwargs={"preserve_thinking": True},
         tool_calls_present=False,
     )
     assert _CharTokenizer().decode(suffix) == "<think>\n\n</think>\n\nHello.<|im_end|>\n"
@@ -582,12 +584,18 @@ class TestCanonicalSuffixTemplates:
     def _run(self, render_gen, render_hist, answer="Hi."):
         from mlx_vlm.server.openai import _canonical_assistant_suffix
 
+        from mlx_vlm.server.openai import _retention_boundary
+
         tk = _CharTokenizer()
         prompt = render_gen(self.MESSAGES)
-        return _canonical_assistant_suffix(
-            answer_text=answer, prompt_ids=tk.encode(prompt), messages=self.MESSAGES,
-            tokenizer=tk, render=lambda msgs, **kw: render_hist(msgs), template_kwargs={},
-            tool_calls_present=False), tk
+        ids = tk.encode(prompt)
+        render = lambda msgs, **kw: render_hist(msgs)  # noqa: E731
+        boundary = _retention_boundary(prompt_ids=ids, messages=self.MESSAGES, tokenizer=tk,
+                                       render=render, template_kwargs={})
+        suffix = _canonical_assistant_suffix(
+            answer_text=answer, prompt_ids=ids, boundary=boundary, messages=self.MESSAGES,
+            tokenizer=tk, render=render, template_kwargs={}, tool_calls_present=False)
+        return (boundary, suffix, ids), tk
 
     def test_qwen_thinking_disabled_header_is_compatible(self):
         # generation: '...assistant\n<think>\n\n</think>\n\n'; history: same + content
@@ -601,10 +609,11 @@ class TestCanonicalSuffixTemplates:
                 if m["role"] == "assistant": c = f"<think>\n\n</think>\n\n{c}"
                 out += f"<|im_start|>{m['role']}\n{c}<|im_end|>\n"
             return out + "<|im_start|>assistant\n<think>\n\n</think>\n\n"
-        suffix, tk = self._run(gen, hist)
+        (boundary, suffix, ids), tk = self._run(gen, hist)
+        assert boundary == len(ids)
         assert tk.decode(suffix) == "Hi.<|im_end|>\n"
 
-    def test_forced_open_thinking_header_is_not_predicted(self):
+    def test_forced_open_thinking_header_retains_before_the_unstable_tail(self):
         # Gemma-style: generation ends with an OPEN thinking marker the history form drops.
         def gen(msgs):
             return "".join(f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n" for m in msgs) + \
@@ -612,8 +621,13 @@ class TestCanonicalSuffixTemplates:
         def hist(msgs):
             return "".join(f"<|im_start|>{m['role']}\n{m.get('content') or ''}<|im_end|>\n" for m in msgs) + \
                    "<|im_start|>assistant\n<|think|>"
-        suffix, _ = self._run(gen, hist)
-        assert suffix is None  # documented limitation: falls back to prompt-end retention
+        # Gemma-style: the open marker is not in the history form, so the boundary
+        # sits BEFORE it (the whole user turn is still retained) and the canonical
+        # suffix restarts from there.
+        (boundary, suffix, ids), tk = self._run(gen, hist)
+        assert tk.decode(ids[:boundary]).endswith("<|im_start|>assistant\n")
+        assert boundary == len(ids) - len("<|think|>")
+        assert tk.decode(suffix) == "Hi.<|im_end|>\n"
 
 
 def test_cached_request_forwards_the_request_scoped_hook(monkeypatch):
@@ -639,6 +653,123 @@ def test_cached_request_forwards_the_request_scoped_hook(monkeypatch):
     hook = lambda text, ids: None  # noqa: E731
     rg._process_cached_request(
         rqueue=Queue(), prompt="hello", images=None, args=G.GenerationArguments(),
-        prompt_tokens=1, prompt_cache_state=SimpleNamespace(), canonical_suffix_fn=hook,
+        prompt_tokens=1, prompt_cache_state=SimpleNamespace(), session_retention=hook,
     )
-    assert seen.get("canonical_suffix_fn") is hook
+    assert seen.get("session_retention") is hook
+
+
+# --------------------------------------------------------------------------- review round 2
+
+
+def test_ring_pin_promotes_an_existing_entry_at_the_same_offset():
+    """P9: a continuation whose latest user turn starts exactly where the previous
+    retire ended must move the pin to that existing entry."""
+    ring = DeltaNetSnapshotRing(max_size=3)
+    ring.capture_states(100, [None, [mx.ones((1,))]], pinned=True)
+    ring.capture_states(160, [None, [mx.ones((1,))]])
+    ring.capture_states(161, [None, [mx.ones((1,))]])
+    assert ring.capture_states(161, [None, [mx.ones((1,))]], pinned=True) is not None
+    assert [(s.offset, s.pinned) for s in ring._snapshots] == [(100, False), (160, False), (161, True)]
+    ring.capture_states(200, [None, [mx.ones((1,))]]); ring.capture_states(201, [None, [mx.ones((1,))]])
+    assert 161 in [s.offset for s in ring._snapshots] and ring.find_nearest(180).offset == 161
+
+
+class TestRetainBoundaryLanding:
+    def _model(self, kv, arrays, n_prompt):
+        def fake_lm(inputs=None, inputs_embeds=None, cache=None, **kw):
+            n = int(inputs_embeds.shape[1]) if inputs_embeds is not None else 1
+            cache[0].offset += n
+            cache[1].state = [mx.full((1, 2, 2), float(cache[0].offset))]
+            return LanguageModelOutput(logits=mx.zeros((1, n, 4)))
+        model = MagicMock(); model.language_model.side_effect = fake_lm
+        model.get_input_embeddings.return_value = InputEmbeddingsFeatures(inputs_embeds=mx.zeros((1, n_prompt, 4)))
+        return model
+
+    def _run(self, retain, step, n_prompt=6, initial=0):
+        kv, arrays = _kv(initial), _arrays(float(initial))
+        off, arr = [], []
+        list(ar_module.generate_step(
+            mx.array([list(range(1, n_prompt + 1))]), self._model(kv, arrays, n_prompt),
+            pixel_values=None, mask=None, prompt_cache=[kv, arrays], max_tokens=1, temperature=0,
+            prefill_step_size=step, prompt_end_rotating_capture=[], prompt_end_arrays_capture=arr,
+            prompt_end_offset=off, retain_at_offset=retain))
+        return off, (arr[1][0][0, 0, 0].item() if arr else None)
+
+    def test_one_before_prompt_end_lands_on_the_last_chunk(self):
+        off, marker = self._run(retain=5, step=4)
+        assert off == [5] and marker == 5.0
+
+    def test_mid_prompt_boundary_shrinks_the_chunk(self):
+        off, marker = self._run(retain=3, step=4)
+        assert off == [3] and marker == 3.0
+
+    def test_prompt_end_is_captured_after_the_final_step(self):
+        off, marker = self._run(retain=None, step=4)
+        assert off == [6] and marker == 6.0
+
+    def test_default_chunking_lands_the_boundary_too(self):
+        # prefill_step_size=None resolves to the default chunk size inside
+        # generate_step, so the landing still happens.
+        off, marker = self._run(retain=5, step=None)
+        assert off == [5] and marker == 5.0
+
+    def test_boundary_at_the_live_cache_offset_is_captured_from_the_start_state(self):
+        off, marker = self._run(retain=10, step=4, initial=10)
+        assert off == [10] and marker == 10.0
+
+
+def test_retire_at_a_boundary_before_prompt_end():
+    t = TestRetire(); s = t._setup(canonical=[7, 8])
+    s.prompt_end["offset"] = [t.PROMPT_END - 1]
+    s.prompt_end["arrays"] = [None, [mx.full((1, 2, 2), 159.0)]]
+    offset = _retire_asymmetric_session(
+        s.state, s.cache, s.full_ids,
+        anchor_rotating=[], anchor_arrays=s.anchor["arrays"], anchor_offset=s.anchor["offset"],
+        prompt_end_rotating=[], prompt_end_arrays=s.prompt_end["arrays"], prompt_end_offset=s.prompt_end["offset"],
+        canonical_ids=[7, 8], canonical_prefill=s.prefill, boundary=t.PROMPT_END - 1)
+    assert offset == t.PROMPT_END + 1
+    assert s.state.token_ids == s.full_ids[: t.PROMPT_END - 1] + [7, 8]
+    assert [snap.offset for snap in s.state.snapshot_ring._snapshots] == [t.ANCHOR, t.PROMPT_END - 1, offset]
+
+
+def _pick_tokenizer():
+    import glob, os
+    for d in glob.glob(os.path.expanduser(
+            "~/.cache/huggingface/hub/models--caslca--Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed/snapshots/*/")):
+        if os.path.exists(d + "tokenizer_config.json"):
+            try:
+                from transformers import AutoTokenizer
+                return AutoTokenizer.from_pretrained(d)
+            except Exception:
+                return None
+    return None
+
+
+@pytest.mark.parametrize("enable_thinking", [True, False])
+def test_shipped_qwen_template_boundary_and_canonical_suffix(enable_thinking):
+    """P5 with the SHIPPED tokenizer/template: thinking-on generation ends in
+    ``<think>\n`` whose final token re-tokenises with the history's ``\n\n`` — the
+    boundary is one token short of prompt end and the canonical suffix restarts there."""
+    tk = _pick_tokenizer()
+    if tk is None:
+        pytest.skip("pick tokenizer not in the local HF cache")
+    from mlx_vlm.server.openai import _canonical_assistant_suffix, _retention_boundary
+
+    msgs = [{"role": "system", "content": "You are terse."}, {"role": "user", "content": "Say hi."}]
+    tkw = {"preserve_thinking": True, "enable_thinking": enable_thinking}
+    render = lambda m, **kw: tk.apply_chat_template(m, tokenize=False, **kw)  # noqa: E731
+    prompt = render(msgs, add_generation_prompt=True, **tkw)
+    ids = tk.encode(prompt, add_special_tokens=False)
+    boundary = _retention_boundary(prompt_ids=ids, messages=msgs, tokenizer=tk, render=render, template_kwargs=tkw)
+    assert boundary is not None and len(ids) - 2 <= boundary <= len(ids)
+    if enable_thinking:
+        assert boundary == len(ids) - 1  # the merged newline
+    suffix = _canonical_assistant_suffix(
+        answer_text="<think>\nplan\n</think>\n\nHi.", prompt_ids=ids, boundary=boundary, messages=msgs,
+        tokenizer=tk, render=render, template_kwargs=tkw, tool_calls_present=False)
+    assert suffix
+    nxt = render(msgs + [{"role": "assistant", "content": "Hi."}, {"role": "user", "content": "."}],
+                 add_generation_prompt=True, **tkw)
+    nxt_ids = tk.encode(nxt, add_special_tokens=False)
+    assert nxt_ids[: boundary + len(suffix)] == ids[:boundary] + suffix  # byte-exact through the assistant turn
+    assert tk.decode(ids[:boundary] + suffix).endswith("Hi.<|im_end|>\n")

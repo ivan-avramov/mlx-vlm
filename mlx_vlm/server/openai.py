@@ -29,6 +29,7 @@ from ..prompt_utils import (  # Fork: THINKING_FORMATS / detect_thinking_format 
     apply_chat_template,
     detect_thinking_format,
     extract_text_from_content,
+    _encode_retrying_on_borrow_error,
     get_cache_alignment_kwargs,
     normalize_image_content,
 )
@@ -441,10 +442,50 @@ def _strip_assistant_thinking(content: str) -> str:
     return content.strip()
 
 
+def _next_rendering_ids(*, content, prompt_ids, messages, tokenizer, render, template_kwargs):
+    """Fork (M48): token ids of the NEXT request's rendering of this conversation with
+    the assistant turn ``content`` echoed and a dummy user turn appended, plus the
+    longest common token prefix with the live prompt ids and the offset where the
+    dummy user turn starts. None when the rendering is unusable."""
+    from ..generate.common import _compute_anchor_before_latest_user_offset
+    from ..prompt_utils import _encode_retrying_on_borrow_error
+
+    next_messages = list(messages) + [
+        {"role": "assistant", "content": content},
+        {"role": "user", "content": "."},
+    ]
+    rendered = render(next_messages, add_generation_prompt=True, **template_kwargs)
+    if not isinstance(rendered, str):
+        return None
+    ids = _encode_retrying_on_borrow_error(tokenizer, rendered)
+    k = 0
+    n = min(len(ids), len(prompt_ids))
+    while k < n and ids[k] == prompt_ids[k]:
+        k += 1
+    end = _compute_anchor_before_latest_user_offset(rendered, tokenizer)
+    return ids, k, end
+
+
+def _retention_boundary(*, prompt_ids, messages, tokenizer, render, template_kwargs):
+    """Fork (M48): the retention boundary for this request — the longest token prefix
+    the live prompt shares with the history rendering the client will send back
+    (computed with a placeholder answer; the header is what matters, e.g. Qwen's
+    thinking-on generation tail ``<think>\n`` re-tokenises as ``\n\n`` once content
+    follows, review P5). None when it cannot be established (worker then takes the
+    legacy path)."""
+    r = _next_rendering_ids(content="x", prompt_ids=prompt_ids, messages=messages,
+                            tokenizer=tokenizer, render=render, template_kwargs=template_kwargs)
+    if r is None:
+        return None
+    _ids, k, _end = r
+    return k if k > 0 else None
+
+
 def _canonical_assistant_suffix(
     *,
     answer_text: str,
     prompt_ids,
+    boundary: int,
     messages,
     tokenizer,
     render,
@@ -455,18 +496,17 @@ def _canonical_assistant_suffix(
     processor=None,
 ):
     """Fork (M48): token ids of the template's HISTORY rendering of the assistant
-    turn just generated — the bytes the client will echo on its next request —
-    or None when that cannot be predicted.
+    turn just generated, FROM the retention boundary — the bytes the client will
+    echo on its next request — or None when that cannot be predicted.
 
     Renders ``messages + [assistant(content), user(dummy)]`` with the SAME
-    template kwargs as the live prompt, requires the rendering to start with the
-    live prompt's ids byte-for-byte (tokenization boundary check), and returns the
-    slice between prompt end and the start of the dummy user turn. Thinking is
-    stripped (clients echo ``content``); tool-call turns are not predicted (their
-    echoed JSON serialisation is client-specific); empty content is not cached.
+    template kwargs as the live prompt, requires the common token prefix with the
+    live prompt to be exactly ``boundary`` (the plan the cache was retired on),
+    and returns the slice from the boundary to the start of the dummy user turn.
+    Thinking is stripped (clients echo ``content``); tool-call turns are not
+    predicted (their echoed JSON serialisation is client-specific); empty content
+    is not cached.
     """
-    from ..generate.common import _compute_anchor_before_latest_user_offset
-
     if tool_calls_present:
         return None
     splitter = _split_thinking or _default_split_thinking
@@ -476,23 +516,16 @@ def _canonical_assistant_suffix(
     content = (content or "").strip("\n")
     if not content.strip():
         return None
-    next_messages = list(messages) + [
-        {"role": "assistant", "content": content},
-        {"role": "user", "content": "."},
-    ]
-    rendered = render(next_messages, add_generation_prompt=True, **template_kwargs)
-    if not isinstance(rendered, str):
+    r = _next_rendering_ids(content=content, prompt_ids=prompt_ids, messages=messages,
+                            tokenizer=tokenizer, render=render, template_kwargs=template_kwargs)
+    if r is None:
         return None
-    from ..prompt_utils import _encode_retrying_on_borrow_error
-
-    ids = _encode_retrying_on_borrow_error(tokenizer, rendered)
-    n = len(prompt_ids)
-    if list(ids[:n]) != list(prompt_ids):
+    ids, k, end = r
+    if k < boundary:
+        return None  # the echo diverges before the retired boundary: nothing to extend
+    if end is None or end <= boundary or end > len(ids):
         return None
-    end = _compute_anchor_before_latest_user_offset(rendered, tokenizer)
-    if end is None or end <= n or end > len(ids):
-        return None
-    return [int(t) for t in ids[n:end]]
+    return [int(t) for t in ids[boundary:end]]
 
 
 def _default_split_thinking(text, start, end, starts_in_thinking, processor):
@@ -2203,40 +2236,47 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             prompt_cache_state.is_asymmetric_rendering = (
                 _is_template_thinking_asymmetric(formatted_prompt)
             )
-            # Fork (M48): let the worker predict the client's echo of this turn.
-            # Media requests are not predicted (their prompt ids carry expanded
-            # media tokens); tool-call turns are excluded inside the hook.
-            canonical_suffix_fn = None
+            # Fork (M48): retention plan for this request — the token boundary the
+            # next request will reproduce, plus a predictor of the client's echo of
+            # this turn. Media requests get no plan (their prompt ids carry expanded
+            # media tokens); tool-call turns are excluded inside the predictor.
+            session_retention = None
             if not (images or audio or videos):
+                from ..generate.common import SessionRetention
+
                 _tk = getattr(processor, "tokenizer", processor)
                 _msgs = list(processed_messages)
                 _tkw = dict(template_kwargs)
                 _tools, _tool_module = tools, tool_module
                 _start, _end = gen_args.thinking_start_token, gen_args.thinking_end_token
-
-                def _canonical_suffix_fn(answer_text, prompt_ids, _tk=_tk):
-                    calls_present = False
-                    if _tool_module is not None:
-                        tc = process_tool_calls(answer_text, _tool_module, _tools)
-                        calls_present = bool(tc is not None and tc.calls)
-                    return _canonical_assistant_suffix(
-                        answer_text=answer_text,
-                        prompt_ids=prompt_ids,
-                        messages=_msgs,
-                        tokenizer=_tk,
-                        render=lambda msgs, **kw: apply_chat_template(
-                            processor, config, msgs, num_images=0, num_audios=0,
-                            tools=_tools, **kw
-                        ),
-                        template_kwargs=_tkw,
-                        tool_calls_present=calls_present,
-                        thinking_start_token=_start,
-                        thinking_end_token=_end,
-                        processor=processor,
+                _render = lambda msgs, **kw: apply_chat_template(  # noqa: E731
+                    processor, config, msgs, num_images=0, num_audios=0, tools=_tools, **kw
+                )
+                try:
+                    _prompt_ids = _encode_retrying_on_borrow_error(_tk, formatted_prompt)
+                    _boundary = _retention_boundary(
+                        prompt_ids=_prompt_ids, messages=_msgs, tokenizer=_tk,
+                        render=_render, template_kwargs=_tkw,
                     )
+                except Exception as e:  # never fail a request over the plan
+                    logger.warning("retention plan failed (%s: %s); legacy path", type(e).__name__, e)
+                    _boundary = None
 
-                canonical_suffix_fn = _canonical_suffix_fn
-            kwargs["canonical_suffix_fn"] = canonical_suffix_fn
+                if _boundary is not None:
+                    def _canonical_suffix_fn(answer_text, prompt_ids, _tk=_tk, _b=_boundary):
+                        calls_present = False
+                        if _tool_module is not None:
+                            tc = process_tool_calls(answer_text, _tool_module, _tools)
+                            calls_present = bool(tc is not None and tc.calls)
+                        return _canonical_assistant_suffix(
+                            answer_text=answer_text, prompt_ids=prompt_ids, boundary=_b,
+                            messages=_msgs, tokenizer=_tk, render=_render, template_kwargs=_tkw,
+                            tool_calls_present=calls_present, thinking_start_token=_start,
+                            thinking_end_token=_end, processor=processor,
+                        )
+
+                    session_retention = SessionRetention(_boundary, _canonical_suffix_fn)
+            kwargs["session_retention"] = session_retention
 
         if request.stream:
             # Streaming response using ResponseGenerator for continuous batching
@@ -2285,8 +2325,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             if prompt_cache_state is not None
                             else {}
                         )
-                        if prompt_cache_state is not None and kwargs.get("canonical_suffix_fn") is not None:
-                            _gen_extra["canonical_suffix_fn"] = kwargs["canonical_suffix_fn"]  # Fork (M48)
+                        if prompt_cache_state is not None and kwargs.get("session_retention") is not None:
+                            _gen_extra["session_retention"] = kwargs["session_retention"]  # Fork (M48)
                         if videos:
                             _gen_extra["videos"] = videos
                         ctx, token_iter = await asyncio.to_thread(
@@ -2779,8 +2819,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             if prompt_cache_state is not None
                             else {}
                         )
-                        if prompt_cache_state is not None and kwargs.get("canonical_suffix_fn") is not None:
-                            _gen_extra["canonical_suffix_fn"] = kwargs["canonical_suffix_fn"]  # Fork (M48)
+                        if prompt_cache_state is not None and kwargs.get("session_retention") is not None:
+                            _gen_extra["session_retention"] = kwargs["session_retention"]  # Fork (M48)
                         if videos:
                             _gen_extra["videos"] = videos
                         ctx, token_iter = runtime.response_generator.generate(
