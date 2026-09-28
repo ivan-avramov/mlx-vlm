@@ -1204,6 +1204,7 @@ def _retire_asymmetric_session(
     canonical_ids,
     canonical_prefill,
     boundary=None,
+    anchor_target=None,
 ) -> int:
     """Fork (M48): retire an asymmetric-rendering session at prompt end, in
     canonical form. Returns the retired offset, or None when the session had to
@@ -1261,7 +1262,12 @@ def _retire_asymmetric_session(
             # ``update()`` sees a pure extension and keeps the entries below.
             prompt_cache_state.token_ids = list(ids)
         if anchor_offset and anchor_arrays:
-            ring.capture_states(int(anchor_offset[0]), anchor_arrays, pinned=True)
+            # Pin ONLY an exact landing on the latest user marker. The
+            # pre-prefill capture at the live cache offset (marker behind the
+            # cache) is a best-available fallback, not the user anchor; pinning
+            # it would evict the real one on repeated continuations (P10).
+            exact = anchor_target is None or int(anchor_offset[0]) == int(anchor_target)
+            ring.capture_states(int(anchor_offset[0]), anchor_arrays, pinned=exact)
         # prompt_end entry: a diverging assistant echo rewinds here (A1).
         ring.capture_states(prompt_end, prompt_end_arrays)
 

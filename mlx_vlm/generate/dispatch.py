@@ -1451,6 +1451,7 @@ def stream_generate(
                         model, tracked_cache, full_input_ids_list[:retain_boundary], ids, kwargs
                     ),
                     boundary=retain_boundary,
+                    anchor_target=snapshot_at_offset,
                 )
                 if retired is None:
                     logger.warning("Prompt-end retention: session dropped (see above).")
@@ -1497,8 +1498,18 @@ def stream_generate(
                         snapshot_at_offset,
                         prefill_len,
                     )
+                elif _has_non_trimmable(tracked_cache):
+                    # No captured state at any usable boundary and the cache has
+                    # recurrent (non-trimmable) layers: trimming KV alone would
+                    # publish end-of-user ids over post-generation recurrent
+                    # state (review P4, missing-capture route). Drop the session.
+                    logger.warning(
+                        "Asymmetric path: no anchor/boundary capture for a hybrid "
+                        "cache; session dropped (prefill_len %d).", prefill_len,
+                    )
+                    prompt_cache_state.clear()
                 else:
-                    # Fallback: anchor at end-of-user (= end-of-prefill).
+                    # Fallback (pure attention): anchor at end-of-user (= end-of-prefill).
                     if rotating_snapshots:
                         _restore_rotating_layers_from_snapshots(
                             tracked_cache, rotating_snapshots

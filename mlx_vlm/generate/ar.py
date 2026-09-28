@@ -617,8 +617,9 @@ def generate_step(
             )
 
         # Fork (M48): retention boundary capture target (absolute). None means
-        # prompt end (captured after the final _step below). A boundary at or
-        # before the live cache offset is captured from the start state; one
+        # prompt end (captured after the final _step below). A boundary AT the
+        # live cache offset is captured from the start state (one below it is
+        # unreachable: dispatch drops the session on a hybrid cache); one
         # inside the prompt is landed exactly by the chunk loop; anything the
         # loop cannot reach stays uncaptured (dispatch takes the legacy path).
         retain_done = False

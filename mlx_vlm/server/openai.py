@@ -501,7 +501,9 @@ def _canonical_assistant_suffix(
 
     Renders ``messages + [assistant(content), user(dummy)]`` with the SAME
     template kwargs as the live prompt, requires the common token prefix with the
-    live prompt to be exactly ``boundary`` (the plan the cache was retired on),
+    live prompt to reach at least ``boundary`` (the plan the cache was retired on;
+    a longer prefix, e.g. a client echoing reasoning, is fine — the suffix restarts
+    at the boundary),
     and returns the slice from the boundary to the start of the dummy user turn.
     Thinking is stripped (clients echo ``content``); tool-call turns are not
     predicted (their echoed JSON serialisation is client-specific); empty content

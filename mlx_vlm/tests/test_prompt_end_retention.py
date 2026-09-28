@@ -773,3 +773,38 @@ def test_shipped_qwen_template_boundary_and_canonical_suffix(enable_thinking):
     nxt_ids = tk.encode(nxt, add_special_tokens=False)
     assert nxt_ids[: boundary + len(suffix)] == ids[:boundary] + suffix  # byte-exact through the assistant turn
     assert tk.decode(ids[:boundary] + suffix).endswith("Hi.<|im_end|>\n")
+
+
+# --------------------------------------------------------------------------- review round 3
+
+
+def test_fallback_capture_is_not_pinned_and_the_true_anchor_survives():
+    """P10: repeated continuations capture the live cache offset as a fallback anchor;
+    only an exact landing on the user marker may take the pin."""
+    t = TestRetire(); s = t._setup(canonical=None)
+    t._retire(s)  # exact anchor 100 (anchor_target None => exact)
+    ring = s.state.snapshot_ring
+    for end in (200, 240, 280):
+        s2 = SimpleNamespace(
+            state=s.state, cache=s.cache, full_ids=list(range(end)),
+            anchor=dict(rotating=[], arrays=[None, [mx.ones((1,))]], offset=[end - 40]),
+            prompt_end=dict(rotating=[], arrays=[None, [mx.full((1, 2, 2), float(end))]], offset=[end]),
+            prefill=s.prefill, canonical=None)
+        s2.kv = s.kv; s2.kv.offset = end + 5
+        _retire_asymmetric_session(
+            s2.state, s2.cache, s2.full_ids, anchor_rotating=[], anchor_arrays=s2.anchor["arrays"],
+            anchor_offset=s2.anchor["offset"], prompt_end_rotating=[], prompt_end_arrays=s2.prompt_end["arrays"],
+            prompt_end_offset=s2.prompt_end["offset"], canonical_ids=None, canonical_prefill=s2.prefill,
+            boundary=end, anchor_target=100)  # marker still at 100; capture is a fallback
+    offsets = [(snap.offset, snap.pinned) for snap in ring._snapshots]
+    assert (100, True) in offsets and len(offsets) == 3
+    assert ring.find_nearest(120).offset == 100
+
+
+def test_hybrid_cache_without_any_capture_is_not_published():
+    """P4 missing-capture route: the pure-attention fallback trims KV only; a hybrid cache
+    must not take it. (The dispatcher branch keys on _has_non_trimmable.)"""
+    from mlx_vlm.generate.common import _has_non_trimmable
+
+    assert _has_non_trimmable([_kv(10), _arrays(1.0)]) is True
+    assert _has_non_trimmable([_kv(10)]) is False
