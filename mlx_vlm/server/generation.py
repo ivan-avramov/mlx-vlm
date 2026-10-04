@@ -192,11 +192,31 @@ def _apply_attention_policy_from_env(model):
     policy = _ap.resolve_policy(os.environ.get(_ap.ENV))
     if policy is None:
         return None
+    _ap.require_gpu()
     _ap.apply_to_model(model, policy)
-    _ap.self_test_model(model, policy)
-    logger.info("attention_policy=%s", policy.name)
-    print(f"attention_policy={policy.name}", file=sys.stderr, flush=True)
+    # Largest KV the decision will see in service; 2**18 when no cap is set.
+    results = _ap.self_test_model(
+        model, policy, max_kv=get_configured_context_limit() or 2**18
+    )
+    line = (
+        f"attention_policy={policy.name} self-test: "
+        f"{sum(r.ran for r in results)} forced calls in "
+        f"{sum(r.elapsed_s for r in results):.2f}s"
+    )
+    logger.info(line)
+    print(line, file=sys.stderr, flush=True)
     return policy
+
+
+def _apply_lazy_embeddings_from_env(model):
+    # Fork (M57): `--lazy-prompt-embeddings`, resolved ONCE at load onto the model.
+    on = os.environ.get("MLX_VLM_LAZY_PROMPT_EMBEDDINGS", "0") == "1"
+    model.lazy_prompt_embeddings = on
+    if on:
+        line = "lazy_prompt_embeddings=on (text-only qwen3_5 prompts)"
+        logger.info(line)
+        print(line, file=sys.stderr, flush=True)
+    return on
 
 
 def get_max_num_seqs():
@@ -595,11 +615,16 @@ class ServerMetricsStore:
         # backend=%s is upstream's and now carries a truthful value (see
         # ``resolve_backend_label``); these two are what say whether a request
         # that took the serial cached-session path actually reused a prefix.
+        _sdpa_fmt, _sdpa_args = "", ()  # Fork (M57): only under a non-auto policy
+        if payload.get("sdpa_forced") is not None:
+            _sdpa_fmt = " sdpa_forced=%d sdpa_auto=%d"
+            _sdpa_args = (payload["sdpa_forced"], payload.get("sdpa_auto") or 0)
         logger.info(
             "Request completed: endpoint=%s model=%s stream=%s backend=%s "
             "session=%s cached_tokens=%d "
             "prompt_tokens=%d generated_tokens=%d elapsed=%.3fs "
-            "prefill=%.1f tok/s decode=%.1f tok/s finish_reason=%s in_flight=%d",
+            "prefill=%.1f tok/s decode=%.1f tok/s finish_reason=%s in_flight=%d"
+            + _sdpa_fmt,
             payload.get("endpoint"),
             payload.get("model"),
             payload.get("stream"),
@@ -613,6 +638,7 @@ class ServerMetricsStore:
             float(payload.get("decode_tok_s") or 0.0),
             payload.get("finish_reason"),
             in_flight,
+            *_sdpa_args,
         )
 
     def record_failure(self, *, endpoint: str, model: str, stream: bool, error: str):
@@ -1367,6 +1393,7 @@ class ResponseGenerator:
             _apply_moe_expand_and_log(model, moe_expand_spec)
 
         self.attention_policy = _apply_attention_policy_from_env(model)  # Fork (M57)
+        _apply_lazy_embeddings_from_env(model)  # Fork (M57)
 
         stop_tokens = set(
             resolve_eos_token_ids(

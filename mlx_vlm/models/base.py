@@ -432,7 +432,9 @@ def scaled_dot_product_attention(
         )
 
     # Fork (M57): fused_v1 forces the fused kernel; None/auto never gets here.
-    if policy is not None and policy.decide(queries, keys.shape[-2], sinks):
+    if policy is not None and policy.decide(
+        queries, keys.shape[-2], sinks, mask, cache
+    ):
         return mx.fast.scaled_dot_product_attention(
             queries,
             keys,

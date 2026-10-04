@@ -840,6 +840,17 @@ def _qwen35_scalar_positions(cache, cache_offset, L):
     return position_ids, cache_offset + 1
 
 
+def _suspend_attention_policy(model):  # Fork (M57)
+    """Nothing is forced while a batch prefill recurses into row-by-row calls."""
+    import contextlib
+
+    for layer in model.layers:
+        policy = getattr(getattr(layer, "self_attn", None), "attention_policy", None)
+        if policy is not None:
+            return policy.suspended()
+    return contextlib.nullcontext()
+
+
 class Qwen3_5Attention(nn.Module):
     attention_policy = None  # Fork (M57): stamped once at load; None == auto
 
@@ -1300,12 +1311,13 @@ class Qwen3_5Model(nn.Module):
                 else:
                     row_cache.append(cache_entry)
 
-            row_out = self(
-                inputs,
-                inputs_embeds=h,
-                cache=row_cache,
-                position_ids=position_ids,
-            )
+            with _suspend_attention_policy(self):  # Fork (M57)
+                row_out = self(
+                    inputs,
+                    inputs_embeds=h,
+                    cache=row_cache,
+                    position_ids=position_ids,
+                )
             for i, cache_entry in enumerate(row_cache):
                 if cache[i] is None or cache_entry is None:
                     continue
@@ -1366,12 +1378,13 @@ class Qwen3_5Model(nn.Module):
                         else:
                             row_position_ids = position_ids[:, row : row + 1, pad:]
 
-                    row_out = self(
-                        row_inputs,
-                        inputs_embeds=row_embeds,
-                        cache=current_cache,
-                        position_ids=row_position_ids,
-                    )
+                    with _suspend_attention_policy(self):  # Fork (M57)
+                        row_out = self(
+                            row_inputs,
+                            inputs_embeds=row_embeds,
+                            cache=current_cache,
+                            position_ids=row_position_ids,
+                        )
                     if pad > 0:
                         row_out = _pad_row_time(row_out, pad, h.shape[1])
                     row_outputs.append(row_out)

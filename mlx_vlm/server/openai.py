@@ -639,12 +639,17 @@ def _final_chat_chunk(
     model: str,
     finish_reason: str,
     predicted_per_second: Optional[float] = None,
+    metrics=None,  # Fork (M57): carries sdpa_* counters when a policy is active
 ) -> ChatStreamChunk:
     return ChatStreamChunk(
         id=request_id,
         created=int(time.time()),
         model=model,
-        timings=StreamingTimings(predicted_per_second=predicted_per_second),
+        timings=StreamingTimings(
+            predicted_per_second=predicted_per_second,
+            sdpa_forced=getattr(metrics, "sdpa_forced", None),  # Fork (M57)
+            sdpa_auto=getattr(metrics, "sdpa_auto", None),  # Fork (M57)
+        ),
         choices=[
             ChatStreamChoice(
                 finish_reason=finish_reason,
@@ -2540,6 +2545,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                 request.model,
                                 finish_reason,
                                 metrics.rate,
+                                metrics,  # Fork (M57)
                             )
                             yield f"data: {chunk_data.to_sse_json()}\n\n"
                         if emit_usage:
@@ -2679,6 +2685,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                 request.model,
                                 finish_reason,
                                 metrics.rate,
+                                metrics,  # Fork (M57)
                             )
                         yield f"data: {chunk_data.to_sse_json()}\n\n"
                         if emit_usage:

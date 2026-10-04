@@ -628,6 +628,12 @@ def main():
         help="Fused-attention dispatch policy for native-KV full attention "
         "(qwen3_5 only). auto = unchanged behaviour. Env: MLX_VLM_ATTENTION_POLICY.",
     )
+    parser.add_argument(  # Fork (M57)
+        "--lazy-prompt-embeddings",
+        action="store_true",
+        help="Embed text-only prefill chunks from token ids instead of "
+        "materialising the whole prompt's embeddings (qwen3_5 only). Default off.",
+    )
     parser.add_argument(
         "--log-level",
         type=str,
@@ -713,6 +719,9 @@ def main():
     _configure_moe_expand(args.moe_expand)
     # Fork (M57): always written (like moe_expand) so a stale export cannot leak.
     os.environ["MLX_VLM_ATTENTION_POLICY"] = args.attention_policy
+    os.environ["MLX_VLM_LAZY_PROMPT_EMBEDDINGS"] = (
+        "1" if args.lazy_prompt_embeddings else "0"
+    )
     os.environ["MLX_VLM_LOG_PROGRESS_INTERVAL"] = str(args.log_progress_interval)
     os.environ["MLX_VLM_MAX_TOKENS"] = str(args.max_tokens)
     os.environ["MLX_VLM_ENABLE_THINKING"] = "1" if args.enable_thinking else "0"

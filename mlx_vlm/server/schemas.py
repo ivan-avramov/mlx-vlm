@@ -1,7 +1,14 @@
 import os
 from typing import TYPE_CHECKING, Any, List, Literal, Optional, Tuple, Union
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_serializer,  # Fork (M57)
+    model_validator,
+)
 from typing_extensions import Required, TypeAlias, TypedDict
 
 if TYPE_CHECKING:
@@ -477,6 +484,16 @@ class GenerationTimings(BaseModel):
     draft_rounds: Optional[int] = None
     draft_n: Optional[int] = None
     draft_n_accepted: Optional[int] = None
+    sdpa_forced: Optional[int] = None  # Fork (M57): fused_v1 request counters
+    sdpa_auto: Optional[int] = None  # Fork (M57)
+
+    @model_serializer(mode="wrap")  # Fork (M57): omitted (not null) under `auto`
+    def _omit_unset_sdpa(self, handler):
+        data = handler(self)
+        for key in ("sdpa_forced", "sdpa_auto"):
+            if data.get(key) is None:
+                data.pop(key, None)
+        return data
 
     @staticmethod
     def _derive_gen_tps(token_times: List[float]) -> Optional[float]:
@@ -521,6 +538,8 @@ class GenerationTimings(BaseModel):
             draft_rounds=getattr(metrics, "draft_rounds", None),
             draft_n=getattr(metrics, "draft_n", None),
             draft_n_accepted=getattr(metrics, "draft_n_accepted", None),
+            sdpa_forced=getattr(metrics, "sdpa_forced", None),  # Fork (M57)
+            sdpa_auto=getattr(metrics, "sdpa_auto", None),  # Fork (M57)
         )
 
 
@@ -528,6 +547,16 @@ class StreamingTimings(BaseModel):
     """Timing data available while a response is still streaming."""
 
     predicted_per_second: Optional[float] = None
+    sdpa_forced: Optional[int] = None  # Fork (M57)
+    sdpa_auto: Optional[int] = None  # Fork (M57)
+
+    @model_serializer(mode="wrap")  # Fork (M57): omitted (not null) under `auto`
+    def _omit_unset_sdpa(self, handler):
+        data = handler(self)
+        for key in ("sdpa_forced", "sdpa_auto"):
+            if data.get(key) is None:
+                data.pop(key, None)
+        return data
 
 
 class OpenAIErrorObject(BaseModel):

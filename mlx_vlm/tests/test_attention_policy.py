@@ -38,6 +38,12 @@ def _cpu_device():
         mx.set_default_device(previous)
 
 
+@pytest.fixture
+def gpu(monkeypatch):
+    """Pretend the default device is the GPU (forced calls are mocked)."""
+    monkeypatch.setattr(ap, "_force_calls_enabled", lambda: True)
+
+
 class Recorder:
     """Stand-in for mx.fast.scaled_dot_product_attention."""
 
@@ -291,7 +297,7 @@ class TestAC3Propagation:
         assert os.environ["MLX_VLM_ATTENTION_POLICY"] == "auto"  # no stale value
 
     def test_ac3_env_to_instance_to_call_site_to_keyword_and_counters(
-        self, passthrough, monkeypatch
+        self, passthrough, monkeypatch, gpu
     ):
         monkeypatch.setenv("MLX_VLM_ATTENTION_POLICY", "fused_v1")
         lm = _tiny_lm()
@@ -490,7 +496,7 @@ class TestAC6LoudFailure:
         assert exc.value.code != 0
 
     def test_ac6_unqualified_family_refuses_with_one_stderr_line(
-        self, monkeypatch, capsys
+        self, monkeypatch, capsys, gpu
     ):
         monkeypatch.setenv("MLX_VLM_ATTENTION_POLICY", "fused_v1")
         model = SimpleNamespace(
@@ -502,7 +508,7 @@ class TestAC6LoudFailure:
         err = [l for l in capsys.readouterr().err.splitlines() if l.strip()]
         assert len(err) == 1 and "fused_v1" in err[0]
 
-    def test_ac6_model_with_attention_sinks_refuses(self, monkeypatch, capsys):
+    def test_ac6_model_with_attention_sinks_refuses(self, monkeypatch, capsys, gpu):
         monkeypatch.setenv("MLX_VLM_ATTENTION_POLICY", "fused_v1")
         lm = _tiny_lm()
         _attn_modules(lm)[0].sinks = mx.zeros((2,))
@@ -520,18 +526,17 @@ class TestAC6LoudFailure:
         assert generation_module._apply_attention_policy_from_env(model) is None
         assert not hasattr(model, "attention_policy")
 
-    def test_ac6_self_test_raise_fails_the_load(self, monkeypatch):
+    def test_ac6_self_test_raise_fails_the_load(self, monkeypatch, gpu):
         monkeypatch.setenv("MLX_VLM_ATTENTION_POLICY", "fused_v1")
         rec = Recorder(raise_on_forced=ValueError("no fused kernel"))
         monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", rec)
-        monkeypatch.setattr(ap, "_force_calls_enabled", lambda: True)
         lm = _tiny_lm()
         model = SimpleNamespace(language_model=lm, config=lm.config)
         with pytest.raises(ap.AttentionPolicyError, match="self-test"):
             generation_module._apply_attention_policy_from_env(model)
 
     def test_ac6_initialize_model_raises_so_the_worker_never_reports_ready(
-        self, monkeypatch
+        self, monkeypatch, gpu
     ):
         monkeypatch.setenv("MLX_VLM_ATTENTION_POLICY", "fused_v1")
         model = SimpleNamespace(
@@ -548,63 +553,32 @@ class TestAC6LoudFailure:
             model_path="x", adapter_path=None, draft_kind_override=None,
             draft_model_path=None, apc_manager=None,
         )
-        with pytest.raises(ap.AttentionPolicyError):
+        with pytest.raises(ap.AttentionPolicyError, match="qualified"):
             generation_module.ResponseGenerator._initialize_model(fake)
-        # _run_impl stores any Exception in _load_error, which wait_until_ready
-        # re-raises: the preload fails, uvicorn lifespan aborts, exit != 0.
-        assert issubclass(ap.AttentionPolicyError, Exception)
+        # The readiness / lifespan propagation is tested for real in
+        # test_attention_policy_r1.py::TestF4ReadinessPath.
 
 
 class TestSelfTest:
     DIMS = dict(heads=24, kv_heads=4, head_dim=256, dtype=mx.bfloat16)
 
-    def test_self_test_issues_exactly_the_forced_cells_of_the_grid(self):
-        policy = ap.resolve_policy("fused_v1")
-        rec = Recorder()
-        result = ap.self_test(policy, sdpa=rec, force_calls=True, **self.DIMS)
-        assert result.skipped_reason is None
-        cells = {
-            (c[0].shape[-2], c[3]["mask"] if isinstance(c[3]["mask"], str)
-             else type(c[3]["mask"]).__name__)
-            for c in rec.calls
-        }
-        # 4096 keys: qL 9 and 127 build score tensors < 2**28 and are not
-        # forced, so only 128 and 512 reach MLX, each under all three masks.
-        assert cells == {
-            (q, m) for q in (128, 512) for m in ("causal", "NoneType", "array")
-        }
-        assert len(rec.calls) == 6
-        assert all(c[3]["force_fused"] is True for c in rec.calls)
-        assert all(c[1].shape[-2] == 4096 for c in rec.calls)
-        assert all(c[0].shape[1:2] == (24,) and c[1].shape[1] == 4 for c in rec.calls)
-        assert all(c[0].dtype == mx.bfloat16 for c in rec.calls)
-        assert {k.dtype for k in (rec.calls[0][3]["mask"],) if hasattr(k, "dtype")} <= {
-            mx.bool_
-        }
-        assert policy.counters() == (0, 0)  # the self-test leaves no trace
-
     def test_self_test_fails_when_a_policy_forces_a_short_query(self):
         class Bad(ap.FusedV1Policy):
-            def should_force(self, queries, key_length, sinks):
+            def should_force(self, queries, key_length, sinks, mask=None, cache=None):
                 return True
 
         with pytest.raises(ap.AttentionPolicyError, match="1..8"):
-            ap.self_test(Bad(), sdpa=Recorder(), force_calls=True, **self.DIMS)
+            ap.self_test(
+                Bad(), sdpa=Recorder(), force_calls=True, max_kv=262144, **self.DIMS
+            )
 
     def test_self_test_raise_from_a_forced_call_is_an_error(self):
         rec = Recorder(raise_on_forced=ValueError("boom"))
         with pytest.raises(ap.AttentionPolicyError, match="self-test.*boom"):
             ap.self_test(
-                ap.resolve_policy("fused_v1"), sdpa=rec, force_calls=True, **self.DIMS
+                ap.resolve_policy("fused_v1"), sdpa=rec, force_calls=True,
+                max_kv=262144, **self.DIMS,
             )
-
-    def test_self_test_off_gpu_skips_forced_calls_explicitly(self, capsys):
-        rec = Recorder()
-        assert mx.default_device() == mx.cpu
-        result = ap.self_test(ap.resolve_policy("fused_v1"), sdpa=rec, **self.DIMS)
-        assert result.skipped_reason and "cpu" in result.skipped_reason
-        assert rec.calls == []
-        assert "SKIPPED" in capsys.readouterr().err
 
 
 # --------------------------------------------------------------------- AC7
@@ -636,7 +610,7 @@ class TestAC7Isolation:
         assert pa.counters()[0] > 0 and pb.counters() == (0, 0)
 
     def test_ac7_environment_change_after_load_has_no_effect(
-        self, passthrough, monkeypatch
+        self, passthrough, monkeypatch, gpu
     ):
         monkeypatch.setenv("MLX_VLM_ATTENTION_POLICY", "fused_v1")
         lm = _tiny_lm()

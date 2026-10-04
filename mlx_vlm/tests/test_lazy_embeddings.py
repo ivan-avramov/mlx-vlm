@@ -33,7 +33,7 @@ def _cpu_device():
         mx.set_default_device(previous)
 
 
-def _tiny_model(model_type="qwen3_5"):
+def _tiny_model(model_type="qwen3_5", lazy=True, multimodal=False):
     mx.random.seed(0)
     cfg = TextConfig(
         model_type="qwen3_5_text",
@@ -66,10 +66,23 @@ def _tiny_model(model_type="qwen3_5"):
         spatial_merge_size=1,
         num_position_embeddings=4,
     )
+    ids = (
+        dict(
+            image_token_id=10,
+            video_token_id=11,
+            vision_start_token_id=12,
+            vision_end_token_id=13,
+        )
+        if multimodal
+        else {}
+    )
     model = Model(
-        ModelConfig(text_config=cfg, vision_config=vision, model_type=model_type)
+        ModelConfig(
+            text_config=cfg, vision_config=vision, model_type=model_type, **ids
+        )
     )
     mx.eval(model.parameters())
+    model.lazy_prompt_embeddings = lazy  # F5: the worker flag, resolved at load
     return model
 
 
@@ -274,3 +287,197 @@ class TestLazyTokenEmbeddings:
             lazy[:, 1:2]
         with pytest.raises(NotImplementedError):
             lazy[0]
+
+
+# ----------------------------------------------------------------- F5 switch
+class TestF5Switch:
+    def test_f5_hook_is_off_unless_the_flag_was_resolved_onto_the_instance(self):
+        off = _tiny_model(lazy=False)
+        assert off.get_lazy_text_embeddings(mx.array([PROMPT]), None) is None
+        on = _tiny_model(lazy=True)
+        assert on.get_lazy_text_embeddings(mx.array([PROMPT]), None) is not None
+        bare = _tiny_model(lazy=True)
+        del bare.lazy_prompt_embeddings
+        assert bare.get_lazy_text_embeddings(mx.array([PROMPT]), None) is None
+
+    def test_f5_default_path_embeds_the_whole_prompt_like_main(self):
+        model = _tiny_model(lazy=False)
+        spy = EmbedSpy(model)
+        _run(model, lazy=True)  # hook present on the type, switch off
+        assert max(spy.lengths) == len(PROMPT)
+
+    def test_f5_env_handoff_resolves_once_onto_the_model(self, monkeypatch):
+        from mlx_vlm.server import generation as gen
+
+        monkeypatch.delenv("MLX_VLM_LAZY_PROMPT_EMBEDDINGS", raising=False)
+        model = _tiny_model(lazy=False)
+        gen._apply_lazy_embeddings_from_env(model)
+        assert model.lazy_prompt_embeddings is False
+        monkeypatch.setenv("MLX_VLM_LAZY_PROMPT_EMBEDDINGS", "1")
+        gen._apply_lazy_embeddings_from_env(model)
+        assert model.lazy_prompt_embeddings is True
+        monkeypatch.setenv("MLX_VLM_LAZY_PROMPT_EMBEDDINGS", "0")
+        assert model.lazy_prompt_embeddings is True  # not re-read after load
+
+    def test_f5_cli_flag_writes_the_env_handoff(self, monkeypatch):
+        import os
+        import sys
+
+        from mlx_vlm.server import cli
+
+        monkeypatch.setattr(cli.uvicorn, "run", lambda *a, **k: None)
+        monkeypatch.setattr(cli, "_apply_mlx_memory_limits", lambda *a, **k: None)
+        monkeypatch.setattr(cli, "_configure_session_manager", lambda **k: None)
+        monkeypatch.setattr(sys, "argv", ["s", "--lazy-prompt-embeddings"])
+        cli.main()
+        assert os.environ["MLX_VLM_LAZY_PROMPT_EMBEDDINGS"] == "1"
+        monkeypatch.setattr(sys, "argv", ["s"])
+        cli.main()
+        assert os.environ["MLX_VLM_LAZY_PROMPT_EMBEDDINGS"] == "0"
+
+
+# ----------------------------------------------------------------- F6 traces
+from mlx_vlm.models.qwen3_5.language import LanguageModel  # noqa: E402
+
+
+def _snap(cache):
+    mx.eval([c.state for c in cache])
+    out = []
+    for c in cache:
+        offset = getattr(c, "offset", None)
+        out.append(
+            (
+                [mx.array(a) for a in _arrays(c.state)],
+                None if offset is None else int(offset),
+            )
+        )
+    return out
+
+
+def _trace(model, lazy, prime=0, ids=None, pixel=None, **gen_kwargs):
+    """Raw logits and cache (arrays + offsets) after every language-model call."""
+    runner = model if lazy else _without_lazy(model)
+    cache = model.language_model.make_cache()
+    logits, snaps = [], []
+    real = LanguageModel.__call__
+
+    def traced(self, *args, **kwargs):
+        out = real(self, *args, **kwargs)
+        mx.eval(out.logits)
+        logits.append(mx.array(out.logits))
+        snaps.append(_snap(cache))
+        return out
+
+    prompt = list(ids if ids is not None else PROMPT)
+    LanguageModel.__call__ = traced
+    try:
+        if prime:  # eager priming, identical in both arms -> warm offset
+            for y, _ in _gen(_without_lazy(model), prompt[:prime], cache, max_tokens=0):
+                pass
+            del logits[:], snaps[:]
+        for _ in _gen(runner, prompt[prime:], cache, max_tokens=1, pixel=pixel,
+                      **gen_kwargs):
+            break
+    finally:
+        LanguageModel.__call__ = real
+    return logits, snaps
+
+
+def _gen(model, ids, cache, max_tokens, pixel=None, **kw):
+    extra = {}
+    if pixel is not None:
+        extra = {"image_grid_thw": mx.array([[1, 2, 2]])}
+    gen = ar_module.generate_step(
+        input_ids=mx.array([ids], dtype=mx.int32),
+        model=model,
+        pixel_values=pixel,
+        mask=None,
+        max_tokens=max_tokens,
+        temperature=0.0,
+        prefill_step_size=STEP,
+        prompt_cache=cache,
+        **extra,
+        **kw,
+    )
+    try:
+        yield from gen
+    finally:
+        gen.close()
+
+
+def _same(a, b):
+    la, sa = a
+    lb, sb = b
+    assert len(la) == len(lb) > 0
+    assert all(mx.array_equal(x, y).item() for x, y in zip(la, lb))  # RAW logits
+    assert len(sa) == len(sb)
+    for call_a, call_b in zip(sa, sb):
+        for (arrs_a, off_a), (arrs_b, off_b) in zip(call_a, call_b):
+            assert off_a == off_b
+            assert len(arrs_a) == len(arrs_b)
+            assert all(mx.array_equal(x, y).item() for x, y in zip(arrs_a, arrs_b))
+
+
+class TestF6AgainstEager:
+    def test_f6_raw_logits_and_cache_after_every_call_cold(self):
+        model = _tiny_model()
+        _same(_trace(model, False), _trace(model, True))
+
+    def test_f6_prompt_end_cache_is_the_state_before_the_lookahead_decode(self):
+        model = _tiny_model()
+        eager, lazy = _trace(model, False), _trace(model, True)
+        # calls: 3 chunks of 4, the last prompt token, then the lookahead decode
+        assert len(eager[0]) == 5
+        _same(([eager[0][3]], [eager[1][3]]), ([lazy[0][3]], [lazy[1][3]]))
+        offsets = {off for _, off in lazy[1][3] if off is not None}
+        assert offsets == {len(PROMPT)}  # prompt end, before any decode token
+
+    def test_f6_warm_session_cache_with_nonzero_initial_offset(self):
+        model = _tiny_model()
+        eager = _trace(model, False, prime=6)
+        lazy = _trace(model, True, prime=6)
+        assert {o for _, o in eager[1][0] if o is not None} == {10}  # 6 + chunk 4
+        _same(eager, lazy)
+
+    def test_f6_snapshot_landing_boundary(self):
+        model = _tiny_model()
+        got = []
+        for flag in (False, True):
+            offsets, arrays, rot = [], [], []
+            out = _trace(
+                model, flag, snapshot_at_offset=6, anchor_capture_offset=offsets,
+                arrays_snapshot_capture=arrays, rotating_snapshot_capture=rot,
+            )
+            got.append((out, offsets, arrays))
+        assert got[0][1] == got[1][1] and got[0][1], got[0][1]
+        _same(got[0][0], got[1][0])
+        for a, b in zip(got[0][2], got[1][2]):
+            assert (a is None) == (b is None)
+
+    @pytest.mark.parametrize("retain_at", [None, 9])
+    def test_f6_prompt_end_retention_boundary(self, retain_at):
+        model = _tiny_model()
+        got = []
+        for flag in (False, True):
+            offsets, arrays, rot = [], [], []
+            out = _trace(
+                model, flag, retain_at_offset=retain_at, prompt_end_offset=offsets,
+                prompt_end_arrays_capture=arrays, prompt_end_rotating_capture=rot,
+            )
+            got.append((out, offsets, arrays))
+        assert got[0][1] == got[1][1] and got[0][1], got[0][1]
+        _same(got[0][0], got[1][0])
+
+    def test_f6_real_multimodal_merge_takes_the_eager_path(self):
+        model = _tiny_model(multimodal=True)
+        spy = EmbedSpy(model)
+        ids = [1, 2, 3, 12, 10, 10, 10, 10, 13, 5, 6, 7, 8, 9]
+        mx.random.seed(3)
+        pixel = mx.random.normal((4, 96))
+        eager = _trace(model, False, ids=ids, pixel=pixel)
+        eager_lengths = list(spy.lengths)
+        spy.lengths.clear()
+        lazy = _trace(model, True, ids=ids, pixel=pixel)
+        assert max(eager_lengths) == len(ids)
+        assert max(spy.lengths) == len(ids)  # whole prompt embedded: eager merge
+        _same(eager, lazy)

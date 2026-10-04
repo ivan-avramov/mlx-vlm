@@ -92,6 +92,8 @@ class Model(Qwen3VLModel):
     def get_lazy_text_embeddings(self, input_ids, pixel_values=None, **kwargs):
         """Fork (M57): `get_input_embeddings` for a prompt with no merged non-text
         features, with the embeddings left lazy. None => caller takes the eager path."""
+        if not getattr(self, "lazy_prompt_embeddings", False):
+            return None  # off unless --lazy-prompt-embeddings resolved onto us
         if getattr(self.config, "model_type", None) != "qwen3_5":
             return None
         if any(
