@@ -374,6 +374,7 @@ def scaled_dot_product_attention(
     scale: float,
     mask: Optional[mx.array],
     sinks: Optional[mx.array] = None,
+    policy=None,  # Fork (M57): versioned fused-dispatch policy; None == auto
 ) -> mx.array:
     if isinstance(cache, (TurboQuantKVCache, BatchTurboQuantKVCache)):
         # The fused kernels have no sink term, and the batch cache only shares
@@ -430,6 +431,17 @@ def scaled_dot_product_attention(
             bits=cache.bits,
         )
 
+    # Fork (M57): fused_v1 forces the fused kernel; None/auto never gets here.
+    if policy is not None and policy.decide(queries, keys.shape[-2], sinks):
+        return mx.fast.scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            scale=scale,
+            mask=mask,
+            sinks=sinks,
+            force_fused=True,
+        )
     return mx.fast.scaled_dot_product_attention(
         queries,
         keys,

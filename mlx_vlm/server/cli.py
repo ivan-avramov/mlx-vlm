@@ -57,6 +57,12 @@ def _configure_moe_expand(moe_expand_arg):
     os.environ["MLX_VLM_MOE_EXPAND"] = moe_expand_arg or ""
 
 
+def _resolve_attention_policy(name):  # Fork (M57)
+    from ..attention_policy import resolve_policy
+
+    return resolve_policy(name)
+
+
 def _model_num_attention_heads(model_path):
     """Read the language model's query-head count from config.json (cheap: only the
     config file is fetched, not weights). Returns None if it can't be determined."""
@@ -80,7 +86,7 @@ def _model_num_attention_heads(model_path):
         return None
 
 
-def _derive_cache_limit_gb(model_path, max_kv_size, prefill_step):
+def _derive_cache_limit_gb(model_path, max_kv_size, prefill_step, policy=None):
     """Auto-size the buffer-pool cap to one full-attention layer's QK^T score tensor at
     the model's MAX context, so it never undershoots at runtime (real ctx <= max_kv_size).
 
@@ -97,6 +103,8 @@ def _derive_cache_limit_gb(model_path, max_kv_size, prefill_step):
         return None
     heads = _model_num_attention_heads(model_path) or 32
     scores_gb = heads * prefill_step * max_kv_size * 2 / 1e9
+    if policy is not None:  # Fork (M57): the policy's largest unfused score tensor
+        scores_gb = policy.max_unfused_score_bytes / 1e9
     return math.ceil(scores_gb) + 2.0
 
 
@@ -106,6 +114,7 @@ def _apply_mlx_memory_limits(
     model_path=None,
     max_kv_size=None,
     prefill_step=None,
+    policy=None,  # Fork (M57)
 ):
     """Bound MLX's Metal allocator at server startup.
 
@@ -121,7 +130,9 @@ def _apply_mlx_memory_limits(
 
     GB = 1024**3
     if not (cache_limit_gb and cache_limit_gb > 0):
-        derived = _derive_cache_limit_gb(model_path, max_kv_size, prefill_step)
+        derived = _derive_cache_limit_gb(
+            model_path, max_kv_size, prefill_step, policy=policy  # Fork (M57)
+        )
         if derived:
             logger.info(
                 "MLX buffer-pool cache limit auto-derived: %.0f GB "
@@ -610,6 +621,13 @@ def main():
             "rewind). Env fallback: MLX_VLM_DELTANET_RING_SIZE. Default: 3."
         ),
     )
+    parser.add_argument(  # Fork (M57)
+        "--attention-policy",
+        choices=["auto", "fused_v1"],
+        default="auto",
+        help="Fused-attention dispatch policy for native-KV full attention "
+        "(qwen3_5 only). auto = unchanged behaviour. Env: MLX_VLM_ATTENTION_POLICY.",
+    )
     parser.add_argument(
         "--log-level",
         type=str,
@@ -651,6 +669,7 @@ def main():
         model_path=args.model,
         max_kv_size=args.max_kv_size,
         prefill_step=args.prefill_step_size or DEFAULT_PREFILL_STEP_SIZE,
+        policy=_resolve_attention_policy(args.attention_policy),  # Fork (M57)
     )
 
     if args.trust_remote_code:
@@ -692,6 +711,8 @@ def main():
     if args.prefill_step_size:
         os.environ["PREFILL_STEP_SIZE"] = str(args.prefill_step_size)
     _configure_moe_expand(args.moe_expand)
+    # Fork (M57): always written (like moe_expand) so a stale export cannot leak.
+    os.environ["MLX_VLM_ATTENTION_POLICY"] = args.attention_policy
     os.environ["MLX_VLM_LOG_PROGRESS_INTERVAL"] = str(args.log_progress_interval)
     os.environ["MLX_VLM_MAX_TOKENS"] = str(args.max_tokens)
     os.environ["MLX_VLM_ENABLE_THINKING"] = "1" if args.enable_thinking else "0"

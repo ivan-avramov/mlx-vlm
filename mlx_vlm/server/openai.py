@@ -1750,6 +1750,8 @@ async def responses_endpoint(request: Request):
                             else "generate"
                         ),
                         cached_tokens=metrics.cached_tokens,
+                        sdpa_forced=metrics.sdpa_forced,  # Fork (M57)
+                        sdpa_auto=metrics.sdpa_auto,  # Fork (M57)
                         prompt_tokens=usage_stats["input_tokens"],
                         completion_tokens=usage_stats["output_tokens"],
                         generated_tokens=usage_stats["output_tokens"],
@@ -1969,6 +1971,8 @@ async def responses_endpoint(request: Request):
                     # None`, which only says a daemon is loaded.
                     backend=backend,
                     cached_tokens=metrics.cached_tokens,
+                    sdpa_forced=metrics.sdpa_forced,  # Fork (M57)
+                    sdpa_auto=metrics.sdpa_auto,  # Fork (M57)
                     prompt_tokens=prompt_tokens,
                     completion_tokens=output_tokens,
                     generated_tokens=output_tokens,
@@ -2715,6 +2719,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         ),
                         session_id=chat_id,
                         cached_tokens=metrics.cached_tokens,
+                        sdpa_forced=metrics.sdpa_forced,  # Fork (M57)
+                        sdpa_auto=metrics.sdpa_auto,  # Fork (M57)
                         prompt_tokens=(
                             ctx.prompt_tokens
                             if runtime.response_generator is not None
@@ -3032,6 +3038,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     backend=backend,
                     session_id=chat_id,
                     cached_tokens=metrics.cached_tokens,
+                    sdpa_forced=metrics.sdpa_forced,  # Fork (M57)
+                    sdpa_auto=metrics.sdpa_auto,  # Fork (M57)
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     generated_tokens=output_tokens,
@@ -3335,6 +3343,8 @@ async def completions_endpoint(request: Request):
                         stream=True,
                         backend=backend,
                         cached_tokens=metrics.cached_tokens,
+                        sdpa_forced=metrics.sdpa_forced,  # Fork (M57)
+                        sdpa_auto=metrics.sdpa_auto,  # Fork (M57)
                         prompt_tokens=prompt_tokens,
                         completion_tokens=completion_tokens,
                         generated_tokens=output_tokens,
@@ -3505,6 +3515,8 @@ async def completions_endpoint(request: Request):
                 stream=False,
                 backend=backend,
                 cached_tokens=metrics.cached_tokens,
+                sdpa_forced=metrics.sdpa_forced,  # Fork (M57)
+                sdpa_auto=metrics.sdpa_auto,  # Fork (M57)
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 generated_tokens=output_tokens,

@@ -841,6 +841,8 @@ def _qwen35_scalar_positions(cache, cache_offset, L):
 
 
 class Qwen3_5Attention(nn.Module):
+    attention_policy = None  # Fork (M57): stamped once at load; None == auto
+
     def __init__(self, args: TextConfig):
         super().__init__()
         self.num_key_value_heads = args.num_key_value_heads
@@ -916,7 +918,13 @@ class Qwen3_5Attention(nn.Module):
 
         if output is None:
             output = scaled_dot_product_attention(
-                queries, keys, values, cache=cache, scale=self.scale, mask=mask
+                queries,
+                keys,
+                values,
+                cache=cache,
+                scale=self.scale,
+                mask=mask,
+                policy=self.attention_policy,  # Fork (M57)
             )
         _pp = prefill_profile.active_layer()  # Fork (M57): None unless profiling
         if _pp is not None:  # Fork (M57)

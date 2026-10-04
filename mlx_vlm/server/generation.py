@@ -185,6 +185,20 @@ def _apply_moe_expand_and_log(model, spec: str) -> int:
     return n_layers
 
 
+def _apply_attention_policy_from_env(model):
+    # Fork (M57): resolved ONCE at load, stamped on the instance; never re-read.
+    from .. import attention_policy as _ap
+
+    policy = _ap.resolve_policy(os.environ.get(_ap.ENV))
+    if policy is None:
+        return None
+    _ap.apply_to_model(model, policy)
+    _ap.self_test_model(model, policy)
+    logger.info("attention_policy=%s", policy.name)
+    print(f"attention_policy={policy.name}", file=sys.stderr, flush=True)
+    return policy
+
+
 def get_max_num_seqs():
     """Max sequences allowed in the running batch at once (None = unbounded)."""
     raw = os.environ.get("MLX_VLM_MAX_NUM_SEQS", "")
@@ -721,6 +735,8 @@ def _build_metrics_envelope(
     # interleaved prefill/completed timestamps across concurrent requests.
     session_id: Optional[str] = None,
     cached_tokens: int = 0,
+    sdpa_forced: Optional[int] = None,  # Fork (M57): fused_v1 request counters
+    sdpa_auto: Optional[int] = None,  # Fork (M57)
 ) -> dict:
     token_times = token_times or []
     ttft_s = max(0.0, token_times[0] - request_started_s) if token_times else None
@@ -736,7 +752,7 @@ def _build_metrics_envelope(
     request_tok_s = (
         completion_tokens / request_elapsed_s if request_elapsed_s > 0 else 0.0
     )
-    return {
+    envelope = {
         "timestamp_unix": time.time(),
         "endpoint": endpoint,
         "model": model,
@@ -781,6 +797,10 @@ def _build_metrics_envelope(
         "session_id": session_id,
         "cached_tokens": max(0, int(cached_tokens or 0)),
     }
+    if sdpa_forced is not None:  # Fork (M57): absent under auto (byte-identical)
+        envelope["sdpa_forced"] = int(sdpa_forced)
+        envelope["sdpa_auto"] = int(sdpa_auto or 0)
+    return envelope
 
 
 def load_model_resources(model_path: str, adapter_path: Optional[str]):
@@ -1017,6 +1037,8 @@ class GenerationMetrics:
     draft_rounds: Optional[int] = None
     draft_n_accepted: Optional[int] = None
     draft_n: Optional[int] = None
+    sdpa_forced: Optional[int] = None  # Fork (M57)
+    sdpa_auto: Optional[int] = None  # Fork (M57)
 
     def record_chunk(self, chunk) -> Optional[float]:
         now = getattr(chunk, "emitted_at", None) or time.perf_counter()
@@ -1074,6 +1096,10 @@ class GenerationMetrics:
         draft_n = getattr(result, "draft_n", None)
         if draft_n is not None:
             self.draft_n = int(draft_n)
+        for _name in ("sdpa_forced", "sdpa_auto"):  # Fork (M57)
+            _value = getattr(result, _name, None)
+            if _value is not None:
+                setattr(self, _name, int(_value))
 
 
 @dataclass
@@ -1099,6 +1125,8 @@ class StreamingToken:
     cached_tokens: int = 0
     token_count: int = 1
     emitted_at: Optional[float] = None
+    sdpa_forced: Optional[int] = None  # Fork (M57): fused_v1 request counters
+    sdpa_auto: Optional[int] = None  # Fork (M57)
 
 
 class _DiffusionBlockEmitter:
@@ -1337,6 +1365,8 @@ class ResponseGenerator:
         moe_expand_spec = os.environ.get("MLX_VLM_MOE_EXPAND")
         if moe_expand_spec:
             _apply_moe_expand_and_log(model, moe_expand_spec)
+
+        self.attention_policy = _apply_attention_policy_from_env(model)  # Fork (M57)
 
         stop_tokens = set(
             resolve_eos_token_ids(
@@ -1680,6 +1710,9 @@ class ResponseGenerator:
         _prealloc = get_kv_prealloc_tokens()
         if _prealloc is not None:
             gen_kwargs["kv_prealloc_tokens"] = _prealloc
+        # Fork (M57): per-request sdpa decision counters (None under auto).
+        _attn_policy = getattr(self, "attention_policy", None)
+        _attn_snapshot = _attn_policy.snapshot() if _attn_policy is not None else None
         if self.kv_bits is not None:
             gen_kwargs["kv_bits"] = self.kv_bits
             gen_kwargs["kv_group_size"] = self.kv_group_size
@@ -1831,8 +1864,13 @@ class ResponseGenerator:
                     token_count = max(int(cumulative) - counted_tokens, 0)
                     counted_tokens = max(counted_tokens, int(cumulative))
 
+                _sdpa = (None, None)  # Fork (M57)
+                if chunk.finish_reason is not None and _attn_snapshot is not None:
+                    _sdpa = _attn_policy.since(_attn_snapshot)
                 rqueue.put(
                     StreamingToken(
+                        sdpa_forced=_sdpa[0],  # Fork (M57)
+                        sdpa_auto=_sdpa[1],  # Fork (M57)
                         text=chunk.text,
                         token=token_id,
                         logprobs=lp_scalar,
