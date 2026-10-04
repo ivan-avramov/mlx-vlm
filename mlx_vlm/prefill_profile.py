@@ -13,17 +13,25 @@ when profiled wall is far above unprofiled wall.
 
 Phase boundaries (a mark closes the time since the previous mark):
 
-* ``other_fence`` entry fence: this chunk's input embeddings, position/mask
-  setup (charged to ``other``, not to layer 0).
+* ``entry``: entry fence before the first layer -- this chunk's input
+  embeddings (the first chunk contains the whole-prompt embedding and any
+  vision work, as in production), position/mask setup, precomputed
+  ``position_embeddings``. Its own field, not ``other``.
 * ``attn_prep``: input layernorm (when the layer is full attention), q/k/v
   projections, norms, rotary, mask -- everything before the cache update.
 * ``kv_update``: ``cache.update_and_fetch`` (and any preallocation inside it).
-* ``sdpa``: the ``scaled_dot_product_attention`` call (plus the EpiCache
-  ``observe`` hook when that cache is in use).
+* ``sdpa``: the ``scaled_dot_product_attention`` call only.
+* ``observe``: a cache's ``observe`` hook (EpiCache): closed on the arrays it
+  creates. Its lazy scores are NOT dependencies of the SDPA output, so they are
+  never part of ``sdpa``; queries it consumes are live even in the terminal
+  layer.
 * ``attn_out``: transpose/reshape, gate, ``o_proj``.
 * ``gdn``: input layernorm + the whole ``linear_attn`` call, closed on the layer
   output AND the recurrent/conv state it stores in its cache entry.
 * ``mlp``: residual add, post-attention norm, ``mlp`` (both layer kinds).
+* ``forward``: only when NO decoder layer declared itself (``layers=0``, a model
+  family without layer hooks): the cache state is evaluated right after the
+  model call and reported here, so ``cache_post`` never holds the forward pass.
 * ``cache_post`` / ``clear_cache``: chunk-loop work after the model call;
   ``cache_post`` closes on the cache state AFTER the eviction hook.
 * ``other``: chunk wall minus the sum of the above (embedding slice, final norm,
@@ -32,7 +40,10 @@ Phase boundaries (a mark closes the time since the previous mark):
 Only work production prefill does is evaluated: the chunk output (logits), the
 terminal decoder layer's attention output / o_proj / MLP, the final norm and the
 head are dead in production (the loop evaluates cache state only) and are never
-passed to a mark.
+passed to a mark. "Terminal" is the last layer actually executed (declared by
+the model via ``begin_layers``); it is live, hence measured, when the chunk
+kwargs carry ``capture_layer_ids`` / ``return_hidden`` (hidden-state drafters).
+Every line carries ``layers=`` (declared decoder layers per chunk, window mean).
 
 Active-profiler handle: ``active()`` is request-local DIAGNOSTIC state, kept
 per thread, set by the chunk loop for the duration of one model call and
@@ -54,12 +65,15 @@ ENV = "MLX_VLM_PREFILL_PROFILE"
 
 # Reported phases, in line order. ``other`` is the chunk-wall residual.
 _NAMED = (
+    "entry",
     "sdpa",
     "kv_update",
+    "observe",
     "attn_prep",
     "attn_out",
     "gdn",
     "mlp",
+    "forward",
     "cache_post",
     "clear_cache",
 )
@@ -103,22 +117,47 @@ class PrefillProfiler(_PhaseTimer):
         self._chunk_tokens = 0
         self._chunk_base: Dict[str, float] = {}
         self.broken = False
+        self.reason = ""
         self.layer_open = False
         self.terminal = False
+        self._n_exec: Optional[int] = None
+        self._live = False
+        self._chunk_live = False
+        self.layers_entered = 0
 
     # -- chunk lifecycle (called by the chunk loop; never raise) -----------
 
-    def begin_chunk(self, tokens: int) -> None:
-        """Start timing a chunk and publish the thread-local active handle."""
+    def begin_chunk(self, tokens: int, live_terminal: bool = False) -> None:
+        """Start timing a chunk and publish the thread-local active handle.
+
+        ``live_terminal``: the chunk kwargs ask for hidden states
+        (``capture_layer_ids`` / ``return_hidden``), so the terminal layer's
+        output is consumed and must be measured like any other layer."""
         try:
             self._chunk_tokens = int(tokens)
             self._chunk_base = dict(self.totals)
             self.layer_open = False
+            self.terminal = False
+            self._n_exec = None
+            self._live = bool(live_terminal)
+            self._chunk_live = bool(live_terminal)
+            self.layers_entered = 0
             self.begin()
             self._chunk_t0 = self._last
-        except Exception:
-            self.broken = True
+        except Exception as exc:
+            self._break(exc)
         _tls.active = None if self.broken else self
+
+    def _break(self, exc: BaseException) -> None:
+        if not self.broken:
+            self.broken = True
+            self.reason = " ".join(repr(exc).split())
+
+    def begin_layers(self, n_exec: int, live_terminal: bool = False) -> None:
+        """The model declares how many decoder layers will execute this chunk
+        (the terminal layer is the LAST ONE EXECUTED, not a stored index)."""
+        self._n_exec = int(n_exec)
+        self._live = self._chunk_live or bool(live_terminal)
 
     def clear_active(self) -> None:
         """Retract the handle (only if this profiler owns it)."""
@@ -126,9 +165,23 @@ class PrefillProfiler(_PhaseTimer):
         if getattr(_tls, "active", None) is self:
             _tls.active = None
 
-    def enter_layer(self, terminal: bool) -> None:
+    def enter_layer(self) -> None:
+        self.layers_entered += 1
         self.layer_open = True
-        self.terminal = bool(terminal)
+        self.terminal = (
+            self._n_exec is not None
+            and not self._live
+            and self.layers_entered == self._n_exec
+        )
+
+    def after_forward(self, prompt_cache) -> None:
+        """Close the model call. If no decoder layer declared itself (a model
+        family without layer hooks) the cache state is evaluated right here and
+        reported as ``forward``, so ``cache_post`` never holds the forward pass."""
+        if self.layers_entered == 0:
+            self.safe_mark("forward", [c.state for c in prompt_cache])
+        else:
+            self.safe_mark(_FENCE)
 
     def exit_layer(self) -> None:
         self.layer_open = False
@@ -140,8 +193,8 @@ class PrefillProfiler(_PhaseTimer):
             return
         try:
             self.mark(phase, *outputs)
-        except Exception:
-            self.broken = True
+        except Exception as exc:
+            self._break(exc)
             self.clear_active()
 
     def layer_mark(self, phase: str, *outputs: Any, live_if_nonterminal=()) -> None:
@@ -162,13 +215,15 @@ class PrefillProfiler(_PhaseTimer):
         try:
             wall = perf_counter() - self._chunk_t0
             phases = {p: self.totals[p] - self._chunk_base[p] for p in _NAMED}
-            self._records.append((wall, self._chunk_tokens, int(keys), phases))
+            self._records.append(
+                (wall, self._chunk_tokens, int(keys), phases, self.layers_entered)
+            )
             self.units += 1
             if self.units % self.every == 0:
                 self._print(self._records[self._window_start :], "", final=False)
                 self._window_start = len(self._records)
-        except Exception:
-            self.broken = True
+        except Exception as exc:
+            self._break(exc)
 
     def finish(self, aborted: bool = False) -> None:
         """Last line (chunks since the previous window line; omitted if none)
@@ -176,6 +231,8 @@ class PrefillProfiler(_PhaseTimer):
         both ``broken=1`` and never ``final=1``."""
         self.clear_active()
         if not self._records:
+            if self.broken or aborted:
+                self._print_empty(self.reason or "'aborted before the first chunk'")
             return
         partial = self.broken or aborted
         remaining = self._records[self._window_start :]
@@ -184,6 +241,16 @@ class PrefillProfiler(_PhaseTimer):
         self._print(self._records, "_total", final=not partial, broken=partial)
 
     # -- reporting ---------------------------------------------------------
+
+    def _print_empty(self, reason: str) -> None:
+        try:
+            print(
+                f"[prefill_profile] chunks=0 broken=1 reason={reason}",
+                file=sys.stderr,
+                flush=True,
+            )
+        except Exception:
+            pass
 
     def _print(self, records, suffix: str, final: bool, broken: bool = False) -> None:
         """Print ONE stderr line. Never raises."""
@@ -203,6 +270,7 @@ class PrefillProfiler(_PhaseTimer):
         wall = sum(r[0] for r in records)
         named = {p: sum(r[3][p] for r in records) for p in _NAMED}
         other = max(0.0, wall - sum(named.values()))
+        layers = sum(r[4] for r in records) / n
 
         def ms(seconds: float) -> str:
             return f"{1000.0 * seconds / n:.2f}"
@@ -210,11 +278,13 @@ class PrefillProfiler(_PhaseTimer):
         return (
             f"[prefill_profile{suffix}] chunks={n} "
             f"tokens={sum(r[1] for r in records)} "
-            f"keys={records[-1][2]} wall={ms(wall)} sdpa={ms(named['sdpa'])} "
-            f"kv_update={ms(named['kv_update'])} "
+            f"keys={records[-1][2]} layers={layers:g} wall={ms(wall)} "
+            f"entry={ms(named['entry'])} sdpa={ms(named['sdpa'])} "
+            f"kv_update={ms(named['kv_update'])} observe={ms(named['observe'])} "
             f"attn_prep={ms(named['attn_prep'])} "
             f"attn_out={ms(named['attn_out'])} gdn={ms(named['gdn'])} "
-            f"mlp={ms(named['mlp'])} cache_post={ms(named['cache_post'])} "
+            f"mlp={ms(named['mlp'])} forward={ms(named['forward'])} "
+            f"cache_post={ms(named['cache_post'])} "
             f"clear_cache={ms(named['clear_cache'])} other={ms(other)} "
             f"final={1 if final else 0}" + (" broken=1" if broken else "")
         )

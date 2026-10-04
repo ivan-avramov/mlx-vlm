@@ -1001,8 +1001,19 @@ class Qwen3_5Attention(nn.Module):
 
         _pp = prefill_profile.active_layer()  # Fork (M57): None unless profiling
         if _pp is not None:  # Fork (M57): q/gate/mask are dead in a terminal layer
+            # ...unless a cache `observe` hook (EpiCache) consumes the queries.
+            _obs = (
+                cache is not None
+                and getattr(cache, "observe", None) is not None
+                and getattr(cache, "budget", None) is not None
+                and cache.offset + L > cache.budget
+            )
             _pp.layer_mark(
-                "attn_prep", keys, values, live_if_nonterminal=(queries, gate, mask)
+                "attn_prep",
+                keys,
+                values,
+                *((queries,) if _obs else ()),
+                live_if_nonterminal=(queries, gate, mask),
             )
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
@@ -1020,6 +1031,8 @@ class Qwen3_5Attention(nn.Module):
             and cache.offset > cache.budget
         ):
             cache.observe(queries, self.scale)
+            if _pp is not None:  # Fork (M57): close on the scores observe built
+                _pp.layer_mark("observe", getattr(cache, "_scores", None))
         return queries, keys, values, gate, mask
 
 
@@ -1192,9 +1205,6 @@ class Qwen3_5DecoderLayer(nn.Module):
         )
         self.mlp = Qwen3_5MLP(args.hidden_size, args.intermediate_size)
 
-        # Fork (M57): the last layer's output is dead in production prefill.
-        self.m57_terminal = layer_idx == args.num_hidden_layers - 1
-
     def __call__(
         self,
         x: mx.array,
@@ -1207,7 +1217,7 @@ class Qwen3_5DecoderLayer(nn.Module):
         if _pp is not None:  # Fork (M57)
             # Declare this a Qwen3_5DecoderLayer so attention hooks fire (they
             # are no-ops inside other layer classes that reuse Qwen3_5Attention).
-            _pp.enter_layer(self.m57_terminal)
+            _pp.enter_layer()
         if self.is_linear:
             r = self.linear_attn(
                 self.input_layernorm(x),
@@ -1391,8 +1401,14 @@ class Qwen3_5Model(nn.Module):
                     break
 
         _pp = prefill_profile.active()  # Fork (M57): None unless profiling
-        if _pp is not None:  # Fork (M57): entry fence, charged to `other`
-            _pp.safe_mark("other_fence", h, fa_mask, ssm_mask, position_ids)
+        if _pp is not None:  # Fork (M57): entry fence (its own `entry` field)
+            _pp.begin_layers(
+                min(len(self.layers), len(cache)),
+                live_terminal=capture_layer_ids is not None or hidden_sink is not None,
+            )
+            _pp.safe_mark(
+                "entry", h, fa_mask, ssm_mask, position_ids, position_embeddings
+            )
         capture_set = set(capture_layer_ids) if capture_layer_ids else set()
         for i, (layer, c) in enumerate(zip(self.layers, cache)):
             mask = ssm_mask if layer.is_linear else fa_mask

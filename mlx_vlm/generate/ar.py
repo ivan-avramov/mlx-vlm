@@ -688,8 +688,13 @@ def generate_step(
                         **speculative_prefill.kwargs,
                         "logits_to_keep": 1,
                     }
-                    if _pp is not None:  # Fork (M57)
-                        _pp.begin_chunk(n_to_process)
+                    if _pp is not None:  # Fork (M57): hidden capture => live
+                        _pp.begin_chunk(
+                            n_to_process,
+                            live_terminal=chunk_kwargs.get("capture_layer_ids")
+                            is not None
+                            or bool(chunk_kwargs.get("return_hidden")),
+                        )
                     try:  # Fork (M57): handle is cleared even if the call raises
                         chunk_output = model.language_model(
                             inputs=input_ids[:, :n_to_process],
@@ -701,8 +706,8 @@ def generate_step(
                     finally:  # Fork (M57)
                         if _pp is not None:
                             _pp.clear_active()
-                    if _pp is not None:  # Fork (M57): no arrays; output is dead
-                        _pp.safe_mark("other_fence")
+                    if _pp is not None:  # Fork (M57): chunk output is dead
+                        _pp.after_forward(prompt_cache)
                     speculative_prefill.append(chunk_output)
                     del chunk_output
                     quantize_cache_fn(prompt_cache)

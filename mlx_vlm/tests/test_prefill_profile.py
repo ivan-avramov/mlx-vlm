@@ -16,6 +16,7 @@ import pytest
 from mlx_vlm import prefill_profile
 from mlx_vlm.generate import ar as ar_module
 from mlx_vlm.generate import common as common_module
+from mlx_vlm.models import cache as qwen_cache
 from mlx_vlm.speculative import mtp_profile
 from mlx_vlm.models.qwen3_5 import language as qwen_language
 from mlx_vlm.models.qwen3_5.config import ModelConfig, TextConfig, VisionConfig
@@ -27,26 +28,35 @@ from mlx_vlm.models.qwen3_5.language import (
 
 ENV = prefill_profile.ENV
 PHASES = (
+    "entry",
     "sdpa",
     "kv_update",
+    "observe",
     "attn_prep",
     "attn_out",
     "gdn",
     "mlp",
+    "forward",
     "cache_post",
     "clear_cache",
     "other",
 )
 _FIELDS = (
-    r"chunks=(?P<chunks>\d+) tokens=(?P<tokens>\d+) "
-    r"keys=(?P<keys>\d+) wall=(?P<wall>[-\d.]+) sdpa=(?P<sdpa>[-\d.]+) "
-    r"kv_update=(?P<kv_update>[-\d.]+) attn_prep=(?P<attn_prep>[-\d.]+) "
-    r"attn_out=(?P<attn_out>[-\d.]+) gdn=(?P<gdn>[-\d.]+) mlp=(?P<mlp>[-\d.]+) "
-    r"cache_post=(?P<cache_post>[-\d.]+) clear_cache=(?P<clear_cache>[-\d.]+) "
-    r"other=(?P<other>[-\d.]+) final=(?P<final>[01])(?P<broken> broken=1)?$"
+    r"chunks=(?P<chunks>\d+) tokens=(?P<tokens>\d+) keys=(?P<keys>\d+) "
+    r"layers=(?P<layers>[-\d.]+) wall=(?P<wall>[-\d.]+) "
+    r"entry=(?P<entry>[-\d.]+) sdpa=(?P<sdpa>[-\d.]+) "
+    r"kv_update=(?P<kv_update>[-\d.]+) observe=(?P<observe>[-\d.]+) "
+    r"attn_prep=(?P<attn_prep>[-\d.]+) attn_out=(?P<attn_out>[-\d.]+) "
+    r"gdn=(?P<gdn>[-\d.]+) mlp=(?P<mlp>[-\d.]+) "
+    r"forward=(?P<forward>[-\d.]+) cache_post=(?P<cache_post>[-\d.]+) "
+    r"clear_cache=(?P<clear_cache>[-\d.]+) other=(?P<other>[-\d.]+) "
+    r"final=(?P<final>[01])(?P<broken> broken=1)?$"
 )
 LINE_RE = re.compile(r"^\[prefill_profile\] " + _FIELDS)
 TOTAL_RE = re.compile(r"^\[prefill_profile_total\] " + _FIELDS)
+BROKEN0_RE = re.compile(
+    r"^\[prefill_profile\] chunks=0 broken=1 reason=(?P<reason>.+)$"
+)
 # 13 prompt tokens, step 4: three chunks of 4 (12 tokens), last token via _step.
 PROMPT = list(range(1, 14))
 STEP = 4
@@ -142,10 +152,10 @@ def _fake_model(lm):
     )
 
 
-def _run(lm=None, layers=3):
+def _run(lm=None, layers=3, prompt_cache=None, **gen_kwargs):
     """One generate_step prefill + first token. Returns (token, logprobs, states)."""
     lm = lm if lm is not None else _tiny_lm(layers)
-    prompt_cache = lm.make_cache()
+    prompt_cache = prompt_cache if prompt_cache is not None else lm.make_cache()
     gen = ar_module.generate_step(
         input_ids=mx.array([PROMPT], dtype=mx.int32),
         model=_fake_model(lm),
@@ -155,6 +165,7 @@ def _run(lm=None, layers=3):
         temperature=0.0,
         prefill_step_size=STEP,
         prompt_cache=prompt_cache,
+        **gen_kwargs,
     )
     y, logprobs = next(gen)
     gen.close()
@@ -230,9 +241,8 @@ class TestSwitchUnset:
         calls = _count_sync(monkeypatch)
         _run()
         assert calls["n"] == 0
-        assert _err_lines(capsys) == [] or not any(
-            l.startswith("[prefill_profile") for l in _err_lines(capsys)
-        )
+        err = _err_lines(capsys)  # read ONCE: capsys.readouterr() drains
+        assert not any(l.startswith("[prefill_profile") for l in err), err
         assert prefill_profile.active() is None
         assert prefill_profile.active_layer() is None
         assert prefill_profile.from_env() is None
@@ -309,7 +319,13 @@ class TestSwitchSet:
 
         monkeypatch.setattr(prefill_profile.PrefillProfiler, "mark", spy)
         _run(layers=layers)
-        expected = {**expected, "cache_post": 3, "clear_cache": 3}
+        expected = {
+            **expected,
+            "entry": 3,
+            "forward": 0,  # layers declared themselves -> state is read at cache_post
+            "cache_post": 3,
+            "clear_cache": 3,
+        }
         for phase, n in expected.items():
             assert seen.count(phase) == n, (phase, seen)
 
@@ -328,10 +344,13 @@ class TestSwitchSet:
         monkeypatch.setattr(prefill_profile, "active", lambda: None)
         monkeypatch.setattr(prefill_profile, "active_layer", lambda: None)
         _run()
-        assert set(seen) == {"other_fence", "cache_post", "clear_cache"}
+        assert set(seen) == {"forward", "other_fence", "cache_post", "clear_cache"}
         m = LINE_RE.match(_lines(capsys)[-1])
         assert m is not None and m["chunks"] == "3"
-        for key in ("sdpa", "kv_update", "attn_prep", "attn_out", "gdn", "mlp"):
+        assert float(m["layers"]) == 0.0
+        for key in ("entry", "sdpa", "kv_update", "attn_prep", "attn_out"):
+            assert float(m[key]) == 0.0
+        for key in ("gdn", "mlp"):
             assert float(m[key]) == 0.0
 
 
@@ -376,64 +395,406 @@ class TestLayerReuseOutsideDecoderLayer:
             lambda self, phase, *o: (seen.append(phase), real_mark(self, phase, *o))[1],
         )
         _run(lm)
-        assert set(seen) == {"other_fence", "cache_post", "clear_cache"}, seen
+        # Qwen3_5Model's own entry fence still fires; no decoder layer declares
+        # itself, so the whole forward is evaluated and reported as `forward`.
+        assert set(seen) == {
+            "entry",
+            "forward",
+            "other_fence",
+            "cache_post",
+            "clear_cache",
+        }, seen
         m = LINE_RE.match(_lines(capsys)[-1])
         assert m is not None and m["chunks"] == "3"
+        assert float(m["layers"]) == 0.0
         for key in ("sdpa", "kv_update", "attn_prep", "attn_out", "gdn", "mlp"):
             assert float(m[key]) == 0.0
+        assert float(m["forward"]) > 0.0
 
 
-class TestOnlyProductionWorkIsEvaluated:
-    @pytest.mark.parametrize("layers", [2, 3])
-    def test_chunk_output_and_terminal_layer_output_never_evaluated(
-        self, monkeypatch, layers
+# --- execution-sensitive sentinels ------------------------------------------
+# MLX is lazy and exposes no "was this evaluated" flag, so a sentinel wraps a
+# module's output with `+ ones(BIG).sum() * 0`: evaluating it allocates ~134 MB,
+# which shows up in mx.get_peak_memory() (verified on the CPU stream); leaving it
+# unevaluated costs nothing. Sentinels are armed only inside a profiled chunk,
+# so the unchunked _step decode calls never trip them.
+BIG = 2**25
+THRESH = 100e6
+
+
+def _sentinel_add(out):
+    return out + (mx.ones((BIG,)).sum() * 0).astype(out.dtype)
+
+
+class _Sentinel(nn.Module):
+    def __init__(self, inner):
+        super().__init__()
+        self.inner = inner
+
+    def __call__(self, *args, **kwargs):
+        out = self.inner(*args, **kwargs)
+        if prefill_profile.active() is None:
+            return out
+        return _sentinel_add(out)
+
+
+def _wrap_terminal(lm, which):
+    term = lm.model.layers[-1]
+    if which == "proj":
+        if term.is_linear:
+            term.linear_attn.out_proj = _Sentinel(term.linear_attn.out_proj)
+        else:
+            term.self_attn.o_proj = _Sentinel(term.self_attn.o_proj)
+    elif which == "q":
+        term.self_attn.q_proj = _Sentinel(term.self_attn.q_proj)
+    elif which == "mlp":
+        term.mlp = _Sentinel(term.mlp)
+    elif which == "norm":
+        lm.model.norm = _Sentinel(lm.model.norm)
+    elif which == "head":
+        lm.lm_head = _Sentinel(lm.lm_head)
+    else:  # pragma: no cover
+        raise AssertionError(which)
+
+
+def _peak_of(fn):
+    mx.eval(mx.zeros(1))
+    mx.reset_peak_memory()
+    fn()
+    return mx.get_peak_memory()
+
+
+class TestSentinelSelfCheck:
+    def test_sentinel_fires_when_consumed_only_inside_a_profiled_chunk(self):
+        sentinel = _Sentinel(nn.Identity())
+        x = mx.ones((2, 3))
+        assert _peak_of(lambda: mx.eval(sentinel(x))) < THRESH  # not armed
+        prof = prefill_profile.PrefillProfiler()
+        prof.begin_chunk(1)
+        try:
+            lazy = sentinel(x)
+            assert _peak_of(lambda: None) < THRESH  # built but not consumed
+            assert _peak_of(lambda: mx.eval(lazy)) >= THRESH  # consumed
+        finally:
+            prof.clear_active()
+
+
+class TestDeadWorkNeverExecuted:
+    @pytest.mark.parametrize(
+        "layers,which",
+        [(2, "proj"), (2, "mlp"), (2, "norm"), (2, "head"),
+         (3, "proj"), (3, "mlp"), (3, "norm"), (3, "head")],
+    )
+    def test_terminal_layer_final_norm_and_head_stay_unevaluated(
+        self, monkeypatch, layers, which
     ):
         monkeypatch.setenv(ENV, "1")
         lm = _tiny_lm(layers)
-        keep = []  # hold references so ids cannot be recycled
-        evaluated = set()
-        real_eval = mx.eval
+        _wrap_terminal(lm, which)
+        assert _peak_of(lambda: _run(lm)) < THRESH
 
-        def recording_eval(*args, **kwargs):
-            found = []
-            for a in args:
-                mtp_profile._collect(a, found)
-            keep.extend(found)
-            evaluated.update(id(x) for x in found)
-            return real_eval(*args, **kwargs)
+    @pytest.mark.parametrize(
+        "layers,which", [(2, "proj"), (2, "mlp"), (3, "proj"), (3, "mlp")]
+    )
+    def test_a_profiler_that_evaluates_dead_work_trips_the_sentinel(
+        self, monkeypatch, layers, which
+    ):
+        """The reviewer mutation: layer_mark ignores terminal-ness."""
+        monkeypatch.setenv(ENV, "1")
 
-        monkeypatch.setattr(mx, "eval", recording_eval)
+        def mutated(self, phase, *outputs, live_if_nonterminal=()):
+            self.safe_mark(phase, *outputs, *live_if_nonterminal)
 
-        layer_outputs = {}
-        real_layer_call = Qwen3_5DecoderLayer.__call__
+        monkeypatch.setattr(prefill_profile.PrefillProfiler, "layer_mark", mutated)
+        lm = _tiny_lm(layers)
+        _wrap_terminal(lm, which)
+        assert _peak_of(lambda: _run(lm)) >= THRESH
 
-        def layer_call(self, *a, **k):
-            out = real_layer_call(self, *a, **k)
-            layer_outputs.setdefault(self.m57_terminal, []).append(out)
+    @pytest.mark.parametrize("live_kwargs", [
+        {"return_hidden": True},
+        {"capture_layer_ids": [0]},
+        {"capture_layer_ids": []},
+    ])
+    @pytest.mark.parametrize(
+        "layers,which", [(2, "proj"), (2, "mlp"), (3, "proj"), (3, "mlp")]
+    )
+    def test_terminal_is_live_when_chunk_kwargs_capture_hidden_states(
+        self, monkeypatch, live_kwargs, layers, which
+    ):
+        monkeypatch.setenv(ENV, "1")
+        lm = _tiny_lm(layers)
+        _wrap_terminal(lm, which)
+        assert _peak_of(lambda: _run(lm, **live_kwargs)) >= THRESH
+
+
+class TestTerminalProductionWorkIsEvaluated:
+    def _spy(self, monkeypatch):
+        seen = []
+        real = prefill_profile.PrefillProfiler.mark
+
+        def spy(self, phase, *outputs):
+            before = mx.get_peak_memory()
+            result = real(self, phase, *outputs)
+            seen.append((phase, before, mx.get_peak_memory()))
+            return result
+
+        monkeypatch.setattr(prefill_profile.PrefillProfiler, "mark", spy)
+        return seen
+
+    def test_terminal_kv_update_is_evaluated_before_its_phase_closes(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv(ENV, "1")
+        seen = self._spy(monkeypatch)
+        real = qwen_cache.KVCache.update_and_fetch
+
+        def update(self, keys, values):
+            k, v = real(self, keys, values)
+            if prefill_profile.active() is not None:
+                k = _sentinel_add(k)
+            return k, v
+
+        monkeypatch.setattr(qwen_cache.KVCache, "update_and_fetch", update)
+        _peak_of(lambda: _run(layers=2))  # layer 1 (attention) is terminal
+        first = [t for t in seen if t[0] == "kv_update"][0]
+        assert first[1] < THRESH <= first[2], first
+
+    def test_terminal_recurrent_state_is_in_the_gdn_mark(self, monkeypatch):
+        """The GatedDeltaNet forward evaluates its own inputs while building (a
+        peak-memory sentinel on its projections trips before any mark), so
+        execution cannot separate the phases here; assert instead that the
+        terminal layer's `gdn` mark receives exactly its stored cache state."""
+        monkeypatch.setenv(ENV, "1")
+        stored = []
+        real_gdn = qwen_language.Qwen3_5GatedDeltaNet.__call__
+
+        def gdn_call(self, inputs, mask=None, cache=None):
+            out = real_gdn(self, inputs, mask, cache)
+            stored.append({id(a) for a in _flat_state(cache)})
             return out
+
+        monkeypatch.setattr(qwen_language.Qwen3_5GatedDeltaNet, "__call__", gdn_call)
+        marked = []
+        real = prefill_profile.PrefillProfiler.mark
+
+        def spy(self, phase, *outputs):
+            if phase == "gdn":
+                found = []
+                mtp_profile._collect(outputs, found)
+                marked.append({id(a) for a in found})
+            return real(self, phase, *outputs)
+
+        monkeypatch.setattr(prefill_profile.PrefillProfiler, "mark", spy)
+        keep = []
+        lm = _tiny_lm(3)  # layer 2 (GatedDeltaNet) is terminal
+        _run(lm)
+        # calls alternate layer 0, terminal layer; chunk 1 is stored[0:2]
+        assert stored[1] and stored[1] <= marked[1], (stored[1], marked[1])
+        # and the terminal layer's output `r` is NOT in its mark (dead)
+        assert len(marked[1]) == len(stored[1])
+        # non-terminal layer 0 additionally closes on its output
+        assert len(marked[0]) == len(stored[0]) + 1
+
+
+class TestTerminalIsLastExecutedLayer:
+    def test_profiler_terminal_logic(self):
+        prof = prefill_profile.PrefillProfiler()
+        try:
+            prof.begin_chunk(4)
+            prof.begin_layers(2, live_terminal=False)
+            prof.enter_layer()
+            assert prof.terminal is False
+            prof.enter_layer()
+            assert prof.terminal is True
+            prof.begin_chunk(4)
+            prof.begin_layers(2, live_terminal=True)
+            prof.enter_layer()
+            prof.enter_layer()
+            assert prof.terminal is False
+            prof.begin_chunk(4)  # model never declared its layer count
+            prof.enter_layer()
+            prof.enter_layer()
+            assert prof.terminal is False
+        finally:
+            prof.clear_active()
+
+    def test_model_declares_executed_layer_count_not_a_stored_index(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv(ENV, "1")
+        calls = []
+        real = prefill_profile.PrefillProfiler.begin_layers
+
+        def spy(self, n_exec, live_terminal=False):
+            calls.append((n_exec, live_terminal))
+            return real(self, n_exec, live_terminal)
+
+        monkeypatch.setattr(prefill_profile.PrefillProfiler, "begin_layers", spy)
+        _run(layers=3)
+        assert calls == [(3, False)] * 3
+        calls.clear()
+        _run(layers=3, capture_layer_ids=[0])
+        assert calls == [(3, True)] * 3
+
+
+class TestEntryFence:
+    def test_precomputed_position_embeddings_are_in_the_entry_fence(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv(ENV, "1")
+        lm = _tiny_lm(2)
+        for layer in lm.model.layers:
+            if not layer.is_linear:
+                layer.self_attn.rotary_emb.fused_apply = False
+        passed = []
+        real_layer = Qwen3_5DecoderLayer.__call__
+
+        def layer_call(self, x, *a, **k):
+            passed.append(k.get("position_embeddings"))
+            return real_layer(self, x, *a, **k)
 
         monkeypatch.setattr(Qwen3_5DecoderLayer, "__call__", layer_call)
-        chunk_outputs = []
-        real_lm_call = LanguageModel.__call__
+        entry_ids = []
+        real_mark = prefill_profile.PrefillProfiler.mark
 
-        def lm_call(self, *a, **k):
-            out = real_lm_call(self, *a, **k)
-            chunk_outputs.append(out)
-            return out
+        def spy(self, phase, *outputs):
+            if phase == "entry":
+                found = []
+                mtp_profile._collect(outputs, found)
+                entry_ids.extend(id(x) for x in found)
+            return real_mark(self, phase, *outputs)
 
-        monkeypatch.setattr(LanguageModel, "__call__", lm_call)
-
+        monkeypatch.setattr(prefill_profile.PrefillProfiler, "mark", spy)
+        keep = []
         _run(lm)
-        # calls 4+ are the unchunked _step decode calls (not profiled)
-        chunk_outputs = chunk_outputs[:3]
-        assert len(chunk_outputs) == 3 and len(layer_outputs[True]) >= 3
-        # sentinel: dead in production, so never directly evaluated
-        for out in chunk_outputs:
-            assert id(out.logits) not in evaluated
-        for out in layer_outputs[True][:3]:
-            assert id(out) not in evaluated
-        # positive control: a live (non-terminal) layer output IS evaluated
-        assert id(layer_outputs[False][0]) in evaluated
+        pe = passed[0]
+        assert pe is not None, "non-fused rotary path did not build embeddings"
+        found = []
+        mtp_profile._collect(pe, found)
+        keep.extend(found)
+        assert found and all(id(x) in entry_ids for x in found)
+
+    def test_entry_is_its_own_field_and_not_in_other(self, monkeypatch, capsys, clock):
+        prof = prefill_profile.PrefillProfiler()
+        _drive(
+            prof,
+            clock,
+            [(4, 4, {"entry": 0.050, "sdpa": 0.010}), (4, 8, {"entry": 0.030})],
+        )
+        prof.finish()
+        lines = [l for l in _err_lines(capsys) if l.startswith("[prefill_profile]")]
+        m = LINE_RE.match(lines[-1])
+        assert abs(float(m["entry"]) - 40.0) < 0.02
+        assert abs(float(m["other"]) - 1.0) < 0.02  # only the un-fenced 1 ms tail
+
+
+class TestForwardAndLayers:
+    @pytest.mark.parametrize("layers", [2, 3])
+    def test_layers_field_counts_declared_decoder_layers_per_chunk(
+        self, monkeypatch, capsys, layers
+    ):
+        monkeypatch.setenv(ENV, "1")
+        _run(layers=layers)
+        m = LINE_RE.match(_lines(capsys)[-1])
+        assert float(m["layers"]) == layers
+        assert float(m["forward"]) == 0.0
+
+    def test_forward_replaces_cache_post_when_no_layer_declared_itself(
+        self, monkeypatch, capsys
+    ):
+        monkeypatch.setenv(ENV, "1")
+        monkeypatch.setattr(
+            Qwen3_5DecoderLayer, "__call__", _undeclared_layer_call, raising=True
+        )
+        seen = {}
+        real = prefill_profile.PrefillProfiler.mark
+
+        def spy(self, phase, *outputs):
+            found = []
+            mtp_profile._collect(outputs, found)
+            seen.setdefault(phase, []).append(len(found))
+            return real(self, phase, *outputs)
+
+        monkeypatch.setattr(prefill_profile.PrefillProfiler, "mark", spy)
+        _run(layers=3)
+        # the cache state is evaluated at `forward` (right after the model call)
+        assert len(seen["forward"]) == 3 and all(n > 0 for n in seen["forward"])
+        m = LINE_RE.match(_lines(capsys)[-1])
+        assert float(m["layers"]) == 0.0 and float(m["forward"]) > 0.0
+
+
+def _undeclared_layer_call(self, x, mask=None, cache=None, position_ids=None,
+                           position_embeddings=None):
+    """Qwen3_5DecoderLayer.__call__ minus every profiler hook (a foreign layer)."""
+    if self.is_linear:
+        r = self.linear_attn(self.input_layernorm(x), mask, cache)
+    else:
+        r = self.self_attn(
+            self.input_layernorm(x),
+            mask=mask,
+            cache=cache,
+            position_ids=position_ids,
+            position_embeddings=position_embeddings,
+        )
+    h = x + r
+    return h + self.mlp(self.post_attention_layernorm(h))
+
+
+class TestObserve:
+    def _epi(self, monkeypatch):
+        monkeypatch.setenv("MLX_EPICACHE_BUDGET", "4")
+        monkeypatch.setenv("MLX_EPICACHE_BLOCK", "2")
+
+    def test_observe_hook_is_closed_on_its_own_arrays_and_reported(
+        self, monkeypatch, capsys
+    ):
+        monkeypatch.setenv(ENV, "1")
+        self._epi(monkeypatch)
+        seen = []
+        real = prefill_profile.PrefillProfiler.mark
+
+        def spy(self, phase, *outputs):
+            if phase == "observe":
+                found = []
+                mtp_profile._collect(outputs, found)
+                seen.append(found)
+            return real(self, phase, *outputs)
+
+        monkeypatch.setattr(prefill_profile.PrefillProfiler, "mark", spy)
+        _run(layers=3)
+        assert seen, "observe never marked"
+        assert all(len(found) == 1 and found[0].ndim == 1 for found in seen)
+        m = LINE_RE.match(_lines(capsys)[-1])
+        assert m is not None and float(m["observe"]) >= 0.0
+
+    def test_terminal_queries_are_live_when_observe_consumes_them(self, monkeypatch):
+        """Terminal attn_prep marks (keys, values) only; with an observing cache
+        the queries are live too. (q_proj cannot be a peak sentinel: the fused
+        rotary op consumes queries and keys together, so keys already pull it.)"""
+
+        def terminal_attn_prep_counts():
+            counts = []
+            real = prefill_profile.PrefillProfiler.mark
+
+            def spy(self, phase, *outputs):
+                if phase == "attn_prep":
+                    found = []
+                    mtp_profile._collect(outputs, found)
+                    counts.append(len(found))
+                return real(self, phase, *outputs)
+
+            monkeypatch.setattr(prefill_profile.PrefillProfiler, "mark", spy)
+            _run(layers=2)  # layer 1 (attention) is terminal
+            monkeypatch.setattr(prefill_profile.PrefillProfiler, "mark", real)
+            return counts
+
+        monkeypatch.setenv(ENV, "1")
+        assert terminal_attn_prep_counts() == [2, 2, 2]  # keys, values
+        self._epi(monkeypatch)
+        # chunk 1: offset 0 + 4 <= budget 4; chunks 2, 3 observe -> + queries
+        assert terminal_attn_prep_counts() == [2, 3, 3]
+
+
 
 
 class TestOutputsUnchanged:
@@ -469,7 +830,10 @@ class TestRaisingProfiler:
         assert mx.array_equal(y0, y1).item()
         assert mx.array_equal(lp0, lp1).item()
         assert prefill_profile.active() is None
-        assert not any(l.startswith("[prefill_profile") for l in _err_lines(capsys))
+        pp = [l for l in _err_lines(capsys) if l.startswith("[prefill_profile")]
+        assert len(pp) == 1, pp
+        m = BROKEN0_RE.match(pp[0])
+        assert m is not None and "profiler bug" in m["reason"], pp
 
     def test_mark_failing_after_a_recorded_chunk_prints_broken_never_final(
         self, monkeypatch, capsys
@@ -540,6 +904,22 @@ class TestActiveHandle:
         # finalisation ran from the outer finally: partial set -> never final=1
         pp = [l for l in _err_lines(capsys) if l.startswith("[prefill_profile")]
         assert pp and not any("final=1" in l for l in pp), pp
+
+    def test_exception_in_first_chunk_prints_chunks_zero_broken_line(
+        self, monkeypatch, capsys
+    ):
+        monkeypatch.setenv(ENV, "1")
+        lm = _tiny_lm()
+        real_call = lm.__class__.__call__
+
+        def failing_call(self, *args, **kwargs):
+            raise ValueError("first chunk failure")
+
+        monkeypatch.setattr(lm.__class__, "__call__", failing_call)
+        with pytest.raises(ValueError, match="first chunk failure"):
+            _run(lm)
+        pp = [l for l in _err_lines(capsys) if l.startswith("[prefill_profile")]
+        assert len(pp) == 1 and BROKEN0_RE.match(pp[0]), pp
 
     def test_handle_is_thread_local_and_owned(self):
         prof = prefill_profile.PrefillProfiler()
