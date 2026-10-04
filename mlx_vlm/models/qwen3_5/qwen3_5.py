@@ -46,6 +46,40 @@ def should_offset_norm_weight(original_key, shift_norm_weights):
     return shift_norm_weights or not original_key.startswith("language_model.")
 
 
+class LazyTokenEmbeddings:  # Fork (M57)
+    """Whole-prompt token embeddings, embedded per slice instead of up front.
+
+    Prefix slices `[:, :n]` return real arrays; suffix slices `[:, n:]` stay lazy.
+    """
+
+    def __init__(self, embed, input_ids):
+        self._embed = embed
+        self._ids = input_ids
+        self._dims = self._embed(input_ids[:, :0]).shape[-1]
+
+    @property
+    def shape(self):
+        return (*self._ids.shape, self._dims)
+
+    def materialize(self):
+        return self._embed(self._ids)
+
+    def __getitem__(self, key):
+        if (
+            isinstance(key, tuple)
+            and len(key) == 2
+            and key[0] == slice(None)
+            and isinstance(key[1], slice)
+            and key[1].step is None
+        ):
+            start, stop = key[1].start, key[1].stop
+            if not start:
+                return self._embed(self._ids[:, :stop])
+            if stop is None:
+                return LazyTokenEmbeddings(self._embed, self._ids[:, start:])
+        raise NotImplementedError(f"unsupported lazy embedding slice: {key!r}")
+
+
 class Model(Qwen3VLModel):
 
     def __init__(self, config: ModelConfig):
@@ -54,6 +88,31 @@ class Model(Qwen3VLModel):
         self.config = config
         self.vision_tower = VisionModel(config.vision_config)
         self.language_model = LanguageModel(config.text_config, config)
+
+    def get_lazy_text_embeddings(self, input_ids, pixel_values=None, **kwargs):
+        """Fork (M57): `get_input_embeddings` for a prompt with no merged non-text
+        features, with the embeddings left lazy. None => caller takes the eager path."""
+        if getattr(self.config, "model_type", None) != "qwen3_5":
+            return None
+        if any(
+            kwargs.get(k) is not None
+            for k in (
+                "pixel_values_videos",
+                "image_grid_thw",
+                "video_grid_thw",
+            )
+        ) or pixel_values is not None:
+            return None
+        position_ids, rope_deltas = self.language_model.get_rope_index(
+            input_ids, attention_mask=kwargs.get("mask")
+        )
+        return InputEmbeddingsFeatures(
+            inputs_embeds=LazyTokenEmbeddings(
+                self.language_model.model.embed_tokens, input_ids
+            ),
+            position_ids=position_ids,
+            rope_deltas=rope_deltas,
+        )
 
     def get_input_embeddings(
         self,

@@ -552,9 +552,18 @@ def generate_step(
             if kwargs.get(key) is not None
         }
         # Get input embeddings (handles both multimodal and text-only)
-        embedding_output = model.get_input_embeddings(
-            input_ids, pixel_values, mask=mask, **kwargs
+        # Fork (M57): text-only prompts may return lazy per-chunk embeddings.
+        # Looked up on the TYPE: duck-typed/mock models never opt in by accident.
+        _lazy_hook = getattr(type(model), "get_lazy_text_embeddings", None)
+        embedding_output = (
+            _lazy_hook(model, input_ids, pixel_values, mask=mask, **kwargs)
+            if _lazy_hook is not None
+            else None
         )
+        if embedding_output is None:
+            embedding_output = model.get_input_embeddings(
+                input_ids, pixel_values, mask=mask, **kwargs
+            )
 
         inputs_embeds = embedding_output.inputs_embeds
 
@@ -778,6 +787,8 @@ def generate_step(
 
             input_ids = input_ids[:, -1:]
 
+        if hasattr(inputs_embeds, "materialize"):  # Fork (M57): lazy remainder
+            inputs_embeds = inputs_embeds.materialize()
         y, logprobs = _step(input_ids, inputs_embeds=inputs_embeds)
 
         # Fork (M48): prompt-end capture. The cache now holds exactly the prompt
