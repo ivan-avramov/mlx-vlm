@@ -657,9 +657,10 @@ def generate_step(
             snapshot_done = False
             # Fork (M57): env-gated prefill component profiler; None when unset.
             _pp = prefill_profile.from_env()
+            # Fork (M57): finalizing() flushes the profiler report on any exit.
             with tqdm(
                 total=total_tokens, desc="Prefill", unit="tok", disable=not verbose
-            ) as pbar:
+            ) as pbar, prefill_profile.finalizing(_pp):
                 while inputs_embeds.shape[1] > 1:
                     n_to_process = min(prefill_step_size, inputs_embeds.shape[1] - 1)
                     if (
@@ -689,7 +690,7 @@ def generate_step(
                     }
                     if _pp is not None:  # Fork (M57)
                         _pp.begin_chunk(n_to_process)
-                    try:
+                    try:  # Fork (M57): handle is cleared even if the call raises
                         chunk_output = model.language_model(
                             inputs=input_ids[:, :n_to_process],
                             inputs_embeds=inputs_embeds[:, :n_to_process],
@@ -697,11 +698,11 @@ def generate_step(
                             n_to_process=n_to_process,
                             **chunk_kwargs,
                         )
-                    finally:
-                        if _pp is not None:  # Fork (M57)
+                    finally:  # Fork (M57)
+                        if _pp is not None:
                             _pp.clear_active()
-                    if _pp is not None:  # Fork (M57)
-                        _pp.safe_mark("other_fence", chunk_output)
+                    if _pp is not None:  # Fork (M57): no arrays; output is dead
+                        _pp.safe_mark("other_fence")
                     speculative_prefill.append(chunk_output)
                     del chunk_output
                     quantize_cache_fn(prompt_cache)
@@ -716,8 +717,8 @@ def generate_step(
                         _evict = getattr(_c, "evict_to_budget", None)
                         if _evict is not None:
                             _evict()
-                    if _pp is not None:  # Fork (M57)
-                        _pp.safe_mark("cache_post")
+                    if _pp is not None:  # Fork (M57): state AFTER eviction
+                        _pp.safe_mark("cache_post", [c.state for c in prompt_cache])
                     processed_tokens += n_to_process
                     cumulative_offset += n_to_process
                     if checkpoint_lengths and processed_tokens == checkpoint_lengths[0]:
@@ -770,8 +771,6 @@ def generate_step(
                         _pp.end_chunk(cumulative_offset)
                     pbar.update(n_to_process)
 
-            if _pp is not None:  # Fork (M57)
-                _pp.finish()
             input_ids = input_ids[:, -1:]
 
         y, logprobs = _step(input_ids, inputs_embeds=inputs_embeds)
