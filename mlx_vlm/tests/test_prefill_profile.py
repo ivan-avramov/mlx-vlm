@@ -596,6 +596,74 @@ class TestTerminalProductionWorkIsEvaluated:
         assert len(marked[0]) == len(stored[0]) + 1
 
 
+class TestTerminalStateEvaluatedBeforeGdnCloses:
+    """Execution-sensitive: after the real GatedDeltaNet call stores its state,
+    the TERMINAL layer's stored arrays are replaced by value-identical arrays
+    carrying a peak-memory sentinel (so projection-side evaluation inside the
+    call cannot trip it). The sentinel must have fired by the time the `gdn`
+    mark returns."""
+
+    def _install(self, monkeypatch, layers=3):
+        lm = _tiny_lm(layers)
+        terminal = lm.model.layers[-1].linear_attn
+        real = qwen_language.Qwen3_5GatedDeltaNet.__call__
+
+        def call(self, inputs, mask=None, cache=None):
+            out = real(self, inputs, mask, cache)
+            if self is terminal and prefill_profile.active() is not None:
+                cache.cache = [
+                    None if a is None else _sentinel_add(a) for a in cache.cache
+                ]
+            return out
+
+        monkeypatch.setattr(qwen_language.Qwen3_5GatedDeltaNet, "__call__", call)
+        # (phase, peak while the mark ran, peak between the previous mark and it)
+        peaks = []
+        real_mark = prefill_profile.PrefillProfiler.mark
+
+        def spy(self, phase, *outputs):
+            between = mx.get_peak_memory()
+            mx.reset_peak_memory()
+            result = real_mark(self, phase, *outputs)
+            peaks.append((phase, mx.get_peak_memory(), between))
+            return result
+
+        monkeypatch.setattr(prefill_profile.PrefillProfiler, "mark", spy)
+        return lm, peaks
+
+    def test_terminal_state_fires_by_the_time_gdn_returns(self, monkeypatch):
+        monkeypatch.setenv(ENV, "1")
+        lm, peaks = self._install(monkeypatch)
+        _run(lm)
+        gdn = [p for ph, p, _ in peaks if ph == "gdn"]
+        assert len(gdn) == 6  # per chunk: layer 0 (live, unwrapped), terminal
+        for layer0, terminal in zip(gdn[0::2], gdn[1::2]):
+            assert layer0 < THRESH  # positive control: unwrapped layer is quiet
+            assert terminal >= THRESH  # state evaluated under `gdn`
+
+    def test_mutation_skipping_state_evaluation_fails_that_assertion(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv(ENV, "1")
+        lm, peaks = self._install(monkeypatch)
+        real_layer_mark = prefill_profile.PrefillProfiler.layer_mark
+
+        def mutated(self, phase, *outputs, live_if_nonterminal=()):
+            if phase == "gdn":
+                return self.safe_mark(phase)  # skip evaluation
+            return real_layer_mark(
+                self, phase, *outputs, live_if_nonterminal=live_if_nonterminal
+            )
+
+        monkeypatch.setattr(prefill_profile.PrefillProfiler, "layer_mark", mutated)
+        _run(lm)
+        gdn = [p for ph, p, _ in peaks if ph == "gdn"]
+        assert all(p < THRESH for p in gdn)  # the assertion above would fail
+        # the state is only evaluated later: between the last layer mark and
+        # the cache_post mark (the loop's mx.eval of the cache state)
+        assert any(b >= THRESH for ph, _, b in peaks if ph == "cache_post")
+
+
 class TestTerminalIsLastExecutedLayer:
     def test_profiler_terminal_logic(self):
         prof = prefill_profile.PrefillProfiler()
