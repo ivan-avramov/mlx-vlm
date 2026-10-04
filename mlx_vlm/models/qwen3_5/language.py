@@ -4,6 +4,7 @@ from typing import Any, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from ... import prefill_profile  # Fork (M57): env-gated prefill profiler
 from ...speculative.cache_state import (
     rollback_speculative_cache as rollback_cache_transaction,
 )
@@ -916,9 +917,15 @@ class Qwen3_5Attention(nn.Module):
             output = scaled_dot_product_attention(
                 queries, keys, values, cache=cache, scale=self.scale, mask=mask
             )
+        _pp = prefill_profile.active()  # Fork (M57): None unless profiling
+        if _pp is not None:
+            _pp.safe_mark("sdpa", output)
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
-        return self.o_proj(output * mx.sigmoid(gate))
+        out = self.o_proj(output * mx.sigmoid(gate))
+        if _pp is not None:  # Fork (M57)
+            _pp.safe_mark("attn_out", out)
+        return out
 
     def _prepare_projected_qkv(
         self,
@@ -991,8 +998,13 @@ class Qwen3_5Attention(nn.Module):
                 kv_seq_len = kv_seq_len.max().item()
             mask = mask[..., : int(kv_seq_len)]
 
+        _pp = prefill_profile.active()  # Fork (M57): None unless profiling
+        if _pp is not None:
+            _pp.safe_mark("attn_prep", queries, keys, values, gate)
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
+        if _pp is not None:  # Fork (M57)
+            _pp.safe_mark("kv_update", keys, values)
         # Fork: EpiCache (150a76f9), pure addition — record SnapKV-style attention-mass so
         # the eviction the generation loop runs after this prefill chunk keeps the
         # most-attended middle keys (not just key-norm). Fires only when this full-attn
@@ -1199,8 +1211,14 @@ class Qwen3_5DecoderLayer(nn.Module):
                 position_ids=position_ids,
                 position_embeddings=position_embeddings,
             )
+        _pp = prefill_profile.active()  # Fork (M57): None unless profiling
+        if _pp is not None and self.is_linear:
+            _pp.safe_mark("gdn", r)
         h = x + r
-        return h + self.mlp(self.post_attention_layernorm(h))
+        out = h + self.mlp(self.post_attention_layernorm(h))
+        if _pp is not None:  # Fork (M57)
+            _pp.safe_mark("mlp", out)
+        return out
 
 
 class Qwen3_5Model(nn.Module):
