@@ -634,6 +634,16 @@ def _extract_video_reference(item):
     return video.get("url") if isinstance(video, dict) else video
 
 
+def _streaming_timings(rate, metrics=None) -> StreamingTimings:
+    # Fork (M57): the one builder for every streamed terminal shape; the sdpa
+    # counters are omitted by the model serializer when the policy is `auto`.
+    return StreamingTimings(
+        predicted_per_second=rate,
+        sdpa_forced=getattr(metrics, "sdpa_forced", None),
+        sdpa_auto=getattr(metrics, "sdpa_auto", None),
+    )
+
+
 def _final_chat_chunk(
     request_id: str,
     model: str,
@@ -645,11 +655,8 @@ def _final_chat_chunk(
         id=request_id,
         created=int(time.time()),
         model=model,
-        timings=StreamingTimings(
-            predicted_per_second=predicted_per_second,
-            sdpa_forced=getattr(metrics, "sdpa_forced", None),  # Fork (M57)
-            sdpa_auto=getattr(metrics, "sdpa_auto", None),  # Fork (M57)
-        ),
+        # Fork (M57): sdpa counters on terminal chunks only
+        timings=_streaming_timings(predicted_per_second, metrics),
         choices=[
             ChatStreamChoice(
                 finish_reason=finish_reason,
@@ -717,12 +724,15 @@ def _completion_final_chunk(
     model: str,
     created: int,
     finish_reason: str,
+    metrics=None,  # Fork (M57): sdpa counters ride along only under a policy
 ) -> CompletionStreamChunk:
+    timings = _streaming_timings(None, metrics)
     return CompletionStreamChunk(
         id=request_id,
         created=created,
         model=model,
         choices=[CompletionStreamChoice(text="", index=0, finish_reason=finish_reason)],
+        timings=timings if timings.sdpa_forced is not None else None,  # Fork (M57)
     )
 
 
@@ -1628,7 +1638,7 @@ async def responses_endpoint(request: Request):
                             },
                         )
                     if tail:
-                        yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=tail, timings=StreamingTimings(predicted_per_second=metrics.rate)).model_dump_json()}\n\n"
+                        yield f"event: response.output_text.delta\ndata: {ResponseOutputTextDeltaEvent(type='response.output_text.delta', item_id=message_id, output_index=0, content_index=0, delta=tail, timings=_streaming_timings(metrics.rate)).model_dump_json()}\n\n"
 
                     output_items, clean_text, _, output_finish_reason = (
                         _response_output_items_from_text(
@@ -1665,7 +1675,7 @@ async def responses_endpoint(request: Request):
                         )
 
                     # Send response.output_text.done event (to match the openai pipeline)
-                    yield f"event: response.output_text.done\ndata: {ResponseOutputTextDoneEvent(type='response.output_text.done', item_id=message_id, output_index=0, content_index=0, text=clean_text, timings=StreamingTimings(predicted_per_second=metrics.rate)).model_dump_json()}\n\n"
+                    yield f"event: response.output_text.done\ndata: {ResponseOutputTextDoneEvent(type='response.output_text.done', item_id=message_id, output_index=0, content_index=0, text=clean_text, timings=_streaming_timings(metrics.rate, metrics)).model_dump_json()}\n\n"
 
                     # Send response.content_part.done event (to match the openai pipeline)
                     final_content_part = ContentPartOutputText(
@@ -2505,9 +2515,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                         )
                                     )
                                 ],
-                                timings=StreamingTimings(
-                                    predicted_per_second=metrics.rate
-                                ),
+                                # Fork (M57): sdpa counters on terminal chunks only
+                                timings=_streaming_timings(metrics.rate),
                             )
                             yield f"data: {chunk_data.model_dump_json()}\n\n"
 
@@ -2533,9 +2542,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                     created=int(time.time()),
                                     model=request.model,
                                     choices=choices,
-                                    timings=StreamingTimings(
-                                        predicted_per_second=metrics.rate
-                                    ),
+                                    # Fork (M57): sdpa counters on terminal chunks only
+                                    timings=_streaming_timings(metrics.rate, metrics),
                                 )
                                 yield f"data: {chunk_data.to_sse_json()}\n\n"
                         if not terminal_emitted:
@@ -2647,9 +2655,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                         )
                                     )
                                 ],
-                                timings=StreamingTimings(
-                                    predicted_per_second=metrics.rate
-                                ),
+                                # Fork (M57): sdpa counters on terminal chunks only
+                                timings=_streaming_timings(metrics.rate),
                             )
                             yield f"data: {chunk_data.to_sse_json()}\n\n"
 
@@ -2674,9 +2681,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                         ),
                                     )
                                 ],
-                                timings=StreamingTimings(
-                                    predicted_per_second=metrics.rate
-                                ),
+                                # Fork (M57): sdpa counters on terminal chunks only
+                                timings=_streaming_timings(metrics.rate, metrics),
                             )
                         else:
                             finish_reason = finish_reason or "stop"
@@ -3339,7 +3345,7 @@ async def completions_endpoint(request: Request):
                     finish_reason = finish_reason or "stop"
                     yield (
                         "data: "
-                        f"{_completion_final_chunk(request_id, completion_request.model, created, finish_reason).to_sse_json()}"
+                        f"{_completion_final_chunk(request_id, completion_request.model, created, finish_reason, metrics).to_sse_json()}"
                         "\n\n"
                     )
 

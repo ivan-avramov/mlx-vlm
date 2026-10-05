@@ -195,9 +195,10 @@ class TestF3SelfTest:
                 sdpa=Recorder(), force_calls=True,
             )
 
-    def test_f3_load_logs_calls_run_and_elapsed(self, monkeypatch, capsys, gpu):
+    def test_f3_load_logs_calls_run_and_elapsed(
+        self, monkeypatch, capsys, gpu, passthrough
+    ):
         monkeypatch.setenv("MLX_VLM_ATTENTION_POLICY", "fused_v1")
-        monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", Recorder())
         lm = _tiny_lm()
         model = SimpleNamespace(language_model=lm, config=lm.config)
         generation_module._apply_attention_policy_from_env(model)
@@ -383,7 +384,7 @@ class TestF4ReadinessPath:
         finally:
             rg.stop_and_join(timeout=2)
 
-    def test_f4_lifespan_preload_propagates_so_startup_fails(self, monkeypatch):
+    def test_f4_lifespan_preload_propagates_so_startup_fails(self, monkeypatch, gpu):
         self._failing_env(monkeypatch)
         monkeypatch.setenv("MLX_VLM_PRELOAD_MODEL", "x")
 
@@ -393,7 +394,7 @@ class TestF4ReadinessPath:
 
         with pytest.raises(Exception) as exc:
             asyncio.run(go())
-        assert "attention-policy fused_v1" in str(exc.value) or isinstance(
-            getattr(exc.value, "detail", None), str
-        ) or exc.type is ap.AttentionPolicyError
+        assert exc.type is ap.AttentionPolicyError
+        assert str(exc.value).startswith("attention-policy fused_v1:")
+        assert "no qualified attention call sites" in str(exc.value)
         server.runtime.response_generator = None

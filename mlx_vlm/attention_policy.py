@@ -12,6 +12,7 @@ is a new version name.
 
 import contextlib
 import sys
+import threading
 import time
 from typing import Optional, Tuple
 
@@ -32,22 +33,24 @@ class FusedV1Policy:
     max_q_len_never_forced = 8
     min_q_len_always_forced = 128
     score_bytes_threshold = 2**28
-    # Largest score tensor an UNFUSED call can build under this policy.
-    max_unfused_score_bytes = 2**28
 
     def __init__(self):
         self.forced = 0
         self.auto = 0
-        self._suspended = 0
+        self._local = threading.local()  # suspension is per thread, never shared
 
     @contextlib.contextmanager
     def suspended(self):
         """Nothing is forced inside (the ragged batch prefill's row recursion)."""
-        self._suspended += 1
+        self._local.depth = self._suspended + 1
         try:
             yield
         finally:
-            self._suspended -= 1
+            self._local.depth -= 1
+
+    @property
+    def _suspended(self) -> int:
+        return getattr(self._local, "depth", 0)
 
     def should_force(self, queries, key_length, sinks, mask=None, cache=None) -> bool:
         """Pure decision; rule 1's cache test is the call site's (native branch)."""
@@ -235,28 +238,50 @@ class _Shape:
         self.dtype = dtype
 
 
-def _probe_query_dtype(target, module):
-    """dtype the attention actually computes in: embeddings -> q_proj -> q_norm."""
-    embed = target.model.embed_tokens
-    hidden = embed(mx.zeros((1, 1), dtype=mx.int32))
-    queries = module.q_proj(hidden)[..., : module.head_dim]
-    return module.q_norm(queries).dtype
+class _DtypeRecorder:
+    """Stands in for the policy during one probe forward: records, never forces."""
+
+    def __init__(self):
+        self.dtypes = []
+
+    def decide(self, queries, key_length, sinks, mask=None, cache=None):
+        self.dtypes.append(queries.dtype)
+        return False
+
+
+def _observe_query_dtypes(target, modules):
+    """Query dtype as the attention computes it: one real one-token forward with a
+    recording policy on each qualified module (the policy's own decision point)."""
+    recorders = []
+    previous = []
+    try:
+        for module in modules:
+            recorder = _DtypeRecorder()
+            recorders.append(recorder)
+            previous.append(module.attention_policy)
+            module.attention_policy = recorder
+        out = target(mx.zeros((1, 1), dtype=mx.int32), cache=target.make_cache())
+        mx.eval(out.logits)
+    except Exception as exc:  # noqa: BLE001 - any probe failure is a load failure
+        _fail(f"self-test dtype probe failed: {type(exc).__name__}: {exc}")
+    finally:
+        for module, old in zip(modules, previous):
+            module.attention_policy = old
+    return [r.dtypes[0] if r.dtypes else None for r in recorders]
 
 
 def self_test_model(model, policy, *, max_kv, **kwargs) -> list:
     """Run the self-test once per distinct (heads, kv_heads, head_dim, dtype)."""
     qualified = _qualified_class()
     target = getattr(model, "language_model", model)
+    modules = [m for _, m in target.named_modules() if type(m) is qualified]
+    dtypes = _observe_query_dtypes(target, modules)
     dims = []
-    for _, module in target.named_modules():
-        if type(module) is not qualified:
-            continue
-        cell = (
-            module.num_attention_heads,
-            module.num_key_value_heads,
-            module.head_dim,
-            _probe_query_dtype(target, module),
-        )
+    for module, dtype in zip(modules, dtypes):
+        if dtype is None:
+            _fail("self-test dtype probe saw no attention call on a qualified module")
+        cell = (module.num_attention_heads, module.num_key_value_heads,
+                module.head_dim, dtype)
         if cell not in dims:
             dims.append(cell)
     return [

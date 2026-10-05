@@ -675,13 +675,13 @@ class TestAC9PoolLimit:
         assert cli_module._derive_cache_limit_gb("m", 262144, 512) == 9.0
         assert cli_module._derive_cache_limit_gb("m", 262144, 512, policy=None) == 9.0
 
-    def test_ac9_fused_v1_uses_the_policy_bound_plus_margin(self, monkeypatch):
+    def test_ac9_fused_v1_derivation_equals_auto_amendment_2_g3(self, monkeypatch):
         self._heads(monkeypatch)
         policy = ap.resolve_policy("fused_v1")
         got = cli_module._derive_cache_limit_gb("m", 262144, 512, policy=policy)
-        assert got == 3.0  # ceil(2**28 / 1e9) + 2 GB margin
+        assert got == 9.0  # unchanged: the batched path still runs unfused
         got = cli_module._derive_cache_limit_gb("m", 262144, 1024, policy=policy)
-        assert got == 3.0
+        assert got == cli_module._derive_cache_limit_gb("m", 262144, 1024)
 
     def test_ac9_explicit_cache_limit_still_overrides(self, monkeypatch):
         import mlx.core as real_mx
@@ -698,7 +698,7 @@ class TestAC9PoolLimit:
         cli_module._apply_mlx_memory_limits(
             0, 0, model_path="m", max_kv_size=262144, prefill_step=512, policy=policy
         )
-        assert calls == [int(3.0 * 1024**3)]
+        assert calls == [9 * 1024**3]
         calls.clear()
         cli_module._apply_mlx_memory_limits(
             0, 0, model_path="m", max_kv_size=262144, prefill_step=512

@@ -1100,7 +1100,7 @@ class CompletionStreamChunk(BaseModel):
     model: str = ""
     choices: List[CompletionStreamChoice] = []
     usage: Optional[UsageStats] = None
-    timings: Optional[GenerationTimings] = None
+    timings: Optional[Union[GenerationTimings, StreamingTimings]] = None  # Fork (M57)
 
     def to_sse_json(self) -> str:
         """Serialize for SSE, omitting the unset llama.cpp-style `timings`

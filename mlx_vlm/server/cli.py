@@ -103,8 +103,8 @@ def _derive_cache_limit_gb(model_path, max_kv_size, prefill_step, policy=None):
         return None
     heads = _model_num_attention_heads(model_path) or 32
     scores_gb = heads * prefill_step * max_kv_size * 2 / 1e9
-    if policy is not None:  # Fork (M57): the policy's largest unfused score tensor
-        scores_gb = policy.max_unfused_score_bytes / 1e9
+    # Fork (M57): `policy` is accepted but does not shrink the pool: the batched
+    # path and the row recursion still run unfused at full size (Amendment 2 G3).
     return math.ceil(scores_gb) + 2.0
 
 
