@@ -394,5 +394,5 @@
 # reviewing that edit (and marking new fork sites), re-pin with
 # `git rev-parse :<path>` -- tests/test_audit_scoped_exclusions.py enforces it.
 mlx_vlm/tests/test_generate.py@a5834584a4d9  # C104(a)/(c): fork-owned copy kept over upstream #2276 rewrite; pinned to this blob
-mlx_vlm/tests/test_server.py@ed0be6a6304b  # C104(a)/(c): fork-owned copy kept over upstream #2276 rewrite; pinned to this blob
+mlx_vlm/tests/test_server.py@b2734c274326  # C104(a)/(c): fork-owned copy kept over upstream #2276 rewrite; pinned to this blob
 mlx_vlm/tests/test_speculative.py@b3373b50b9e4  # C104(a)/(c): fork-owned copy kept over upstream #2276 rewrite; pinned to this blob

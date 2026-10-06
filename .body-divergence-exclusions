@@ -81,7 +81,6 @@ mlx_vlm/tests/test_server.py::_input_image  # C104(c) port @1dcc142d: byte-ident
 mlx_vlm/tests/test_server.py::_input_message  # C104(c) port @1dcc142d: byte-identical to upstream v0.7.6; placed in the fork-owned copy's layout, not upstream's order
 mlx_vlm/tests/test_server.py::_response  # C104(c) port @1dcc142d: byte-identical to upstream v0.7.6; placed in the fork-owned copy's layout, not upstream's order
 mlx_vlm/tests/test_server.py::test_chat_fallback_stream_parses_tool_calls  # C104(c) port @1dcc142d: byte-identical to upstream v0.7.6; placed in the fork-owned copy's layout, not upstream's order
-mlx_vlm/tests/test_server.py::test_responses_replay_ignores_empty_assistant_turns  # C104(c) port @1dcc142d: byte-identical to upstream v0.7.6; placed in the fork-owned copy's layout, not upstream's order
 mlx_vlm/tests/test_server.py::test_responses_replay_preserves_assistant_payloads_without_text  # C104(c) port @1dcc142d: byte-identical to upstream v0.7.6; placed in the fork-owned copy's layout, not upstream's order
 mlx_vlm/tests/test_server.py::test_responses_stream_items_match_completed_output  # C104(c) port @1dcc142d: byte-identical to upstream v0.7.6; placed in the fork-owned copy's layout, not upstream's order
 mlx_vlm/tests/test_server.py::test_responses_tool_arguments_are_normalized_without_mutating_input  # C104(c) port @1dcc142d: byte-identical to upstream v0.7.6; placed in the fork-owned copy's layout, not upstream's order

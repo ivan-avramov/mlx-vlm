@@ -10667,6 +10667,11 @@ def test_responses_replay_ignores_empty_assistant_turns(
         *_function_result("File contents", name="read_file"),
     ]
     if sealed:
+        # Fork: capsules need the optional cryptography package (v0.7.6 sync).
+        pytest.importorskip(
+            "cryptography",
+            reason="optional dependency for compaction capsules (cryptography>=43.0.0)",
+        )
         history = [_seal_context(history)]
     with _endpoint() as fake:
         response = _post(
@@ -10903,6 +10908,12 @@ class TestCompaction:
         # Fork: chat compaction is a server switch (default off); upstream's
         # contracts are exercised with it on.
         monkeypatch.setenv("MLX_VLM_CHAT_COMPACTION", "1")
+        # Fork: cryptography is optional (capsules only) since the v0.7.6 sync;
+        # without it these contracts skip with a reason instead of failing.
+        pytest.importorskip(
+            "cryptography",
+            reason="optional dependency for compaction capsules (cryptography>=43.0.0)",
+        )
         monkeypatch.setattr(server.runtime.config, "max_kv_size", None)
         server.response_store.clear()
         server.response_store_order.clear()
