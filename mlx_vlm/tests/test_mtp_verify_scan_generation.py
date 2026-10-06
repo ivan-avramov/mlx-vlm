@@ -81,6 +81,30 @@ def _record_only(drafter, record):
     drafter.accept_verified_tokens = accept
 
 
+def _mixed(drafter, ref, record):
+    """Real proposals on odd rounds; on even rounds the target's own greedy continuation, so the
+    acceptance and rollback paths run while half the rounds are still the unmodified drafter's."""
+    cls = type(drafter)
+    state = {"pos": 0, "round": 0}
+
+    def draft_block(last_bonus, hidden, cache, block_size, sampler, *a, **kw):
+        real = cls.draft_block(drafter, last_bonus, hidden, cache, block_size, sampler, *a, **kw)
+        state["round"] += 1
+        if state["round"] % 2 == 0:
+            real = mx.array([list(ref[state["pos"] + 1 : state["pos"] + block_size])],
+                            dtype=mx.int32)
+        return real
+
+    def accept(verify_hidden, draft_tokens, accepted, new_tokens, *a, **kw):
+        record["hidden"].append(verify_hidden)
+        record["accepted"].append(int(accepted))
+        state["pos"] += len(new_tokens)
+        return cls.accept_verified_tokens(drafter, verify_hidden, draft_tokens, accepted,
+                                          new_tokens, *a, **kw)
+
+    drafter.draft_block, drafter.accept_verified_tokens = draft_block, accept
+
+
 def _drafter_state(drafter):
     arrays = []
     for layer in drafter._cache:
@@ -126,7 +150,9 @@ def _oracle(drafter, ref, record):
 def _run(lm, drafter, ref, oracle=True):
     mx.random.seed(7)  # RNG state restored before each run
     record = {"hidden": [], "accepted": []}
-    if oracle:
+    if oracle == "mixed":
+        _mixed(drafter, ref, record)
+    elif oracle:
         _oracle(drafter, ref, record)
     else:
         _record_only(drafter, record)
@@ -215,6 +241,24 @@ class TestAC8GenerationIdentity:
         assert again[0] == base[0] and again[3] == base[3]
         assert again[1]["accepted"] == base[1]["accepted"]
         assert len(base[1]["accepted"]) > 3  # real rounds ran
+        for got, want in zip(again[1]["hidden"], base[1]["hidden"]):
+            assert got.shape == want.shape and mx.allclose(got, want, **TOL).item()
+        _assert_drafter_state(again[1]["drafter"], base[1]["drafter"])
+
+    def test_unmodified_drafter_rounds_with_real_acceptance(self, micro):
+        lm, drafter = micro
+        ref = _reference(lm)
+        base = _run(lm, drafter, ref, oracle="mixed")
+        accepted = base[1]["accepted"]
+        assert sum(accepted) > 0 and any(a == 0 for a in accepted)   # both real and oracle rounds
+        assert sum(base[1]["drafter"]["accept_lens"]) > 0            # draft_n_accepted > 0
+        model = type("M", (), {"config": lm.config, "language_model": lm})()
+        policy = mv.JointV1Policy()
+        mv.apply_to_model(model, policy)
+        again = _run(lm, drafter, ref, oracle="mixed")
+        assert policy.counters()["verify_blocks_joint_v1"] > 0
+        assert again[0] == base[0] and again[3] == base[3]
+        assert again[1]["accepted"] == accepted
         for got, want in zip(again[1]["hidden"], base[1]["hidden"]):
             assert got.shape == want.shape and mx.allclose(got, want, **TOL).item()
         _assert_drafter_state(again[1]["drafter"], base[1]["drafter"])

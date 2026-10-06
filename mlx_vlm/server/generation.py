@@ -210,6 +210,10 @@ def _apply_attention_policy_from_env(model):
 
 def _apply_mtp_verify_from_env(model, *, draft_kind, kv_bits, kv_quant_scheme=None):
     # Fork (M58): resolved ONCE at load, stamped on the instance; never re-read.
+    if (os.environ.get("MLX_VLM_MTP_VERIFY_SCAN") or "per_query") == "per_query" and (
+        os.environ.get("MLX_VLM_MTP_VERIFY_AB", "0") != "1"
+    ):
+        return None  # default: nothing from the module is imported or executed
     from .. import mtp_verify_scan as _mv
 
     try:
@@ -1537,9 +1541,10 @@ class ResponseGenerator:
                 f"cooldown={draft_model.cooldown or 'off'})."
             )
 
-        from .. import mtp_verify_scan as _mv  # Fork (M58)
+        if self.mtp_verify_policy is not None:  # Fork (M58): the default path imports nothing
+            from .. import mtp_verify_scan as _mv
 
-        _mv.require_loaded_mtp_drafter(self.mtp_verify_policy, draft_model, draft_kind)  # Fork (M58)
+            _mv.require_loaded_mtp_drafter(self.mtp_verify_policy, draft_model, draft_kind)
         self.model = model
         self.processor = processor
         self.config = config

@@ -75,3 +75,11 @@ def pytest_report_collectionfinish() -> list[str]:
         symbol, _reason = UNPORTED_UPSTREAM_TESTS[name]
         lines.append(f"  - {name}  (needs {symbol})")
     return lines
+
+
+def pytest_configure(config):  # M58 D5
+    config.addinivalue_line(
+        "markers",
+        "requires_stack_registry: golden test over the stack's real main_models.yaml; CI must "
+        "enforce it (MLX_REQUIRE_STACK_REGISTRY=1 turns the machine-without-checkout skip into a failure)",
+    )

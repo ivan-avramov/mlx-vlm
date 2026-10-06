@@ -9,6 +9,7 @@ import itertools
 import json
 import logging
 import subprocess
+import time
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -1192,10 +1193,10 @@ class TestB6LoadedMtpDrafter:
             with pytest.raises(mv.VerifyScanError, match="MTP drafter"):
                 mv.require_loaded_mtp_drafter(pol, model, kind)
 
-    def _init(self, monkeypatch, gpu, qualified, resolved, compat_fails=False):
+    def _init(self, monkeypatch, gpu, qualified, resolved, compat_fails=False, scan="joint_v1"):
         import mlx_vlm.speculative.drafters as drafters
 
-        monkeypatch.setenv("MLX_VLM_MTP_VERIFY_SCAN", "joint_v1")
+        monkeypatch.setenv("MLX_VLM_MTP_VERIFY_SCAN", scan)
         monkeypatch.setenv("MLX_VLM_MTP_VERIFY_AB", "0")
         monkeypatch.delenv("MLX_SDPA_BLOCKS", raising=False)
         monkeypatch.delenv("MLX_VLM_MOE_EXPAND", raising=False)
@@ -1413,9 +1414,16 @@ class TestB10RealMirror:
             expected = "straddle" if (q_len, key_length) in STEP1_MISMATCH else "joint"
             assert route == expected, (q_len, key_length)
 
-    def test_b10_mismatch_positions_are_the_first_qL_minus_d(self):
-        for (q_len, key_length), positions in STEP1_MISMATCH.items():
-            assert positions == list(range(len(positions)))  # leading positions only
+    def test_b10_mismatch_positions_are_the_first_qL_minus_d_via_the_real_mirror(self, real_mirror):
+        plan = qwen_language._qwen3_5_sdpa_vector_plan
+        for q_len in (2, 3, 4, 5):
+            for key_length in SWEEP_KEYS:
+                joint = plan(key_length, 24, 4)
+                # per-query position i attends keys [0, key_length - q_len + i]
+                positions = [i for i in range(q_len)
+                             if plan(key_length - q_len + 1 + i, 24, 4) != joint]
+                assert positions == STEP1_MISMATCH.get((q_len, key_length), []), (q_len, key_length)
+                assert positions == list(range(len(positions)))        # leading positions only
 
     def test_b10_the_length_two_straddle_at_1025_and_1024(self, real_mirror, rec):
         policy = mv.JointV1Policy()
@@ -1449,6 +1457,7 @@ class TestB9DeviceDiscoveryConsistency:
         d = policy.classify(q, k, v, NativeCache(), "causal")
         assert (d.route, d.reason) == ("per_query", "domain")
         qwen_language._qwen3_5_device_arch_suffix.cache_clear()
+        policy.refresh_device()                    # the device is resolved at load, not per call
         assert policy.classify(q, k, v, NativeCache(), "causal").route == "joint"
 
     def test_b9_missing_architecture_fails_closed_in_the_domain_and_the_mirror(
@@ -1497,17 +1506,34 @@ class TestF4QuantizedKvPredicate:
 
 # ------------------------------------------------------------------ golden: shipped first pick
 FIRST_PICK = "Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed"
-STACK_REGISTRY = Path(
-    __import__("os").environ.get("MLX_STACK_REGISTRY")
-    or REPO.parent / "mlx_local_stack" / "main_models.yaml"
-)
+def _stack_registry():
+    """Resolve the stack registry for the golden tests: env MLX_STACK_REGISTRY, else the sibling
+    checkout. A set-but-absent MLX_STACK_REGISTRY FAILS (never skips); with neither present the
+    test skips LOUDLY unless MLX_REQUIRE_STACK_REGISTRY=1 (CI: set it, or select
+    `-m requires_stack_registry` and treat any skip as a failure)."""
+    import os
+
+    env = os.environ.get("MLX_STACK_REGISTRY")
+    if env:
+        path = Path(env)
+        if not path.exists():
+            pytest.fail(f"MLX_STACK_REGISTRY={env!r} does not exist")
+        return path
+    path = REPO.parent / "mlx_local_stack" / "main_models.yaml"
+    if not path.exists():
+        msg = (f"GOLDEN TEST NOT RUN: no stack registry at {path} (set MLX_STACK_REGISTRY); the "
+               f"shipped first-pick configuration is UNVERIFIED on this machine")
+        if os.environ.get("MLX_REQUIRE_STACK_REGISTRY") == "1":
+            pytest.fail(msg)
+        pytest.skip(msg)
+    return path
 
 
-@pytest.mark.skipif(not STACK_REGISTRY.exists(), reason="stack main_models.yaml not present")
+@pytest.mark.requires_stack_registry
 def test_golden_the_shipped_first_pick_passes_every_load_time_refusal(monkeypatch, gpu, qualified):
     import yaml
 
-    entries = yaml.safe_load(STACK_REGISTRY.read_text())["models"]
+    entries = yaml.safe_load(_stack_registry().read_text())["models"]
     pick = next(e for e in entries if e["name"] == FIRST_PICK)
     assert (pick["kv_bits"], pick.get("kv_quant_scheme"), pick["draft_kind"]) == (0, "turboquant", "mtp")
     # what the worker resolves for that entry: KV_BITS=0 -> None (native), scheme passed through
@@ -1528,3 +1554,246 @@ def test_golden_the_shipped_first_pick_passes_every_load_time_refusal(monkeypatc
     assert isinstance(policy, mv.JointV1Policy)               # no load-time refusal fired
     # and the runtime predicate agrees: a native cache has no `bits` attribute
     assert policy.classify(*make_qkv(3, 64, gqa=2, head_dim=16), NativeCache(), "causal").reason != "cache"
+
+
+# ------------------------------------------------------------------ D6 default path imports nothing
+class TestD6DefaultPathIsInert:
+    @pytest.fixture
+    def no_import(self, monkeypatch):
+        import builtins
+
+        real = builtins.__import__
+
+        def guard(name, globals=None, locals=None, fromlist=(), level=0):
+            if "mtp_verify_scan" in (name or "") or "mtp_verify_scan" in (fromlist or ()):
+                raise AssertionError("mtp_verify_scan imported on the default path")
+            return real(name, globals, locals, fromlist, level)
+
+        monkeypatch.setattr(builtins, "__import__", guard)
+
+    @pytest.mark.parametrize("scan", [None, "", "per_query"])
+    def test_d6_apply_hook_without_flags_imports_and_calls_nothing(self, monkeypatch, no_import, scan):
+        monkeypatch.delenv("MLX_VLM_MTP_VERIFY_AB", raising=False)
+        if scan is None:
+            monkeypatch.delenv("MLX_VLM_MTP_VERIFY_SCAN", raising=False)
+        else:
+            monkeypatch.setenv("MLX_VLM_MTP_VERIFY_SCAN", scan)
+        model = SimpleNamespace()
+        assert generation_module._apply_mtp_verify_from_env(
+            model, draft_kind=None, kv_bits=4.0, kv_quant_scheme="turboquant") is None
+
+    def test_d6_flags_still_import_and_refuse(self, monkeypatch):
+        monkeypatch.setenv("MLX_VLM_MTP_VERIFY_SCAN", "per_query")
+        monkeypatch.setenv("MLX_VLM_MTP_VERIFY_AB", "1")       # AB without joint_v1 must refuse
+        with pytest.raises(mv.VerifyScanError, match="joint_v1"):
+            generation_module._apply_mtp_verify_from_env(SimpleNamespace(), draft_kind="mtp", kv_bits=None)
+        monkeypatch.setenv("MLX_VLM_MTP_VERIFY_AB", "0")
+        monkeypatch.setenv("MLX_VLM_MTP_VERIFY_SCAN", "joint_v9")
+        with pytest.raises(mv.VerifyScanError, match="joint_v9"):
+            generation_module._apply_mtp_verify_from_env(SimpleNamespace(), draft_kind="mtp", kv_bits=None)
+
+    def test_d6_initialize_model_default_path_never_touches_the_module(
+        self, monkeypatch, no_import, gpu
+    ):
+        harness = TestB6LoadedMtpDrafter()
+        # a plain-decode init (no drafter env); only the import hook is under test
+        monkeypatch.delenv("MLX_VLM_DRAFT_KIND", raising=False)
+        monkeypatch.delenv("MLX_VLM_DRAFT_MODEL", raising=False)
+        monkeypatch.setenv("MLX_VLM_MTP_VERIFY_SCAN", "per_query")
+        monkeypatch.setenv("MLX_VLM_MTP_VERIFY_AB", "0")
+        monkeypatch.delenv("MLX_VLM_MOE_EXPAND", raising=False)
+        monkeypatch.delenv("MLX_VLM_ATTENTION_POLICY", raising=False)
+        lm = _tiny_lm()
+        model = SimpleNamespace(language_model=lm, config=lm.config)
+        monkeypatch.setattr(generation_module, "load_model_resources",
+                            lambda *a, **k: (model, SimpleNamespace(), lm.config))
+        fake = SimpleNamespace(model_path="x", adapter_path=None, draft_kind_override=None,
+                               draft_model_path=None, apc_manager=None, kv_bits=None)
+        try:
+            generation_module.ResponseGenerator._initialize_model(fake)
+        except AssertionError as e:
+            assert "mtp_verify_scan" not in str(e), e         # only our hook may fail the test
+        except Exception:
+            pass                                               # unrelated fake-processor gaps
+        assert fake.mtp_verify_policy is None
+
+
+# ------------------------------------------------------------------ D7 self-test deadline
+class TestD7Deadline:
+    def test_d7_expiry_prints_one_line_and_exits_nonzero(self, monkeypatch, capsys):
+        codes = []
+        monkeypatch.setattr(mv, "_hard_exit", codes.append)
+        with mv.deadline(0.05):
+            time.sleep(0.3)
+        assert codes == [mv.SELF_TEST_EXIT_CODE] and codes[0] != 0
+        err = [l for l in capsys.readouterr().err.splitlines() if l.strip()]
+        assert len(err) == 1 and "deadline" in err[0] and "joint_v1" in err[0]
+
+    def test_d7_a_finished_block_cancels_the_watchdog(self, monkeypatch):
+        codes = []
+        monkeypatch.setattr(mv, "_hard_exit", codes.append)
+        with mv.deadline(0.2):
+            pass
+        time.sleep(0.4)
+        assert codes == []
+
+    def test_d7_a_hung_cell_call_is_covered(self, qualified, gpu, monkeypatch):
+        codes = []
+        monkeypatch.setattr(mv, "_hard_exit", codes.append)
+        monkeypatch.setattr(mv, "SELF_TEST_BUDGET_S", 0.05)
+
+        fake = TestSelfTest.FakeSdpa()
+
+        def slow(q, k, v, **kw):
+            time.sleep(0.1)
+            return fake(q, k, v, **kw)              # consistent known positive, but slow
+
+        monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", slow)
+        with pytest.raises(mv.VerifyScanError, match="budget"):   # (the real exit ends the process)
+            mv.self_test(mv.JointV1Policy(), **TestSelfTest.DIMS)
+        assert codes == [mv.SELF_TEST_EXIT_CODE]
+
+    def test_d7_a_hung_dtype_probe_is_covered(self, monkeypatch):
+        from mlx_vlm import attention_policy as ap
+
+        codes = []
+        monkeypatch.setattr(mv, "_hard_exit", codes.append)
+        monkeypatch.setattr(mv, "SELF_TEST_BUDGET_S", 0.05)
+
+        def hang(target, modules):
+            time.sleep(0.3)
+            return []
+
+        monkeypatch.setattr(ap, "_observe_query_dtypes", hang)
+        lm = _tiny_lm()
+        assert mv.self_test_model(SimpleNamespace(language_model=lm, config=lm.config),
+                                  mv.JointV1Policy()) == []
+        assert codes == [mv.SELF_TEST_EXIT_CODE]
+
+    def test_d7_the_process_really_terminates_nonzero(self):
+        code = (
+            "import time\n"
+            "from mlx_vlm import mtp_verify_scan as mv\n"
+            "with mv.deadline(0.2):\n"
+            "    time.sleep(30)\n"
+            "print('NOT REACHED')\n"
+        )
+        started = time.perf_counter()
+        proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                              timeout=25, cwd=str(REPO))
+        assert proc.returncode == mv.SELF_TEST_EXIT_CODE
+        assert "NOT REACHED" not in proc.stdout and "deadline" in proc.stderr
+        assert time.perf_counter() - started < 20
+
+
+# ------------------------------------------------------------------ D5 registry resolution
+class TestD5GoldenRegistryResolution:
+    def test_d5_a_set_but_absent_env_fails_not_skips(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("MLX_STACK_REGISTRY", str(tmp_path / "nope.yaml"))
+        with pytest.raises(pytest.fail.Exception, match="does not exist"):
+            _stack_registry()
+
+    def test_d5_env_path_wins_when_present(self, monkeypatch, tmp_path):
+        p = tmp_path / "r.yaml"
+        p.write_text("models: []")
+        monkeypatch.setenv("MLX_STACK_REGISTRY", str(p))
+        assert _stack_registry() == p
+
+    def test_d5_absent_everywhere_skips_loudly_or_fails_when_required(self, monkeypatch):
+        monkeypatch.delenv("MLX_STACK_REGISTRY", raising=False)
+        monkeypatch.setattr(type(REPO), "exists", lambda self: False, raising=False)
+        monkeypatch.delenv("MLX_REQUIRE_STACK_REGISTRY", raising=False)
+        with pytest.raises(pytest.skip.Exception, match="GOLDEN TEST NOT RUN"):
+            _stack_registry()
+        monkeypatch.setenv("MLX_REQUIRE_STACK_REGISTRY", "1")
+        with pytest.raises(pytest.fail.Exception, match="GOLDEN TEST NOT RUN"):
+            _stack_registry()
+
+
+# ------------------------------------------------------------------ review round 2: test gaps
+class TestRound2Gaps:
+    def test_d6_key_and_value_dtype_and_head_dim_are_part_of_the_domain(self, qualified, rec):
+        policy = mv.JointV1Policy()
+        q, k, v = make_qkv(3, 4096)
+        for bad_k, bad_v in ((k.astype(mx.float16), v), (k, v.astype(mx.float16))):
+            d = policy.classify(q, bad_k, bad_v, NativeCache(), "causal")
+            assert (d.route, d.reason) == ("per_query", "domain")
+        wide = mx.zeros((1, 1, 4096, 128), mx.bfloat16)
+        assert policy.classify(q, wide, v, NativeCache(), "causal").reason == "domain"
+        assert policy.classify(q, k, wide, NativeCache(), "causal").reason == "domain"
+        assert policy.classify(q, k, v, NativeCache(), "causal").route == "joint"
+
+    def test_d5_the_query_head_dim_is_checked(self, qualified):
+        q, k, v = make_qkv(3, 4096, head_dim=128)
+        assert mv.JointV1Policy().classify(q, k, v, NativeCache(), "causal").reason == "domain"
+
+    def test_d7_the_self_test_never_touches_the_global_rng(self, qualified, gpu, monkeypatch):
+        monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", TestSelfTest.FakeSdpa())
+        mx.random.seed(123)
+        expected = mx.random.uniform(shape=(4,)).tolist()
+        mx.random.seed(123)
+        mv.self_test(mv.JointV1Policy(), **TestSelfTest.DIMS)
+        assert mx.random.uniform(shape=(4,)).tolist() == expected
+
+    def test_d7_the_self_test_is_deterministic(self, qualified, gpu, monkeypatch):
+        seen = []
+        real = TestSelfTest.FakeSdpa()
+
+        def spy(q, k, v, **kw):
+            seen.append(float(q.astype(mx.float32).sum().item()))
+            return real(q, k, v, **kw)
+        monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", spy)
+        mv.self_test(mv.JointV1Policy(), **TestSelfTest.DIMS)
+        first, seen[:] = list(seen), []
+        mv.self_test(mv.JointV1Policy(), **TestSelfTest.DIMS)
+        assert seen == first
+
+    def test_d8_classify_never_queries_the_device_on_the_hot_path(self, qualified, monkeypatch):
+        calls = []
+        monkeypatch.setattr(mv, "_device_class", lambda: calls.append(1) or "applegpu_g17s")
+        policy = mv.JointV1Policy()
+        for _ in range(50):
+            policy.classify(*make_qkv(3, 4096), NativeCache(), "causal")
+        assert len(calls) == 1                      # resolved once, then cached
+        policy.refresh_device()
+        assert len(calls) == 2
+
+    def test_d5_the_straddle_known_positive_is_required(self, gpu, monkeypatch):
+        monkeypatch.setattr(mv, "_device_class", lambda: "applegpu_g17s")
+        monkeypatch.setattr(qwen_language, "_qwen3_5_device_arch_suffix", lambda: "s")
+        monkeypatch.setattr(qwen_language, "_qwen3_5_sdpa_vector_plan",
+                            lambda n, q, kv: ("one_pass", 0))        # predicts no straddle
+        monkeypatch.setattr(mx.fast, "scaled_dot_product_attention",
+                            lambda q, k, v, **kw: mx.zeros(q.shape, q.dtype))   # and none occurs
+        with pytest.raises(mv.VerifyScanError, match="known positive"):
+            mv.self_test(mv.JointV1Policy(), **TestSelfTest.DIMS)
+
+    def test_d5_length_one_blocks_never_enter_the_fallback_reasons(self, qualified, rec):
+        policy = mv.JointV1Policy()
+        for _ in range(3):
+            assert attend(policy, *make_qkv(1, 4096)) is None
+        c = policy.counters()
+        assert c["verify_blocks_len1"] == 3 and c["verify_blocks_per_query"] == 0
+        assert c["verify_fallback_reasons"] == {}
+
+    def test_d5_the_hook_never_overrides_the_left_padded_helpers_output(self, monkeypatch):
+        sentinel = mx.ones((1, 6, 3, D), mx.bfloat16)
+        monkeypatch.setattr(qwen_language, "_qwen3_5_left_padded_attention",
+                            lambda *a, **k: sentinel)
+
+        class Spy(mv.JointV1Policy):
+            def attend(self, **kw):
+                raise AssertionError("policy consulted although the ragged helper produced output")
+
+        q, k, v = make_qkv(3, 64)
+        out = run_verifier_attention(q, k, v, "causal", policy=Spy())
+        assert out is not None                      # the helper's output flowed through untouched
+
+    def test_d5_the_gpu_requirement_is_enforced_at_load(self, monkeypatch):
+        monkeypatch.setenv("MLX_VLM_MTP_VERIFY_SCAN", "joint_v1")
+        monkeypatch.setenv("MLX_VLM_MTP_VERIFY_AB", "0")
+        monkeypatch.delenv("MLX_SDPA_BLOCKS", raising=False)
+        lm = _tiny_lm()
+        with pytest.raises(mv.VerifyScanError, match="GPU"):
+            generation_module._apply_mtp_verify_from_env(
+                SimpleNamespace(language_model=lm, config=lm.config), draft_kind="mtp", kv_bits=None)

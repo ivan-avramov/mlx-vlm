@@ -21,8 +21,10 @@ constants, thresholds and domain belong to the version name. ``per_query`` is
 today's behaviour and never creates a policy object.
 """
 
+import contextlib
 import os
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -45,6 +47,7 @@ VECTOR_QUERY_BOUND = 32  # STEP 1: 36 > 32 leaves the vector kernel (applegpu_g1
 SELF_TEST_KEYS = 2048
 SELF_TEST_STRADDLE_PREFIX = 1022  # keys 1023..1025 cross the 1024 threshold
 SELF_TEST_BUDGET_S = 30.0
+SELF_TEST_SEED = 58
 
 BLOCK_KEYS = (
     "verify_blocks_joint_v1",
@@ -195,6 +198,33 @@ class _Pending:
     other: object
 
 
+SELF_TEST_EXIT_CODE = 75
+
+
+def _hard_exit(code):  # indirection so tests can observe the expiry without dying
+    os._exit(code)
+
+
+@contextlib.contextmanager
+def deadline(budget_s, what="self-test"):
+    """Worker-level deadline: if the guarded block has not finished after ``budget_s`` seconds
+    (a hung Metal call cannot be interrupted from Python), a watchdog thread prints one stderr
+    line and terminates the whole process with a nonzero code, so the router's readiness timeout
+    is never the only guard. Cancelled on normal exit."""
+    def expire():
+        print(f"mtp-verify-scan joint_v1: {what} exceeded its {budget_s:.0f}s deadline; "
+              f"terminating the worker (exit {SELF_TEST_EXIT_CODE})", file=sys.stderr, flush=True)
+        _hard_exit(SELF_TEST_EXIT_CODE)
+
+    timer = threading.Timer(budget_s, expire)
+    timer.daemon = True
+    timer.start()
+    try:
+        yield
+    finally:
+        timer.cancel()
+
+
 class SelfTestResult:
     def __init__(self, ran=0, elapsed_s=0.0):
         self.ran = ran
@@ -212,6 +242,16 @@ class JointV1Policy:
         self._pending = []
         self._ordinal = 0
         self._logged_shapes = set()
+        self._device = None  # (live class, mirror agrees) resolved ONCE, never on the hot path
+
+    def refresh_device(self):
+        """Resolve the live device class and the mirror agreement once (load / self-test)."""
+        live = _device_class()
+        self._device = (live, _mirror_matches_live_device(live))
+        return self._device
+
+    def _device_state(self):
+        return self._device if self._device is not None else self.refresh_device()
 
     # ------------------------------------------------------------ decision
     def classify(self, queries, keys, values, cache, mask) -> Decision:
@@ -247,13 +287,18 @@ class JointV1Policy:
         if length * gqa > VECTOR_QUERY_BOUND:
             return Decision("per_query", "gqa_bound")
         domain = self.domain or QUALIFIED_DOMAIN
+        live_class, mirror_ok = self._device_state()
         if (
             queries.dtype not in domain.dtypes
+            or keys.dtype != queries.dtype
+            or values.dtype != queries.dtype
             or queries.shape[-1] != domain.head_dim
+            or keys.shape[-1] != domain.head_dim
+            or values.shape[-1] != domain.head_dim
             or n_q % n_kv != 0
             or gqa not in domain.gqa
-            or _device_class() not in domain.device_classes
-            or not _mirror_matches_live_device(_device_class())
+            or live_class not in domain.device_classes
+            or not mirror_ok
         ):
             return Decision("per_query", "domain")
         joint_mask = "causal"
@@ -463,11 +508,18 @@ def self_test(
     2048 keys; (2) one straddling cell (keys 1023..1025): the mirror must
     PREDICT the mismatch and it must occur. A raise, an unpredicted mismatch, or
     a predicted mismatch that does not occur is a failure; so is a non-GPU
-    default device (no skip). Counters are untouched. A hung call is bounded by
-    the router's readiness timeout, not by this function: nothing here can
-    interrupt a Metal call that never returns.
+    default device (no skip). Counters are untouched. Nothing here can interrupt a Metal
+    call that never returns, so the whole test runs under a watchdog `deadline()` that
+    terminates the worker with a nonzero exit; the router's readiness timeout is only the
+    second guard.
     """
+    with deadline(SELF_TEST_BUDGET_S):
+        return _self_test(policy, heads, kv_heads, head_dim, dtype, force_calls)
+
+
+def _self_test(policy, heads, kv_heads, head_dim, dtype, force_calls):
     started = time.perf_counter()
+    policy.refresh_device()  # once per self-test, never per classify
     if force_calls is None:
         force_calls = _gpu_enabled()
     if not force_calls:
@@ -478,9 +530,12 @@ def self_test(
     scale = head_dim**-0.5
 
     def cell(length, key_length):
-        q = mx.random.normal((1, heads, length, head_dim)).astype(dtype)
-        k = mx.random.normal((1, kv_heads, key_length, head_dim)).astype(dtype)
-        v = mx.random.normal((1, kv_heads, key_length, head_dim)).astype(dtype)
+        # a fixed LOCAL key: the global RNG state is never read or advanced (D7), so workers
+        # under either policy start serving from identical RNG state
+        kq, kk, kv_ = mx.random.split(mx.random.key(SELF_TEST_SEED + length * 7919 + key_length), 3)
+        q = mx.random.normal((1, heads, length, head_dim), key=kq).astype(dtype)
+        k = mx.random.normal((1, kv_heads, key_length, head_dim), key=kk).astype(dtype)
+        v = mx.random.normal((1, kv_heads, key_length, head_dim), key=kv_).astype(dtype)
         decision = policy.classify(q, k, v, cache, "causal")
         return q, k, v, decision
 
@@ -542,16 +597,17 @@ def self_test_model(model, policy, **kwargs) -> list:
     qualified = _qualified_class()
     target = getattr(model, "language_model", model)
     modules = [m for _, m in target.named_modules() if type(m) is qualified]
-    dtypes = ap._observe_query_dtypes(target, modules)
-    dims = []
-    for module, dtype in zip(modules, dtypes):
-        if dtype is None:
-            _fail("self-test dtype probe saw no attention call on a qualified module")
-        cell = (module.num_attention_heads, module.num_key_value_heads,
-                module.head_dim, dtype)
-        if cell not in dims:
-            dims.append(cell)
-    return [
-        self_test(policy, heads=h, kv_heads=kv, head_dim=hd, dtype=dt, **kwargs)
-        for h, kv, hd, dt in dims
-    ]
+    with deadline(SELF_TEST_BUDGET_S):  # the dtype probe AND every cell share one deadline
+        dtypes = ap._observe_query_dtypes(target, modules)
+        dims = []
+        for module, dtype in zip(modules, dtypes):
+            if dtype is None:
+                _fail("self-test dtype probe saw no attention call on a qualified module")
+            cell = (module.num_attention_heads, module.num_key_value_heads,
+                    module.head_dim, dtype)
+            if cell not in dims:
+                dims.append(cell)
+        return [
+            self_test(policy, heads=h, kv_heads=kv, head_dim=hd, dtype=dt, **kwargs)
+            for h, kv, hd, dt in dims
+        ]
