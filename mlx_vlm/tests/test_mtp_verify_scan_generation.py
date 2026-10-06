@@ -262,3 +262,54 @@ class TestAC8GenerationIdentity:
         for got, want in zip(again[1]["hidden"], base[1]["hidden"]):
             assert got.shape == want.shape and mx.allclose(got, want, **TOL).item()
         _assert_drafter_state(again[1]["drafter"], base[1]["drafter"])
+
+
+def _drafter(lm, seed):
+    mx.random.seed(seed)
+    text_config = copy.deepcopy(lm.config.text_config)
+    text_config.mtp_num_hidden_layers = 1
+    drafter = Qwen3_5MTPDraftModel(MTPConfig(text_config=text_config, block_size=BLOCK))
+    mx.eval(drafter.parameters())
+    return drafter
+
+
+@pytest.fixture
+def genuine(micro):
+    """A drafter whose OWN proposals the target accepts in some rounds and rejects in others.
+    Deterministic: the first drafter initialisation (seed 0..63) with genuine acceptance wins; the
+    chosen seed is part of the assertion message."""
+    lm, _ = micro
+    for seed in range(64):
+        drafter = _drafter(lm, seed)
+        record = _run(lm, drafter, None, oracle=False)[1]
+        if sum(record["drafter"]["accept_lens"]) > 0 and not all(
+            a == BLOCK - 1 for a in record["accepted"]
+        ):
+            return lm, drafter, seed
+    pytest.fail("no seed in 0..63 gives a drafter with genuine acceptance; widen the search")
+
+
+class TestD5GenuineAcceptance:
+    def test_the_unmodified_drafter_is_genuinely_accepted_and_rolled_back(self, genuine):
+        lm, drafter, seed = genuine
+        base = _run(lm, drafter, None, oracle=False)
+        accepted = base[1]["accepted"]
+        draft_n_accepted = sum(base[1]["drafter"]["accept_lens"])
+        assert draft_n_accepted > 0, f"seed {seed}: no genuine acceptance"
+        assert any(a < BLOCK - 1 for a in accepted), "no rejection, hence no rollback exercised"
+        assert any(a > 0 for a in accepted)
+
+        model = type("M", (), {"config": lm.config, "language_model": lm})()
+        policy = mv.JointV1Policy()
+        mv.apply_to_model(model, policy)
+        again = _run(lm, drafter, None, oracle=False)
+        assert policy.counters()["verify_blocks_joint_v1"] > 0
+        assert again[0] == base[0] and again[3] == base[3]            # tokens, cache offsets
+        assert again[1]["accepted"] == accepted                       # per-round acceptance
+        assert sum(again[1]["drafter"]["accept_lens"]) == draft_n_accepted
+        for got, want in zip(again[1]["hidden"], base[1]["hidden"]):
+            assert got.shape == want.shape and mx.allclose(got, want, **TOL).item()
+        _assert_drafter_state(again[1]["drafter"], base[1]["drafter"])
+        for got_layer, want_layer in zip(again[2], base[2]):          # post-rollback target state
+            for g, w in zip(got_layer, want_layer):
+                assert g.shape == w.shape and mx.allclose(g, w, **TOL).item()
