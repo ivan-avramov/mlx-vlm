@@ -8,6 +8,20 @@ name: Upstream parity
 #
 # Runs on pushes to main as well as PRs, because this fork is usually committed
 # to directly rather than through PRs.
+#
+# WHAT IT COMPARES AGAINST (changed at the v0.7.6 sync): the gating job audits
+# against the upstream version we LAST MERGED, held in one place below
+# (UPSTREAM_SYNC_REF), so red means "the fork lost parity with what it merged",
+# never "upstream added a file this morning". Auditing against the moving
+# upstream/main made this workflow red on every upstream commit regardless of
+# fork health. The non-gating `drift` job still runs the same checks against
+# upstream/main and reports the result as information.
+#
+# BUMP STEP (part of every upstream sync -- see AGENTS.md "Fork & branches"):
+# after merging upstream ref X (a release tag such as v0.7.6, or a commit sha if
+# you merged an untagged upstream/main), set UPSTREAM_SYNC_REF to X in the same
+# commit/PR as the merge, and run the eight checks locally with
+# `--upstream-ref X` before pushing.
 
 on:
   pull_request:
@@ -17,6 +31,10 @@ on:
     branches:
       - main
   workflow_dispatch:
+
+env:
+  # The upstream ref the fork last merged. Bump at every sync (see above).
+  UPSTREAM_SYNC_REF: v0.7.6
 
 jobs:
   parity:
@@ -39,34 +57,37 @@ jobs:
         run: |
           git remote add upstream https://github.com/Blaizzy/mlx-vlm.git
           git remote set-url --push upstream no_push
-          git fetch --no-tags upstream main
+          # main for the drift report, every tag so UPSTREAM_SYNC_REF can be a tag;
+          # a sha in main's history resolves too.
+          git fetch --no-tags upstream main "+refs/tags/*:refs/tags/*"
+          git rev-parse --verify "${UPSTREAM_SYNC_REF}^{commit}"
 
       - name: Check no upstream file is silently missing
-        run: python dev/check_upstream_parity.py --upstream-ref upstream/main
+        run: python dev/check_upstream_parity.py --upstream-ref "$UPSTREAM_SYNC_REF"
 
       - name: Check no upstream symbol is silently missing
-        run: python dev/check_upstream_symbols.py --upstream-ref upstream/main
+        run: python dev/check_upstream_symbols.py --upstream-ref "$UPSTREAM_SYNC_REF"
 
       # The mirror image of the two checks above, and the one that was missing:
       # content upstream *deleted* that a merge resolution kept. Same mechanism,
       # opposite sign — see the module docstring and AGENTS.md. --strict because
       # the baseline is clean; keep it that way.
       - name: Check no upstream deletion was silently reverted
-        run: python dev/check_upstream_deletions.py --upstream-ref upstream/main --strict
+        run: python dev/check_upstream_deletions.py --upstream-ref "$UPSTREAM_SYNC_REF" --strict
 
       # The fourth direction: not "what is missing" or "what did we wrongly keep"
       # but "which side wrote this hunk?" — the question every merge conflict asks
       # and nothing could answer. Enforces the `# Fork:` convention on files
       # outside .fork-marker-allowlist, which is a shrinking rollout schedule.
       - name: Check every fork change in a shared file is marked
-        run: python dev/check_fork_markers.py --upstream-ref upstream/main
+        run: python dev/check_fork_markers.py --upstream-ref "$UPSTREAM_SYNC_REF"
 
       # "Helper landed, call site dropped" — the one shape all four checks above
       # are blind to by construction: the file is present, the def is present,
       # nothing was deleted, and the missing hunk is in a different file. Four real
       # instances were found by hand in one session before this existed.
       - name: Check no upstream-called helper is unreachable here
-        run: python dev/check_dead_helpers.py --upstream-ref upstream/main
+        run: python dev/check_dead_helpers.py --upstream-ref "$UPSTREAM_SYNC_REF"
 
       # The fifth direction, and the only measurement rather than a presence test:
       # is a file's divergence CONTENT, or only ALIGNMENT? Every wrong sizing call
@@ -74,14 +95,14 @@ jobs:
       # cannot tell a rewrite from a reordering. Gates only on the three findings
       # that are alignment masquerading as content, all mechanically fixable.
       - name: Check no divergence is alignment-only
-        run: python dev/check_body_divergence.py --upstream-ref upstream/main
+        run: python dev/check_body_divergence.py --upstream-ref "$UPSTREAM_SYNC_REF"
 
       # The sixth direction: a dropped dict entry, __init__.py re-export or dataclass
       # field is an ast.Assign/AnnAssign/Import, not a definition, so every check above
       # passes it. Demonstrated: with gemma4/__init__.py's Gemma4VideoProcessor
       # re-export deleted, all 2817 tests pass and all five checks above stay green.
       - name: Check no upstream registry entry or re-export is missing
-        run: python dev/check_upstream_registries.py --upstream-ref upstream/main
+        run: python dev/check_upstream_registries.py --upstream-ref "$UPSTREAM_SYNC_REF"
 
       # The eighth direction: every check above asks whether something EXISTS. None can
       # see a call that exists, is reached, and passes FEWER ARGUMENTS than upstream's.
@@ -96,4 +117,60 @@ jobs:
       #    second argument of `mx.tile(position_ids, (3, 1, 1))` in qwen3_5/language.py
       #    leaves all six checks above green and test_models.py passing.
       - name: Check no call passes fewer arguments than upstream
+        run: python dev/check_call_arguments.py --upstream-ref "$UPSTREAM_SYNC_REF"
+
+  # Information only: the same eight checks against the MOVING upstream/main, i.e.
+  # "what the next sync will have to absorb". Never fails the workflow.
+  drift:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/Blaizzy/mlx-vlm.git
+          git remote set-url --push upstream no_push
+          git fetch --no-tags upstream main "+refs/tags/*:refs/tags/*"
+          echo "upstream/main is $(git rev-list --count "${UPSTREAM_SYNC_REF:-HEAD}"..upstream/main 2>/dev/null || echo '?') commit(s) past the last sync"
+
+      - name: "Drift: check_upstream_parity.py"
+        continue-on-error: true
+        run: python dev/check_upstream_parity.py --upstream-ref upstream/main
+
+      - name: "Drift: check_upstream_symbols.py"
+        continue-on-error: true
+        run: python dev/check_upstream_symbols.py --upstream-ref upstream/main
+
+      - name: "Drift: check_upstream_deletions.py"
+        continue-on-error: true
+        run: python dev/check_upstream_deletions.py --upstream-ref upstream/main --strict
+
+      - name: "Drift: check_fork_markers.py"
+        continue-on-error: true
+        run: python dev/check_fork_markers.py --upstream-ref upstream/main
+
+      - name: "Drift: check_dead_helpers.py"
+        continue-on-error: true
+        run: python dev/check_dead_helpers.py --upstream-ref upstream/main
+
+      - name: "Drift: check_body_divergence.py"
+        continue-on-error: true
+        run: python dev/check_body_divergence.py --upstream-ref upstream/main
+
+      - name: "Drift: check_upstream_registries.py"
+        continue-on-error: true
+        run: python dev/check_upstream_registries.py --upstream-ref upstream/main
+
+      - name: "Drift: check_call_arguments.py"
+        continue-on-error: true
         run: python dev/check_call_arguments.py --upstream-ref upstream/main

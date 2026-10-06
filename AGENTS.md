@@ -125,6 +125,14 @@ python dev/find_untested_fork_code.py   # fork-only code no test mentions (non-g
 cd mlx_vlm/ && pytest ./tests --ignore=tests/test_smoke.py
 ```
 
+**Bump the CI sync ref in the same commit as the merge.** `.github/workflows/upstream-parity.yml`
+gates on `env: UPSTREAM_SYNC_REF` -- the upstream ref the fork last merged -- not on the moving
+`upstream/main` (which made the workflow red on every upstream commit, whatever the fork's
+health). After merging ref X (a release tag such as `v0.7.6`, or the merged sha if you merged
+an untagged `upstream/main`), set `UPSTREAM_SYNC_REF: X`, run the checks above with
+`--upstream-ref X`, and push both together. The workflow's non-gating `drift` job reports the
+same checks against `upstream/main` as information about the next sync.
+
 **`find_dropped_hunks.py` has THREE floors and the bare invocation is decoration.**
 `--min-lines 3`, `--min-share 0.5` and `--max-commits 80` are all defaults, and each
 hides real content: `f044f36a` was hidden by the *share* floor (its `generation.py`
@@ -1087,7 +1095,9 @@ top of `reranking.py`. **Re-check this after every merge that adds a server modu
   file had failures). Because it is PR-only, pushes straight to `main` are never
   style-checked — which is how style drift went unnoticed.
 - `upstream-parity.yml` — runs on pushes to `main` as well as PRs, since this fork
-  is usually committed to directly. Runs the eight gating audit scripts.
+  is usually committed to directly. Runs the eight gating audit scripts against
+  `UPSTREAM_SYNC_REF` (the last merged upstream ref, bumped at every sync -- see "Fork &
+  branches"), plus a non-gating `drift` job against `upstream/main`.
 
 ## Key dependencies
 
