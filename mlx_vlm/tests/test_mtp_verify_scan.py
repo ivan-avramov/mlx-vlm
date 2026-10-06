@@ -1474,20 +1474,57 @@ class TestB9DeviceDiscoveryConsistency:
 
 # ------------------------------------------------------------------ F4 quantized-KV predicate
 class TestF4QuantizedKvPredicate:
-    @pytest.mark.parametrize("kv_bits,scheme", [(4.0, None), (3.5, "turboquant"), (0, "turboquant"),
-                                                (None, "TurboQuant")])
-    def test_f4_any_kv_quantization_refuses_at_load(self, monkeypatch, kv_bits, scheme):
+    @pytest.mark.parametrize("kv_bits,scheme", [(4.0, None), (3.5, "turboquant"), (4, "uniform"),
+                                                (8, "turboquant")])
+    def test_f4_a_cache_that_would_be_quantized_refuses_at_load(self, monkeypatch, kv_bits, scheme):
         monkeypatch.delenv("MLX_SDPA_BLOCKS", raising=False)
         with pytest.raises(mv.VerifyScanError, match="quantized KV"):
             mv.require_environment(draft_kind="mtp", kv_bits=kv_bits, kv_quant_scheme=scheme)
 
-    def test_f4_native_kv_passes_and_scheme_threads_through_the_hook(self, monkeypatch, gpu):
+    @pytest.mark.parametrize("scheme", [None, "uniform", "turboquant"])
+    def test_f4_kv_bits_zero_or_none_is_native_whatever_the_scheme(self, monkeypatch, scheme):
         monkeypatch.delenv("MLX_SDPA_BLOCKS", raising=False)
-        mv.require_environment(draft_kind="mtp", kv_bits=None, kv_quant_scheme=None)
-        monkeypatch.setenv("MLX_VLM_MTP_VERIFY_SCAN", "joint_v1")
-        monkeypatch.setenv("MLX_VLM_MTP_VERIFY_AB", "0")
-        lm = _tiny_lm()
-        with pytest.raises(mv.VerifyScanError, match="quantized KV"):
-            generation_module._apply_mtp_verify_from_env(
-                SimpleNamespace(language_model=lm, config=lm.config),
-                draft_kind="mtp", kv_bits=0, kv_quant_scheme="turboquant")
+        for kv_bits in (None, 0, 0.0):
+            mv.require_environment(draft_kind="mtp", kv_bits=kv_bits, kv_quant_scheme=scheme)
+
+    def test_f4_the_predicate_matches_the_forks_cache_construction(self):
+        from mlx_vlm.kv_quant import from_legacy
+
+        for scheme in (None, "uniform", "turboquant"):
+            assert from_legacy(None, scheme) is None           # native: nothing quantized
+        assert from_legacy(4, "turboquant") is not None and from_legacy(3.5) is not None
+
+
+# ------------------------------------------------------------------ golden: shipped first pick
+FIRST_PICK = "Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed"
+STACK_REGISTRY = Path(
+    __import__("os").environ.get("MLX_STACK_REGISTRY")
+    or REPO.parent / "mlx_local_stack" / "main_models.yaml"
+)
+
+
+@pytest.mark.skipif(not STACK_REGISTRY.exists(), reason="stack main_models.yaml not present")
+def test_golden_the_shipped_first_pick_passes_every_load_time_refusal(monkeypatch, gpu, qualified):
+    import yaml
+
+    entries = yaml.safe_load(STACK_REGISTRY.read_text())["models"]
+    pick = next(e for e in entries if e["name"] == FIRST_PICK)
+    assert (pick["kv_bits"], pick.get("kv_quant_scheme"), pick["draft_kind"]) == (0, "turboquant", "mtp")
+    # what the worker resolves for that entry: KV_BITS=0 -> None (native), scheme passed through
+    monkeypatch.setenv("KV_BITS", str(pick["kv_bits"]))
+    kv_bits = generation_module.get_quantized_kv_bits()
+    assert kv_bits is None
+    monkeypatch.setenv("MLX_VLM_MTP_VERIFY_SCAN", "joint_v1")
+    monkeypatch.setenv("MLX_VLM_MTP_VERIFY_AB", "0")
+    monkeypatch.delenv("MLX_SDPA_BLOCKS", raising=False)
+    monkeypatch.setattr(
+        mv, "QUALIFIED_DOMAIN",
+        mv.Domain(dtypes=(mx.bfloat16,), head_dim=16, gqa=(2,), device_classes=("applegpu_g17s",)))
+    monkeypatch.setattr(mv, "self_test_model", lambda *a, **k: [mv.SelfTestResult()])
+    lm = _tiny_lm()
+    policy = generation_module._apply_mtp_verify_from_env(
+        SimpleNamespace(language_model=lm, config=lm.config), draft_kind=pick["draft_kind"],
+        kv_bits=kv_bits, kv_quant_scheme=pick["kv_quant_scheme"])
+    assert isinstance(policy, mv.JointV1Policy)               # no load-time refusal fired
+    # and the runtime predicate agrees: a native cache has no `bits` attribute
+    assert policy.classify(*make_qkv(3, 64, gqa=2, head_dim=16), NativeCache(), "causal").reason != "cache"

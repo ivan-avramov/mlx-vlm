@@ -410,13 +410,14 @@ def require_gpu():
         _fail(f"default device is {mx.default_device()}, not the GPU; refusing")
 
 
-def require_environment(*, draft_kind, kv_bits, kv_quant_scheme=None):
+def require_environment(*, draft_kind, kv_bits, kv_quant_scheme=None):  # scheme: informational only
     if draft_kind != "mtp":
         _fail(f"requires --draft-kind mtp (got {draft_kind!r}); refusing")
-    # The runtime `cache` fallback reason fires on a `bits` cache or a TurboQuant cache; refuse at
-    # load on the same predicate (any KV quantization), not later as a fully fallen-back run.
-    if kv_bits or str(kv_quant_scheme or "").lower() == "turboquant":
-        _fail("quantized KV (kv_bits / TurboQuant) is not supported; refusing")
+    # Effective-cache predicate (kv_quant.from_legacy / turboquant_enabled): with kv_bits None or 0
+    # the worker builds a NATIVE cache whatever kv_quant_scheme says (the shipped first pick declares
+    # scheme turboquant with kv_bits 0). Refuse only when the resolved cache WOULD be quantized.
+    if kv_bits:
+        _fail("quantized KV (kv_bits > 0, uniform or TurboQuant) is not supported; refusing")
     if os.environ.get("MLX_SDPA_BLOCKS"):
         _fail("MLX_SDPA_BLOCKS is set (libmlx honours it, the plan mirror does not)")
 
