@@ -1909,3 +1909,65 @@ class TestE2MutationGaps:
         attend(policy, *make_qkv(6, 4096))
         assert policy.since(snap)["verify_fallback_reasons"] == {"gqa_bound": 1}
         assert policy.counters()["verify_fallback_reasons"] == {"gqa_bound": 2, "domain": 1}
+
+
+# ------------------------------------------------------------------ round 4: D3 invalid vs difference
+class TestR4InvalidIsNotAKnownPositive:
+    def _straddle(self, monkeypatch, qualified, joint, other, length=3, keys=1025):
+        monkeypatch.setattr(mv, "joint_attention", lambda *a, **k: joint)
+        monkeypatch.setattr(mv, "per_query_attention", lambda *a, **k: other)
+        policy = mv.JointV1Policy(ab=True)
+        attend(policy, *make_qkv(length, keys))
+        policy.end_block()
+        return policy.counters()
+
+    def test_r4_a_shape_invalid_straddle_counts_invalid_and_mismatch_not_the_positive(
+        self, qualified, monkeypatch
+    ):
+        c = self._straddle(monkeypatch, qualified, mx.zeros((1, 6, 3, D), mx.bfloat16),
+                           mx.zeros((1, 6, 2, D), mx.bfloat16))
+        assert (c["verify_ab_mismatch"], c["verify_ab_invalid"],
+                c["verify_ab_straddle_mismatch"], c["verify_ab_straddle_blocks"]) == (1, 1, 0, 1)
+
+    def test_r4_a_nan_straddle_likewise(self, qualified, monkeypatch):
+        nan = mx.full((1, 6, 3, D), float("nan"), mx.bfloat16)
+        c = self._straddle(monkeypatch, qualified, nan, mx.zeros((1, 6, 3, D), mx.bfloat16))
+        assert (c["verify_ab_mismatch"], c["verify_ab_invalid"], c["verify_ab_straddle_mismatch"]) == (1, 1, 0)
+        c = self._straddle(monkeypatch, qualified, nan, nan)          # the same NaN on both sides
+        assert (c["verify_ab_mismatch"], c["verify_ab_invalid"], c["verify_ab_straddle_mismatch"]) == (1, 1, 0)
+
+    def test_r4_a_dtype_invalid_straddle_likewise(self, qualified, monkeypatch):
+        c = self._straddle(monkeypatch, qualified, mx.zeros((1, 6, 3, D), mx.bfloat16),
+                           mx.zeros((1, 6, 3, D), mx.float32))
+        assert (c["verify_ab_mismatch"], c["verify_ab_invalid"], c["verify_ab_straddle_mismatch"]) == (1, 1, 0)
+
+    def test_r4_a_valid_straddle_difference_is_the_known_positive_and_no_mismatch(
+        self, qualified, monkeypatch
+    ):
+        c = self._straddle(monkeypatch, qualified, mx.ones((1, 6, 3, D), mx.bfloat16),
+                           mx.zeros((1, 6, 3, D), mx.bfloat16))
+        assert (c["verify_ab_mismatch"], c["verify_ab_invalid"], c["verify_ab_straddle_mismatch"]) == (0, 0, 1)
+
+    def test_r4_an_invalid_eligible_block_counts_both_and_a_valid_difference_only_mismatch(
+        self, qualified, monkeypatch
+    ):
+        nan = mx.full((1, 6, 3, D), float("nan"), mx.bfloat16)
+        c = self._straddle(monkeypatch, qualified, nan, nan, keys=4096)    # eligible (no straddle)
+        assert (c["verify_ab_mismatch"], c["verify_ab_invalid"], c["verify_ab_blocks"]) == (1, 1, 1)
+        c = self._straddle(monkeypatch, qualified, mx.ones((1, 6, 3, D), mx.bfloat16),
+                           mx.zeros((1, 6, 3, D), mx.bfloat16), keys=4096)
+        assert (c["verify_ab_mismatch"], c["verify_ab_invalid"]) == (1, 0)
+
+    def test_r4_one_batched_materialisation_is_preserved(self, qualified, monkeypatch):
+        monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", ShapeRecorder())
+        policy = mv.JointV1Policy(ab=True)
+        evals = []
+        real_eval = mx.eval
+        monkeypatch.setattr(mv.mx, "eval", lambda *a: evals.append(1) or real_eval(*a))
+        for _ in range(4):
+            attend(policy, *make_qkv(3, 4096))
+            attend(policy, *make_qkv(3, 1025))
+        policy.end_block()
+        assert len(evals) == 1
+        assert "verify_ab_invalid" in policy.counters()
+        assert "verify_ab_invalid" not in mv.JointV1Policy(ab=False).counters()

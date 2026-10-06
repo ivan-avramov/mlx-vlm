@@ -64,6 +64,9 @@ AB_KEYS = (
     "verify_ab_mismatch",
     "verify_ab_straddle_blocks",
     "verify_ab_straddle_mismatch",
+    # an INVALID output (shape/dtype/non-finite) on any AB block, straddling or not: counted here
+    # AND in verify_ab_mismatch; never satisfies the straddle known positive
+    "verify_ab_invalid",
 )
 REASONS_KEY = "verify_fallback_reasons"
 
@@ -194,7 +197,8 @@ class Decision:
 @dataclass
 class _Pending:
     straddle: bool
-    flag: object
+    invalid: object   # True or lazy bool: shape/dtype/non-finite
+    differ: object    # True/False or lazy bool: representation-level difference (valid outputs)
     layer: int
     length: int
     key_length: int
@@ -350,9 +354,11 @@ class JointV1Policy:
     def _shadow(self, straddle, joint, other, queries, keys):
         # AB counters advance only in end_block(), after the flags are materialised.
         self._ordinal += 1
+        invalid = _invalid(joint, other)
+        differ = False if invalid is True else _bits_differ(joint, other)
         self._pending.append(
             _Pending(
-                straddle, _differs(joint, other), self._ordinal, queries.shape[2],
+                straddle, invalid, differ, self._ordinal, queries.shape[2],
                 keys.shape[-2], joint, other,
             )
         )
@@ -363,19 +369,23 @@ class JointV1Policy:
         if not self._pending:
             return
         pending, self._pending = self._pending, []
-        flags = [p.flag for p in pending if isinstance(p.flag, mx.array)]
+        flags = [f for p in pending for f in (p.invalid, p.differ) if isinstance(f, mx.array)]
         if flags:
-            mx.eval(flags)
+            mx.eval(flags)          # ONE batched materialisation per round
         for entry in pending:
             self._counts["verify_ab_straddle_blocks" if entry.straddle else "verify_ab_blocks"] += 1
-            bad = entry.flag if isinstance(entry.flag, bool) else bool(entry.flag.item())
-            if not bad:
-                continue
-            if entry.straddle:
-                self._counts["verify_ab_straddle_mismatch"] += 1
-                continue
-            self._counts["verify_ab_mismatch"] += 1
-            self._log_mismatch(entry)
+            invalid = entry.invalid if isinstance(entry.invalid, bool) else bool(entry.invalid.item())
+            differ = entry.differ if isinstance(entry.differ, bool) else bool(entry.differ.item())
+            if invalid:     # validity is separate from a bit difference: never a known positive
+                self._counts["verify_ab_invalid"] += 1
+                self._counts["verify_ab_mismatch"] += 1
+                self._log_mismatch(entry)
+            elif differ:
+                if entry.straddle:
+                    self._counts["verify_ab_straddle_mismatch"] += 1
+                else:
+                    self._counts["verify_ab_mismatch"] += 1
+                    self._log_mismatch(entry)
 
     def discard_pending(self):
         """Drop this round's unmaterialised comparisons (an exception aborted the round): no
