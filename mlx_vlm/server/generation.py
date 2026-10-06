@@ -208,7 +208,7 @@ def _apply_attention_policy_from_env(model):
     return policy
 
 
-def _apply_mtp_verify_from_env(model, *, draft_kind, kv_bits):
+def _apply_mtp_verify_from_env(model, *, draft_kind, kv_bits, kv_quant_scheme=None):
     # Fork (M58): resolved ONCE at load, stamped on the instance; never re-read.
     from .. import mtp_verify_scan as _mv
 
@@ -220,7 +220,9 @@ def _apply_mtp_verify_from_env(model, *, draft_kind, kv_bits):
         _mv._fail(str(exc))
     if policy is None:
         return None
-    _mv.require_environment(draft_kind=draft_kind, kv_bits=kv_bits)
+    _mv.require_environment(
+        draft_kind=draft_kind, kv_bits=kv_bits, kv_quant_scheme=kv_quant_scheme
+    )
     _mv.require_gpu()
     _mv.apply_to_model(model, policy)
     results = _mv.self_test_model(model, policy)
@@ -1447,6 +1449,7 @@ class ResponseGenerator:
             model,
             draft_kind=self.draft_kind_override or os.environ.get("MLX_VLM_DRAFT_KIND"),
             kv_bits=self.kv_bits,
+            kv_quant_scheme=getattr(self, "kv_quant_scheme", None),
         )
         _apply_lazy_embeddings_from_env(model)  # Fork (M57)
 
@@ -1799,6 +1802,8 @@ class ResponseGenerator:
         _attn_policy = getattr(self, "attention_policy", None)
         _attn_snapshot = _attn_policy.snapshot() if _attn_policy is not None else None
         # Fork (M58): per-request verification-scan counters (None under per_query).
+        # NOTE (M58 F5): only this serial inline path reports verify_* counters; the
+        # continuous-batching `_step` path reports none, like M57's sdpa_* (not fixed here).
         _verify_policy = getattr(self, "mtp_verify_policy", None)
         _verify_snapshot = (
             _verify_policy.snapshot() if _verify_policy is not None else None

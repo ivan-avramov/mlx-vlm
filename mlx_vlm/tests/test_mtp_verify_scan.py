@@ -1470,3 +1470,24 @@ class TestB9DeviceDiscoveryConsistency:
         assert not mv._mirror_matches_live_device(None)
         d = mv.JointV1Policy().classify(*make_qkv(3, 4096), NativeCache(), "causal")
         assert d.reason == "domain"
+
+
+# ------------------------------------------------------------------ F4 quantized-KV predicate
+class TestF4QuantizedKvPredicate:
+    @pytest.mark.parametrize("kv_bits,scheme", [(4.0, None), (3.5, "turboquant"), (0, "turboquant"),
+                                                (None, "TurboQuant")])
+    def test_f4_any_kv_quantization_refuses_at_load(self, monkeypatch, kv_bits, scheme):
+        monkeypatch.delenv("MLX_SDPA_BLOCKS", raising=False)
+        with pytest.raises(mv.VerifyScanError, match="quantized KV"):
+            mv.require_environment(draft_kind="mtp", kv_bits=kv_bits, kv_quant_scheme=scheme)
+
+    def test_f4_native_kv_passes_and_scheme_threads_through_the_hook(self, monkeypatch, gpu):
+        monkeypatch.delenv("MLX_SDPA_BLOCKS", raising=False)
+        mv.require_environment(draft_kind="mtp", kv_bits=None, kv_quant_scheme=None)
+        monkeypatch.setenv("MLX_VLM_MTP_VERIFY_SCAN", "joint_v1")
+        monkeypatch.setenv("MLX_VLM_MTP_VERIFY_AB", "0")
+        lm = _tiny_lm()
+        with pytest.raises(mv.VerifyScanError, match="quantized KV"):
+            generation_module._apply_mtp_verify_from_env(
+                SimpleNamespace(language_model=lm, config=lm.config),
+                draft_kind="mtp", kv_bits=0, kv_quant_scheme="turboquant")
