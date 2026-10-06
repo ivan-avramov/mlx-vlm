@@ -208,7 +208,8 @@ class Qwen3_5BatchInvariantForward:
             )
             top_k = feed_forward.top_k
             indices = mx.argpartition(gates, kth=-top_k, axis=-1)[..., -top_k:]
-            indices = mx.stop_gradient(indices)  # Fork note: upstream #2409 (v0.7.6 sync), not M58
+            # Fork note: next line is upstream #2409 (v0.7.6 sync), not M58.
+            indices = mx.stop_gradient(indices)
             scores = mx.take_along_axis(gates, indices, axis=-1)
             scores = scores / scores.sum(axis=-1, keepdims=True)
 
@@ -415,7 +416,9 @@ class Qwen3_5BatchInvariantForward:
                 capture_layer_ids,
                 hidden_sink,
             )
-        except BaseException:  # Fork (M58): never leak pending AB comparisons; re-raise as is
+        except (
+            BaseException
+        ):  # Fork (M58): never leak pending AB comparisons; re-raise as is
             if verify_policy is not None:
                 verify_policy.discard_pending()
             raise

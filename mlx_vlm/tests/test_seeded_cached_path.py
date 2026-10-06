@@ -7,6 +7,7 @@ cached path. The fix widens ``generate/ar.py``'s ``_PositionedTargetSampler`` to
 the server twin's filter semantics (top_p / min_p / top_k, `sample_utils` chain
 order) and DE-DUPLICATES the two drifted twins, which were the root cause.
 """
+
 import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -92,8 +93,7 @@ def test_twins_are_deduplicated():
     """The server sampler IS the ar sampler — drift between two copies is what
     produced C26; identity locks it out."""
     assert (
-        server_generation._PositionedTargetSampler
-        is ar_module._PositionedTargetSampler
+        server_generation._PositionedTargetSampler is ar_module._PositionedTargetSampler
     )
 
 

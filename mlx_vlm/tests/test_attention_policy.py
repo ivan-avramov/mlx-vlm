@@ -143,7 +143,12 @@ class TestAC1DefaultPreservation:
         monkeypatch.setattr(os, "environ", Boom())
         try:
             base.scaled_dot_product_attention(
-                _q(512), _k(4096), _k(4096), NativeCache(), 0.5, "causal",
+                _q(512),
+                _k(4096),
+                _k(4096),
+                NativeCache(),
+                0.5,
+                "causal",
                 policy=policy,
             )
             base.scaled_dot_product_attention(
@@ -346,8 +351,12 @@ class TestAC3Propagation:
 
     def test_ac3_counters_flow_through_metrics_and_streaming_token(self):
         tok = generation_module.StreamingToken(
-            text="", token=1, logprobs=0.0, finish_reason="stop",
-            sdpa_forced=4, sdpa_auto=6,
+            text="",
+            token=1,
+            logprobs=0.0,
+            finish_reason="stop",
+            sdpa_forced=4,
+            sdpa_auto=6,
         )
         metrics = generation_module.GenerationMetrics()
         metrics.record_result(tok)
@@ -406,8 +415,14 @@ class TestAC4QuantizedDispatchUnchanged:
         keys = mx.zeros((1, 1, 4, 4))
         queries = mx.zeros((1, 1, 512, 4))
         base.scaled_dot_product_attention(
-            queries, keys, keys, _TQ(), 0.5, "causal",
-            sinks=mx.zeros((1,)), policy=policy,
+            queries,
+            keys,
+            keys,
+            _TQ(),
+            0.5,
+            "causal",
+            sinks=mx.zeros((1,)),
+            policy=policy,
         )
         (kwargs,) = sdpa.kwargs
         assert "force_fused" not in kwargs
@@ -464,9 +479,12 @@ class TestAC5Scope:
         assert "attention_policy" not in inspect.getsource(
             qwen_language._qwen3_5_left_padded_attention
         )
-        assert "policy" not in inspect.signature(
-            qwen_language._qwen3_5_left_padded_attention
-        ).parameters
+        assert (
+            "policy"
+            not in inspect.signature(
+                qwen_language._qwen3_5_left_padded_attention
+            ).parameters
+        )
 
     def test_ac5_foreign_family_modules_are_not_stamped(self):
         from mlx_vlm.models.qwen4_exp.language import Qwen4ExpAttention
@@ -550,8 +568,11 @@ class TestAC6LoudFailure:
         )
         monkeypatch.delenv("MLX_VLM_MOE_EXPAND", raising=False)
         fake = SimpleNamespace(
-            model_path="x", adapter_path=None, draft_kind_override=None,
-            draft_model_path=None, apc_manager=None,
+            model_path="x",
+            adapter_path=None,
+            draft_kind_override=None,
+            draft_model_path=None,
+            apc_manager=None,
         )
         with pytest.raises(ap.AttentionPolicyError, match="qualified"):
             generation_module.ResponseGenerator._initialize_model(fake)
@@ -576,8 +597,11 @@ class TestSelfTest:
         rec = Recorder(raise_on_forced=ValueError("boom"))
         with pytest.raises(ap.AttentionPolicyError, match="self-test.*boom"):
             ap.self_test(
-                ap.resolve_policy("fused_v1"), sdpa=rec, force_calls=True,
-                max_kv=262144, **self.DIMS,
+                ap.resolve_policy("fused_v1"),
+                sdpa=rec,
+                force_calls=True,
+                max_kv=262144,
+                **self.DIMS,
             )
 
 

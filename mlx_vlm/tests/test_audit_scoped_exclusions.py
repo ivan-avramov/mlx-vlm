@@ -43,7 +43,7 @@ def cfm():
     return _load("check_fork_markers")
 
 
-SOURCE = '''
+SOURCE = """
 class TestA:
     def verify(self):
         pass
@@ -55,7 +55,7 @@ class TestB:
 def helper():
     def verify():
         pass
-'''
+"""
 
 
 class TestQualifiedNames:
@@ -94,7 +94,9 @@ class TestQualifiedNames:
     @pytest.mark.parametrize("module", ["sym", "dele"])
     def test_a_module_scope_entry_excuses_only_the_top_level_def(self, module, request):
         audit = request.getfixturevalue(module)
-        source = "def verify():\n    pass\n\nclass C:\n    def verify(self):\n        pass\n"
+        source = (
+            "def verify():\n    pass\n\nclass C:\n    def verify(self):\n        pass\n"
+        )
         quals = audit.defined_qualnames(source)["verify"]
         assert quals == {"verify", "C.verify"}
         entry = [("t.py", ".verify", "r")]
@@ -108,8 +110,17 @@ class TestQualifiedNames:
         assert covered
 
     GENERIC = (
-        "verify", "values", "start", "sampler", "image", "forward", "embeddings",
-        "language", "criteria", "has_pending_prompts", "unprocessed_prompts",
+        "verify",
+        "values",
+        "start",
+        "sampler",
+        "image",
+        "forward",
+        "embeddings",
+        "language",
+        "criteria",
+        "has_pending_prompts",
+        "unprocessed_prompts",
         "last_segment",
     )
 
@@ -152,7 +163,9 @@ class TestPinnedAllowlist:
             assert pin, f"{rule}: whole-file entries must be pinned to a blob"
             blob = subprocess.run(
                 ["git", "-C", str(_ROOT), "rev-parse", f":{glob}"],
-                capture_output=True, text=True, check=True,
+                capture_output=True,
+                text=True,
+                check=True,
             ).stdout.strip()
             assert blob.startswith(pin), (
                 f"{glob} changed since its allowlist pin {pin}: mark the new fork "

@@ -38,7 +38,7 @@ does not rely on `mx.argsort`'s tie-handling being stable.
 """
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Tuple
 
 import mlx.core as mx
 

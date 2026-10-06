@@ -9,13 +9,6 @@ from types import SimpleNamespace
 import mlx.core as mx
 import pytest
 from fastapi.testclient import TestClient
-
-import mlx_vlm.server as server
-import mlx_vlm.server.generation as generation_module
-import mlx_vlm.server.session_manager as session_manager
-from mlx_vlm import attention_policy as ap
-from mlx_vlm.models.cache import ArraysCache, BatchKVCache, KVCache
-from mlx_vlm.server.schemas import GenerationTimings, StreamingTimings
 from test_attention_policy import (  # noqa: F401  (fixtures + helpers)
     NativeCache,
     Recorder,
@@ -28,6 +21,13 @@ from test_attention_policy import (  # noqa: F401  (fixtures + helpers)
     sdpa,
 )
 from test_cached_tokens_reporting import _bare_response_generator
+
+import mlx_vlm.server as server
+import mlx_vlm.server.generation as generation_module
+import mlx_vlm.server.session_manager as session_manager
+from mlx_vlm import attention_policy as ap
+from mlx_vlm.models.cache import ArraysCache, BatchKVCache, KVCache
+from mlx_vlm.server.schemas import GenerationTimings, StreamingTimings
 
 
 @pytest.fixture
@@ -90,13 +90,12 @@ class TestF2RealPaddedBatch:
         lm.model(ids, cache=[ArraysCache(size=2), KVCache()])
         assert [k.get("force_fused") for k in passthrough.kwargs] == [True]
 
-    def test_f2_padded_batch_prefill_and_row_recursion_never_forced(
-        self, passthrough
-    ):
+    def test_f2_padded_batch_prefill_and_row_recursion_never_forced(self, passthrough):
         lm, policy = self._stamped()
-        ids = mx.array(
-            [[0] + list(range(1, 130)), list(range(1, 131))], dtype=mx.int32
-        ) % 60
+        ids = (
+            mx.array([[0] + list(range(1, 130)), list(range(1, 131))], dtype=mx.int32)
+            % 60
+        )
         out = lm.model(ids, cache=_batch_cache([1, 0]))
         mx.eval(out)
         assert passthrough.calls, "attention never ran"
@@ -112,9 +111,10 @@ class TestF2RealPaddedBatch:
     def test_f2_row_recursion_alone_is_suspended(self, passthrough):
         """Rows re-enter the same stamped modules with a plain B=1 cache."""
         lm, policy = self._stamped()
-        ids = mx.array(
-            [[0] + list(range(1, 130)), list(range(1, 131))], dtype=mx.int32
-        ) % 60
+        ids = (
+            mx.array([[0] + list(range(1, 130)), list(range(1, 131))], dtype=mx.int32)
+            % 60
+        )
         mx.eval(lm.model(ids, cache=_batch_cache([1, 0])))
         shapes = {c[0].shape[0] for c in passthrough.calls}
         assert 1 in shapes  # the recursion really ran single-row attention
@@ -138,15 +138,22 @@ class TestNonGpuRefusal:
         with pytest.raises(ap.AttentionPolicyError, match="GPU"):
             ap.self_test(
                 ap.resolve_policy("fused_v1"),
-                heads=24, kv_heads=4, head_dim=256, dtype=mx.bfloat16,
-                max_kv=262144, sdpa=Recorder(),
+                heads=24,
+                kv_heads=4,
+                head_dim=256,
+                dtype=mx.bfloat16,
+                max_kv=262144,
+                sdpa=Recorder(),
             )
 
     def test_auto_on_cpu_still_loads(self, monkeypatch):
         monkeypatch.setenv("MLX_VLM_ATTENTION_POLICY", "auto")
-        assert generation_module._apply_attention_policy_from_env(
-            SimpleNamespace(language_model=None)
-        ) is None
+        assert (
+            generation_module._apply_attention_policy_from_env(
+                SimpleNamespace(language_model=None)
+            )
+            is None
+        )
 
 
 # ------------------------------------------------------------ F3 self-test
@@ -174,14 +181,18 @@ class TestF3SelfTest:
                 return False
 
         with pytest.raises(ap.AttentionPolicyError, match="zero"):
-            ap.self_test(Never(), max_kv=262144, sdpa=Recorder(),
-                         force_calls=True, **self.DIMS)
+            ap.self_test(
+                Never(), max_kv=262144, sdpa=Recorder(), force_calls=True, **self.DIMS
+            )
 
     def test_f3_query_dtype_comes_from_the_models_attention_computation(self):
         lm = _tiny_lm()  # bf16 weights and activations
         rec = Recorder()
         results = ap.self_test_model(
-            lm, ap.resolve_policy("fused_v1"), max_kv=262144, sdpa=rec,
+            lm,
+            ap.resolve_policy("fused_v1"),
+            max_kv=262144,
+            sdpa=rec,
             force_calls=True,
         )
         assert results and rec.calls
@@ -191,8 +202,11 @@ class TestF3SelfTest:
         lm = _tiny_lm(dtype=mx.float32)
         with pytest.raises(ap.AttentionPolicyError, match="zero"):
             ap.self_test_model(
-                lm, ap.resolve_policy("fused_v1"), max_kv=262144,
-                sdpa=Recorder(), force_calls=True,
+                lm,
+                ap.resolve_policy("fused_v1"),
+                max_kv=262144,
+                sdpa=Recorder(),
+                force_calls=True,
             )
 
     def test_f3_load_logs_calls_run_and_elapsed(
@@ -220,9 +234,16 @@ def _fake_stream(policy, forced=3, auto=2):
             policy.decide(_q(1), 4096, None)
         for i in range(2):
             yield GenerationResult(
-                text="x", token=100 + i, logprobs=None, prompt_tokens=56,
-                generation_tokens=i + 1, total_tokens=57 + i, prompt_tps=400.0,
-                generation_tps=170.0, peak_memory=1.5, cached_tokens=39,
+                text="x",
+                token=100 + i,
+                logprobs=None,
+                prompt_tokens=56,
+                generation_tokens=i + 1,
+                total_tokens=57 + i,
+                prompt_tps=400.0,
+                generation_tps=170.0,
+                peak_memory=1.5,
+                cached_tokens=39,
                 finish_reason="stop" if i else None,
             )
 
@@ -230,8 +251,9 @@ def _fake_stream(policy, forced=3, auto=2):
 
 
 def _endpoint(monkeypatch, policy, stream):
-    import mlx_vlm.tests.test_cached_tokens_reporting  # noqa: F401
     from queue import Queue
+
+    import mlx_vlm.tests.test_cached_tokens_reporting  # noqa: F401
 
     monkeypatch.setattr(session_manager, "_session_cache_max", 8)
     monkeypatch.setattr(
@@ -252,8 +274,11 @@ def _endpoint(monkeypatch, policy, stream):
         def generate(self, prompt=None, images=None, audio=None, args=None, **kw):
             rqueue = Queue()
             rg._process_cached_request(
-                rqueue=rqueue, prompt=prompt or "hi", images=None,
-                args=args or server.GenerationArguments(), prompt_tokens=56,
+                rqueue=rqueue,
+                prompt=prompt or "hi",
+                images=None,
+                args=args or server.GenerationArguments(),
+                prompt_tokens=56,
                 prompt_cache_state=SimpleNamespace(),
             )
             ctx = rqueue.get_nowait()
@@ -273,17 +298,25 @@ def _endpoint(monkeypatch, policy, stream):
 def _post(client, stream=False):
     from unittest.mock import patch
 
-    body = {"model": "demo", "messages": [{"role": "user", "content": "Hi"}],
-            "max_tokens": 8}
+    body = {
+        "model": "demo",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "max_tokens": 8,
+    }
     if stream:
         body["stream"] = True
     with patch.object(
-        server, "get_cached_model",
-        return_value=(SimpleNamespace(), SimpleNamespace(),
-                      SimpleNamespace(model_type="qwen2_vl")),
+        server,
+        "get_cached_model",
+        return_value=(
+            SimpleNamespace(),
+            SimpleNamespace(),
+            SimpleNamespace(model_type="qwen2_vl"),
+        ),
     ):
         return client.post(
-            "/v1/chat/completions", json=body,
+            "/v1/chat/completions",
+            json=body,
             headers={session_manager._chat_id_header: "chat-r1" + str(stream)},
         )
 
@@ -312,9 +345,7 @@ class TestF1HttpTimings:
         t = r.json()["timings"]
         assert "sdpa_forced" not in t and "sdpa_auto" not in t
 
-    def test_f1_streaming_final_chunk_timings_carry_counters(
-        self, client, monkeypatch
-    ):
+    def test_f1_streaming_final_chunk_timings_carry_counters(self, client, monkeypatch):
         _endpoint(monkeypatch, ap.resolve_policy("fused_v1"), None)
         r = _post(client, stream=True)
         seen = []
@@ -326,12 +357,19 @@ class TestF1HttpTimings:
         assert seen == [(3, 2)]
 
     def test_f1_timing_models_omit_none_counters(self):
-        assert "sdpa_forced" not in StreamingTimings(
-            predicted_per_second=1.0
-        ).model_dump_json()
+        assert (
+            "sdpa_forced"
+            not in StreamingTimings(predicted_per_second=1.0).model_dump_json()
+        )
         m = SimpleNamespace(
-            rate=10.0, generation_tps=10.0, token_times=[], cached_tokens=0,
-            prompt_tps=100.0, peak_memory=0.0, sdpa_forced=None, sdpa_auto=None,
+            rate=10.0,
+            generation_tps=10.0,
+            token_times=[],
+            cached_tokens=0,
+            prompt_tps=100.0,
+            peak_memory=0.0,
+            sdpa_forced=None,
+            sdpa_auto=None,
         )
         dumped = GenerationTimings.from_metrics(m, 10, 5).model_dump_json()
         assert "sdpa" not in dumped
@@ -339,25 +377,40 @@ class TestF1HttpTimings:
         dumped = json.loads(GenerationTimings.from_metrics(m, 10, 5).model_dump_json())
         assert (dumped["sdpa_forced"], dumped["sdpa_auto"]) == (1, 2)
 
-    def test_f1_request_completed_log_line_carries_counters_only_when_set(
-        self, caplog
-    ):
+    def test_f1_request_completed_log_line_carries_counters_only_when_set(self, caplog):
         env = generation_module._build_metrics_envelope(
-            endpoint="e", model="m", stream=False, backend="b", prompt_tokens=1,
-            completion_tokens=1, generated_tokens=1, request_elapsed_s=1.0,
-            request_started_s=0.0, sdpa_forced=3, sdpa_auto=2,
+            endpoint="e",
+            model="m",
+            stream=False,
+            backend="b",
+            prompt_tokens=1,
+            completion_tokens=1,
+            generated_tokens=1,
+            request_elapsed_s=1.0,
+            request_started_s=0.0,
+            sdpa_forced=3,
+            sdpa_auto=2,
         )
         plain = generation_module._build_metrics_envelope(
-            endpoint="e", model="m", stream=False, backend="b", prompt_tokens=1,
-            completion_tokens=1, generated_tokens=1, request_elapsed_s=1.0,
+            endpoint="e",
+            model="m",
+            stream=False,
+            backend="b",
+            prompt_tokens=1,
+            completion_tokens=1,
+            generated_tokens=1,
+            request_elapsed_s=1.0,
             request_started_s=0.0,
         )
         rec = generation_module.ServerMetricsStore()
         with caplog.at_level(logging.INFO):
             rec.record_success(env)
             rec.record_success(plain)
-        lines = [r.getMessage() for r in caplog.records
-                 if "Request completed" in r.getMessage()]
+        lines = [
+            r.getMessage()
+            for r in caplog.records
+            if "Request completed" in r.getMessage()
+        ]
         assert "sdpa_forced=3 sdpa_auto=2" in lines[0]
         assert "sdpa" not in lines[1]
 
@@ -371,7 +424,8 @@ class TestF4ReadinessPath:
             config=SimpleNamespace(model_type="llama"),
         )
         monkeypatch.setattr(
-            generation_module, "load_model_resources",
+            generation_module,
+            "load_model_resources",
             lambda *a, **k: (model, SimpleNamespace(), model.config),
         )
 

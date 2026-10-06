@@ -18,7 +18,9 @@ import pytest
 
 from mlx_vlm.models.nemotron_h.config import ModelConfig as NemotronHConfig
 from mlx_vlm.speculative.drafters import DRAFTER_KIND_BY_MODEL_TYPE
-from mlx_vlm.speculative.drafters.nemotron_h_mtp import ModelConfig as NemotronHMTPConfig
+from mlx_vlm.speculative.drafters.nemotron_h_mtp import (
+    ModelConfig as NemotronHMTPConfig,
+)
 from mlx_vlm.speculative.drafters.nemotron_h_mtp import NemotronHMTPDraftModel
 from mlx_vlm.speculative.drafters.nemotron_h_mtp.split import split_nemotron_h_mtp
 
@@ -296,7 +298,9 @@ def _raw_mtp_weights(text_config: NemotronHConfig) -> dict:
     }
     for e in range(n_experts):
         weights[f"mtp.layers.1.mixer.experts.{e}.up_proj.weight"] = mx.zeros((moe_h, h))
-        weights[f"mtp.layers.1.mixer.experts.{e}.down_proj.weight"] = mx.zeros((h, moe_h))
+        weights[f"mtp.layers.1.mixer.experts.{e}.down_proj.weight"] = mx.zeros(
+            (h, moe_h)
+        )
     return weights
 
 

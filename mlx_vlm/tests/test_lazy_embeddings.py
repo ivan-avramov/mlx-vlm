@@ -77,9 +77,7 @@ def _tiny_model(model_type="qwen3_5", lazy=True, multimodal=False):
         else {}
     )
     model = Model(
-        ModelConfig(
-            text_config=cfg, vision_config=vision, model_type=model_type, **ids
-        )
+        ModelConfig(text_config=cfg, vision_config=vision, model_type=model_type, **ids)
     )
     mx.eval(model.parameters())
     model.lazy_prompt_embeddings = lazy  # F5: the worker flag, resolved at load
@@ -125,7 +123,8 @@ def _run(model, lazy, step=STEP, **gen_kwargs):
     for c in cache:
         state = c.state
         states.extend(
-            a for a in (state if isinstance(state, (list, tuple)) else [state])
+            a
+            for a in (state if isinstance(state, (list, tuple)) else [state])
             if isinstance(a, mx.array)
         )
     mx.eval(states, logprobs)
@@ -255,8 +254,11 @@ class TestAC10LazyEmbeddings:
 
 
 def _arrays(state):
-    return [a for a in (state if isinstance(state, (list, tuple)) else [state])
-            if isinstance(a, mx.array)]
+    return [
+        a
+        for a in (state if isinstance(state, (list, tuple)) else [state])
+        if isinstance(a, mx.array)
+    ]
 
 
 class TestLazyTokenEmbeddings:
@@ -375,8 +377,9 @@ def _trace(model, lazy, prime=0, ids=None, pixel=None, **gen_kwargs):
             for y, _ in _gen(_without_lazy(model), prompt[:prime], cache, max_tokens=0):
                 pass
             del logits[:], snaps[:]
-        for _ in _gen(runner, prompt[prime:], cache, max_tokens=1, pixel=pixel,
-                      **gen_kwargs):
+        for _ in _gen(
+            runner, prompt[prime:], cache, max_tokens=1, pixel=pixel, **gen_kwargs
+        ):
             break
     finally:
         LanguageModel.__call__ = real
@@ -445,8 +448,12 @@ class TestF6AgainstEager:
         for flag in (False, True):
             offsets, arrays, rot = [], [], []
             out = _trace(
-                model, flag, snapshot_at_offset=6, anchor_capture_offset=offsets,
-                arrays_snapshot_capture=arrays, rotating_snapshot_capture=rot,
+                model,
+                flag,
+                snapshot_at_offset=6,
+                anchor_capture_offset=offsets,
+                arrays_snapshot_capture=arrays,
+                rotating_snapshot_capture=rot,
             )
             got.append((out, offsets, arrays))
         assert got[0][1] == got[1][1] and got[0][1], got[0][1]
@@ -461,8 +468,12 @@ class TestF6AgainstEager:
         for flag in (False, True):
             offsets, arrays, rot = [], [], []
             out = _trace(
-                model, flag, retain_at_offset=retain_at, prompt_end_offset=offsets,
-                prompt_end_arrays_capture=arrays, prompt_end_rotating_capture=rot,
+                model,
+                flag,
+                retain_at_offset=retain_at,
+                prompt_end_offset=offsets,
+                prompt_end_arrays_capture=arrays,
+                prompt_end_rotating_capture=rot,
             )
             got.append((out, offsets, arrays))
         assert got[0][1] == got[1][1] and got[0][1], got[0][1]

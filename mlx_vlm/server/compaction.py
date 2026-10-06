@@ -20,7 +20,12 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event
-from typing import TYPE_CHECKING, Any, Awaitable, Callable  # Fork: TYPE_CHECKING (lazy Fernet)
+from typing import (  # Fork: TYPE_CHECKING (lazy Fernet)
+    TYPE_CHECKING,
+    Any,
+    Awaitable,
+    Callable,
+)
 
 # Fork: no module-level `from cryptography.fernet import ...`; see _fernet().
 from fastapi import HTTPException
@@ -154,7 +159,9 @@ def _invalid_token_type():
     return InvalidToken
 
 
-class _NeverRaised(Exception):  # Fork: placeholder for InvalidToken without cryptography
+class _NeverRaised(
+    Exception
+):  # Fork: placeholder for InvalidToken without cryptography
     """Stands in for InvalidToken when cryptography is absent (nothing raises it)."""
 
 

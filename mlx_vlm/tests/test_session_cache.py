@@ -60,7 +60,10 @@ def _make_request(headers=None, chat_id=None, metadata=None, **extra):
     # Real Starlette Headers: case-insensitive lookup, FIRST occurrence wins on duplicates —
     # the production semantics, not a dict stand-in (cold review P8, 2026-09-27).
     from starlette.datastructures import Headers
-    raw.headers = Headers(raw=[(k.lower().encode(), str(v).encode()) for k, v in (headers or {}).items()])
+
+    raw.headers = Headers(
+        raw=[(k.lower().encode(), str(v).encode()) for k, v in (headers or {}).items()]
+    )
     parsed = SimpleNamespace(chat_id=chat_id, metadata=metadata, **extra)
     return raw, parsed
 
@@ -371,19 +374,32 @@ class TestResolveChatIdAliases:
         srv._chat_id_header = "X-MLX-VLM-Chat-Id"
 
     def test_our_header_wins_over_client_aliases(self):
-        raw, parsed = _make_request(headers={"X-MLX-VLM-Chat-Id": "ours", "x-session-id": "ses_1"})
+        raw, parsed = _make_request(
+            headers={"X-MLX-VLM-Chat-Id": "ours", "x-session-id": "ses_1"}
+        )
         assert srv._resolve_chat_id(raw, parsed) == "ours"
 
-    @pytest.mark.parametrize("name", [
-        "x-session-id", "X-Session-Id", "x-session-affinity", "x-claude-code-session-id",
-        "X-OpenWebUI-Chat-Id", "session-id", "session_id", "x-switchyard-session-id",
-    ])
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "x-session-id",
+            "X-Session-Id",
+            "x-session-affinity",
+            "x-claude-code-session-id",
+            "X-OpenWebUI-Chat-Id",
+            "session-id",
+            "session_id",
+            "x-switchyard-session-id",
+        ],
+    )
     def test_client_session_headers_are_accepted(self, name):
         raw, parsed = _make_request(headers={name: "ses_alias"})
         assert srv._resolve_chat_id(raw, parsed) == "ses_alias"
 
     def test_alias_precedence_is_deterministic(self):
-        raw, parsed = _make_request(headers={"x-session-affinity": "aff", "x-session-id": "sid"})
+        raw, parsed = _make_request(
+            headers={"x-session-affinity": "aff", "x-session-id": "sid"}
+        )
         assert srv._resolve_chat_id(raw, parsed) == "sid"
 
     def test_body_prompt_cache_key_is_accepted(self):
@@ -391,7 +407,9 @@ class TestResolveChatIdAliases:
         assert srv._resolve_chat_id(raw, parsed) == "thread-42"
 
     def test_body_chat_id_wins_over_prompt_cache_key(self):
-        raw, parsed = _make_request(headers={}, chat_id="body", prompt_cache_key="thread-42")
+        raw, parsed = _make_request(
+            headers={}, chat_id="body", prompt_cache_key="thread-42"
+        )
         assert srv._resolve_chat_id(raw, parsed) == "body"
 
     def test_claude_code_metadata_user_id_json_session_id(self):
@@ -414,7 +432,9 @@ class TestResolveChatIdAliases:
         raw, parsed = _make_request(headers={}, **{field: "user-1"})
         assert srv._resolve_chat_id(raw, parsed) is None
 
-    @pytest.mark.parametrize("name", ["x-request-id", "x-client-request-id", "X-Interaction-Id"])
+    @pytest.mark.parametrize(
+        "name", ["x-request-id", "x-client-request-id", "X-Interaction-Id"]
+    )
     def test_per_request_ids_are_ignored(self, name):
         raw, parsed = _make_request(headers={name: "req-1"})
         assert srv._resolve_chat_id(raw, parsed) is None
@@ -439,20 +459,32 @@ class TestResolveChatIdAliases:
     def test_genuine_conversation_ids_beat_the_generic_cache_key(self):
         # cold review P6: prompt_cache_key is a cache-affinity hint that some clients share
         # across conversations; metadata.session_id / Claude Code's session_id are conversation ids.
-        raw, parsed = _make_request(headers={}, prompt_cache_key="account-42", metadata={"session_id": "conv-7"})
+        raw, parsed = _make_request(
+            headers={}, prompt_cache_key="account-42", metadata={"session_id": "conv-7"}
+        )
         assert srv._resolve_chat_id(raw, parsed) == "conv-7"
         uid = '{"device_id":"d","session_id":"cc-9"}'
-        raw, parsed = _make_request(headers={}, prompt_cache_key="account-42", metadata={"user_id": uid})
+        raw, parsed = _make_request(
+            headers={}, prompt_cache_key="account-42", metadata={"user_id": uid}
+        )
         assert srv._resolve_chat_id(raw, parsed) == "cc-9"
 
     def test_duplicate_header_first_occurrence_wins_like_starlette(self):
         from starlette.datastructures import Headers
+
         raw = MagicMock()
-        raw.headers = Headers(raw=[(b"x-session-id", b"first"), (b"x-session-id", b"second")])
-        assert srv._resolve_chat_id(raw, SimpleNamespace(chat_id=None, metadata=None)) == "first"
+        raw.headers = Headers(
+            raw=[(b"x-session-id", b"first"), (b"x-session-id", b"second")]
+        )
+        assert (
+            srv._resolve_chat_id(raw, SimpleNamespace(chat_id=None, metadata=None))
+            == "first"
+        )
 
     def test_blank_alias_values_are_skipped(self):
-        raw, parsed = _make_request(headers={"x-session-id": "   ", "session-id": "codex-1"})
+        raw, parsed = _make_request(
+            headers={"x-session-id": "   ", "session-id": "codex-1"}
+        )
         assert srv._resolve_chat_id(raw, parsed) == "codex-1"
 
 

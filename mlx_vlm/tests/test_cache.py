@@ -25,7 +25,6 @@ import pytest
 
 import mlx_vlm.models as models
 import mlx_vlm.turboquant as tq
-from mlx_vlm.models.epicache import EpiCacheKVCache  # Fork: EpiCache in the contract sampler
 from mlx_vlm import apc as P
 from mlx_vlm import apc_adapters as A
 from mlx_vlm.apc import harvest_blocks_from_batch_cache as harvest
@@ -60,6 +59,9 @@ from mlx_vlm.models.cache import (
     create_causal_mask,
 )
 from mlx_vlm.models.deepseek_v41.language import DeepseekV41Cache
+from mlx_vlm.models.epicache import (  # Fork: EpiCache in the contract sampler
+    EpiCacheKVCache,
+)
 from mlx_vlm.models.hy_v4.cache import HyV4KVCache
 from mlx_vlm.models.minimax_m3_vl.language import (
     MiniMaxM3BatchKVCache,
@@ -1596,7 +1598,11 @@ def sample(name, length=0):
         cache.win_eKV, cache.win_eK = mx.ones((1, 3, 4)) * 3, mx.ones((1, 3, 4)) * 4
     elif name == "EpiCacheKVCache":
         # Fork: wrapper; populate the inner KVCache it delegates to.
-        cache.inner.keys, cache.inner.values, cache.inner.offset = keys, keys * 2, length
+        cache.inner.keys, cache.inner.values, cache.inner.offset = (
+            keys,
+            keys * 2,
+            length,
+        )
     elif name in ("SimpleKVCache", "MiniMaxM3KVCache"):
         cache.update_and_fetch(keys, keys * 2)
         if name == "MiniMaxM3KVCache":

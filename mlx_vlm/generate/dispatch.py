@@ -54,9 +54,9 @@ from .common import (  # Fork: the snapshot-ring helpers (_capture/_restore_*, _
     _restore_deltanet_state,
     _restore_rotating_layers_from_snapshots,
     _retire_asymmetric_session,
-    session_retain_prompt_end,
     _rotating_rewind_safe,
     _trim_cache,
+    session_retain_prompt_end,
     wired_limit,
 )
 from .image import DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_TASK, run_image_generation_cli
@@ -1397,16 +1397,24 @@ def stream_generate(
         if prompt_cache_state is not None:
             prefill_len = len(full_input_ids_list)
             retain_boundary = (
-                int(session_retention.boundary) if session_retention is not None else prefill_len
+                int(session_retention.boundary)
+                if session_retention is not None
+                else prefill_len
             )
-            if is_asymmetric_rendering and prompt_end_offset and prompt_end_offset[0] != retain_boundary:
+            if (
+                is_asymmetric_rendering
+                and prompt_end_offset
+                and prompt_end_offset[0] != retain_boundary
+            ):
                 # P4: the capture must sit exactly at the planned boundary
                 # (media token expansion can break that). Nothing consistent
                 # can be published: drop the session.
                 logger.warning(
                     "Prompt-end retention: captured offset %d != boundary %d "
                     "(prompt length %d); session dropped.",
-                    prompt_end_offset[0], retain_boundary, prefill_len,
+                    prompt_end_offset[0],
+                    retain_boundary,
+                    prefill_len,
                 )
                 prompt_cache_state.clear()
                 mx.clear_cache()
@@ -1417,7 +1425,9 @@ def stream_generate(
                 # the client will echo; None => retire at the boundary only.
                 canonical_ids = None
                 canonical_fn = (
-                    session_retention.canonical_suffix_fn if session_retention is not None else None
+                    session_retention.canonical_suffix_fn
+                    if session_retention is not None
+                    else None
                 )
                 if canonical_fn is not None and any(
                     _is_rotating_kv_layer(c) for c in tracked_cache
@@ -1434,7 +1444,8 @@ def stream_generate(
                         logger.warning(
                             "Prompt-end retention: canonical rendering failed "
                             "(%s: %s); retiring at prompt end only.",
-                            type(e).__name__, e,
+                            type(e).__name__,
+                            e,
                         )
                 retired = _retire_asymmetric_session(
                     prompt_cache_state,
@@ -1448,7 +1459,11 @@ def stream_generate(
                     prompt_end_offset=prompt_end_offset,
                     canonical_ids=canonical_ids,
                     canonical_prefill=lambda ids: _prefill_canonical_suffix(
-                        model, tracked_cache, full_input_ids_list[:retain_boundary], ids, kwargs
+                        model,
+                        tracked_cache,
+                        full_input_ids_list[:retain_boundary],
+                        ids,
+                        kwargs,
                     ),
                     boundary=retain_boundary,
                     anchor_target=snapshot_at_offset,
@@ -1463,7 +1478,11 @@ def stream_generate(
                         retain_boundary,
                         prefill_len,
                         retired - retain_boundary,
-                        mid_prefill_anchor_offset[0] if mid_prefill_anchor_offset else None,
+                        (
+                            mid_prefill_anchor_offset[0]
+                            if mid_prefill_anchor_offset
+                            else None
+                        ),
                     )
             elif is_asymmetric_rendering:
                 if mid_prefill_anchor_offset and snapshot_at_offset is not None:
@@ -1477,8 +1496,11 @@ def stream_generate(
                             tracked_cache, mid_prefill_rotating_capture
                         )
                     except TypeError as e:  # P2: layout changed after capture
-                        logger.warning("Asymmetric path: cannot restore rotating "
-                                       "snapshot (%s); session dropped.", e)
+                        logger.warning(
+                            "Asymmetric path: cannot restore rotating "
+                            "snapshot (%s); session dropped.",
+                            e,
+                        )
                         prompt_cache_state.clear()
                         mx.clear_cache()
                         return
@@ -1505,7 +1527,8 @@ def stream_generate(
                     # state (review P4, missing-capture route). Drop the session.
                     logger.warning(
                         "Asymmetric path: no anchor/boundary capture for a hybrid "
-                        "cache; session dropped (prefill_len %d).", prefill_len,
+                        "cache; session dropped (prefill_len %d).",
+                        prefill_len,
                     )
                     prompt_cache_state.clear()
                 else:
@@ -1533,9 +1556,18 @@ def stream_generate(
 
 
 _CANONICAL_PREFILL_KWARGS = (  # Fork (M48): kwargs threaded into the canonical-suffix prefill
-    "max_kv_size", "kv_bits", "kv_key_bits", "kv_value_bits", "kv_key_scheme",
-    "kv_value_scheme", "kv_group_size", "kv_quant_scheme", "quantized_kv_start",
-    "kv_prealloc_tokens", "prefill_step_size", "serialize_kv_quantization",
+    "max_kv_size",
+    "kv_bits",
+    "kv_key_bits",
+    "kv_value_bits",
+    "kv_key_scheme",
+    "kv_value_scheme",
+    "kv_group_size",
+    "kv_quant_scheme",
+    "quantized_kv_start",
+    "kv_prealloc_tokens",
+    "prefill_step_size",
+    "serialize_kv_quantization",
 )
 
 
@@ -1552,9 +1584,13 @@ def _prefill_canonical_suffix(
     cached-prefix reuse path does (``_prime_cached_prefix_rope_state``); the
     language model then slices it at the cache offset."""
     ck = {k: gen_kwargs[k] for k in _CANONICAL_PREFILL_KWARGS if k in gen_kwargs}
-    full_ids = mx.array([[int(t) for t in prefix_ids] + [int(t) for t in canonical_ids]])
+    full_ids = mx.array(
+        [[int(t) for t in prefix_ids] + [int(t) for t in canonical_ids]]
+    )
     if not _prime_cached_prefix_rope_state(model, full_ids, None, ck):
-        raise RuntimeError("could not prime absolute RoPE positions for the canonical prefill")
+        raise RuntimeError(
+            "could not prime absolute RoPE positions for the canonical prefill"
+        )
     for _ in generate_step(
         mx.array([list(canonical_ids)]),
         model,

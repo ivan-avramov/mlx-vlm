@@ -67,7 +67,9 @@ def _pinned_upstream_source(rev, path):
         pytest.skip(f"pinned upstream revision {rev} is not in this clone")
     return subprocess.run(
         ["git", "-C", str(root), "show", f"{rev}:{path}"],
-        capture_output=True, text=True, check=True,
+        capture_output=True,
+        text=True,
+        check=True,
     ).stdout
 
 
@@ -405,7 +407,8 @@ class TestExclusionsFileParsing:
         for path, symbol, reason in c104:
             upstream = _pinned_upstream_source(_pinned_rev(reason), path)
             found = {
-                sym for _kind, sym, _detail in cur.findings_for_file(
+                sym
+                for _kind, sym, _detail in cur.findings_for_file(
                     path, upstream, (root / path).read_text()
                 )
             }

@@ -10,7 +10,6 @@ import mlx.core as mx
 from safetensors import safe_open
 
 from ....utils import get_model_path
-from .config import NemotronHMTPConfig
 from .nemotron_h_mtp import NemotronHMTPDraftModel
 
 

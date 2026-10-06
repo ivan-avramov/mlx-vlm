@@ -1253,9 +1253,7 @@ class Qwen3_5DecoderLayer(nn.Module):
             )
         if _pp is not None and self.is_linear:  # Fork (M57)
             # close on the layer output AND the cache state it writes
-            _pp.layer_mark(
-                "gdn", cache_state_arrays([cache]), live_if_nonterminal=(r,)
-            )
+            _pp.layer_mark("gdn", cache_state_arrays([cache]), live_if_nonterminal=(r,))
         h = x + r  # Fork (M57): unchanged, kept inside the hooked block
         out = h + self.mlp(self.post_attention_layernorm(h))  # Fork (M57)
         if _pp is not None:  # Fork (M57)

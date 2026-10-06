@@ -342,7 +342,9 @@ def _pinned_upstream_source(rev, path):
         pytest.skip(f"pinned upstream revision {rev} is not in this clone")
     return subprocess.run(
         ["git", "-C", str(root), "show", f"{rev}:{path}"],
-        capture_output=True, text=True, check=True,
+        capture_output=True,
+        text=True,
+        check=True,
     ).stdout
 
 

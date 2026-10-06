@@ -298,7 +298,9 @@ def test_every_model_cache_factory_has_a_restorable_apc_adapter():
     by_package = MODEL_CACHE_FACTORIES
     discovered = set().union(*by_package.values())
     samples = _cache_samples()
-    unknown = discovered - samples.keys() - NO_UPSTREAM_APC_ADAPTER  # Fork (v0.7.6 sync)
+    unknown = (
+        discovered - samples.keys() - NO_UPSTREAM_APC_ADAPTER
+    )  # Fork (v0.7.6 sync)
     assert not unknown, (
         "New model cache types need an APC adapter/sample: " f"{sorted(unknown)}"
     )

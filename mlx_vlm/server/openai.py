@@ -27,9 +27,9 @@ from ..generate.image import generate_image, parse_size
 from ..generate.video import resolve_video_inputs
 from ..prompt_utils import (  # Fork: THINKING_FORMATS / detect_thinking_format / get_cache_alignment_kwargs are fork-only (1c3f1e50)
     THINKING_FORMATS,
+    _encode_retrying_on_borrow_error,
     apply_chat_template,
     detect_thinking_format,
-    _encode_retrying_on_borrow_error,
     get_cache_alignment_kwargs,
 )
 from ..tools import (
@@ -47,14 +47,14 @@ from .generation import (  # Fork: resolve_backend_label is fork-only — it rep
     _count_prompt_tokens,
     resolve_backend_label,
 )
-from .request_normalization import (  # Fork: _strip_assistant_thinking lives with the one message normalizer
+from .request_normalization import (  # Fork: _strip_assistant_thinking lives here, re-exported by mlx_vlm.server # noqa: F401
     _chat_message_to_prompt,
     _normalize_instruction_messages,
-    _strip_assistant_thinking,  # noqa: F401  (re-exported by mlx_vlm.server)
+    _strip_assistant_thinking,
     chat_compaction_enabled,
     validate_chat_context_management,
 )
-from .responses_state import (  # Fork: _CONTENT_MARKERS is fork-only (08723a3f's marker-set union)
+from .responses_state import (  # Fork: _CONTENT_MARKERS is fork-only (08723a3f's marker-set union); Fork: _step_thinking_state is fork-only — the positional opener scan that supersedes upstream's ThinkingStreamState.feed on the streaming chat path when the model ships no parse_response template
     _CONTENT_MARKERS,
     ResponseTemplateStreamState,
     ThinkingStreamState,
@@ -86,12 +86,12 @@ from .schemas import (  # Fork: adds the /v1/completions response models and Cha
     ChatResponse,
     ChatStreamChoice,
     ChatStreamChunk,
+    CompactRequest,
     CompletionChoice,
     CompletionRequest,
     CompletionResponse,
     CompletionStreamChoice,
     CompletionStreamChunk,
-    CompactRequest,
     ContentPartOutputText,
     GenerationTimings,
     ImageEditRequest,
@@ -427,9 +427,9 @@ def _resolve_streaming_thinking_format(
     return _union_thinking_format(thinking_start_token, thinking_end_token)
 
 
-
-
-def _next_rendering_ids(*, content, prompt_ids, messages, tokenizer, render, template_kwargs):
+def _next_rendering_ids(
+    *, content, prompt_ids, messages, tokenizer, render, template_kwargs
+):
     """Fork (M48): token ids of the NEXT request's rendering of this conversation with
     the assistant turn ``content`` echoed and a dummy user turn appended, plus the
     longest common token prefix with the live prompt ids and the offset where the
@@ -460,8 +460,14 @@ def _retention_boundary(*, prompt_ids, messages, tokenizer, render, template_kwa
     thinking-on generation tail ``<think>\n`` re-tokenises as ``\n\n`` once content
     follows, review P5). None when it cannot be established (worker then takes the
     legacy path)."""
-    r = _next_rendering_ids(content="x", prompt_ids=prompt_ids, messages=messages,
-                            tokenizer=tokenizer, render=render, template_kwargs=template_kwargs)
+    r = _next_rendering_ids(
+        content="x",
+        prompt_ids=prompt_ids,
+        messages=messages,
+        tokenizer=tokenizer,
+        render=render,
+        template_kwargs=template_kwargs,
+    )
     if r is None:
         return None
     _ids, k, _end = r
@@ -505,8 +511,14 @@ def _canonical_assistant_suffix(
     content = (content or "").strip("\n")
     if not content.strip():
         return None
-    r = _next_rendering_ids(content=content, prompt_ids=prompt_ids, messages=messages,
-                            tokenizer=tokenizer, render=render, template_kwargs=template_kwargs)
+    r = _next_rendering_ids(
+        content=content,
+        prompt_ids=prompt_ids,
+        messages=messages,
+        tokenizer=tokenizer,
+        render=render,
+        template_kwargs=template_kwargs,
+    )
     if r is None:
         return None
     ids, k, end = r
@@ -2531,34 +2543,64 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                 _msgs = list(processed_messages)
                 _tkw = dict(template_kwargs)
                 _tools, _tool_module = tools, tool_module
-                _start, _end = gen_args.thinking_start_token, gen_args.thinking_end_token
+                _start, _end = (
+                    gen_args.thinking_start_token,
+                    gen_args.thinking_end_token,
+                )
                 _render = lambda msgs, **kw: apply_chat_template(  # noqa: E731
-                    processor, config, msgs, num_images=0, num_audios=0, tools=_tools, **kw
+                    processor,
+                    config,
+                    msgs,
+                    num_images=0,
+                    num_audios=0,
+                    tools=_tools,
+                    **kw,
                 )
                 try:
-                    _prompt_ids = _encode_retrying_on_borrow_error(_tk, formatted_prompt)
+                    _prompt_ids = _encode_retrying_on_borrow_error(
+                        _tk, formatted_prompt
+                    )
                     _boundary = _retention_boundary(
-                        prompt_ids=_prompt_ids, messages=_msgs, tokenizer=_tk,
-                        render=_render, template_kwargs=_tkw,
+                        prompt_ids=_prompt_ids,
+                        messages=_msgs,
+                        tokenizer=_tk,
+                        render=_render,
+                        template_kwargs=_tkw,
                     )
                 except Exception as e:  # never fail a request over the plan
-                    logger.warning("retention plan failed (%s: %s); legacy path", type(e).__name__, e)
+                    logger.warning(
+                        "retention plan failed (%s: %s); legacy path",
+                        type(e).__name__,
+                        e,
+                    )
                     _boundary = None
 
                 if _boundary is not None:
-                    def _canonical_suffix_fn(answer_text, prompt_ids, _tk=_tk, _b=_boundary):
+
+                    def _canonical_suffix_fn(
+                        answer_text, prompt_ids, _tk=_tk, _b=_boundary
+                    ):
                         calls_present = False
                         if _tool_module is not None:
                             tc = process_tool_calls(answer_text, _tool_module, _tools)
                             calls_present = bool(tc is not None and tc.calls)
                         return _canonical_assistant_suffix(
-                            answer_text=answer_text, prompt_ids=prompt_ids, boundary=_b,
-                            messages=_msgs, tokenizer=_tk, render=_render, template_kwargs=_tkw,
-                            tool_calls_present=calls_present, thinking_start_token=_start,
-                            thinking_end_token=_end, processor=processor,
+                            answer_text=answer_text,
+                            prompt_ids=prompt_ids,
+                            boundary=_b,
+                            messages=_msgs,
+                            tokenizer=_tk,
+                            render=_render,
+                            template_kwargs=_tkw,
+                            tool_calls_present=calls_present,
+                            thinking_start_token=_start,
+                            thinking_end_token=_end,
+                            processor=processor,
                         )
 
-                    session_retention = SessionRetention(_boundary, _canonical_suffix_fn)
+                    session_retention = SessionRetention(
+                        _boundary, _canonical_suffix_fn
+                    )
             kwargs["session_retention"] = session_retention
 
         if request.stream:
@@ -2608,8 +2650,13 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             if prompt_cache_state is not None
                             else {}
                         )
-                        if prompt_cache_state is not None and kwargs.get("session_retention") is not None:
-                            _gen_extra["session_retention"] = kwargs["session_retention"]  # Fork (M48)
+                        if (
+                            prompt_cache_state is not None
+                            and kwargs.get("session_retention") is not None
+                        ):
+                            _gen_extra["session_retention"] = kwargs[
+                                "session_retention"
+                            ]  # Fork (M48)
                         if videos:
                             _gen_extra["videos"] = videos
                         ctx, token_iter = await asyncio.to_thread(
@@ -3103,8 +3150,13 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             if prompt_cache_state is not None
                             else {}
                         )
-                        if prompt_cache_state is not None and kwargs.get("session_retention") is not None:
-                            _gen_extra["session_retention"] = kwargs["session_retention"]  # Fork (M48)
+                        if (
+                            prompt_cache_state is not None
+                            and kwargs.get("session_retention") is not None
+                        ):
+                            _gen_extra["session_retention"] = kwargs[
+                                "session_retention"
+                            ]  # Fork (M48)
                         if videos:
                             _gen_extra["videos"] = videos
                         ctx, token_iter = runtime.response_generator.generate(

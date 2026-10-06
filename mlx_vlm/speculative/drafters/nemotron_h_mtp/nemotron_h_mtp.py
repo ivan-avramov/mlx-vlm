@@ -187,7 +187,9 @@ class NemotronHMTPDraftModel(nn.Module):
         token_dtype: mx.Dtype,
     ) -> mx.array:
         token_embed = self._input_embed(tokens.astype(token_dtype))
-        h = self._forward_hidden(token_embed, hidden[:, : tokens.shape[1], :], self._cache)
+        h = self._forward_hidden(
+            token_embed, hidden[:, : tokens.shape[1], :], self._cache
+        )
         steps = int(tokens.shape[1])
         self._next_position = (
             self._next_position + steps

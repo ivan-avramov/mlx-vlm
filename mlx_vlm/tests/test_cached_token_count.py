@@ -21,13 +21,11 @@ import sys
 from queue import Queue
 from types import SimpleNamespace
 
-import pytest
+from test_cached_tokens_reporting import _bare_response_generator
 
 import mlx_vlm.server as server
 import mlx_vlm.server.generation as server_generation
 from mlx_vlm.generate.common import GenerationResult
-
-from test_cached_tokens_reporting import _bare_response_generator
 
 
 def _chunk(text, token, generation_tokens, finish_reason=None):
@@ -78,7 +76,9 @@ class TestCachedPathTokenCount:
     def test_max_tokens_one_length_reports_one_token(self, monkeypatch):
         """The saved C89/C84 calibration shape: one token, then a finalization chunk
         repeating ``generation_tokens=1`` with ``finish_reason='length'``."""
-        tokens = _drive(monkeypatch, [_chunk("The", 100, 1), _chunk("", 100, 1, "length")])
+        tokens = _drive(
+            monkeypatch, [_chunk("The", 100, 1), _chunk("", 100, 1, "length")]
+        )
         assert [t.token_count for t in tokens] == [1, 0]
         assert sum(t.token_count for t in tokens) == 1
         # Text and terminal metadata are preserved untouched.
@@ -86,13 +86,19 @@ class TestCachedPathTokenCount:
         assert [t.finish_reason for t in tokens] == [None, "length"]
 
     def test_many_tokens_then_repeated_count_finalization(self, monkeypatch):
-        chunks = [_chunk("a", 1, 1), _chunk("b", 2, 2), _chunk("c", 3, 3), _chunk("", 3, 3, "length")]
+        chunks = [
+            _chunk("a", 1, 1),
+            _chunk("b", 2, 2),
+            _chunk("c", 3, 3),
+            _chunk("", 3, 3, "length"),
+        ]
         tokens = _drive(monkeypatch, chunks)
         assert [t.token_count for t in tokens] == [1, 1, 1, 0]
 
     def test_stop_finalization_counts_the_newly_reported_eos(self, monkeypatch):
         """On EOS dispatch breaks before yielding the EOS token; its finalization chunk
-        carries ``n + 1`` — a real increment, so it IS counted (no universal minus one)."""
+        carries ``n + 1`` — a real increment, so it IS counted (no universal minus one).
+        """
         chunks = [_chunk("a", 1, 1), _chunk("b", 2, 2), _chunk("", 7, 3, "stop")]
         tokens = _drive(monkeypatch, chunks)
         assert [t.token_count for t in tokens] == [1, 1, 1]
@@ -110,28 +116,47 @@ class TestCachedPathTokenCount:
     def test_chunk_without_generation_tokens_keeps_one_per_chunk(self, monkeypatch):
         """Minimal stand-ins used elsewhere in the suite carry no cumulative count;
         they keep the historical one-token-per-chunk behaviour."""
-        chunks = [SimpleNamespace(text="x", token=5, logprobs=None, finish_reason=None, peak_memory=0.0),
-                  SimpleNamespace(text="", token=5, logprobs=None, finish_reason="stop", peak_memory=0.0)]
+        chunks = [
+            SimpleNamespace(
+                text="x", token=5, logprobs=None, finish_reason=None, peak_memory=0.0
+            ),
+            SimpleNamespace(
+                text="", token=5, logprobs=None, finish_reason="stop", peak_memory=0.0
+            ),
+        ]
         tokens = _drive(monkeypatch, chunks)
         assert [t.token_count for t in tokens] == [1, 1]
 
     def test_metrics_agree_with_the_bridge(self, monkeypatch):
-        tokens = _drive(monkeypatch, [_chunk("The", 100, 1), _chunk("", 100, 1, "length")])
+        tokens = _drive(
+            monkeypatch, [_chunk("The", 100, 1), _chunk("", 100, 1, "length")]
+        )
         metrics = server_generation.GenerationMetrics()
         for t in tokens:
             metrics.record_chunk(t)
         assert metrics.generated_tokens == 1
 
-    def test_mixed_stand_in_and_cumulative_chunks_do_not_double_count(self, monkeypatch):
+    def test_mixed_stand_in_and_cumulative_chunks_do_not_double_count(
+        self, monkeypatch
+    ):
         """C99 finding 2: a stand-in chunk (no cumulative count) is charged one token,
         so the NEXT cumulative chunk must not charge that token again."""
-        stand_in = SimpleNamespace(text="b", token=2, logprobs=None, finish_reason=None, peak_memory=0.0)
-        chunks = [_chunk("a", 1, 1), stand_in, _chunk("c", 3, 3), _chunk("", 3, 3, "length")]
+        stand_in = SimpleNamespace(
+            text="b", token=2, logprobs=None, finish_reason=None, peak_memory=0.0
+        )
+        chunks = [
+            _chunk("a", 1, 1),
+            stand_in,
+            _chunk("c", 3, 3),
+            _chunk("", 3, 3, "length"),
+        ]
         tokens = _drive(monkeypatch, chunks)
         assert [t.token_count for t in tokens] == [1, 1, 1, 0]
         assert sum(t.token_count for t in tokens) == 3
 
     def test_stand_in_first_then_cumulative_stop(self, monkeypatch):
-        stand_in = SimpleNamespace(text="a", token=1, logprobs=None, finish_reason=None, peak_memory=0.0)
+        stand_in = SimpleNamespace(
+            text="a", token=1, logprobs=None, finish_reason=None, peak_memory=0.0
+        )
         tokens = _drive(monkeypatch, [stand_in, _chunk("", 2, 2, "stop")])
         assert [t.token_count for t in tokens] == [1, 1]

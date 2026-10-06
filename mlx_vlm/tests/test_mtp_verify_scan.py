@@ -6,33 +6,32 @@ STEP 1, the load-time self-test and gate 1, never by these tests.
 """
 
 import itertools
-import os
 import json
 import logging
+import os
 import subprocess
-import time
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
-
-import mlx_vlm.models.base as base
-from mlx_vlm import mtp_verify_scan as mv
-from mlx_vlm.models.qwen3_5 import language as qwen_language
-from mlx_vlm.models.qwen3_5 import speculative_verifier as qwen_verifier
-from mlx_vlm.server import cli as cli_module
-from mlx_vlm.server import generation as generation_module
 from test_attention_policy import (  # noqa: F401  (fixtures + helpers)
-    NativeCache,
     _TQ,
+    NativeCache,
     _attn_modules,
     _cpu_device,
     _tiny_lm,
     passthrough,
 )
+
+from mlx_vlm import mtp_verify_scan as mv
+from mlx_vlm.models.qwen3_5 import language as qwen_language
+from mlx_vlm.models.qwen3_5 import speculative_verifier as qwen_verifier
+from mlx_vlm.server import cli as cli_module
+from mlx_vlm.server import generation as generation_module
 
 REAL_SDPA = mx.fast.scaled_dot_product_attention
 REPO = Path(__file__).resolve().parents[2]
@@ -97,8 +96,12 @@ def make_qkv(length, key_length, *, gqa=6, batch=1, dtype=mx.bfloat16, head_dim=
 
 def attend(policy, q, k, v, cache=None, mask="causal", scale=0.0625):
     return policy.attend(
-        queries=q, keys=k, values=v,
-        cache=cache if cache is not None else NativeCache(), scale=scale, mask=mask,
+        queries=q,
+        keys=k,
+        values=v,
+        cache=cache if cache is not None else NativeCache(),
+        scale=scale,
+        mask=mask,
     )
 
 
@@ -109,9 +112,7 @@ class TestAC1DefaultPreservation:
             assert mv.resolve_policy(name) is None
 
     @pytest.mark.parametrize("length", [3, 4, 5])
-    def test_ac1_verifier_branch_calls_sdpa_exactly_as_today(
-        self, monkeypatch, length
-    ):
+    def test_ac1_verifier_branch_calls_sdpa_exactly_as_today(self, monkeypatch, length):
         calls = []
 
         def spy(queries, keys, values, **kwargs):
@@ -164,7 +165,11 @@ def run_verifier_attention(q, k, v, mask, policy=None, cache=None):
     verifier._linear = lambda linear, x: x
     gate = mx.zeros((batch, length, q.shape[1] * q.shape[3]), q.dtype)
     attention = SimpleNamespace(
-        q_proj=None, k_proj=None, v_proj=None, o_proj=None, scale=0.0625,
+        q_proj=None,
+        k_proj=None,
+        v_proj=None,
+        o_proj=None,
+        scale=0.0625,
         _prepare_projected_qkv=lambda *a: (q, k, v, gate, mask),
     )
     if policy is not None:
@@ -304,7 +309,9 @@ class TestAC2DecisionTable:
         policy = mv.JointV1Policy()
         q, k, v = make_qkv(3, 4096)
         for kind in ("float4", "bool2", "other"):
-            assert attend(policy, q, k, v, mask=_mask(kind, 3, 4096, mx.bfloat16)) is None
+            assert (
+                attend(policy, q, k, v, mask=_mask(kind, 3, 4096, mx.bfloat16)) is None
+            )
         assert policy.counters()["verify_fallback_reasons"] == {"mask_form": 3}
 
     def test_ac2_bool_mask_too_small_falls_back(self, qualified, rec):
@@ -421,15 +428,15 @@ class TestAC3aMaskExactness:
                 k2 = k.at[:, :, pos:, :].add(5.0)
                 v2 = v.at[:, :, pos:, :].add(5.0)
                 got = REAL_SDPA(q, k2, v2, scale=0.25, mask=mask)
-                assert mx.allclose(got[:, :, : index + 1], ref[:, :, : index + 1]).item()
+                assert mx.allclose(
+                    got[:, :, : index + 1], ref[:, :, : index + 1]
+                ).item()
 
 
 class TestAC3bNumerics:
     @pytest.mark.parametrize("length", [2, 3, 4, 5])
     @pytest.mark.parametrize("key_length", [64, 1024])
-    def test_ac3b_joint_and_per_query_match_an_fp32_reference(
-        self, length, key_length
-    ):
+    def test_ac3b_joint_and_per_query_match_an_fp32_reference(self, length, key_length):
         mx.random.seed(length)
         q = mx.random.normal((1, 6, length, D)).astype(mx.bfloat16)
         k = mx.random.normal((1, 1, key_length, D)).astype(mx.bfloat16)
@@ -442,8 +449,11 @@ class TestAC3bNumerics:
         ref = mx.concatenate(
             [
                 REAL_SDPA(
-                    q32[:, :, i : i + 1], k32[:, :, : prefix + i + 1],
-                    v32[:, :, : prefix + i + 1], scale=D**-0.5, mask=None,
+                    q32[:, :, i : i + 1],
+                    k32[:, :, : prefix + i + 1],
+                    v32[:, :, : prefix + i + 1],
+                    scale=D**-0.5,
+                    mask=None,
                 )
                 for i in range(length)
             ],
@@ -462,14 +472,17 @@ class TestAC4Propagation:
         monkeypatch.setattr(
             cli_module.uvicorn, "run", lambda *a, **k: seen.setdefault("ran", True)
         )
-        monkeypatch.setattr(cli_module, "_apply_mlx_memory_limits", lambda *a, **k: None)
+        monkeypatch.setattr(
+            cli_module, "_apply_mlx_memory_limits", lambda *a, **k: None
+        )
         monkeypatch.setattr(cli_module, "_configure_session_manager", lambda **k: None)
         monkeypatch.delenv("MLX_VLM_MTP_VERIFY_SCAN", raising=False)
         monkeypatch.delenv("MLX_VLM_MTP_VERIFY_AB", raising=False)
         import os
 
         monkeypatch.setattr(
-            sys, "argv",
+            sys,
+            "argv",
             ["mlx_vlm.server", "--mtp-verify-scan", "joint_v1", "--mtp-verify-ab"],
         )
         cli_module.main()
@@ -493,11 +506,18 @@ class TestAC4Propagation:
     def tiny_domain(self, monkeypatch, qualified, gpu):
         """The tiny model's shape (GQA 2, head dim 16) stands in for the domain."""
         monkeypatch.setattr(
-            mv, "QUALIFIED_DOMAIN",
-            mv.Domain(dtypes=(mx.bfloat16,), head_dim=16, gqa=(2,),
-                      device_classes=("applegpu_g17s",)),
+            mv,
+            "QUALIFIED_DOMAIN",
+            mv.Domain(
+                dtypes=(mx.bfloat16,),
+                head_dim=16,
+                gqa=(2,),
+                device_classes=("applegpu_g17s",),
+            ),
         )
-        monkeypatch.setattr(mv, "self_test_model", lambda *a, **k: [mv.SelfTestResult()])
+        monkeypatch.setattr(
+            mv, "self_test_model", lambda *a, **k: [mv.SelfTestResult()]
+        )
 
     def test_ac4_env_to_instance_to_modules_to_branch_to_counters(
         self, monkeypatch, tiny_domain, rec
@@ -516,9 +536,14 @@ class TestAC4Propagation:
 
     def test_ac4_two_instances_dispatch_per_instance(self, qualified, rec, monkeypatch):
         monkeypatch.setattr(
-            mv, "QUALIFIED_DOMAIN",
-            mv.Domain(dtypes=(mx.bfloat16,), head_dim=16, gqa=(2,),
-                      device_classes=("applegpu_g17s",)),
+            mv,
+            "QUALIFIED_DOMAIN",
+            mv.Domain(
+                dtypes=(mx.bfloat16,),
+                head_dim=16,
+                gqa=(2,),
+                device_classes=("applegpu_g17s",),
+            ),
         )
         joint = mv.JointV1Policy()
         q, k, v = make_qkv(3, 64, gqa=2, head_dim=16)
@@ -540,13 +565,17 @@ class TestAC4Propagation:
         _, policy = self._apply(monkeypatch, lm)
         monkeypatch.setenv("MLX_VLM_MTP_VERIFY_SCAN", "per_query")
         q, k, v = make_qkv(3, 64, gqa=2, head_dim=16)
-        run_verifier_attention(q, k, v, "causal", policy=_attn_modules(lm)[0].mtp_verify_policy)
+        run_verifier_attention(
+            q, k, v, "causal", policy=_attn_modules(lm)[0].mtp_verify_policy
+        )
         assert len(rec.calls) == 1
 
     def test_ac4_the_verifier_singleton_carries_no_state(self):
         before = dict(vars(qwen_verifier.Qwen3_5BatchInvariantForward()))
         assert before == {}
-        assert not hasattr(qwen_verifier.Qwen3_5BatchInvariantForward, "mtp_verify_policy")
+        assert not hasattr(
+            qwen_verifier.Qwen3_5BatchInvariantForward, "mtp_verify_policy"
+        )
         assert "mtp_verify_policy" not in vars(qwen_language.Qwen3_5Attention) or (
             vars(qwen_language.Qwen3_5Attention)["mtp_verify_policy"] is None
         )
@@ -556,7 +585,9 @@ class TestAC4Propagation:
         model, policy = self._apply(monkeypatch, lm, scan="per_query")
         assert policy is None
         assert not hasattr(model, "mtp_verify_policy")
-        assert all(getattr(m, "mtp_verify_policy", None) is None for m in _attn_modules(lm))
+        assert all(
+            getattr(m, "mtp_verify_policy", None) is None for m in _attn_modules(lm)
+        )
 
 
 # ------------------------------------------------------------------ AC5
@@ -595,8 +626,10 @@ class TestAC5Scope:
         """Upstream code merged into the M58-scope verifier says so, so it is never
         mistaken for M58 work (the MoE stop_gradient came with #2409)."""
         lines = (REPO / _VERIFIER).read_text().splitlines()
-        stops = [l for l in lines if "mx.stop_gradient(" in l]
-        assert stops and all("upstream #2409" in l for l in stops), stops
+        stops = [i for i, l in enumerate(lines) if "mx.stop_gradient(" in l]
+        assert stops and all("upstream #2409" in lines[i - 1] for i in stops), [
+            lines[i - 1 : i + 1] for i in stops
+        ]
 
 
 # ------------------------------------------------------------------ AC6
@@ -606,7 +639,9 @@ class TestAC6LoudFailure:
             mv.resolve_policy("bogus")
 
     def test_ac6_worker_argparse_rejects_unknown_value(self, monkeypatch):
-        monkeypatch.setattr(sys, "argv", ["mlx_vlm.server", "--mtp-verify-scan", "bogus"])
+        monkeypatch.setattr(
+            sys, "argv", ["mlx_vlm.server", "--mtp-verify-scan", "bogus"]
+        )
         with pytest.raises(SystemExit) as exc:
             cli_module.main()
         assert exc.value.code != 0
@@ -687,9 +722,14 @@ class TestAC6LoudFailure:
     def test_ac6_self_test_failure_fails_the_load(self, monkeypatch, gpu, qualified):
         self._env(monkeypatch)
         monkeypatch.setattr(
-            mv, "QUALIFIED_DOMAIN",
-            mv.Domain(dtypes=(mx.bfloat16,), head_dim=16, gqa=(2,),
-                      device_classes=("applegpu_g17s",)),
+            mv,
+            "QUALIFIED_DOMAIN",
+            mv.Domain(
+                dtypes=(mx.bfloat16,),
+                head_dim=16,
+                gqa=(2,),
+                device_classes=("applegpu_g17s",),
+            ),
         )
 
         def boom(*a, **k):
@@ -709,7 +749,8 @@ class TestAC6LoudFailure:
             config=SimpleNamespace(model_type="llama"),
         )
         monkeypatch.setattr(
-            generation_module, "load_model_resources",
+            generation_module,
+            "load_model_resources",
             lambda *a, **k: (model, SimpleNamespace(), model.config),
         )
         monkeypatch.delenv("MLX_VLM_MOE_EXPAND", raising=False)
@@ -717,8 +758,12 @@ class TestAC6LoudFailure:
         monkeypatch.setenv("MLX_VLM_DRAFT_KIND", "mtp")
         monkeypatch.delenv("MLX_VLM_DRAFT_MODEL", raising=False)
         fake = SimpleNamespace(
-            model_path="x", adapter_path=None, draft_kind_override=None,
-            draft_model_path=None, apc_manager=None, kv_bits=None,
+            model_path="x",
+            adapter_path=None,
+            draft_kind_override=None,
+            draft_model_path=None,
+            apc_manager=None,
+            kv_bits=None,
         )
         with pytest.raises(mv.VerifyScanError, match="qualified"):
             generation_module.ResponseGenerator._initialize_model(fake)
@@ -758,11 +803,13 @@ class TestAC7ABInstrument:
         calls = []
         real = mv.joint_attention
         monkeypatch.setattr(
-            mv, "joint_attention",
+            mv,
+            "joint_attention",
             lambda *a, **k: calls.append(1) or real(*a, **k),
         )
         monkeypatch.setattr(
-            mv, "per_query_attention",
+            mv,
+            "per_query_attention",
             lambda q, *a, **k: mx.zeros(q.shape, q.dtype),
         )
         monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", ShapeRecorder())
@@ -784,7 +831,8 @@ class TestAC7ABInstrument:
         real = mv.per_query_attention
         monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", ShapeRecorder())
         monkeypatch.setattr(
-            mv, "per_query_attention",
+            mv,
+            "per_query_attention",
             lambda q, *a, **k: mx.ones(q.shape, q.dtype),  # differs from zeros
         )
         policy = mv.JointV1Policy(ab=True)
@@ -867,9 +915,13 @@ class TestAC7ABInstrument:
     def test_ac7_ab_keys_are_absent_without_ab(self, qualified):
         c = mv.JointV1Policy(ab=False).counters()
         assert not any(k.startswith("verify_ab_") for k in c)
-        assert {"verify_blocks_joint_v1", "verify_blocks_per_query",
-                "verify_blocks_straddle", "verify_blocks_len1",
-                "verify_fallback_reasons"} <= set(c)
+        assert {
+            "verify_blocks_joint_v1",
+            "verify_blocks_per_query",
+            "verify_blocks_straddle",
+            "verify_blocks_len1",
+            "verify_fallback_reasons",
+        } <= set(c)
 
 
 # ------------------------------------------------------------------ self-test
@@ -957,8 +1009,14 @@ class TestSelfTest:
 # ------------------------------------------------------------------ AC9
 class TestAC9Counters:
     BASE = dict(
-        endpoint="e", model="m", stream=False, backend="b", prompt_tokens=1,
-        completion_tokens=1, generated_tokens=1, request_elapsed_s=1.0,
+        endpoint="e",
+        model="m",
+        stream=False,
+        backend="b",
+        prompt_tokens=1,
+        completion_tokens=1,
+        generated_tokens=1,
+        request_elapsed_s=1.0,
         request_started_s=0.0,
     )
 
@@ -980,8 +1038,10 @@ class TestAC9Counters:
         plain = generation_module._build_metrics_envelope(**self.BASE)
         assert not any(k.startswith("verify_") for k in plain)
         counters = {
-            "verify_blocks_joint_v1": 7, "verify_blocks_per_query": 1,
-            "verify_blocks_straddle": 2, "verify_blocks_len1": 5,
+            "verify_blocks_joint_v1": 7,
+            "verify_blocks_per_query": 1,
+            "verify_blocks_straddle": 2,
+            "verify_blocks_len1": 5,
             "verify_fallback_reasons": {"domain": 1},
         }
         env = generation_module._build_metrics_envelope(
@@ -993,8 +1053,11 @@ class TestAC9Counters:
         with caplog.at_level(logging.INFO):
             store.record_success(env)
             store.record_success(plain)
-        lines = [r.getMessage() for r in caplog.records
-                 if "Request completed" in r.getMessage()]
+        lines = [
+            r.getMessage()
+            for r in caplog.records
+            if "Request completed" in r.getMessage()
+        ]
         assert "verify_blocks_joint_v1=7" in lines[0]
         assert 'verify_fallback_reasons={"domain":1}' in lines[0]
         assert "verify_" not in lines[1]
@@ -1004,29 +1067,42 @@ class TestAC9Counters:
 
         counters = {"verify_blocks_joint_v1": 4, "verify_fallback_reasons": {}}
         tok = generation_module.StreamingToken(
-            text="", token=1, logprobs=0.0, finish_reason="stop",
+            text="",
+            token=1,
+            logprobs=0.0,
+            finish_reason="stop",
             verify_counters=counters,
         )
         metrics = generation_module.GenerationMetrics()
         metrics.record_result(tok)
         assert metrics.verify_counters == counters
-        dumped = json.loads(GenerationTimings.from_metrics(metrics, 10, 5).model_dump_json())
+        dumped = json.loads(
+            GenerationTimings.from_metrics(metrics, 10, 5).model_dump_json()
+        )
         assert dumped["verify_blocks_joint_v1"] == 4
         assert dumped["verify_fallback_reasons"] == {}
         assert "verify_counters" not in dumped
         bare = generation_module.GenerationMetrics()
-        dumped = json.loads(GenerationTimings.from_metrics(bare, 10, 5).model_dump_json())
+        dumped = json.loads(
+            GenerationTimings.from_metrics(bare, 10, 5).model_dump_json()
+        )
         assert not any(k.startswith("verify_") for k in dumped)
-        assert "verify" not in StreamingTimings(predicted_per_second=1.0).model_dump_json()
+        assert (
+            "verify" not in StreamingTimings(predicted_per_second=1.0).model_dump_json()
+        )
 
     def test_ac9_streaming_timings_helper_carries_counters(self):
         import mlx_vlm.server.openai as openai_module
 
         metrics = SimpleNamespace(
-            rate=3.0, sdpa_forced=None, sdpa_auto=None,
+            rate=3.0,
+            sdpa_forced=None,
+            sdpa_auto=None,
             verify_counters={"verify_blocks_joint_v1": 2},
         )
-        dumped = json.loads(openai_module._streaming_timings(3.0, metrics).model_dump_json())
+        dumped = json.loads(
+            openai_module._streaming_timings(3.0, metrics).model_dump_json()
+        )
         assert dumped == {"predicted_per_second": 3.0, "verify_blocks_joint_v1": 2}
         bare = openai_module._streaming_timings(
             3.0, SimpleNamespace(sdpa_forced=None, sdpa_auto=None)
@@ -1037,10 +1113,10 @@ class TestAC9Counters:
 
 
 from fastapi.testclient import TestClient  # noqa: E402
+from test_cached_tokens_reporting import _bare_response_generator  # noqa: E402
 
 import mlx_vlm.server as server  # noqa: E402
 import mlx_vlm.server.session_manager as session_manager  # noqa: E402
-from test_cached_tokens_reporting import _bare_response_generator  # noqa: E402
 
 
 class _CountingPolicy:
@@ -1068,9 +1144,16 @@ def _endpoint(monkeypatch, policy):
             if policy is not None:
                 policy.n += 6
             yield GenerationResult(
-                text="x", token=100 + i, logprobs=None, prompt_tokens=56,
-                generation_tokens=i + 1, total_tokens=57 + i, prompt_tps=400.0,
-                generation_tps=170.0, peak_memory=1.5, cached_tokens=39,
+                text="x",
+                token=100 + i,
+                logprobs=None,
+                prompt_tokens=56,
+                generation_tokens=i + 1,
+                total_tokens=57 + i,
+                prompt_tps=400.0,
+                generation_tps=170.0,
+                peak_memory=1.5,
+                cached_tokens=39,
                 finish_reason="stop" if i else None,
             )
 
@@ -1090,8 +1173,11 @@ def _endpoint(monkeypatch, policy):
         def generate(self, prompt=None, images=None, audio=None, args=None, **kw):
             rqueue = Queue()
             rg._process_cached_request(
-                rqueue=rqueue, prompt=prompt or "hi", images=None,
-                args=args or server.GenerationArguments(), prompt_tokens=56,
+                rqueue=rqueue,
+                prompt=prompt or "hi",
+                images=None,
+                args=args or server.GenerationArguments(),
+                prompt_tokens=56,
                 prompt_cache_state=SimpleNamespace(),
             )
             ctx = rqueue.get_nowait()
@@ -1111,17 +1197,25 @@ def _endpoint(monkeypatch, policy):
 def _post(client, stream=False):
     from unittest.mock import patch
 
-    body = {"model": "demo", "messages": [{"role": "user", "content": "Hi"}],
-            "max_tokens": 8}
+    body = {
+        "model": "demo",
+        "messages": [{"role": "user", "content": "Hi"}],
+        "max_tokens": 8,
+    }
     if stream:
         body["stream"] = True
     with patch.object(
-        server, "get_cached_model",
-        return_value=(SimpleNamespace(), SimpleNamespace(),
-                      SimpleNamespace(model_type="qwen2_vl")),
+        server,
+        "get_cached_model",
+        return_value=(
+            SimpleNamespace(),
+            SimpleNamespace(),
+            SimpleNamespace(model_type="qwen2_vl"),
+        ),
     ):
         return client.post(
-            "/v1/chat/completions", json=body,
+            "/v1/chat/completions",
+            json=body,
             headers={session_manager._chat_id_header: "chat-m58" + str(stream)},
         )
 
@@ -1142,7 +1236,9 @@ class TestAC9Endpoints:
         second = _post(client).json()["timings"]
         assert second["verify_blocks_joint_v1"] == 12  # per-request reset, not lifetime
 
-    def test_ac9_streaming_final_chunk_timings_carry_counters(self, client, monkeypatch):
+    def test_ac9_streaming_final_chunk_timings_carry_counters(
+        self, client, monkeypatch
+    ):
         _endpoint(monkeypatch, _CountingPolicy())
         r = _post(client, stream=True)
         seen = []
@@ -1167,11 +1263,18 @@ class TestB6LoadedMtpDrafter:
         pol = mv.JointV1Policy()
         mv.require_loaded_mtp_drafter(None, None, None)  # per_query: never refuses
         mv.require_loaded_mtp_drafter(pol, object(), "mtp")
-        for model, kind in [(None, None), (None, "mtp"), (object(), "dflash"), (object(), None)]:
+        for model, kind in [
+            (None, None),
+            (None, "mtp"),
+            (object(), "dflash"),
+            (object(), None),
+        ]:
             with pytest.raises(mv.VerifyScanError, match="MTP drafter"):
                 mv.require_loaded_mtp_drafter(pol, model, kind)
 
-    def _init(self, monkeypatch, gpu, qualified, resolved, compat_fails=False, scan="joint_v1"):
+    def _init(
+        self, monkeypatch, gpu, qualified, resolved, compat_fails=False, scan="joint_v1"
+    ):
         import mlx_vlm.speculative.drafters as drafters
 
         monkeypatch.setenv("MLX_VLM_MTP_VERIFY_SCAN", scan)
@@ -1182,26 +1285,49 @@ class TestB6LoadedMtpDrafter:
         monkeypatch.setenv("MLX_VLM_DRAFT_KIND", "mtp")
         monkeypatch.setenv("MLX_VLM_DRAFT_MODEL", "/drafter")
         monkeypatch.setattr(
-            mv, "QUALIFIED_DOMAIN",
-            mv.Domain(dtypes=(mx.bfloat16,), head_dim=16, gqa=(2,),
-                      device_classes=("applegpu_g17s",)))
-        monkeypatch.setattr(mv, "self_test_model", lambda *a, **k: [mv.SelfTestResult()])
+            mv,
+            "QUALIFIED_DOMAIN",
+            mv.Domain(
+                dtypes=(mx.bfloat16,),
+                head_dim=16,
+                gqa=(2,),
+                device_classes=("applegpu_g17s",),
+            ),
+        )
+        monkeypatch.setattr(
+            mv, "self_test_model", lambda *a, **k: [mv.SelfTestResult()]
+        )
         lm = _tiny_lm()
         model = SimpleNamespace(language_model=lm, config=lm.config)
-        monkeypatch.setattr(generation_module, "load_model_resources",
-                            lambda *a, **k: (model, SimpleNamespace(), lm.config))
+        monkeypatch.setattr(
+            generation_module,
+            "load_model_resources",
+            lambda *a, **k: (model, SimpleNamespace(), lm.config),
+        )
         monkeypatch.setattr(drafters, "load_drafter", lambda path, kind=None: resolved)
         if compat_fails:
+
             def bad(*a, **k):
                 raise ValueError("incompatible")
+
             monkeypatch.setattr(drafters, "validate_drafter_compatibility", bad)
         else:
-            monkeypatch.setattr(drafters, "validate_drafter_compatibility", lambda *a, **k: None)
-        fake = SimpleNamespace(model_path="x", adapter_path=None, draft_kind_override=None,
-                               draft_model_path=None, apc_manager=None, kv_bits=None)
+            monkeypatch.setattr(
+                drafters, "validate_drafter_compatibility", lambda *a, **k: None
+            )
+        fake = SimpleNamespace(
+            model_path="x",
+            adapter_path=None,
+            draft_kind_override=None,
+            draft_model_path=None,
+            apc_manager=None,
+            kv_bits=None,
+        )
         generation_module.ResponseGenerator._initialize_model(fake)
 
-    def test_b6_drafter_resolving_to_a_non_mtp_kind_refuses(self, monkeypatch, gpu, qualified):
+    def test_b6_drafter_resolving_to_a_non_mtp_kind_refuses(
+        self, monkeypatch, gpu, qualified
+    ):
         with pytest.raises(mv.VerifyScanError, match="MTP drafter"):
             self._init(monkeypatch, gpu, qualified, (SimpleNamespace(), "dflash"))
 
@@ -1210,7 +1336,13 @@ class TestB6LoadedMtpDrafter:
     ):
         monkeypatch.setenv("MLX_VLM_DRAFT_ALLOW_FALLBACK", "1")
         with pytest.raises(mv.VerifyScanError, match="MTP drafter"):
-            self._init(monkeypatch, gpu, qualified, (SimpleNamespace(), "mtp"), compat_fails=True)
+            self._init(
+                monkeypatch,
+                gpu,
+                qualified,
+                (SimpleNamespace(), "mtp"),
+                compat_fails=True,
+            )
 
 
 # ------------------------------------------------------------------ B7 self-test validity
@@ -1235,24 +1367,32 @@ class TestB7SelfTestValidity:
 
         def odd(q, k, v, scale=None, mask=None, **kw):
             calls["n"] += 1
-            dtype = mx.float32 if q.shape[2] == 1 else q.dtype  # per-query pieces differ in dtype
+            dtype = (
+                mx.float32 if q.shape[2] == 1 else q.dtype
+            )  # per-query pieces differ in dtype
             return mx.zeros(q.shape, dtype)
 
         monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", odd)
         with pytest.raises(mv.VerifyScanError, match="invalid output"):
             mv.self_test(mv.JointV1Policy(), **self.DIMS)
 
-    def test_b7_nan_on_the_eligible_cell_rejects_as_invalid(self, qualified, gpu, monkeypatch):
+    def test_b7_nan_on_the_eligible_cell_rejects_as_invalid(
+        self, qualified, gpu, monkeypatch
+    ):
         monkeypatch.setattr(
-            mx.fast, "scaled_dot_product_attention",
-            lambda q, k, v, **kw: mx.full(q.shape, float("nan"), q.dtype))
+            mx.fast,
+            "scaled_dot_product_attention",
+            lambda q, k, v, **kw: mx.full(q.shape, float("nan"), q.dtype),
+        )
         with pytest.raises(mv.VerifyScanError, match="non-finite"):
             mv.self_test(mv.JointV1Policy(), **self.DIMS)
 
 
 # ------------------------------------------------------------------ B8 AB finalization
 class TestB8ABFinalization:
-    def test_b8_counters_do_not_advance_before_materialisation(self, qualified, monkeypatch):
+    def test_b8_counters_do_not_advance_before_materialisation(
+        self, qualified, monkeypatch
+    ):
         monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", ShapeRecorder())
         policy = mv.JointV1Policy(ab=True)
         attend(policy, *make_qkv(3, 4096))
@@ -1273,22 +1413,29 @@ class TestB8ABFinalization:
         assert policy._pending == [] and policy._ordinal == 0
         c = policy.counters()
         assert c["verify_ab_blocks"] == 0 and c["verify_ab_mismatch"] == 0
-        assert c["verify_blocks_joint_v1"] == 1  # the block itself was served and counted
+        assert (
+            c["verify_blocks_joint_v1"] == 1
+        )  # the block itself was served and counted
 
     def test_b8_exception_mid_round_discards_and_keeps_the_original_exception(
         self, qualified, monkeypatch
     ):
         monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", ShapeRecorder())
         policy = mv.JointV1Policy(ab=True)
-        lm = SimpleNamespace(mtp_verify_policy=policy, model=object(),
-                             args=SimpleNamespace(tie_word_embeddings=True))
+        lm = SimpleNamespace(
+            mtp_verify_policy=policy,
+            model=object(),
+            args=SimpleNamespace(tie_word_embeddings=True),
+        )
         verifier = qwen_verifier.Qwen3_5BatchInvariantForward()
 
         class Boom(RuntimeError):
             pass
 
         def model(*a, **k):
-            attend(policy, *make_qkv(3, 4096))  # an AB comparison is pending when it dies
+            attend(
+                policy, *make_qkv(3, 4096)
+            )  # an AB comparison is pending when it dies
             raise Boom("mid-round")
 
         verifier._model = model
@@ -1302,11 +1449,16 @@ class TestB8ABFinalization:
     ):
         monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", ShapeRecorder())
         policy = mv.JointV1Policy(ab=True)
-        lm = SimpleNamespace(mtp_verify_policy=policy, model=SimpleNamespace(),
-                             args=SimpleNamespace(tie_word_embeddings=True))
+        lm = SimpleNamespace(
+            mtp_verify_policy=policy,
+            model=SimpleNamespace(),
+            args=SimpleNamespace(tie_word_embeddings=True),
+        )
         verifier = qwen_verifier.Qwen3_5BatchInvariantForward()
-        verifier._model = lambda *a, **k: (attend(policy, *make_qkv(3, 4096)),
-                                           mx.zeros((1, 3, 4)))[1]
+        verifier._model = lambda *a, **k: (
+            attend(policy, *make_qkv(3, 4096)),
+            mx.zeros((1, 3, 4)),
+        )[1]
         verifier._embedding_as_linear = lambda emb, h: h
         lm.model.embed_tokens = None
         verifier(lm, mx.zeros((1, 3), dtype=mx.int32))
@@ -1365,7 +1517,60 @@ STEP1_MISMATCH = {
     (5, 65539): [0, 1],
     (5, 65540): [0],
 }
-SWEEP_KEYS = [1018, 1019, 1020, 1021, 1022, 1023, 1024, 1025, 1026, 1027, 1028, 1029, 1030, 8188, 8189, 8190, 8191, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 32764, 32765, 32766, 32767, 32768, 32769, 32770, 32771, 32772, 32773, 32774, 32775, 32776, 65532, 65533, 65534, 65535, 65536, 65537, 65538, 65539, 65540, 65541, 65542, 65543, 65544]
+SWEEP_KEYS = [
+    1018,
+    1019,
+    1020,
+    1021,
+    1022,
+    1023,
+    1024,
+    1025,
+    1026,
+    1027,
+    1028,
+    1029,
+    1030,
+    8188,
+    8189,
+    8190,
+    8191,
+    8192,
+    8193,
+    8194,
+    8195,
+    8196,
+    8197,
+    8198,
+    8199,
+    8200,
+    32764,
+    32765,
+    32766,
+    32767,
+    32768,
+    32769,
+    32770,
+    32771,
+    32772,
+    32773,
+    32774,
+    32775,
+    32776,
+    65532,
+    65533,
+    65534,
+    65535,
+    65536,
+    65537,
+    65538,
+    65539,
+    65540,
+    65541,
+    65542,
+    65543,
+    65544,
+]
 
 
 @pytest.fixture
@@ -1392,16 +1597,26 @@ class TestB10RealMirror:
             expected = "straddle" if (q_len, key_length) in STEP1_MISMATCH else "joint"
             assert route == expected, (q_len, key_length)
 
-    def test_b10_mismatch_positions_are_the_first_qL_minus_d_via_the_real_mirror(self, real_mirror):
+    def test_b10_mismatch_positions_are_the_first_qL_minus_d_via_the_real_mirror(
+        self, real_mirror
+    ):
         plan = qwen_language._qwen3_5_sdpa_vector_plan
         for q_len in (2, 3, 4, 5):
             for key_length in SWEEP_KEYS:
                 joint = plan(key_length, 24, 4)
                 # per-query position i attends keys [0, key_length - q_len + i]
-                positions = [i for i in range(q_len)
-                             if plan(key_length - q_len + 1 + i, 24, 4) != joint]
-                assert positions == STEP1_MISMATCH.get((q_len, key_length), []), (q_len, key_length)
-                assert positions == list(range(len(positions)))        # leading positions only
+                positions = [
+                    i
+                    for i in range(q_len)
+                    if plan(key_length - q_len + 1 + i, 24, 4) != joint
+                ]
+                assert positions == STEP1_MISMATCH.get((q_len, key_length), []), (
+                    q_len,
+                    key_length,
+                )
+                assert positions == list(
+                    range(len(positions))
+                )  # leading positions only
 
     def test_b10_the_length_two_straddle_at_1025_and_1024(self, real_mirror, rec):
         policy = mv.JointV1Policy()
@@ -1428,14 +1643,21 @@ class TestB9DeviceDiscoveryConsistency:
         real_mirror["architecture"] = "applegpu_g17d"  # mirror caches 'd' ...
         policy = mv.JointV1Policy()
         q, k, v = make_qkv(3, 4096)
-        assert qwen_language._qwen3_5_device_arch_suffix() == "d"  # primes the cache with 'd'
-        monkeypatch.setattr(mv, "QUALIFIED_DOMAIN",
-                            mv.Domain(device_classes=("applegpu_g17d", "applegpu_g17s")))
-        real_mirror["architecture"] = "applegpu_g17s"  # ... the live device then reads 's'
+        assert (
+            qwen_language._qwen3_5_device_arch_suffix() == "d"
+        )  # primes the cache with 'd'
+        monkeypatch.setattr(
+            mv,
+            "QUALIFIED_DOMAIN",
+            mv.Domain(device_classes=("applegpu_g17d", "applegpu_g17s")),
+        )
+        real_mirror["architecture"] = (
+            "applegpu_g17s"  # ... the live device then reads 's'
+        )
         d = policy.classify(q, k, v, NativeCache(), "causal")
         assert (d.route, d.reason) == ("per_query", "domain")
         qwen_language._qwen3_5_device_arch_suffix.cache_clear()
-        policy.refresh_device()                    # the device is resolved at load, not per call
+        policy.refresh_device()  # the device is resolved at load, not per call
         assert policy.classify(q, k, v, NativeCache(), "causal").route == "joint"
 
     def test_b9_missing_architecture_fails_closed_in_the_domain_and_the_mirror(
@@ -1451,6 +1673,7 @@ class TestB9DeviceDiscoveryConsistency:
     def test_b9_unreadable_device_info_fails_closed(self, real_mirror, monkeypatch):
         def boom():
             raise RuntimeError("no device info")
+
         monkeypatch.setattr(mx, "device_info", boom, raising=False)
         qwen_language._qwen3_5_device_arch_suffix.cache_clear()
         assert mv._device_class() is None
@@ -1461,31 +1684,43 @@ class TestB9DeviceDiscoveryConsistency:
 
 # ------------------------------------------------------------------ F4 quantized-KV predicate
 class TestF4QuantizedKvPredicate:
-    @pytest.mark.parametrize("kv_bits,scheme", [(4.0, None), (3.5, "turboquant"), (4, "uniform"),
-                                                (8, "turboquant")])
-    def test_f4_a_cache_that_would_be_quantized_refuses_at_load(self, monkeypatch, kv_bits, scheme):
+    @pytest.mark.parametrize(
+        "kv_bits,scheme",
+        [(4.0, None), (3.5, "turboquant"), (4, "uniform"), (8, "turboquant")],
+    )
+    def test_f4_a_cache_that_would_be_quantized_refuses_at_load(
+        self, monkeypatch, kv_bits, scheme
+    ):
         monkeypatch.delenv("MLX_SDPA_BLOCKS", raising=False)
         with pytest.raises(mv.VerifyScanError, match="quantized KV"):
-            mv.require_environment(draft_kind="mtp", kv_bits=kv_bits, kv_quant_scheme=scheme)
+            mv.require_environment(
+                draft_kind="mtp", kv_bits=kv_bits, kv_quant_scheme=scheme
+            )
 
     @pytest.mark.parametrize("scheme", [None, "uniform", "turboquant"])
-    def test_f4_kv_bits_zero_or_none_is_native_whatever_the_scheme(self, monkeypatch, scheme):
+    def test_f4_kv_bits_zero_or_none_is_native_whatever_the_scheme(
+        self, monkeypatch, scheme
+    ):
         monkeypatch.delenv("MLX_SDPA_BLOCKS", raising=False)
         for kv_bits in (None, 0, 0.0):
-            mv.require_environment(draft_kind="mtp", kv_bits=kv_bits, kv_quant_scheme=scheme)
+            mv.require_environment(
+                draft_kind="mtp", kv_bits=kv_bits, kv_quant_scheme=scheme
+            )
 
     def test_f4_the_predicate_matches_the_forks_cache_construction(self):
         from mlx_vlm.kv_quant import from_legacy
 
         for scheme in (None, "uniform", "turboquant"):
-            assert from_legacy(None, scheme) is None           # native: nothing quantized
+            assert from_legacy(None, scheme) is None  # native: nothing quantized
         assert from_legacy(4, "turboquant") is not None and from_legacy(3.5) is not None
 
 
 # ------------------------------------------------------------------ golden: shipped first pick
 FIRST_PICK = "Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed"
 SIBLING_REGISTRY = REPO.parent / "mlx_local_stack" / "main_models.yaml"
-FIXTURE_REGISTRY = Path(__file__).resolve().parent / "fixtures" / "stack_registry_golden.yaml"
+FIXTURE_REGISTRY = (
+    Path(__file__).resolve().parent / "fixtures" / "stack_registry_golden.yaml"
+)
 FIXTURE_MARKER = "# ---- BEGIN VERBATIM main_models.yaml ----\n"
 FIXTURE_SHA256 = "323ee54aa5ddc1cea312bd0729079f7a7a45d6b57b6370747b741d9bb734f64f"
 
@@ -1496,7 +1731,8 @@ def _stack_registry():
     Default: env MLX_STACK_REGISTRY (set-but-absent FAILS), else the sibling stack checkout, else
     the PINNED fixture (a verbatim copy; CI has no sibling), warning when the sibling is absent.
     With MLX_REQUIRE_STACK_REGISTRY=1 (operator machines) the LIVE registry is mandatory: the env
-    path or the sibling must exist AND equal the pinned fixture, else FAIL (refresh the fixture)."""
+    path or the sibling must exist AND equal the pinned fixture, else FAIL (refresh the fixture).
+    """
     import warnings
 
     env = os.environ.get("MLX_STACK_REGISTRY")
@@ -1511,17 +1747,24 @@ def _stack_registry():
         live = None
     if required:
         if live is None:
-            pytest.fail("MLX_REQUIRE_STACK_REGISTRY=1 but no live stack registry (MLX_STACK_REGISTRY "
-                        f"or {SIBLING_REGISTRY}) exists")
+            pytest.fail(
+                "MLX_REQUIRE_STACK_REGISTRY=1 but no live stack registry (MLX_STACK_REGISTRY "
+                f"or {SIBLING_REGISTRY}) exists"
+            )
         if live.read_text() != _fixture_verbatim():
-            pytest.fail(f"the live registry {live} differs from the pinned golden fixture; "
-                        "refresh stack_registry_golden.yaml (see its header)")
+            pytest.fail(
+                f"the live registry {live} differs from the pinned golden fixture; "
+                "refresh stack_registry_golden.yaml (see its header)"
+            )
         return live
     if live is not None:
         return live
     if not FIXTURE_REGISTRY.exists():
         pytest.fail(f"no stack registry and no fixture {FIXTURE_REGISTRY}")
-    warnings.warn("no live stack registry; golden tests run against the PINNED fixture", stacklevel=2)
+    warnings.warn(
+        "no live stack registry; golden tests run against the PINNED fixture",
+        stacklevel=2,
+    )
     return FIXTURE_REGISTRY
 
 
@@ -1532,8 +1775,9 @@ def _fixture_verbatim() -> str:
 def test_golden_fixture_matches_its_recorded_sha():
     import hashlib
 
-    assert hashlib.sha256(_fixture_verbatim().encode()).hexdigest() == FIXTURE_SHA256, (
-        "stack_registry_golden.yaml changed: refresh procedure is in its header (update the sha)")
+    assert (
+        hashlib.sha256(_fixture_verbatim().encode()).hexdigest() == FIXTURE_SHA256
+    ), "stack_registry_golden.yaml changed: refresh procedure is in its header (update the sha)"
 
 
 def test_golden_sibling_registry_drift_warns_but_does_not_fail():
@@ -1542,8 +1786,11 @@ def test_golden_sibling_registry_drift_warns_but_does_not_fail():
     if not SIBLING_REGISTRY.exists():
         pytest.skip("no sibling stack checkout on this machine")
     if SIBLING_REGISTRY.read_text() != _fixture_verbatim():
-        warnings.warn("the sibling stack registry differs from the pinned golden fixture; "
-                      "refresh tests/fixtures/stack_registry_golden.yaml", stacklevel=1)
+        warnings.warn(
+            "the sibling stack registry differs from the pinned golden fixture; "
+            "refresh tests/fixtures/stack_registry_golden.yaml",
+            stacklevel=1,
+        )
 
 
 def test_golden_registry_resolution_rules(monkeypatch, tmp_path):
@@ -1555,22 +1802,30 @@ def test_golden_registry_resolution_rules(monkeypatch, tmp_path):
     monkeypatch.setenv("MLX_STACK_REGISTRY", str(present))
     assert _stack_registry() == present
     monkeypatch.delenv("MLX_STACK_REGISTRY")
-    monkeypatch.setattr(sys.modules[__name__], "SIBLING_REGISTRY", tmp_path / "absent.yaml")
+    monkeypatch.setattr(
+        sys.modules[__name__], "SIBLING_REGISTRY", tmp_path / "absent.yaml"
+    )
     monkeypatch.delenv("MLX_REQUIRE_STACK_REGISTRY", raising=False)
     with pytest.warns(UserWarning, match="PINNED fixture"):
         assert _stack_registry() == FIXTURE_REGISTRY
 
 
-def test_e3_require_mode_demands_a_live_registry_equal_to_the_fixture(monkeypatch, tmp_path):
+def test_e3_require_mode_demands_a_live_registry_equal_to_the_fixture(
+    monkeypatch, tmp_path
+):
     monkeypatch.setenv("MLX_REQUIRE_STACK_REGISTRY", "1")
     monkeypatch.delenv("MLX_STACK_REGISTRY", raising=False)
-    monkeypatch.setattr(sys.modules[__name__], "SIBLING_REGISTRY", tmp_path / "absent.yaml")
+    monkeypatch.setattr(
+        sys.modules[__name__], "SIBLING_REGISTRY", tmp_path / "absent.yaml"
+    )
     with pytest.raises(pytest.fail.Exception, match="no live stack registry"):
         _stack_registry()
     drifted = tmp_path / "live.yaml"
     drifted.write_text(_fixture_verbatim() + "# edited\n")
     monkeypatch.setenv("MLX_STACK_REGISTRY", str(drifted))
-    with pytest.raises(pytest.fail.Exception, match="differs from the pinned golden fixture"):
+    with pytest.raises(
+        pytest.fail.Exception, match="differs from the pinned golden fixture"
+    ):
         _stack_registry()
     same = tmp_path / "same.yaml"
     same.write_text(_fixture_verbatim())
@@ -1579,12 +1834,18 @@ def test_e3_require_mode_demands_a_live_registry_equal_to_the_fixture(monkeypatc
 
 
 @pytest.mark.requires_stack_registry
-def test_golden_the_shipped_first_pick_passes_every_load_time_refusal(monkeypatch, gpu, qualified):
+def test_golden_the_shipped_first_pick_passes_every_load_time_refusal(
+    monkeypatch, gpu, qualified
+):
     import yaml
 
     entries = yaml.safe_load(_stack_registry().read_text())["models"]
     pick = next(e for e in entries if e["name"] == FIRST_PICK)
-    assert (pick["kv_bits"], pick.get("kv_quant_scheme"), pick["draft_kind"]) == (0, "turboquant", "mtp")
+    assert (pick["kv_bits"], pick.get("kv_quant_scheme"), pick["draft_kind"]) == (
+        0,
+        "turboquant",
+        "mtp",
+    )
     # what the worker resolves for that entry: KV_BITS=0 -> None (native), scheme passed through
     monkeypatch.setenv("KV_BITS", str(pick["kv_bits"]))
     kv_bits = generation_module.get_quantized_kv_bits()
@@ -1593,16 +1854,31 @@ def test_golden_the_shipped_first_pick_passes_every_load_time_refusal(monkeypatc
     monkeypatch.setenv("MLX_VLM_MTP_VERIFY_AB", "0")
     monkeypatch.delenv("MLX_SDPA_BLOCKS", raising=False)
     monkeypatch.setattr(
-        mv, "QUALIFIED_DOMAIN",
-        mv.Domain(dtypes=(mx.bfloat16,), head_dim=16, gqa=(2,), device_classes=("applegpu_g17s",)))
+        mv,
+        "QUALIFIED_DOMAIN",
+        mv.Domain(
+            dtypes=(mx.bfloat16,),
+            head_dim=16,
+            gqa=(2,),
+            device_classes=("applegpu_g17s",),
+        ),
+    )
     monkeypatch.setattr(mv, "self_test_model", lambda *a, **k: [mv.SelfTestResult()])
     lm = _tiny_lm()
     policy = generation_module._apply_mtp_verify_from_env(
-        SimpleNamespace(language_model=lm, config=lm.config), draft_kind=pick["draft_kind"],
-        kv_bits=kv_bits, kv_quant_scheme=pick["kv_quant_scheme"])
-    assert isinstance(policy, mv.JointV1Policy)               # no load-time refusal fired
+        SimpleNamespace(language_model=lm, config=lm.config),
+        draft_kind=pick["draft_kind"],
+        kv_bits=kv_bits,
+        kv_quant_scheme=pick["kv_quant_scheme"],
+    )
+    assert isinstance(policy, mv.JointV1Policy)  # no load-time refusal fired
     # and the runtime predicate agrees: a native cache has no `bits` attribute
-    assert policy.classify(*make_qkv(3, 64, gqa=2, head_dim=16), NativeCache(), "causal").reason != "cache"
+    assert (
+        policy.classify(
+            *make_qkv(3, 64, gqa=2, head_dim=16), NativeCache(), "causal"
+        ).reason
+        != "cache"
+    )
 
 
 # ------------------------------------------------------------------ D6 default path imports nothing
@@ -1614,32 +1890,46 @@ class TestD6DefaultPathIsInert:
         real = builtins.__import__
 
         def guard(name, globals=None, locals=None, fromlist=(), level=0):
-            if "mtp_verify_scan" in (name or "") or "mtp_verify_scan" in (fromlist or ()):
+            if "mtp_verify_scan" in (name or "") or "mtp_verify_scan" in (
+                fromlist or ()
+            ):
                 raise AssertionError("mtp_verify_scan imported on the default path")
             return real(name, globals, locals, fromlist, level)
 
         monkeypatch.setattr(builtins, "__import__", guard)
 
     @pytest.mark.parametrize("scan", [None, "", "per_query"])
-    def test_d6_apply_hook_without_flags_imports_and_calls_nothing(self, monkeypatch, no_import, scan):
+    def test_d6_apply_hook_without_flags_imports_and_calls_nothing(
+        self, monkeypatch, no_import, scan
+    ):
         monkeypatch.delenv("MLX_VLM_MTP_VERIFY_AB", raising=False)
         if scan is None:
             monkeypatch.delenv("MLX_VLM_MTP_VERIFY_SCAN", raising=False)
         else:
             monkeypatch.setenv("MLX_VLM_MTP_VERIFY_SCAN", scan)
         model = SimpleNamespace()
-        assert generation_module._apply_mtp_verify_from_env(
-            model, draft_kind=None, kv_bits=4.0, kv_quant_scheme="turboquant") is None
+        assert (
+            generation_module._apply_mtp_verify_from_env(
+                model, draft_kind=None, kv_bits=4.0, kv_quant_scheme="turboquant"
+            )
+            is None
+        )
 
     def test_d6_flags_still_import_and_refuse(self, monkeypatch):
         monkeypatch.setenv("MLX_VLM_MTP_VERIFY_SCAN", "per_query")
-        monkeypatch.setenv("MLX_VLM_MTP_VERIFY_AB", "1")       # AB without joint_v1 must refuse
+        monkeypatch.setenv(
+            "MLX_VLM_MTP_VERIFY_AB", "1"
+        )  # AB without joint_v1 must refuse
         with pytest.raises(mv.VerifyScanError, match="joint_v1"):
-            generation_module._apply_mtp_verify_from_env(SimpleNamespace(), draft_kind="mtp", kv_bits=None)
+            generation_module._apply_mtp_verify_from_env(
+                SimpleNamespace(), draft_kind="mtp", kv_bits=None
+            )
         monkeypatch.setenv("MLX_VLM_MTP_VERIFY_AB", "0")
         monkeypatch.setenv("MLX_VLM_MTP_VERIFY_SCAN", "joint_v9")
         with pytest.raises(mv.VerifyScanError, match="joint_v9"):
-            generation_module._apply_mtp_verify_from_env(SimpleNamespace(), draft_kind="mtp", kv_bits=None)
+            generation_module._apply_mtp_verify_from_env(
+                SimpleNamespace(), draft_kind="mtp", kv_bits=None
+            )
 
     def test_d6_initialize_model_default_path_never_touches_the_module(
         self, monkeypatch, no_import, gpu
@@ -1654,16 +1944,25 @@ class TestD6DefaultPathIsInert:
         monkeypatch.delenv("MLX_VLM_ATTENTION_POLICY", raising=False)
         lm = _tiny_lm()
         model = SimpleNamespace(language_model=lm, config=lm.config)
-        monkeypatch.setattr(generation_module, "load_model_resources",
-                            lambda *a, **k: (model, SimpleNamespace(), lm.config))
-        fake = SimpleNamespace(model_path="x", adapter_path=None, draft_kind_override=None,
-                               draft_model_path=None, apc_manager=None, kv_bits=None)
+        monkeypatch.setattr(
+            generation_module,
+            "load_model_resources",
+            lambda *a, **k: (model, SimpleNamespace(), lm.config),
+        )
+        fake = SimpleNamespace(
+            model_path="x",
+            adapter_path=None,
+            draft_kind_override=None,
+            draft_model_path=None,
+            apc_manager=None,
+            kv_bits=None,
+        )
         try:
             generation_module.ResponseGenerator._initialize_model(fake)
         except AssertionError as e:
-            assert "mtp_verify_scan" not in str(e), e         # only our hook may fail the test
+            assert "mtp_verify_scan" not in str(e), e  # only our hook may fail the test
         except Exception:
-            pass                                               # unrelated fake-processor gaps
+            pass  # unrelated fake-processor gaps
         assert fake.mtp_verify_policy is None
 
 
@@ -1695,10 +1994,12 @@ class TestD7Deadline:
 
         def slow(q, k, v, **kw):
             time.sleep(0.1)
-            return fake(q, k, v, **kw)              # consistent known positive, but slow
+            return fake(q, k, v, **kw)  # consistent known positive, but slow
 
         monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", slow)
-        with pytest.raises(mv.VerifyScanError, match="budget"):   # (the real exit ends the process)
+        with pytest.raises(
+            mv.VerifyScanError, match="budget"
+        ):  # (the real exit ends the process)
             mv.self_test(mv.JointV1Policy(), **TestSelfTest.DIMS)
         assert codes == [mv.SELF_TEST_EXIT_CODE]
 
@@ -1715,8 +2016,12 @@ class TestD7Deadline:
 
         monkeypatch.setattr(ap, "_observe_query_dtypes", hang)
         lm = _tiny_lm()
-        assert mv.self_test_model(SimpleNamespace(language_model=lm, config=lm.config),
-                                  mv.JointV1Policy()) == []
+        assert (
+            mv.self_test_model(
+                SimpleNamespace(language_model=lm, config=lm.config), mv.JointV1Policy()
+            )
+            == []
+        )
         assert codes == [mv.SELF_TEST_EXIT_CODE]
 
     def test_d7_the_process_really_terminates_nonzero(self):
@@ -1728,8 +2033,13 @@ class TestD7Deadline:
             "print('NOT REACHED')\n"
         )
         started = time.perf_counter()
-        proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
-                              timeout=25, cwd=str(REPO))
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=25,
+            cwd=str(REPO),
+        )
         assert proc.returncode == mv.SELF_TEST_EXIT_CODE
         assert "NOT REACHED" not in proc.stdout and "deadline" in proc.stderr
         assert time.perf_counter() - started < 20
@@ -1737,7 +2047,9 @@ class TestD7Deadline:
 
 # ------------------------------------------------------------------ review round 2: test gaps
 class TestRound2Gaps:
-    def test_d6_key_and_value_dtype_and_head_dim_are_part_of_the_domain(self, qualified, rec):
+    def test_d6_key_and_value_dtype_and_head_dim_are_part_of_the_domain(
+        self, qualified, rec
+    ):
         policy = mv.JointV1Policy()
         q, k, v = make_qkv(3, 4096)
         for bad_k, bad_v in ((k.astype(mx.float16), v), (k, v.astype(mx.float16))):
@@ -1750,10 +2062,17 @@ class TestRound2Gaps:
 
     def test_d5_the_query_head_dim_is_checked(self, qualified):
         q, k, v = make_qkv(3, 4096, head_dim=128)
-        assert mv.JointV1Policy().classify(q, k, v, NativeCache(), "causal").reason == "domain"
+        assert (
+            mv.JointV1Policy().classify(q, k, v, NativeCache(), "causal").reason
+            == "domain"
+        )
 
-    def test_d7_the_self_test_never_touches_the_global_rng(self, qualified, gpu, monkeypatch):
-        monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", TestSelfTest.FakeSdpa())
+    def test_d7_the_self_test_never_touches_the_global_rng(
+        self, qualified, gpu, monkeypatch
+    ):
+        monkeypatch.setattr(
+            mx.fast, "scaled_dot_product_attention", TestSelfTest.FakeSdpa()
+        )
         mx.random.seed(123)
         expected = mx.random.uniform(shape=(4,)).tolist()
         mx.random.seed(123)
@@ -1767,33 +2086,44 @@ class TestRound2Gaps:
         def spy(q, k, v, **kw):
             seen.append(float(q.astype(mx.float32).sum().item()))
             return real(q, k, v, **kw)
+
         monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", spy)
         mv.self_test(mv.JointV1Policy(), **TestSelfTest.DIMS)
         first, seen[:] = list(seen), []
         mv.self_test(mv.JointV1Policy(), **TestSelfTest.DIMS)
         assert seen == first
 
-    def test_d8_classify_never_queries_the_device_on_the_hot_path(self, qualified, monkeypatch):
+    def test_d8_classify_never_queries_the_device_on_the_hot_path(
+        self, qualified, monkeypatch
+    ):
         calls = []
-        monkeypatch.setattr(mv, "_device_class", lambda: calls.append(1) or "applegpu_g17s")
+        monkeypatch.setattr(
+            mv, "_device_class", lambda: calls.append(1) or "applegpu_g17s"
+        )
         policy = mv.JointV1Policy()
         for _ in range(50):
             policy.classify(*make_qkv(3, 4096), NativeCache(), "causal")
-        assert len(calls) == 1                      # resolved once, then cached
+        assert len(calls) == 1  # resolved once, then cached
         policy.refresh_device()
         assert len(calls) == 2
 
     def test_d5_the_straddle_known_positive_is_required(self, gpu, monkeypatch):
         monkeypatch.setattr(mv, "_device_class", lambda: "applegpu_g17s")
         monkeypatch.setattr(qwen_language, "_qwen3_5_device_arch_suffix", lambda: "s")
-        monkeypatch.setattr(qwen_language, "_qwen3_5_sdpa_vector_plan",
-                            lambda n, q, kv: ("one_pass", 0))        # predicts no straddle
-        monkeypatch.setattr(mx.fast, "scaled_dot_product_attention",
-                            lambda q, k, v, **kw: mx.zeros(q.shape, q.dtype))   # and none occurs
+        monkeypatch.setattr(
+            qwen_language, "_qwen3_5_sdpa_vector_plan", lambda n, q, kv: ("one_pass", 0)
+        )  # predicts no straddle
+        monkeypatch.setattr(
+            mx.fast,
+            "scaled_dot_product_attention",
+            lambda q, k, v, **kw: mx.zeros(q.shape, q.dtype),
+        )  # and none occurs
         with pytest.raises(mv.VerifyScanError, match="known positive"):
             mv.self_test(mv.JointV1Policy(), **TestSelfTest.DIMS)
 
-    def test_d5_length_one_blocks_never_enter_the_fallback_reasons(self, qualified, rec):
+    def test_d5_length_one_blocks_never_enter_the_fallback_reasons(
+        self, qualified, rec
+    ):
         policy = mv.JointV1Policy()
         for _ in range(3):
             assert attend(policy, *make_qkv(1, 4096)) is None
@@ -1801,18 +2131,23 @@ class TestRound2Gaps:
         assert c["verify_blocks_len1"] == 3 and c["verify_blocks_per_query"] == 0
         assert c["verify_fallback_reasons"] == {}
 
-    def test_d5_the_hook_never_overrides_the_left_padded_helpers_output(self, monkeypatch):
+    def test_d5_the_hook_never_overrides_the_left_padded_helpers_output(
+        self, monkeypatch
+    ):
         sentinel = mx.ones((1, 6, 3, D), mx.bfloat16)
-        monkeypatch.setattr(qwen_language, "_qwen3_5_left_padded_attention",
-                            lambda *a, **k: sentinel)
+        monkeypatch.setattr(
+            qwen_language, "_qwen3_5_left_padded_attention", lambda *a, **k: sentinel
+        )
 
         class Spy(mv.JointV1Policy):
             def attend(self, **kw):
-                raise AssertionError("policy consulted although the ragged helper produced output")
+                raise AssertionError(
+                    "policy consulted although the ragged helper produced output"
+                )
 
         q, k, v = make_qkv(3, 64)
         out = run_verifier_attention(q, k, v, "causal", policy=Spy())
-        assert out is not None                      # the helper's output flowed through untouched
+        assert out is not None  # the helper's output flowed through untouched
 
     def test_d5_the_gpu_requirement_is_enforced_at_load(self, monkeypatch):
         monkeypatch.setenv("MLX_VLM_MTP_VERIFY_SCAN", "joint_v1")
@@ -1821,21 +2156,30 @@ class TestRound2Gaps:
         lm = _tiny_lm()
         with pytest.raises(mv.VerifyScanError, match="GPU"):
             generation_module._apply_mtp_verify_from_env(
-                SimpleNamespace(language_model=lm, config=lm.config), draft_kind="mtp", kv_bits=None)
+                SimpleNamespace(language_model=lm, config=lm.config),
+                draft_kind="mtp",
+                kv_bits=None,
+            )
 
 
 # ------------------------------------------------------------------ round 3: E1 / E2
 class TestE1StraddleLen2Counter:
-    def test_e1_length_two_straddles_are_counted_as_a_subset_of_straddle(self, qualified, rec):
+    def test_e1_length_two_straddles_are_counted_as_a_subset_of_straddle(
+        self, qualified, rec
+    ):
         policy = mv.JointV1Policy()
-        attend(policy, *make_qkv(2, 1024))      # length 2: keys 1023 | 1024 straddle
-        attend(policy, *make_qkv(3, 1025))      # length 3 straddling
-        attend(policy, *make_qkv(2, 4096))      # length 2, no straddle: joint
+        attend(policy, *make_qkv(2, 1024))  # length 2: keys 1023 | 1024 straddle
+        attend(policy, *make_qkv(3, 1025))  # length 3 straddling
+        attend(policy, *make_qkv(2, 4096))  # length 2, no straddle: joint
         c = policy.counters()
-        assert c["verify_blocks_straddle"] == 2 and c["verify_blocks_straddle_len2"] == 1
+        assert (
+            c["verify_blocks_straddle"] == 2 and c["verify_blocks_straddle_len2"] == 1
+        )
         assert c["verify_blocks_joint_v1"] == 1
 
-    def test_e1_the_counter_is_scoped_per_request_and_reaches_the_timings(self, qualified, rec):
+    def test_e1_the_counter_is_scoped_per_request_and_reaches_the_timings(
+        self, qualified, rec
+    ):
         from mlx_vlm.server.schemas import GenerationTimings
 
         policy = mv.JointV1Policy()
@@ -1846,17 +2190,21 @@ class TestE1StraddleLen2Counter:
         assert delta["verify_blocks_straddle_len2"] == 1
         metrics = generation_module.GenerationMetrics()
         metrics.verify_counters = delta
-        dumped = json.loads(GenerationTimings.from_metrics(metrics, 4, 2).model_dump_json())
+        dumped = json.loads(
+            GenerationTimings.from_metrics(metrics, 4, 2).model_dump_json()
+        )
         assert dumped["verify_blocks_straddle_len2"] == 1
 
 
 class TestE2MutationGaps:
-    def test_e2a_the_self_test_compares_the_LARGEST_eligible_length(self, qualified, gpu, monkeypatch):
+    def test_e2a_the_self_test_compares_the_LARGEST_eligible_length(
+        self, qualified, gpu, monkeypatch
+    ):
         plan = TestSelfTest.FakeSdpa()
         longest = mv.VECTOR_QUERY_BOUND // 6
 
         def kernel(q, k, v, scale=None, mask=None, **kw):
-            if k.shape[2] > 1100:                          # the eligible cell: only qL == longest differs
+            if k.shape[2] > 1100:  # the eligible cell: only qL == longest differs
                 return mx.full(q.shape, 1.0 if q.shape[2] == longest else 0.0, q.dtype)
             return plan(q, k, v, scale=scale, mask=mask, **kw)
 
@@ -1874,17 +2222,24 @@ class TestE2MutationGaps:
         policy = mv.JointV1Policy(ab=True)
         attend(policy, *_two_pass_cells())
         policy.end_block()
-        assert policy.counters()["verify_ab_mismatch"] == 1     # bit-identical, still invalid
+        assert (
+            policy.counters()["verify_ab_mismatch"] == 1
+        )  # bit-identical, still invalid
 
-    def test_e2c_since_resets_the_reason_histogram_when_reasons_pre_exist(self, qualified, rec):
+    def test_e2c_since_resets_the_reason_histogram_when_reasons_pre_exist(
+        self, qualified, rec
+    ):
         policy = mv.JointV1Policy()
-        attend(policy, *make_qkv(6, 4096))                       # gqa_bound reason pre-exists
-        attend(policy, *make_qkv(3, 4096, dtype=mx.float16))     # domain reason pre-exists
+        attend(policy, *make_qkv(6, 4096))  # gqa_bound reason pre-exists
+        attend(policy, *make_qkv(3, 4096, dtype=mx.float16))  # domain reason pre-exists
         snap = policy.snapshot()
         assert policy.since(snap)["verify_fallback_reasons"] == {}
         attend(policy, *make_qkv(6, 4096))
         assert policy.since(snap)["verify_fallback_reasons"] == {"gqa_bound": 1}
-        assert policy.counters()["verify_fallback_reasons"] == {"gqa_bound": 2, "domain": 1}
+        assert policy.counters()["verify_fallback_reasons"] == {
+            "gqa_bound": 2,
+            "domain": 1,
+        }
 
 
 # ------------------------------------------------------------------ round 4: D3 invalid vs difference
@@ -1900,38 +2255,85 @@ class TestR4InvalidIsNotAKnownPositive:
     def test_r4_a_shape_invalid_straddle_counts_invalid_and_mismatch_not_the_positive(
         self, qualified, monkeypatch
     ):
-        c = self._straddle(monkeypatch, qualified, mx.zeros((1, 6, 3, D), mx.bfloat16),
-                           mx.zeros((1, 6, 2, D), mx.bfloat16))
-        assert (c["verify_ab_mismatch"], c["verify_ab_invalid"],
-                c["verify_ab_straddle_mismatch"], c["verify_ab_straddle_blocks"]) == (1, 1, 0, 1)
+        c = self._straddle(
+            monkeypatch,
+            qualified,
+            mx.zeros((1, 6, 3, D), mx.bfloat16),
+            mx.zeros((1, 6, 2, D), mx.bfloat16),
+        )
+        assert (
+            c["verify_ab_mismatch"],
+            c["verify_ab_invalid"],
+            c["verify_ab_straddle_mismatch"],
+            c["verify_ab_straddle_blocks"],
+        ) == (1, 1, 0, 1)
 
     def test_r4_a_nan_straddle_likewise(self, qualified, monkeypatch):
         nan = mx.full((1, 6, 3, D), float("nan"), mx.bfloat16)
-        c = self._straddle(monkeypatch, qualified, nan, mx.zeros((1, 6, 3, D), mx.bfloat16))
-        assert (c["verify_ab_mismatch"], c["verify_ab_invalid"], c["verify_ab_straddle_mismatch"]) == (1, 1, 0)
-        c = self._straddle(monkeypatch, qualified, nan, nan)          # the same NaN on both sides
-        assert (c["verify_ab_mismatch"], c["verify_ab_invalid"], c["verify_ab_straddle_mismatch"]) == (1, 1, 0)
+        c = self._straddle(
+            monkeypatch, qualified, nan, mx.zeros((1, 6, 3, D), mx.bfloat16)
+        )
+        assert (
+            c["verify_ab_mismatch"],
+            c["verify_ab_invalid"],
+            c["verify_ab_straddle_mismatch"],
+        ) == (1, 1, 0)
+        c = self._straddle(
+            monkeypatch, qualified, nan, nan
+        )  # the same NaN on both sides
+        assert (
+            c["verify_ab_mismatch"],
+            c["verify_ab_invalid"],
+            c["verify_ab_straddle_mismatch"],
+        ) == (1, 1, 0)
 
     def test_r4_a_dtype_invalid_straddle_likewise(self, qualified, monkeypatch):
-        c = self._straddle(monkeypatch, qualified, mx.zeros((1, 6, 3, D), mx.bfloat16),
-                           mx.zeros((1, 6, 3, D), mx.float32))
-        assert (c["verify_ab_mismatch"], c["verify_ab_invalid"], c["verify_ab_straddle_mismatch"]) == (1, 1, 0)
+        c = self._straddle(
+            monkeypatch,
+            qualified,
+            mx.zeros((1, 6, 3, D), mx.bfloat16),
+            mx.zeros((1, 6, 3, D), mx.float32),
+        )
+        assert (
+            c["verify_ab_mismatch"],
+            c["verify_ab_invalid"],
+            c["verify_ab_straddle_mismatch"],
+        ) == (1, 1, 0)
 
     def test_r4_a_valid_straddle_difference_is_the_known_positive_and_no_mismatch(
         self, qualified, monkeypatch
     ):
-        c = self._straddle(monkeypatch, qualified, mx.ones((1, 6, 3, D), mx.bfloat16),
-                           mx.zeros((1, 6, 3, D), mx.bfloat16))
-        assert (c["verify_ab_mismatch"], c["verify_ab_invalid"], c["verify_ab_straddle_mismatch"]) == (0, 0, 1)
+        c = self._straddle(
+            monkeypatch,
+            qualified,
+            mx.ones((1, 6, 3, D), mx.bfloat16),
+            mx.zeros((1, 6, 3, D), mx.bfloat16),
+        )
+        assert (
+            c["verify_ab_mismatch"],
+            c["verify_ab_invalid"],
+            c["verify_ab_straddle_mismatch"],
+        ) == (0, 0, 1)
 
     def test_r4_an_invalid_eligible_block_counts_both_and_a_valid_difference_only_mismatch(
         self, qualified, monkeypatch
     ):
         nan = mx.full((1, 6, 3, D), float("nan"), mx.bfloat16)
-        c = self._straddle(monkeypatch, qualified, nan, nan, keys=4096)    # eligible (no straddle)
-        assert (c["verify_ab_mismatch"], c["verify_ab_invalid"], c["verify_ab_blocks"]) == (1, 1, 1)
-        c = self._straddle(monkeypatch, qualified, mx.ones((1, 6, 3, D), mx.bfloat16),
-                           mx.zeros((1, 6, 3, D), mx.bfloat16), keys=4096)
+        c = self._straddle(
+            monkeypatch, qualified, nan, nan, keys=4096
+        )  # eligible (no straddle)
+        assert (
+            c["verify_ab_mismatch"],
+            c["verify_ab_invalid"],
+            c["verify_ab_blocks"],
+        ) == (1, 1, 1)
+        c = self._straddle(
+            monkeypatch,
+            qualified,
+            mx.ones((1, 6, 3, D), mx.bfloat16),
+            mx.zeros((1, 6, 3, D), mx.bfloat16),
+            keys=4096,
+        )
         assert (c["verify_ab_mismatch"], c["verify_ab_invalid"]) == (1, 0)
 
     def test_r4_one_batched_materialisation_is_preserved(self, qualified, monkeypatch):

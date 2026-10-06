@@ -23,9 +23,13 @@ from ..models.epicache import EpiCacheKVCache  # Fork: EpiCache is fork-only
 from ..prompt_utils import apply_chat_template
 from ..sample_utils import apply_min_p  # Fork: deployed seeded sampler filter chain
 from ..sample_utils import apply_top_p  # Fork: deployed seeded sampler filter chain
-from ..sample_utils import apply_top_k, make_logits_processors, make_sampler
-from ..sample_utils import (
+from ..sample_utils import (  # Fork: isort regrouping around the fork's sampler imports
+    apply_top_k,
     clamp_temperature,
+    make_logits_processors,
+    make_sampler,
+)
+from ..sample_utils import (
     top_p_sampling as top_p_sampling,  # Fork: explicit compatibility re-export
 )
 from ..speculative.utils import (
@@ -634,7 +638,9 @@ def generate_step(
         # loop cannot reach stays uncaptured (dispatch takes the legacy path).
         retain_done = False
         prompt_end_abs = initial_cache_offset + int(inputs_embeds.shape[1])
-        retain_target = prompt_end_abs if retain_at_offset is None else int(retain_at_offset)
+        retain_target = (
+            prompt_end_abs if retain_at_offset is None else int(retain_at_offset)
+        )
         if (
             prompt_end_offset is not None
             and prompt_cache
@@ -643,7 +649,8 @@ def generate_step(
         ):
             mx.eval([c.state for c in prompt_cache])
             _capture_anchor_state(
-                prompt_cache, offset=initial_cache_offset,
+                prompt_cache,
+                offset=initial_cache_offset,
                 rotating_capture=prompt_end_rotating_capture,
                 arrays_capture=prompt_end_arrays_capture,
                 anchor_offset_list=prompt_end_offset,
@@ -667,9 +674,12 @@ def generate_step(
             # Fork (M57): env-gated prefill component profiler; None when unset.
             _pp = prefill_profile.from_env()
             # Fork (M57): finalizing() flushes the profiler report on any exit.
-            with tqdm(
-                total=total_tokens, desc="Prefill", unit="tok", disable=not verbose
-            ) as pbar, prefill_profile.finalizing(_pp):
+            with (
+                tqdm(
+                    total=total_tokens, desc="Prefill", unit="tok", disable=not verbose
+                ) as pbar,
+                prefill_profile.finalizing(_pp),
+            ):
                 while inputs_embeds.shape[1] > 1:
                     n_to_process = min(prefill_step_size, inputs_embeds.shape[1] - 1)
                     if (
@@ -768,7 +778,8 @@ def generate_step(
                     ):
                         mx.eval([c.state for c in prompt_cache])
                         _capture_anchor_state(
-                            prompt_cache, offset=cumulative_offset,
+                            prompt_cache,
+                            offset=cumulative_offset,
                             rotating_capture=prompt_end_rotating_capture,
                             arrays_capture=prompt_end_arrays_capture,
                             anchor_offset_list=prompt_end_offset,
@@ -796,7 +807,12 @@ def generate_step(
         # decoded yet — the speculative rounds and the decode loop below both
         # write further tokens before their first yield, so this is the only
         # place the prompt-end state exists for every draft kind.
-        if prompt_end_offset is not None and prompt_cache and not retain_done and retain_target == prompt_end_abs:
+        if (
+            prompt_end_offset is not None
+            and prompt_cache
+            and not retain_done
+            and retain_target == prompt_end_abs
+        ):
             mx.eval([c.state for c in prompt_cache])
             _capture_anchor_state(
                 prompt_cache,
@@ -3084,7 +3100,9 @@ class BatchGenerator:
         prompt_kwargs_list = [s[3] for s in sequences]
         logits_processors = [s[4] for s in sequences]
         thinking_budget_criteria = [s[5] for s in sequences]
-        seeds_list = [s[6] if len(s) > 6 else None for s in sequences]  # Fork (O30): seed slot
+        seeds_list = [
+            s[6] if len(s) > 6 else None for s in sequences
+        ]  # Fork (O30): seed slot
 
         # Per-row prefix length and suffix tokens
         prefix_lens = [p["prefix_len"] if p else 0 for p in picks]
@@ -3546,7 +3564,9 @@ class BatchGenerator:
             prompt_kwargs_list = [s[3] for s in sequences]
             logits_processors = [s[4] for s in sequences]
             thinking_budget_criteria = [s[5] for s in sequences]
-            seeds_list = [s[6] if len(s) > 6 else None for s in sequences]  # Fork (O30): seed slot
+            seeds_list = [
+                s[6] if len(s) > 6 else None for s in sequences
+            ]  # Fork (O30): seed slot
 
             inputs_embeds, merged_kwargs = _merge_prefill_prompt_kwargs(
                 prompt_kwargs_list, input_ids

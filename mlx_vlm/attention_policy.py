@@ -280,13 +280,22 @@ def self_test_model(model, policy, *, max_kv, **kwargs) -> list:
     for module, dtype in zip(modules, dtypes):
         if dtype is None:
             _fail("self-test dtype probe saw no attention call on a qualified module")
-        cell = (module.num_attention_heads, module.num_key_value_heads,
-                module.head_dim, dtype)
+        cell = (
+            module.num_attention_heads,
+            module.num_key_value_heads,
+            module.head_dim,
+            dtype,
+        )
         if cell not in dims:
             dims.append(cell)
     return [
         self_test(
-            policy, heads=h, kv_heads=kv, head_dim=hd, dtype=dt, max_kv=max_kv,
+            policy,
+            heads=h,
+            kv_heads=kv,
+            head_dim=hd,
+            dtype=dt,
+            max_kv=max_kv,
             **kwargs,
         )
         for h, kv, hd, dt in dims

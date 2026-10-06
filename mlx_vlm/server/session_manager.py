@@ -222,7 +222,9 @@ def _clean_id(value) -> Optional[str]:
     text = value.strip()
     if not text or len(text) > _MAX_CHAT_ID_LEN:
         return None
-    if any(ch.isspace() and ch != " " for ch in text) or any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
+    if any(ch.isspace() and ch != " " for ch in text) or any(
+        ord(ch) < 32 or ord(ch) == 127 for ch in text
+    ):
         return None
     return text
 

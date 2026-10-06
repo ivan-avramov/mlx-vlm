@@ -11,15 +11,8 @@ from dataclasses import dataclass, field
 from queue import Empty as QueueEmpty
 from queue import Queue
 from threading import Event, Lock, Thread
-from typing import (
-    Any,  # Fork: Union for the fork-only annotations below
-    Callable,
-    Generator,
-    List,
-    Optional,
-    Tuple,
-    Union,
-)
+from typing import Any  # Fork: Any for the fork-only annotations below
+from typing import Callable, Generator, List, Optional, Tuple
 
 import mlx.core as mx
 from fastapi import HTTPException
@@ -53,10 +46,9 @@ from ..prompt_utils import (  # Fork: fork-only, the THINKING_FORMATS registry (
     prompt_is_inside_thinking,
 )
 from ..sample_utils import (
-    clamp_temperature,
     apply_top_k as apply_top_k,  # Fork: explicit compatibility re-export.
 )
-from ..sample_utils import make_logits_processors, make_sampler
+from ..sample_utils import clamp_temperature, make_logits_processors, make_sampler
 from ..sample_utils import (
     top_p_sampling as top_p_sampling,  # Fork: explicit compatibility re-export.
 )
@@ -1541,10 +1533,14 @@ class ResponseGenerator:
                 f"cooldown={draft_model.cooldown or 'off'})."
             )
 
-        if self.mtp_verify_policy is not None:  # Fork (M58): the default path imports nothing
+        if (
+            self.mtp_verify_policy is not None
+        ):  # Fork (M58): the default path imports nothing
             from .. import mtp_verify_scan as _mv
 
-            _mv.require_loaded_mtp_drafter(self.mtp_verify_policy, draft_model, draft_kind)
+            _mv.require_loaded_mtp_drafter(
+                self.mtp_verify_policy, draft_model, draft_kind
+            )
         self.model = model
         self.processor = processor
         self.config = config

@@ -10,11 +10,6 @@ from unittest.mock import patch
 import mlx.core as mx
 import pytest
 from fastapi.testclient import TestClient
-
-import mlx_vlm.server as server
-import mlx_vlm.server.openai as openai_module
-from mlx_vlm import attention_policy as ap
-from mlx_vlm.server import cli as cli_module
 from test_attention_policy import (  # noqa: F401  (fixtures + helpers)
     NativeCache,
     Recorder,
@@ -25,6 +20,11 @@ from test_attention_policy import (  # noqa: F401  (fixtures + helpers)
     passthrough,
     sdpa,
 )
+
+import mlx_vlm.server as server
+import mlx_vlm.server.openai as openai_module
+from mlx_vlm import attention_policy as ap
+from mlx_vlm.server import cli as cli_module
 
 
 # ---------------------------------------------------------------------- G1
@@ -39,7 +39,9 @@ class TestG1EveryTerminalShape:
         timings = openai_module._streaming_timings(12.5, _Metrics())
         dumped = json.loads(timings.model_dump_json())
         assert dumped == {
-            "predicted_per_second": 12.5, "sdpa_forced": 3, "sdpa_auto": 2,
+            "predicted_per_second": 12.5,
+            "sdpa_forced": 3,
+            "sdpa_auto": 2,
         }
         bare = openai_module._streaming_timings(
             1.0, SimpleNamespace(sdpa_forced=None, sdpa_auto=None)
@@ -75,9 +77,7 @@ class TestG1EveryTerminalShape:
         assert tool_terminals == 3
 
     def test_g1_completions_final_chunk_carries_counters_only_when_set(self):
-        chunk = openai_module._completion_final_chunk(
-            "id", "m", 1, "stop", _Metrics()
-        )
+        chunk = openai_module._completion_final_chunk("id", "m", 1, "stop", _Metrics())
         assert json.loads(chunk.to_sse_json())["timings"]["sdpa_forced"] == 3
         plain = openai_module._completion_final_chunk("id", "m", 1, "stop")
         assert "timings" not in json.loads(plain.to_sse_json())
@@ -111,9 +111,14 @@ def _tool_stream(client, monkeypatch, forced, auto):
             return server.GenerationContext(uid=1, prompt_tokens=10), iter(
                 [
                     server.StreamingToken(
-                        text=text, token=1, logprobs=0.0, finish_reason="stop",
-                        prompt_tps=20.0, cached_tokens=2,
-                        sdpa_forced=forced, sdpa_auto=auto,
+                        text=text,
+                        token=1,
+                        logprobs=0.0,
+                        finish_reason="stop",
+                        prompt_tps=20.0,
+                        cached_tokens=2,
+                        sdpa_forced=forced,
+                        sdpa_auto=auto,
                     )
                 ]
             )
@@ -121,7 +126,8 @@ def _tool_stream(client, monkeypatch, forced, auto):
     monkeypatch.setattr(server.runtime, "response_generator", Gen())
     with (
         patch.object(
-            server, "get_cached_model",
+            server,
+            "get_cached_model",
             return_value=(
                 SimpleNamespace(),
                 SimpleNamespace(tokenizer=_MuseResponseTemplateTokenizer()),
@@ -161,7 +167,8 @@ class TestG1ToolCallStream:
         chunks = _tool_stream(client, monkeypatch, 3, 2)
         assert not any(c.get("usage") for c in chunks)
         tool = [
-            c for c in chunks
+            c
+            for c in chunks
             if c["choices"] and c["choices"][0]["finish_reason"] == "tool_calls"
         ]
         assert len(tool) == 1
@@ -224,9 +231,10 @@ class TestG3PoolLimit:
         policy = ap.resolve_policy("fused_v1")
         for step in (512, 1024):
             auto = cli_module._derive_cache_limit_gb("m", 262144, step)
-            assert cli_module._derive_cache_limit_gb(
-                "m", 262144, step, policy=policy
-            ) == auto
+            assert (
+                cli_module._derive_cache_limit_gb("m", 262144, step, policy=policy)
+                == auto
+            )
         assert cli_module._derive_cache_limit_gb("m", 262144, 512) == 9.0
 
     def test_g3_policy_no_longer_advertises_an_unfused_score_bound(self):
@@ -251,14 +259,16 @@ class TestG4Dtype:
         lm = _tiny_lm()
         rec = Recorder()
         ap.self_test_model(
-            lm, ap.resolve_policy("fused_v1"), max_kv=262144, sdpa=rec,
+            lm,
+            ap.resolve_policy("fused_v1"),
+            max_kv=262144,
+            sdpa=rec,
             force_calls=True,
         )
         assert rec.calls and all(c[0].dtype == mx.bfloat16 for c in rec.calls)
         # the probe left the model unstamped and unchanged
         assert all(
-            getattr(m, "attention_policy", None) is None
-            for _, m in lm.named_modules()
+            getattr(m, "attention_policy", None) is None for _, m in lm.named_modules()
         )
 
     @pytest.mark.parametrize("which", ["q_norm_fp32", "q_proj_fp32"])
@@ -269,13 +279,14 @@ class TestG4Dtype:
         lm = _mixed(_tiny_lm(), which)
         with pytest.raises(ap.AttentionPolicyError, match="zero"):
             ap.self_test_model(
-                lm, ap.resolve_policy("fused_v1"), max_kv=262144,
-                sdpa=Recorder(), force_calls=True,
+                lm,
+                ap.resolve_policy("fused_v1"),
+                max_kv=262144,
+                sdpa=Recorder(),
+                force_calls=True,
             )
 
-    def test_g4_probe_error_is_the_one_line_attention_policy_failure(
-        self, capsys
-    ):
+    def test_g4_probe_error_is_the_one_line_attention_policy_failure(self, capsys):
         lm = _tiny_lm()
 
         class Broken:  # a variant without the expected structure
@@ -287,8 +298,11 @@ class TestG4Dtype:
 
         with pytest.raises(ap.AttentionPolicyError, match="dtype probe"):
             ap.self_test_model(
-                Broken(), ap.resolve_policy("fused_v1"), max_kv=262144,
-                sdpa=Recorder(), force_calls=True,
+                Broken(),
+                ap.resolve_policy("fused_v1"),
+                max_kv=262144,
+                sdpa=Recorder(),
+                force_calls=True,
             )
         err = [l for l in capsys.readouterr().err.splitlines() if l.strip()]
         assert len(err) == 1 and err[0].startswith("attention-policy fused_v1:")

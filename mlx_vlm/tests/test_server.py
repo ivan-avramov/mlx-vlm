@@ -1,5 +1,8 @@
 import asyncio
 import base64
+
+# Fork (2026-10-06 v0.7.6 sync): imports for the tests ported from upstream below
+import copy
 import json
 import logging
 import math
@@ -9,63 +12,57 @@ import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from queue import Queue
 from threading import Event, Lock, Thread
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace as NS
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import httpx
 import mlx.core as mx
 import numpy as np
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from huggingface_hub import scan_cache_dir
 from PIL import Image
 from transformers.utils.chat_parsing import ResponseParser, parse_response
 
 import mlx_vlm.reranker_loader as reranker_loader
 import mlx_vlm.server as server
 import mlx_vlm.server.anthropic as server_anthropic
-import mlx_vlm.server.cli as server_cli
+import mlx_vlm.server.cli as cli
 import mlx_vlm.server.generation as server_generation
+import mlx_vlm.server.generation as generation
 import mlx_vlm.server.openai as server_openai
+import mlx_vlm.server.openai as openai
 import mlx_vlm.server.reranking as server_reranking
 import mlx_vlm.speculative.utils as speculative_utils
 from mlx_vlm import apc as apc_module
 from mlx_vlm.apc import hash_image_payload
 from mlx_vlm.generate import GenerationResult
 from mlx_vlm.generate.image import ImageGenerationResult
-from mlx_vlm.prompt_utils import apply_chat_template
+from mlx_vlm.prompt_utils import (  # noqa: F401 -- kept: upstream's copy imports it (registry audit)
+    apply_chat_template,
+)
+from mlx_vlm.server import compaction
+from mlx_vlm.server.model_discovery import discover_models, is_model_directory
+from mlx_vlm.server.responses_state import (
+    ToolCallStreamState,
+    _response_items_to_chat,
+    strip_protocol_markers,
+)
 from mlx_vlm.server.runtime_config import RuntimeConfig
-from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
-from mlx_vlm.tools import _infer_tool_parser
-from mlx_vlm.tools.parsers import minicpm5
 
 # Fork (2026-09-27 sync): imports for the tests ported from upstream's test_server.py
 from mlx_vlm.tests.test_processors import MINICPM_MULTICALL
-from unittest.mock import Mock
-from types import SimpleNamespace as NS
-from mlx_vlm.server.responses_state import ToolCallStreamState
-import mlx_vlm.server.cli as cli
-from mlx_vlm.server.model_discovery import discover_models
-from mlx_vlm.server.model_discovery import is_model_directory
-from mlx_vlm.tools import load_tool_module
-from mlx_vlm.tools import process_tool_calls
-from huggingface_hub import scan_cache_dir
-from mlx_vlm.server.responses_state import strip_protocol_markers
-from contextlib import ExitStack
-from contextlib import contextmanager
-
-# Fork (2026-10-06 v0.7.6 sync): imports for the tests ported from upstream below
-import copy
-from functools import partial
-from unittest.mock import AsyncMock
-from fastapi import HTTPException
-import mlx_vlm.server.generation as generation
-import mlx_vlm.server.openai as openai
-from mlx_vlm.server import compaction
-from mlx_vlm.server.responses_state import _response_items_to_chat
+from mlx_vlm.tokenizer_utils import SPMStreamingDetokenizer, _ServerTokenStreamer
+from mlx_vlm.tools import _infer_tool_parser, load_tool_module, process_tool_calls
+from mlx_vlm.tools.parsers import minicpm5
 
 
 def test_response_generator_prefill_step_override_wins_over_environment(monkeypatch):
@@ -4462,7 +4459,6 @@ def test_metrics_endpoint_records_chat_completion_metrics(client, monkeypatch):
 class TestResponseGenerator:
     """Tests for the ResponseGenerator continuous batching engine."""
 
-
     # Ported from upstream (2026-09-27 sync): --model-discovery was removed upstream (53616323).
     def test_server_cli_sets_thinking_defaults(self, monkeypatch):
         flags = [
@@ -7047,6 +7043,7 @@ class TestToolCallStreamState:
         assert state.feed("text<|tool") == "text"
         assert state.buffer == "<|tool"
         assert state.in_tool_call is False
+
 
 class TestProcessToolCalls:
     """Tests for tool call parsing from model output."""
@@ -9987,7 +9984,6 @@ def test_thinking_stream_strips_newlines_after_close(chunks, enabled, expected):
     assert _thoughts(_feed_thinking(state, chunks, last=True)) == expected
 
 
-
 _JSON_TOOLS = NS(
     tool_call_start="<tool_call>",
     tool_call_end="</tool_call>",
@@ -10135,7 +10131,6 @@ def _tool(name="get_weather", api="chat"):
     )
 
 
-
 def _msg(content="Hello", role="user", **extra):
     return dict(role=role, content=content, **extra)
 
@@ -10153,18 +10148,12 @@ def _streaming(chunks, prompt_tokens=3):
     )
 
 
-
-
-
-
-
-
-
 # ---------------------------------------------------------------------------
 # Ported from upstream at the 2026-09-27 sync (behaviour changed upstream; the fork's
 # stale copies were dropped): model discovery (53616323), Anthropic tool-use streaming
 # (67599f2e/8ff71517), tool-call stream parity (f16c98f2..3c001d01).
 # ---------------------------------------------------------------------------
+
 
 class TestModelDiscovery:
     @staticmethod

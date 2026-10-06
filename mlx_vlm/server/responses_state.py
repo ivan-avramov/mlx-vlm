@@ -10,10 +10,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import HTTPException
 
-from ..prompt_utils import _normalize_tool_message
 from ..prompt_utils import (  # Fork: the THINKING_FORMATS registry is fork-only
     THINKING_FORMATS,
     ThinkingFormat,
+    _normalize_tool_message,
     detect_thinking_format,
 )
 from ..tools import process_tool_calls

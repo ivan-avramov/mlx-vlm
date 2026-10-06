@@ -17,13 +17,13 @@ import copy
 
 import mlx.core as mx
 import pytest
+from test_attention_policy import _attn_modules, _cpu_device, _tiny_lm  # noqa: F401
 
 import mlx_vlm.speculative.mtp as mtp_utils
 from mlx_vlm import mtp_verify_scan as mv
 from mlx_vlm.models.qwen3_5 import language as qwen_language
 from mlx_vlm.speculative.drafters.qwen3_5_mtp import ModelConfig as MTPConfig
 from mlx_vlm.speculative.drafters.qwen3_5_mtp import Qwen3_5MTPDraftModel
-from test_attention_policy import _attn_modules, _cpu_device, _tiny_lm  # noqa: F401
 
 PROMPT = [3, 5, 7, 9, 11, 13, 2, 4]
 BLOCK = 4
@@ -42,9 +42,14 @@ def micro(monkeypatch):
     monkeypatch.setattr(qwen_language, "_qwen3_5_device_arch_suffix", lambda: "s")
     monkeypatch.setattr(qwen_language, "_qwen3_5_sdpa_vector_plan", _plan)
     monkeypatch.setattr(
-        mv, "QUALIFIED_DOMAIN",
-        mv.Domain(dtypes=(mx.float32,), head_dim=16, gqa=(2,),
-                  device_classes=("applegpu_g17s",)),
+        mv,
+        "QUALIFIED_DOMAIN",
+        mv.Domain(
+            dtypes=(mx.float32,),
+            head_dim=16,
+            gqa=(2,),
+            device_classes=("applegpu_g17s",),
+        ),
     )
     lm = _tiny_lm(dtype=mx.float32, layers=4)
     text_config = copy.deepcopy(lm.config.text_config)
@@ -74,8 +79,9 @@ def _record_only(drafter, record):
     def accept(verify_hidden, draft_tokens, accepted, new_tokens, *a, **kw):
         record["hidden"].append(verify_hidden)
         record["accepted"].append(int(accepted))
-        return cls.accept_verified_tokens(drafter, verify_hidden, draft_tokens, accepted,
-                                          new_tokens, *a, **kw)
+        return cls.accept_verified_tokens(
+            drafter, verify_hidden, draft_tokens, accepted, new_tokens, *a, **kw
+        )
 
     drafter.draft_block = lambda *a, **kw: cls.draft_block(drafter, *a, **kw)
     drafter.accept_verified_tokens = accept
@@ -83,24 +89,30 @@ def _record_only(drafter, record):
 
 def _mixed(drafter, ref, record):
     """Real proposals on odd rounds; on even rounds the target's own greedy continuation, so the
-    acceptance and rollback paths run while half the rounds are still the unmodified drafter's."""
+    acceptance and rollback paths run while half the rounds are still the unmodified drafter's.
+    """
     cls = type(drafter)
     state = {"pos": 0, "round": 0}
 
     def draft_block(last_bonus, hidden, cache, block_size, sampler, *a, **kw):
-        real = cls.draft_block(drafter, last_bonus, hidden, cache, block_size, sampler, *a, **kw)
+        real = cls.draft_block(
+            drafter, last_bonus, hidden, cache, block_size, sampler, *a, **kw
+        )
         state["round"] += 1
         if state["round"] % 2 == 0:
-            real = mx.array([list(ref[state["pos"] + 1 : state["pos"] + block_size])],
-                            dtype=mx.int32)
+            real = mx.array(
+                [list(ref[state["pos"] + 1 : state["pos"] + block_size])],
+                dtype=mx.int32,
+            )
         return real
 
     def accept(verify_hidden, draft_tokens, accepted, new_tokens, *a, **kw):
         record["hidden"].append(verify_hidden)
         record["accepted"].append(int(accepted))
         state["pos"] += len(new_tokens)
-        return cls.accept_verified_tokens(drafter, verify_hidden, draft_tokens, accepted,
-                                          new_tokens, *a, **kw)
+        return cls.accept_verified_tokens(
+            drafter, verify_hidden, draft_tokens, accepted, new_tokens, *a, **kw
+        )
 
     drafter.draft_block, drafter.accept_verified_tokens = draft_block, accept
 
@@ -109,15 +121,21 @@ def _drafter_state(drafter):
     arrays = []
     for layer in drafter._cache:
         st = layer.state
-        arrays += [a for a in (st if isinstance(st, (list, tuple)) else [st]) if a is not None]
+        arrays += [
+            a for a in (st if isinstance(st, (list, tuple)) else [st]) if a is not None
+        ]
     seed = drafter._seed_token
     nxt = drafter._next_position
     mx.eval(arrays, seed)
     if isinstance(nxt, mx.array):
         mx.eval(nxt)
         nxt = nxt.tolist()
-    return {"arrays": arrays, "seed": seed.tolist(), "next": nxt,
-            "accept_lens": list(drafter.accept_lens)}
+    return {
+        "arrays": arrays,
+        "seed": seed.tolist(),
+        "next": nxt,
+        "accept_lens": list(drafter.accept_lens),
+    }
 
 
 def _oracle(drafter, ref, record):
@@ -126,7 +144,9 @@ def _oracle(drafter, ref, record):
     state = {"pos": 0, "round": 0}
     cls = type(drafter)  # always the class methods: re-wrapping never stacks wrappers
     real_draft = lambda *a, **kw: cls.draft_block(drafter, *a, **kw)  # noqa: E731
-    real_accept = lambda *a, **kw: cls.accept_verified_tokens(drafter, *a, **kw)  # noqa: E731
+    real_accept = lambda *a, **kw: cls.accept_verified_tokens(
+        drafter, *a, **kw
+    )  # noqa: E731
 
     def draft_block(last_bonus, hidden, cache, block_size, sampler, *a, **kw):
         real_draft(last_bonus, hidden, cache, block_size, sampler, *a, **kw)
@@ -164,10 +184,18 @@ def _run(lm, drafter, ref, oracle=True):
     tokens = [first]
     model = type("M", (), {"language_model": lm})()
     for token, _ in mtp_utils._mtp_rounds(
-        model, drafter, cache, out.hidden_states[-1], out.shared_kv_states,
-        prompt_tokens=ids, first_bonus=first, max_tokens=STEPS,
-        sampler=lambda logits: mx.argmax(logits, axis=-1), draft_block_size=BLOCK,
-        token_dtype=mx.int32, greedy_sampling=True,
+        model,
+        drafter,
+        cache,
+        out.hidden_states[-1],
+        out.shared_kv_states,
+        prompt_tokens=ids,
+        first_bonus=first,
+        max_tokens=STEPS,
+        sampler=lambda logits: mx.argmax(logits, axis=-1),
+        draft_block_size=BLOCK,
+        token_dtype=mx.int32,
+        greedy_sampling=True,
     ):
         tokens.append(token)
     states = []
@@ -250,8 +278,10 @@ class TestAC8GenerationIdentity:
         ref = _reference(lm)
         base = _run(lm, drafter, ref, oracle="mixed")
         accepted = base[1]["accepted"]
-        assert sum(accepted) > 0 and any(a == 0 for a in accepted)   # both real and oracle rounds
-        assert sum(base[1]["drafter"]["accept_lens"]) > 0            # draft_n_accepted > 0
+        assert sum(accepted) > 0 and any(
+            a == 0 for a in accepted
+        )  # both real and oracle rounds
+        assert sum(base[1]["drafter"]["accept_lens"]) > 0  # draft_n_accepted > 0
         model = type("M", (), {"config": lm.config, "language_model": lm})()
         policy = mv.JointV1Policy()
         mv.apply_to_model(model, policy)
@@ -286,17 +316,23 @@ def genuine(micro):
             a == BLOCK - 1 for a in record["accepted"]
         ):
             return lm, drafter, seed
-    pytest.fail("no seed in 0..63 gives a drafter with genuine acceptance; widen the search")
+    pytest.fail(
+        "no seed in 0..63 gives a drafter with genuine acceptance; widen the search"
+    )
 
 
 class TestD5GenuineAcceptance:
-    def test_the_unmodified_drafter_is_genuinely_accepted_and_rolled_back(self, genuine):
+    def test_the_unmodified_drafter_is_genuinely_accepted_and_rolled_back(
+        self, genuine
+    ):
         lm, drafter, seed = genuine
         base = _run(lm, drafter, None, oracle=False)
         accepted = base[1]["accepted"]
         draft_n_accepted = sum(base[1]["drafter"]["accept_lens"])
         assert draft_n_accepted > 0, f"seed {seed}: no genuine acceptance"
-        assert any(a < BLOCK - 1 for a in accepted), "no rejection, hence no rollback exercised"
+        assert any(
+            a < BLOCK - 1 for a in accepted
+        ), "no rejection, hence no rollback exercised"
         assert any(a > 0 for a in accepted)
 
         model = type("M", (), {"config": lm.config, "language_model": lm})()
@@ -304,12 +340,14 @@ class TestD5GenuineAcceptance:
         mv.apply_to_model(model, policy)
         again = _run(lm, drafter, None, oracle=False)
         assert policy.counters()["verify_blocks_joint_v1"] > 0
-        assert again[0] == base[0] and again[3] == base[3]            # tokens, cache offsets
-        assert again[1]["accepted"] == accepted                       # per-round acceptance
+        assert again[0] == base[0] and again[3] == base[3]  # tokens, cache offsets
+        assert again[1]["accepted"] == accepted  # per-round acceptance
         assert sum(again[1]["drafter"]["accept_lens"]) == draft_n_accepted
         for got, want in zip(again[1]["hidden"], base[1]["hidden"]):
             assert got.shape == want.shape and mx.allclose(got, want, **TOL).item()
         _assert_drafter_state(again[1]["drafter"], base[1]["drafter"])
-        for got_layer, want_layer in zip(again[2], base[2]):          # post-rollback target state
+        for got_layer, want_layer in zip(
+            again[2], base[2]
+        ):  # post-rollback target state
             for g, w in zip(got_layer, want_layer):
                 assert g.shape == w.shape and mx.allclose(g, w, **TOL).item()

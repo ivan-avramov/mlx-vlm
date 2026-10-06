@@ -16,6 +16,7 @@ So the toggle gets the same treatment every other TQ A/B knob already has: an en
 `TQ_FUSED_PREFILL` / `TQ_PREFILL_IMPL` idiom, plus a constructor argument, with the tile-reuse path
 staying the DEFAULT so shipped behaviour is unchanged.
 """
+
 import mlx.core as mx
 
 from mlx_vlm.turboquant import TurboQuantKVCache
@@ -52,11 +53,19 @@ def test_constructor_WINS_over_env(monkeypatch):
     while an operator has the variable exported — the same precedence bug that made
     MLX_BENCH_RESULTS able to defeat a test's monkeypatch in the bench harness."""
     monkeypatch.setenv("TQ_DECODE_2PASS_LEGACY", "1")
-    assert TurboQuantKVCache(bits=3, seed=0,
-                             decode_2pass_use_legacy=False)._decode_2pass_use_legacy is False
+    assert (
+        TurboQuantKVCache(
+            bits=3, seed=0, decode_2pass_use_legacy=False
+        )._decode_2pass_use_legacy
+        is False
+    )
     monkeypatch.delenv("TQ_DECODE_2PASS_LEGACY", raising=False)
-    assert TurboQuantKVCache(bits=3, seed=0,
-                             decode_2pass_use_legacy=True)._decode_2pass_use_legacy is True
+    assert (
+        TurboQuantKVCache(
+            bits=3, seed=0, decode_2pass_use_legacy=True
+        )._decode_2pass_use_legacy
+        is True
+    )
 
 
 def test_both_arms_produce_the_same_decode_output():
@@ -66,6 +75,7 @@ def test_both_arms_produce_the_same_decode_output():
     Note the kernel's benefit is conditional: heads_per_group = 2 only when n_repeats is EVEN, and at
     G=1 tile-reuse degenerates to the legacy read. n_repeats = 4 here (4 q-heads / 1 kv-head).
     """
+
     def run(legacy):
         cache = TurboQuantKVCache(bits=3, seed=0, decode_2pass_use_legacy=legacy)
         k = mx.random.normal((1, 1, 128, 64), key=mx.random.key(0))
@@ -76,5 +86,5 @@ def test_both_arms_produce_the_same_decode_output():
 
     a, b = run(False), run(True)
     if a is None or b is None:
-        return          # this dim/bit combination has no fused decode path; nothing to compare
+        return  # this dim/bit combination has no fused decode path; nothing to compare
     assert mx.abs(a - b).max().item() < 1e-4, "tile-reuse and legacy decode disagree"

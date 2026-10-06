@@ -72,7 +72,11 @@ def _patched(stack, config=None):
             server,
             "stream_generate",
             side_effect=lambda *a, **kw: iter(
-                [server.StreamingToken(text="ok", token=1, logprobs=0.0, finish_reason="stop")]
+                [
+                    server.StreamingToken(
+                        text="ok", token=1, logprobs=0.0, finish_reason="stop"
+                    )
+                ]
             ),
         )
     )
@@ -207,7 +211,9 @@ def test_gate_off_context_management_is_ignored(client, monkeypatch, value, stre
     assert [m["content"] for m in templ.call_args_list[0].args[2]] == [
         m["content"] for m in _big_conversation()
     ]
-    assert _generation_call(gen, streamer, stream).kwargs.get("max_tokens") == MAX_TOKENS
+    assert (
+        _generation_call(gen, streamer, stream).kwargs.get("max_tokens") == MAX_TOKENS
+    )
 
 
 def _gate_on(monkeypatch):
@@ -274,7 +280,9 @@ def test_gate_on_without_a_list_never_compacts(client, monkeypatch, value):
         (200_000, 62_144, 49_715),
     ],
 )
-def test_soft_clamp_is_unchanged(monkeypatch, prompt_tokens, max_tokens, thinking_budget):
+def test_soft_clamp_is_unchanged(
+    monkeypatch, prompt_tokens, max_tokens, thinking_budget
+):
     """Values computed by fork 664c2ead's _apply_generation_budget (limit 262144,
     deployed max_tokens 102400 / thinking_budget 81920, ratio 0.8, floor 2048)."""
     monkeypatch.setattr(server.runtime.config, "max_kv_size", LIMIT)
@@ -295,8 +303,7 @@ def test_soft_clamp_rejects_below_the_floor(monkeypatch, prompt_tokens):
         )
 
 
-_BLOCK_CRYPTOGRAPHY = textwrap.dedent(
-    """
+_BLOCK_CRYPTOGRAPHY = textwrap.dedent("""
     import importlib.abc, sys
 
     class _Block(importlib.abc.MetaPathFinder):
@@ -306,8 +313,7 @@ _BLOCK_CRYPTOGRAPHY = textwrap.dedent(
             return None
 
     sys.meta_path.insert(0, _Block())
-    """
-)
+    """)
 
 
 def test_server_imports_without_cryptography():
@@ -315,8 +321,7 @@ def test_server_imports_without_cryptography():
     needs a compaction capsule gets a clear 400 instead of a 500."""
     if compaction is None:
         pytest.skip("pre-sync tree: no compaction module")
-    code = _BLOCK_CRYPTOGRAPHY + textwrap.dedent(
-        """
+    code = _BLOCK_CRYPTOGRAPHY + textwrap.dedent("""
         import mlx_vlm.server
         from mlx_vlm.server import compaction, openai
         from mlx_vlm.server.cli import main
@@ -340,8 +345,7 @@ def test_server_imports_without_cryptography():
         assert r.status_code == 400, (r.status_code, r.text)
         assert "cryptography" in r.text, r.text
         print("CAPSULE_400_OK")
-        """
-    )
+        """)
     proc = subprocess.run(
         [sys.executable, "-c", code], capture_output=True, text=True, timeout=300
     )
@@ -362,8 +366,10 @@ def _run_cli(monkeypatch, *extra):
     monkeypatch.setattr(sys, "argv", ["mlx_vlm.server", "--port", "8080", *extra])
     # cli.main() also publishes process-wide session-manager config; keep it out of
     # the other tests (it turned anonymous sessions on for later streaming tests).
-    with patch.dict(os.environ), patch.object(cli.uvicorn, "run"), patch.object(
-        cli, "_configure_session_manager"
+    with (
+        patch.dict(os.environ),
+        patch.object(cli.uvicorn, "run"),
+        patch.object(cli, "_configure_session_manager"),
     ):
         for key in ("MLX_VLM_CHAT_COMPACTION", "MLX_VLM_GENERATION_DEFAULTS"):
             os.environ.pop(key, None)
@@ -371,7 +377,9 @@ def _run_cli(monkeypatch, *extra):
         return dict(os.environ)
 
 
-@pytest.mark.parametrize("flag,expected", [((), "off"), (("--chat-compaction", "on"), "on")])
+@pytest.mark.parametrize(
+    "flag,expected", [((), "off"), (("--chat-compaction", "on"), "on")]
+)
 def test_cli_chat_compaction_flag_is_exported(monkeypatch, flag, expected):
     env = _run_cli(monkeypatch, *flag)
     assert env["MLX_VLM_CHAT_COMPACTION"] == expected
@@ -379,7 +387,10 @@ def test_cli_chat_compaction_flag_is_exported(monkeypatch, flag, expected):
 
 @pytest.mark.parametrize(
     "defaults,expected",
-    [(None, "typical_p=1.0 (default)"), ('{"typical_p": 0.9}', "typical_p=0.9 (--generation-defaults)")],
+    [
+        (None, "typical_p=1.0 (default)"),
+        ('{"typical_p": 0.9}', "typical_p=0.9 (--generation-defaults)"),
+    ],
 )
 def test_cli_logs_effective_typical_p(monkeypatch, caplog, defaults, expected):
     """typical_p != 1 changes sampling and the registry never sets it; make the

@@ -17,7 +17,6 @@ from mlx_vlm import prefill_profile
 from mlx_vlm.generate import ar as ar_module
 from mlx_vlm.generate import common as common_module
 from mlx_vlm.models import cache as qwen_cache
-from mlx_vlm.speculative import mtp_profile
 from mlx_vlm.models.qwen3_5 import language as qwen_language
 from mlx_vlm.models.qwen3_5.config import ModelConfig, TextConfig, VisionConfig
 from mlx_vlm.models.qwen3_5.language import (
@@ -25,6 +24,7 @@ from mlx_vlm.models.qwen3_5.language import (
     Qwen3_5Attention,
     Qwen3_5DecoderLayer,
 )
+from mlx_vlm.speculative import mtp_profile
 
 ENV = prefill_profile.ENV
 PHASES = (
@@ -133,9 +133,7 @@ def _tiny_lm(layers=3):
     )
     lm = LanguageModel(
         cfg,
-        config=ModelConfig(
-            text_config=cfg, vision_config=vision, model_type="qwen3_5"
-        ),
+        config=ModelConfig(text_config=cfg, vision_config=vision, model_type="qwen3_5"),
     )
     mx.eval(lm.parameters())
     return lm
@@ -147,9 +145,7 @@ def _fake_model(lm):
             inputs_embeds=lm.model.embed_tokens(input_ids), to_dict=lambda: {}
         )
 
-    return SimpleNamespace(
-        language_model=lm, get_input_embeddings=get_input_embeddings
-    )
+    return SimpleNamespace(language_model=lm, get_input_embeddings=get_input_embeddings)
 
 
 def _run(lm=None, layers=3, prompt_cache=None, **gen_kwargs):
@@ -299,11 +295,29 @@ class TestSwitchSet:
         "layers,expected",
         [
             # layers: GDN, attention, GDN(terminal). Terminal mlp is dead -> fence.
-            (3, {"gdn": 6, "mlp": 6, "attn_prep": 3, "kv_update": 3, "sdpa": 3,
-                 "attn_out": 3}),
+            (
+                3,
+                {
+                    "gdn": 6,
+                    "mlp": 6,
+                    "attn_prep": 3,
+                    "kv_update": 3,
+                    "sdpa": 3,
+                    "attn_out": 3,
+                },
+            ),
             # layers: GDN, attention(terminal): its sdpa/attn_out/mlp are dead.
-            (2, {"gdn": 3, "mlp": 3, "attn_prep": 3, "kv_update": 3, "sdpa": 0,
-                 "attn_out": 0}),
+            (
+                2,
+                {
+                    "gdn": 3,
+                    "mlp": 3,
+                    "attn_prep": 3,
+                    "kv_update": 3,
+                    "sdpa": 0,
+                    "attn_out": 0,
+                },
+            ),
         ],
     )
     def test_hooks_fire_per_chunk_and_layer_skipping_dead_terminal_work(
@@ -370,8 +384,14 @@ class TestLayerReuseOutsideDecoderLayer:
                 self.is_linear = False
                 self.self_attn = Qwen3_5Attention(args)
 
-            def __call__(self, x, mask=None, cache=None, position_ids=None,
-                         position_embeddings=None):
+            def __call__(
+                self,
+                x,
+                mask=None,
+                cache=None,
+                position_ids=None,
+                position_embeddings=None,
+            ):
                 return x + self.self_attn(
                     x,
                     mask=mask,
@@ -482,8 +502,16 @@ class TestSentinelSelfCheck:
 class TestDeadWorkNeverExecuted:
     @pytest.mark.parametrize(
         "layers,which",
-        [(2, "proj"), (2, "mlp"), (2, "norm"), (2, "head"),
-         (3, "proj"), (3, "mlp"), (3, "norm"), (3, "head")],
+        [
+            (2, "proj"),
+            (2, "mlp"),
+            (2, "norm"),
+            (2, "head"),
+            (3, "proj"),
+            (3, "mlp"),
+            (3, "norm"),
+            (3, "head"),
+        ],
     )
     def test_terminal_layer_final_norm_and_head_stay_unevaluated(
         self, monkeypatch, layers, which
@@ -510,11 +538,14 @@ class TestDeadWorkNeverExecuted:
         _wrap_terminal(lm, which)
         assert _peak_of(lambda: _run(lm)) >= THRESH
 
-    @pytest.mark.parametrize("live_kwargs", [
-        {"return_hidden": True},
-        {"capture_layer_ids": [0]},
-        {"capture_layer_ids": []},
-    ])
+    @pytest.mark.parametrize(
+        "live_kwargs",
+        [
+            {"return_hidden": True},
+            {"capture_layer_ids": [0]},
+            {"capture_layer_ids": []},
+        ],
+    )
     @pytest.mark.parametrize(
         "layers,which", [(2, "proj"), (2, "mlp"), (3, "proj"), (3, "mlp")]
     )
@@ -541,9 +572,7 @@ class TestTerminalProductionWorkIsEvaluated:
         monkeypatch.setattr(prefill_profile.PrefillProfiler, "mark", spy)
         return seen
 
-    def test_terminal_kv_update_is_evaluated_before_its_phase_closes(
-        self, monkeypatch
-    ):
+    def test_terminal_kv_update_is_evaluated_before_its_phase_closes(self, monkeypatch):
         monkeypatch.setenv(ENV, "1")
         seen = self._spy(monkeypatch)
         real = qwen_cache.KVCache.update_and_fetch
@@ -641,9 +670,7 @@ class TestTerminalStateEvaluatedBeforeGdnCloses:
             assert layer0 < THRESH  # positive control: unwrapped layer is quiet
             assert terminal >= THRESH  # state evaluated under `gdn`
 
-    def test_mutation_skipping_state_evaluation_fails_that_assertion(
-        self, monkeypatch
-    ):
+    def test_mutation_skipping_state_evaluation_fails_that_assertion(self, monkeypatch):
         monkeypatch.setenv(ENV, "1")
         lm, peaks = self._install(monkeypatch)
         real_layer_mark = prefill_profile.PrefillProfiler.layer_mark
@@ -686,9 +713,7 @@ class TestTerminalIsLastExecutedLayer:
         finally:
             prof.clear_active()
 
-    def test_model_declares_executed_layer_count_not_a_stored_index(
-        self, monkeypatch
-    ):
+    def test_model_declares_executed_layer_count_not_a_stored_index(self, monkeypatch):
         monkeypatch.setenv(ENV, "1")
         calls = []
         real = prefill_profile.PrefillProfiler.begin_layers
@@ -706,9 +731,7 @@ class TestTerminalIsLastExecutedLayer:
 
 
 class TestEntryFence:
-    def test_precomputed_position_embeddings_are_in_the_entry_fence(
-        self, monkeypatch
-    ):
+    def test_precomputed_position_embeddings_are_in_the_entry_fence(self, monkeypatch):
         monkeypatch.setenv(ENV, "1")
         lm = _tiny_lm(2)
         for layer in lm.model.layers:
@@ -791,8 +814,9 @@ class TestForwardAndLayers:
         assert float(m["layers"]) == 0.0 and float(m["forward"]) > 0.0
 
 
-def _undeclared_layer_call(self, x, mask=None, cache=None, position_ids=None,
-                           position_embeddings=None):
+def _undeclared_layer_call(
+    self, x, mask=None, cache=None, position_ids=None, position_embeddings=None
+):
     """Qwen3_5DecoderLayer.__call__ minus every profiler hook (a foreign layer)."""
     if self.is_linear:
         r = self.linear_attn(self.input_layernorm(x), mask, cache)
@@ -861,8 +885,6 @@ class TestObserve:
         self._epi(monkeypatch)
         # chunk 1: offset 0 + 4 <= budget 4; chunks 2, 3 observe -> + queries
         assert terminal_attn_prep_counts() == [2, 3, 3]
-
-
 
 
 class TestOutputsUnchanged:
@@ -1063,10 +1085,7 @@ class TestReportSemantics:
         _drive(
             prof,
             clock,
-            [
-                (4 + i, 10 * (i + 1), {"sdpa": sdpa[i], "gdn": gdn[i]})
-                for i in range(5)
-            ],
+            [(4 + i, 10 * (i + 1), {"sdpa": sdpa[i], "gdn": gdn[i]}) for i in range(5)],
         )
         prof.finish()
         err = _err_lines(capsys)
@@ -1079,15 +1098,27 @@ class TestReportSemantics:
             assert abs(float(m[key]) - want) < 0.02, (key, m[key], want)
 
         assert (w1["chunks"], w1["tokens"], w1["keys"], w1["final"]) == (
-            "2", "9", "20", "0")
+            "2",
+            "9",
+            "20",
+            "0",
+        )
         close(w1, "sdpa", 15.0)
         close(w1, "gdn", 100.0)
         assert (w2["chunks"], w2["tokens"], w2["keys"], w2["final"]) == (
-            "2", "13", "40", "0")
+            "2",
+            "13",
+            "40",
+            "0",
+        )
         close(w2, "sdpa", 35.0)
         close(w2, "gdn", 200.0)
         assert (rest["chunks"], rest["tokens"], rest["keys"], rest["final"]) == (
-            "1", "8", "50", "1")
+            "1",
+            "8",
+            "50",
+            "1",
+        )
         close(rest, "sdpa", 50.0)
         close(rest, "gdn", 400.0)
         assert (total["chunks"], total["tokens"], total["keys"]) == ("5", "30", "50")

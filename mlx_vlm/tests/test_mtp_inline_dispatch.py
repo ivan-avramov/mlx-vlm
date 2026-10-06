@@ -99,7 +99,9 @@ class TestDrafterConflictGate:
     def test_no_drafter_never_conflicts(self):
         assert (
             _drafter_conflict(
-                None, False, _args(thinking_budget=81920, logits_processors=[1]),
+                None,
+                False,
+                _args(thinking_budget=81920, logits_processors=[1]),
                 cached=False,
             )
             is None

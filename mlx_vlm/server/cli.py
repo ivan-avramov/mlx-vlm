@@ -21,16 +21,18 @@ from .generation import (  # Fork: generation_defaults + thinking getters are fo
     get_server_thinking_end_token,
     get_server_thinking_start_token,
 )
+from .model_discovery import MODEL_PATHS_ENV
+from .request_normalization import (  # Fork: chat compaction switch (v0.7.6 sync)
+    CHAT_COMPACTION_ENV,
+    chat_compaction_enabled,
+)
 from .session_manager import (  # Fork: session manager is fork
     _env_choice,
     _env_float,
     _env_int,
 )
-from .model_discovery import MODEL_PATHS_ENV
-from .session_manager import configure as _configure_session_manager  # Fork: session manager is fork
-from .request_normalization import (  # Fork: chat compaction switch (v0.7.6 sync)
-    CHAT_COMPACTION_ENV,
-    chat_compaction_enabled,
+from .session_manager import (
+    configure as _configure_session_manager,  # Fork: session manager is fork
 )
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
@@ -785,7 +787,9 @@ def main():
         _defaults.get("typical_p", 1.0),
         "--generation-defaults" if "typical_p" in _defaults else "default",
     )
-    os.environ[CHAT_COMPACTION_ENV] = args.chat_compaction  # Fork: chat compaction switch
+    os.environ[CHAT_COMPACTION_ENV] = (
+        args.chat_compaction
+    )  # Fork: chat compaction switch
     if args.kv_bits is not None:
         os.environ["KV_BITS"] = str(args.kv_bits)
     if args.kv_key_bits is not None:

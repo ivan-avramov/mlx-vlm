@@ -1247,8 +1247,11 @@ def _retire_asymmetric_session(
         # Rotating layout changed after capture (MTP buffers SWA layers): the
         # snapshot cannot describe the live layer. Drop the session rather than
         # publish a cache whose ring metadata is wrong (P2).
-        logger.warning("Prompt-end retention: cannot restore prompt-end state (%s); "
-                       "session dropped.", e)
+        logger.warning(
+            "Prompt-end retention: cannot restore prompt-end state (%s); "
+            "session dropped.",
+            e,
+        )
         prompt_cache_state.clear()
         return None
 
@@ -1281,12 +1284,17 @@ def _retire_asymmetric_session(
             stored = ids + canonical
             logger.debug(
                 "Prompt-end retention: canonical assistant turn prefilled "
-                "(%d tokens); retiring at %d.", len(canonical), retired,
+                "(%d tokens); retiring at %d.",
+                len(canonical),
+                retired,
             )
         except Exception as e:  # never lose the session over the optional part
             logger.warning(
                 "Prompt-end retention: canonical prefill failed (%s: %s); "
-                "retiring at prompt_end %d.", type(e).__name__, e, prompt_end,
+                "retiring at prompt_end %d.",
+                type(e).__name__,
+                e,
+                prompt_end,
             )
             _restore_prompt_end()
             retired, stored = prompt_end, ids

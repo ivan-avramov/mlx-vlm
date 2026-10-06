@@ -129,7 +129,9 @@ class DeltaNetSnapshotRing:
             # that actually describes the latest user turn.
             if pinned and not existing.pinned:
                 self._snapshots = [
-                    DeltaNetSnapshot(s.offset, s.states, s.captured_at, s.offset == offset)
+                    DeltaNetSnapshot(
+                        s.offset, s.states, s.captured_at, s.offset == offset
+                    )
                     for s in self._snapshots
                 ]
                 return next(s for s in self._snapshots if s.offset == offset)
@@ -140,12 +142,18 @@ class DeltaNetSnapshotRing:
             return None
         if pinned:
             self._snapshots = [
-                DeltaNetSnapshot(s.offset, s.states, s.captured_at, False) if s.pinned else s
+                (
+                    DeltaNetSnapshot(s.offset, s.states, s.captured_at, False)
+                    if s.pinned
+                    else s
+                )
                 for s in self._snapshots
             ]
         snap = DeltaNetSnapshot(
-            offset=offset, states=[list(st) if st is not None else None for st in states],
-            captured_at=time.time(), pinned=pinned,
+            offset=offset,
+            states=[list(st) if st is not None else None for st in states],
+            captured_at=time.time(),
+            pinned=pinned,
         )
         self._snapshots.append(snap)
         self._evict()

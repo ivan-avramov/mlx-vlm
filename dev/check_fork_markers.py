@@ -144,7 +144,9 @@ def parse_allowlist_rule(rule: str) -> tuple[str, str | None]:
         return rule, None
     pin = pin.strip().lower()
     if len(pin) < _MIN_PIN or any(c not in "0123456789abcdef" for c in pin):
-        sys.exit(f"{ALLOWLIST_FILE.name}: bad blob pin in {rule!r} (hex, >= {_MIN_PIN})")
+        sys.exit(
+            f"{ALLOWLIST_FILE.name}: bad blob pin in {rule!r} (hex, >= {_MIN_PIN})"
+        )
     return glob.strip(), pin
 
 
@@ -413,8 +415,10 @@ def main() -> int:
     for path in list(uncovered):
         for rule, _reason in allowlist:
             glob, pin = parse_allowlist_rule(rule)
-            if pin is not None and fnmatch.fnmatch(path, glob) and not (
-                allowlist_entry_applies(path, glob, pin, staged_blob)
+            if (
+                pin is not None
+                and fnmatch.fnmatch(path, glob)
+                and not (allowlist_entry_applies(path, glob, pin, staged_blob))
             ):
                 pinned_out.append(f"{rule} (now {staged_blob(path)[:12]})")
                 continue

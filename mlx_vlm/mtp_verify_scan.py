@@ -96,9 +96,13 @@ def _device_class() -> Optional[str]:
     if not _gpu_enabled():
         return None
     try:
-        info = mx.device_info() if hasattr(mx, "device_info") else mx.metal.device_info()
+        info = (
+            mx.device_info() if hasattr(mx, "device_info") else mx.metal.device_info()
+        )
         return str(info.get("architecture", ""))
-    except Exception:  # noqa: BLE001 - undiscoverable device: fail closed (not in any domain)
+    except (
+        Exception
+    ):  # noqa: BLE001 - undiscoverable device: fail closed (not in any domain)
         return None
 
 
@@ -163,7 +167,9 @@ def per_query_attention(queries, keys, values, *, cache, scale, mask):
 
 
 def _bits(array):
-    return array.view({1: mx.uint8, 2: mx.uint16, 4: mx.uint32, 8: mx.uint64}[array.dtype.size])
+    return array.view(
+        {1: mx.uint8, 2: mx.uint16, 4: mx.uint32, 8: mx.uint64}[array.dtype.size]
+    )
 
 
 def _invalid(a, b):
@@ -197,8 +203,8 @@ class Decision:
 @dataclass
 class _Pending:
     straddle: bool
-    invalid: object   # True or lazy bool: shape/dtype/non-finite
-    differ: object    # True/False or lazy bool: representation-level difference (valid outputs)
+    invalid: object  # True or lazy bool: shape/dtype/non-finite
+    differ: object  # True/False or lazy bool: representation-level difference (valid outputs)
     layer: int
     length: int
     key_length: int
@@ -219,9 +225,14 @@ def deadline(budget_s, what="self-test"):
     (a hung Metal call cannot be interrupted from Python), a watchdog thread prints one stderr
     line and terminates the whole process with a nonzero code, so the router's readiness timeout
     is never the only guard. Cancelled on normal exit."""
+
     def expire():
-        print(f"mtp-verify-scan joint_v1: {what} exceeded its {budget_s:.0f}s deadline; "
-              f"terminating the worker (exit {SELF_TEST_EXIT_CODE})", file=sys.stderr, flush=True)
+        print(
+            f"mtp-verify-scan joint_v1: {what} exceeded its {budget_s:.0f}s deadline; "
+            f"terminating the worker (exit {SELF_TEST_EXIT_CODE})",
+            file=sys.stderr,
+            flush=True,
+        )
         _hard_exit(SELF_TEST_EXIT_CODE)
 
     timer = threading.Timer(budget_s, expire)
@@ -250,7 +261,9 @@ class JointV1Policy:
         self._pending = []
         self._ordinal = 0
         self._logged_shapes = set()
-        self._device = None  # (live class, mirror agrees) resolved ONCE, never on the hot path
+        self._device = (
+            None  # (live class, mirror agrees) resolved ONCE, never on the hot path
+        )
 
     def refresh_device(self):
         """Resolve the live device class and the mirror agreement once (load / self-test)."""
@@ -337,7 +350,9 @@ class JointV1Policy:
         args = dict(cache=cache, scale=scale)
         if route == "joint":
             self._counts["verify_blocks_joint_v1"] += 1
-            joint = joint_attention(queries, keys, values, mask=decision.joint_mask, **args)
+            joint = joint_attention(
+                queries, keys, values, mask=decision.joint_mask, **args
+            )
             if self.ab:
                 other = per_query_attention(queries, keys, values, mask=mask, **args)
                 self._shadow(False, joint, other, queries, keys)
@@ -347,7 +362,9 @@ class JointV1Policy:
             self._counts["verify_blocks_straddle_len2"] += 1
         served = per_query_attention(queries, keys, values, mask=mask, **args)
         if self.ab:
-            joint = joint_attention(queries, keys, values, mask=decision.joint_mask, **args)
+            joint = joint_attention(
+                queries, keys, values, mask=decision.joint_mask, **args
+            )
             self._shadow(True, joint, served, queries, keys)
         return served
 
@@ -358,8 +375,14 @@ class JointV1Policy:
         differ = False if invalid is True else _bits_differ(joint, other)
         self._pending.append(
             _Pending(
-                straddle, invalid, differ, self._ordinal, queries.shape[2],
-                keys.shape[-2], joint, other,
+                straddle,
+                invalid,
+                differ,
+                self._ordinal,
+                queries.shape[2],
+                keys.shape[-2],
+                joint,
+                other,
             )
         )
 
@@ -369,14 +392,28 @@ class JointV1Policy:
         if not self._pending:
             return
         pending, self._pending = self._pending, []
-        flags = [f for p in pending for f in (p.invalid, p.differ) if isinstance(f, mx.array)]
+        flags = [
+            f for p in pending for f in (p.invalid, p.differ) if isinstance(f, mx.array)
+        ]
         if flags:
-            mx.eval(flags)          # ONE batched materialisation per round
+            mx.eval(flags)  # ONE batched materialisation per round
         for entry in pending:
-            self._counts["verify_ab_straddle_blocks" if entry.straddle else "verify_ab_blocks"] += 1
-            invalid = entry.invalid if isinstance(entry.invalid, bool) else bool(entry.invalid.item())
-            differ = entry.differ if isinstance(entry.differ, bool) else bool(entry.differ.item())
-            if invalid:     # validity is separate from a bit difference: never a known positive
+            self._counts[
+                "verify_ab_straddle_blocks" if entry.straddle else "verify_ab_blocks"
+            ] += 1
+            invalid = (
+                entry.invalid
+                if isinstance(entry.invalid, bool)
+                else bool(entry.invalid.item())
+            )
+            differ = (
+                entry.differ
+                if isinstance(entry.differ, bool)
+                else bool(entry.differ.item())
+            )
+            if (
+                invalid
+            ):  # validity is separate from a bit difference: never a known positive
                 self._counts["verify_ab_invalid"] += 1
                 self._counts["verify_ab_mismatch"] += 1
                 self._log_mismatch(entry)
@@ -401,7 +438,9 @@ class JointV1Policy:
         try:
             max_abs = float(
                 mx.max(
-                    mx.abs(entry.joint.astype(mx.float32) - entry.other.astype(mx.float32))
+                    mx.abs(
+                        entry.joint.astype(mx.float32) - entry.other.astype(mx.float32)
+                    )
                 ).item()
             )
         except Exception:  # noqa: BLE001 - shape mismatch: no elementwise diff
@@ -471,14 +510,18 @@ def require_gpu():
         _fail(f"default device is {mx.default_device()}, not the GPU; refusing")
 
 
-def require_environment(*, draft_kind, kv_bits, kv_quant_scheme=None):  # scheme: informational only
+def require_environment(
+    *, draft_kind, kv_bits, kv_quant_scheme=None
+):  # scheme: informational only
     if draft_kind != "mtp":
         _fail(f"requires --draft-kind mtp (got {draft_kind!r}); refusing")
     # Effective-cache predicate (kv_quant.from_legacy / turboquant_enabled): with kv_bits None or 0
     # the worker builds a NATIVE cache whatever kv_quant_scheme says (the shipped first pick declares
     # scheme turboquant with kv_bits 0). Refuse only when the resolved cache WOULD be quantized.
     if kv_bits:
-        _fail("quantized KV (kv_bits > 0, uniform or TurboQuant) is not supported; refusing")
+        _fail(
+            "quantized KV (kv_bits > 0, uniform or TurboQuant) is not supported; refusing"
+        )
     if os.environ.get("MLX_SDPA_BLOCKS"):
         _fail("MLX_SDPA_BLOCKS is set (libmlx honours it, the plan mirror does not)")
 
@@ -486,7 +529,8 @@ def require_environment(*, draft_kind, kv_bits, kv_quant_scheme=None):  # scheme
 def require_loaded_mtp_drafter(policy, draft_model, draft_kind):
     """After drafter resolution/compatibility handling: ``joint_v1`` serves only with a LOADED
     MTP drafter. A drafter that resolved to another kind, or the incompatibility fallback
-    ``(None, None)``, must stop the load before READY (the verifier also serves suffix decoding)."""
+    ``(None, None)``, must stop the load before READY (the verifier also serves suffix decoding).
+    """
     if policy is not None and (draft_model is None or draft_kind != "mtp"):
         _fail(
             f"requires a loaded MTP drafter after resolution (draft_model "
@@ -548,7 +592,9 @@ def _self_test(policy, heads, kv_heads, head_dim, dtype, force_calls):
     def cell(length, key_length):
         # a fixed LOCAL key: the global RNG state is never read or advanced (D7), so workers
         # under either policy start serving from identical RNG state
-        kq, kk, kv_ = mx.random.split(mx.random.key(SELF_TEST_SEED + length * 7919 + key_length), 3)
+        kq, kk, kv_ = mx.random.split(
+            mx.random.key(SELF_TEST_SEED + length * 7919 + key_length), 3
+        )
         q = mx.random.normal((1, heads, length, head_dim), key=kq).astype(dtype)
         k = mx.random.normal((1, kv_heads, key_length, head_dim), key=kk).astype(dtype)
         v = mx.random.normal((1, kv_heads, key_length, head_dim), key=kv_).astype(dtype)
@@ -613,14 +659,22 @@ def self_test_model(model, policy, **kwargs) -> list:
     qualified = _qualified_class()
     target = getattr(model, "language_model", model)
     modules = [m for _, m in target.named_modules() if type(m) is qualified]
-    with deadline(SELF_TEST_BUDGET_S):  # the dtype probe AND every cell share one deadline
+    with deadline(
+        SELF_TEST_BUDGET_S
+    ):  # the dtype probe AND every cell share one deadline
         dtypes = ap._observe_query_dtypes(target, modules)
         dims = []
         for module, dtype in zip(modules, dtypes):
             if dtype is None:
-                _fail("self-test dtype probe saw no attention call on a qualified module")
-            cell = (module.num_attention_heads, module.num_key_value_heads,
-                    module.head_dim, dtype)
+                _fail(
+                    "self-test dtype probe saw no attention call on a qualified module"
+                )
+            cell = (
+                module.num_attention_heads,
+                module.num_key_value_heads,
+                module.head_dim,
+                dtype,
+            )
             if cell not in dims:
                 dims.append(cell)
         return [

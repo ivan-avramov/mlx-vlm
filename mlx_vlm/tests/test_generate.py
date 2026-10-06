@@ -3003,7 +3003,9 @@ class TestPrefixCacheReuseTrim:
         c = self._ring(36, start_position=20)
         assert common_module._rotating_rewind_safe([c], 5) is False
 
-    def test_wrapped_buffered_rotating_allows_rewind_only_with_its_window_retained(self):
+    def test_wrapped_buffered_rotating_allows_rewind_only_with_its_window_retained(
+        self,
+    ):
         # M48 review (P3): the rewind POINT being retained is not enough — the
         # whole attention window behind it must be, else the replayed token
         # attends over a truncated window (measured: window 4, buffer 32,

@@ -59,7 +59,10 @@ class TestIncompatPolicy:
     def test_env_gate_restores_the_fallback(self, monkeypatch):
         monkeypatch.setenv("MLX_VLM_DRAFT_ALLOW_FALLBACK", "1")
         # Returns (None, None) = serve plain decode, deliberately.
-        assert drafter_incompat_policy(ValueError("hidden size mismatch")) == (None, None)
+        assert drafter_incompat_policy(ValueError("hidden size mismatch")) == (
+            None,
+            None,
+        )
 
     def test_env_gate_zero_still_refuses(self, monkeypatch):
         monkeypatch.setenv("MLX_VLM_DRAFT_ALLOW_FALLBACK", "0")

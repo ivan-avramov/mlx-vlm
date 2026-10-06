@@ -31,8 +31,8 @@ from mlx_vlm.generate import (
     _restore_rotating_layers_from_snapshots,
     _rotating_post_gen_trim_safe,
     _rotating_rewind_safe,
-    _shrink_cache_entries,
     _should_capture_anchor_pre_prefill,
+    _shrink_cache_entries,
     _trim_cache,
     set_session_shrink_on_retire,
 )
@@ -331,7 +331,10 @@ class TestSessionShrinkOnRetire:
         set_session_shrink_on_retire(False)
         state = PromptCacheState()
         c = PreallocKVCache(prealloc_tokens=262144)
-        c.update_and_fetch(mx.zeros((1, 4, 1000, 32), mx.float16), mx.zeros((1, 4, 1000, 32), mx.float16))
+        c.update_and_fetch(
+            mx.zeros((1, 4, 1000, 32), mx.float16),
+            mx.zeros((1, 4, 1000, 32), mx.float16),
+        )
         assert c.keys.shape[2] == 262144
 
         state.update(token_ids=list(range(1000)), kv_cache=[c])
@@ -342,7 +345,10 @@ class TestSessionShrinkOnRetire:
         set_session_shrink_on_retire(True)
         state = PromptCacheState()
         c = PreallocKVCache(prealloc_tokens=262144)
-        c.update_and_fetch(mx.zeros((1, 4, 1000, 32), mx.float16), mx.zeros((1, 4, 1000, 32), mx.float16))
+        c.update_and_fetch(
+            mx.zeros((1, 4, 1000, 32), mx.float16),
+            mx.zeros((1, 4, 1000, 32), mx.float16),
+        )
         assert c.keys.shape[2] == 262144
 
         state.update(token_ids=list(range(1000)), kv_cache=[c])
@@ -354,10 +360,16 @@ class TestSessionShrinkOnRetire:
         set_session_shrink_on_retire(True)
         state = PromptCacheState()
         c1 = PreallocKVCache(prealloc_tokens=262144)
-        c1.update_and_fetch(mx.zeros((1, 4, 500, 128), mx.float16), mx.zeros((1, 4, 500, 128), mx.float16))
+        c1.update_and_fetch(
+            mx.zeros((1, 4, 500, 128), mx.float16),
+            mx.zeros((1, 4, 500, 128), mx.float16),
+        )
         # head_dim=128 (divisible by the default group_size=64 for mx.quantize).
         c2 = PreallocQuantizedKVCache(group_size=64, bits=4, prealloc_tokens=262144)
-        c2.update_and_fetch(mx.zeros((1, 4, 500, 128), mx.float16), mx.zeros((1, 4, 500, 128), mx.float16))
+        c2.update_and_fetch(
+            mx.zeros((1, 4, 500, 128), mx.float16),
+            mx.zeros((1, 4, 500, 128), mx.float16),
+        )
 
         state.update(token_ids=list(range(500)), kv_cache=[c1, c2])
 
@@ -383,11 +395,15 @@ class TestSessionShrinkOnRetire:
         # left untouched by another session's retirement.
         set_session_shrink_on_retire(True)
         active = PreallocKVCache(prealloc_tokens=262144)
-        active.update_and_fetch(mx.zeros((1, 4, 100, 32), mx.float16), mx.zeros((1, 4, 100, 32), mx.float16))
+        active.update_and_fetch(
+            mx.zeros((1, 4, 100, 32), mx.float16), mx.zeros((1, 4, 100, 32), mx.float16)
+        )
 
         other_state = PromptCacheState()
         other_cache = PreallocKVCache(prealloc_tokens=262144)
-        other_cache.update_and_fetch(mx.zeros((1, 4, 100, 32), mx.float16), mx.zeros((1, 4, 100, 32), mx.float16))
+        other_cache.update_and_fetch(
+            mx.zeros((1, 4, 100, 32), mx.float16), mx.zeros((1, 4, 100, 32), mx.float16)
+        )
         other_state.update(token_ids=list(range(100)), kv_cache=[other_cache])
 
         assert other_cache.keys.shape[2] == 256  # retired session shrunk

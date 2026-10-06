@@ -97,14 +97,17 @@ class Model(Qwen3VLModel):
             return None  # off unless --lazy-prompt-embeddings resolved onto us
         if getattr(self.config, "model_type", None) != "qwen3_5":
             return None
-        if any(
-            kwargs.get(k) is not None
-            for k in (
-                "pixel_values_videos",
-                "image_grid_thw",
-                "video_grid_thw",
+        if (
+            any(
+                kwargs.get(k) is not None
+                for k in (
+                    "pixel_values_videos",
+                    "image_grid_thw",
+                    "video_grid_thw",
+                )
             )
-        ) or pixel_values is not None:
+            or pixel_values is not None
+        ):
             return None
         position_ids, rope_deltas = self.language_model.get_rope_index(
             input_ids, attention_mask=kwargs.get("mask")
