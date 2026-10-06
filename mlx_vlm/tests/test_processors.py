@@ -617,25 +617,7 @@ def _assert_attrs(obj, **expected):
     assert {key: attrgetter(key)(obj) for key in expected} == expected
 
 
-@pytest.mark.parametrize(
-    "model_type,module_path,class_name",
-    [
-        # Fork: C104(d) box-local xfail for the qwen4_exp route (see reason string).
-        pytest.param(
-            *route,
-            marks=pytest.mark.xfail(
-                reason="Fork (2026-09-27 sync): on this box Qwen3VLProcessor.from_pretrained "
-                "raises on a config-only directory (transformers 5.x backend tokenizer), so "
-                "the route falls back to HF AutoProcessor. Loader code is identical to "
-                "upstream; upstream CI status for this case is unknown.",
-                strict=False,
-            ),
-        )
-        if route[0] == "qwen4_exp"
-        else route
-        for route in DATA["routes"]
-    ],
-)
+@pytest.mark.parametrize("model_type,module_path,class_name", DATA["routes"])
 def test_auto_processor_routes_to_custom_loader(
     tmp_path, model_type, module_path, class_name
 ):

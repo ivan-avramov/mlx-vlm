@@ -1923,14 +1923,6 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
                 best = mx.sort(expected_scores, axis=-1)[..., -indices.shape[-1] :]
                 self.assertTrue(mx.array_equal(mx.sort(selected), best).item())
 
-    # Fork: box-local xfail (v0.7.6 sync). The bits=4/8, length=17 subtests fail on pristine
-    # upstream v0.7.6 too on this M5 Max with MLX 0.32.2 (quantized prefill GEMM vs the
-    # gather_qmm reference); DeepSeek V4.1 is not a stack model.
-    @pytest.mark.xfail(
-        reason="Fork (v0.7.6 sync): fails on pristine upstream v0.7.6 on this box "
-        "(MLX 0.32.2, M5 Max); not a fork change",
-        strict=False,
-    )
     def test_moe_matches_reference_activation_and_routing_precision(self):
         from mlx_vlm.models import deepseek_v41
         from mlx_vlm.models.deepseek_v41.language import DeepseekV41MoE
@@ -2013,9 +2005,16 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
                     ).astype(x.dtype)
                     actual = model(x)
                     self.assertEqual(actual.dtype, x.dtype)
-                    self.assertTrue(
-                        mx.allclose(actual, expected, rtol=1e-5, atol=1e-5).item()
-                    )
+                    close = mx.allclose(actual, expected, rtol=1e-5, atol=1e-5).item()
+                    # Fork: box-local xfail for exactly the subtests that also fail on
+                    # pristine upstream v0.7.6 here (M5 Max, MLX 0.32.2): quantized
+                    # (bits 4/8) sorted-dispatch prefill (length 17). Non-strict.
+                    if not close and bits in (4, 8) and length == 17:
+                        pytest.xfail(
+                            "Fork (v0.7.6 sync): fails on pristine upstream v0.7.6 on "
+                            "this box (MLX 0.32.2, M5 Max); not a fork change"
+                        )
+                    self.assertTrue(close)
 
     def test_image_tokens_use_visual_routing_and_break_engram_history(self):
         """The generation path supplies token ids, including during chunked prefill.
