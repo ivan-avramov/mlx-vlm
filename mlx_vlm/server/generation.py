@@ -1534,6 +1534,9 @@ class ResponseGenerator:
                 f"cooldown={draft_model.cooldown or 'off'})."
             )
 
+        from .. import mtp_verify_scan as _mv  # Fork (M58)
+
+        _mv.require_loaded_mtp_drafter(self.mtp_verify_policy, draft_model, draft_kind)  # Fork (M58)
         self.model = model
         self.processor = processor
         self.config = config

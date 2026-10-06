@@ -4,10 +4,13 @@ One seeded prompt runs under the default (`per_query`); the target cache, drafte
 cache and RNG are rebuilt on the SAME model instance; the run repeats with
 `joint_v1` (AB off, the production path). Emitted tokens, the per-round acceptance
 sequence, the hidden states handed to the drafter and the post-rollback cache
-state must agree. CPU limits: the CPU attention fallback is not bitwise between
-the joint and the per-query call (STEP 1 / Claude S3), so numeric agreement is
-asserted at a stated tolerance; control flow (tokens, acceptance, offsets) is
-asserted EXACTLY. Bit identity is the GPU gate (self-test, AB, parity replay).
+state must agree. Two drafters are exercised: an oracle wrapper (varied acceptance) and the
+UNMODIFIED drafter (real proposals, recording wrappers only). The drafter's final state
+(cache arrays, next position, seed token, accept_lens) is compared explicitly.
+CPU limits: the CPU attention fallback is not bitwise between the joint and the per-query call
+(STEP 1 / Claude S3), so numeric agreement is asserted at a stated 1e-4 tolerance; control flow
+(tokens, acceptance, offsets) is asserted EXACTLY. EXACT bit identity is the GPU gate (load-time
+self-test, AB instrument, parity replay) and is NOT established by this test.
 """
 
 import copy
@@ -36,6 +39,7 @@ def _plan(n_keys, q_heads, kv_heads):
 @pytest.fixture
 def micro(monkeypatch):
     monkeypatch.setattr(mv, "_device_class", lambda: "applegpu_g17s")
+    monkeypatch.setattr(qwen_language, "_qwen3_5_device_arch_suffix", lambda: "s")
     monkeypatch.setattr(qwen_language, "_qwen3_5_sdpa_vector_plan", _plan)
     monkeypatch.setattr(
         mv, "QUALIFIED_DOMAIN",
@@ -61,6 +65,35 @@ def _reference(lm):
         token = int(mx.argmax(out.logits[0, -1]).item())
         ref.append(token)
     return ref
+
+
+def _record_only(drafter, record):
+    """Unmodified drafter: real proposals; the wrappers only record what the rounds hand over."""
+    cls = type(drafter)
+
+    def accept(verify_hidden, draft_tokens, accepted, new_tokens, *a, **kw):
+        record["hidden"].append(verify_hidden)
+        record["accepted"].append(int(accepted))
+        return cls.accept_verified_tokens(drafter, verify_hidden, draft_tokens, accepted,
+                                          new_tokens, *a, **kw)
+
+    drafter.draft_block = lambda *a, **kw: cls.draft_block(drafter, *a, **kw)
+    drafter.accept_verified_tokens = accept
+
+
+def _drafter_state(drafter):
+    arrays = []
+    for layer in drafter._cache:
+        st = layer.state
+        arrays += [a for a in (st if isinstance(st, (list, tuple)) else [st]) if a is not None]
+    seed = drafter._seed_token
+    nxt = drafter._next_position
+    mx.eval(arrays, seed)
+    if isinstance(nxt, mx.array):
+        mx.eval(nxt)
+        nxt = nxt.tolist()
+    return {"arrays": arrays, "seed": seed.tolist(), "next": nxt,
+            "accept_lens": list(drafter.accept_lens)}
 
 
 def _oracle(drafter, ref, record):
@@ -90,10 +123,13 @@ def _oracle(drafter, ref, record):
     drafter.draft_block, drafter.accept_verified_tokens = draft_block, accept
 
 
-def _run(lm, drafter, ref):
+def _run(lm, drafter, ref, oracle=True):
     mx.random.seed(7)  # RNG state restored before each run
     record = {"hidden": [], "accepted": []}
-    _oracle(drafter, ref, record)
+    if oracle:
+        _oracle(drafter, ref, record)
+    else:
+        _record_only(drafter, record)
     cache = lm.make_cache()  # target cache rebuilt (drafter cache: reset by the rounds)
     ids = mx.array([PROMPT], dtype=mx.int32)
     out = lm(ids, cache=cache, return_hidden=True, return_shared_kv=True)
@@ -115,7 +151,16 @@ def _run(lm, drafter, ref):
         states.append([a for a in arrays if a is not None])
     mx.eval([a for layer in states for a in layer])
     offsets = [int(getattr(layer, "offset", 0)) for layer in cache]
+    record["drafter"] = _drafter_state(drafter)
     return tokens, record, states, offsets
+
+
+def _assert_drafter_state(got, want):
+    assert got["seed"] == want["seed"] and got["next"] == want["next"]
+    assert got["accept_lens"] == want["accept_lens"]
+    assert len(got["arrays"]) == len(want["arrays"]) > 0
+    for a, b in zip(got["arrays"], want["arrays"]):
+        assert a.shape == b.shape and mx.allclose(a, b, **TOL).item()
 
 
 class TestAC8GenerationIdentity:
@@ -144,6 +189,7 @@ class TestAC8GenerationIdentity:
         for got, want in zip(again[1]["hidden"], base[1]["hidden"]):  # to the drafter
             assert got.shape == want.shape
             assert mx.allclose(got, want, **TOL).item()
+        _assert_drafter_state(again[1]["drafter"], base[1]["drafter"])
         for got_layer, want_layer in zip(again[2], base[2]):  # post-rollback state
             assert len(got_layer) == len(want_layer)
             for got, want in zip(got_layer, want_layer):
@@ -157,3 +203,18 @@ class TestAC8GenerationIdentity:
         assert one[0] == two[0] and one[1]["accepted"] == two[1]["accepted"]
         for got, want in zip(two[1]["hidden"], one[1]["hidden"]):
             assert mx.array_equal(got, want).item()
+
+    def test_b11_unmodified_drafter_real_proposals_per_query_then_joint_v1(self, micro):
+        lm, drafter = micro
+        base = _run(lm, drafter, None, oracle=False)
+        model = type("M", (), {"config": lm.config, "language_model": lm})()
+        policy = mv.JointV1Policy()
+        mv.apply_to_model(model, policy)
+        again = _run(lm, drafter, None, oracle=False)
+        assert policy.counters()["verify_blocks_joint_v1"] > 0
+        assert again[0] == base[0] and again[3] == base[3]
+        assert again[1]["accepted"] == base[1]["accepted"]
+        assert len(base[1]["accepted"]) > 3  # real rounds ran
+        for got, want in zip(again[1]["hidden"], base[1]["hidden"]):
+            assert got.shape == want.shape and mx.allclose(got, want, **TOL).item()
+        _assert_drafter_state(again[1]["drafter"], base[1]["drafter"])

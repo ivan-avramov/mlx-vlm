@@ -403,16 +403,21 @@ class Qwen3_5BatchInvariantForward:
         hidden_sink: list[mx.array] | None = (
             [] if capture_layer_ids is not None else None
         )
-        hidden = self._model(
-            language_model.model,
-            inputs,
-            cache,
-            inputs_embeds,
-            position_ids,
-            capture_layer_ids,
-            hidden_sink,
-        )
         verify_policy = getattr(language_model, "mtp_verify_policy", None)  # Fork (M58)
+        try:
+            hidden = self._model(
+                language_model.model,
+                inputs,
+                cache,
+                inputs_embeds,
+                position_ids,
+                capture_layer_ids,
+                hidden_sink,
+            )
+        except BaseException:  # Fork (M58): never leak pending AB comparisons; re-raise as is
+            if verify_policy is not None:
+                verify_policy.discard_pending()
+            raise
         if verify_policy is not None:  # Fork (M58): one AB materialisation per round
             verify_policy.end_block()
         if return_hidden:

@@ -77,6 +77,7 @@ def stub_plan(n_keys, q_heads, kv_heads):
 def qualified(monkeypatch):
     """Pretend: GPU class applegpu_g17s with the STEP 1 plan mirror."""
     monkeypatch.setattr(mv, "_device_class", lambda: "applegpu_g17s")
+    monkeypatch.setattr(qwen_language, "_qwen3_5_device_arch_suffix", lambda: "s")
     monkeypatch.setattr(qwen_language, "_qwen3_5_sdpa_vector_plan", stub_plan)
     return stub_plan
 
@@ -935,6 +936,7 @@ class TestSelfTest:
 
     def test_self_test_fails_on_an_unpredicted_mismatch(self, gpu, monkeypatch):
         monkeypatch.setattr(mv, "_device_class", lambda: "applegpu_g17s")
+        monkeypatch.setattr(qwen_language, "_qwen3_5_device_arch_suffix", lambda: "s")
         # a mirror that predicts nothing, against a kernel that mismatches
         monkeypatch.setattr(
             qwen_language, "_qwen3_5_sdpa_vector_plan", lambda n, q, kv: ("one_pass", 0)
@@ -1178,3 +1180,293 @@ class TestAC9Endpoints:
         assert not any(k.startswith("verify_") for k in t)
         r = _post(client, stream=True)
         assert "verify_" not in r.read().decode()
+
+
+# ------------------------------------------------------------------ B6 resolved drafter
+class TestB6LoadedMtpDrafter:
+    def test_b6_guard_function(self):
+        pol = mv.JointV1Policy()
+        mv.require_loaded_mtp_drafter(None, None, None)  # per_query: never refuses
+        mv.require_loaded_mtp_drafter(pol, object(), "mtp")
+        for model, kind in [(None, None), (None, "mtp"), (object(), "dflash"), (object(), None)]:
+            with pytest.raises(mv.VerifyScanError, match="MTP drafter"):
+                mv.require_loaded_mtp_drafter(pol, model, kind)
+
+    def _init(self, monkeypatch, gpu, qualified, resolved, compat_fails=False):
+        import mlx_vlm.speculative.drafters as drafters
+
+        monkeypatch.setenv("MLX_VLM_MTP_VERIFY_SCAN", "joint_v1")
+        monkeypatch.setenv("MLX_VLM_MTP_VERIFY_AB", "0")
+        monkeypatch.delenv("MLX_SDPA_BLOCKS", raising=False)
+        monkeypatch.delenv("MLX_VLM_MOE_EXPAND", raising=False)
+        monkeypatch.delenv("MLX_VLM_ATTENTION_POLICY", raising=False)
+        monkeypatch.setenv("MLX_VLM_DRAFT_KIND", "mtp")
+        monkeypatch.setenv("MLX_VLM_DRAFT_MODEL", "/drafter")
+        monkeypatch.setattr(
+            mv, "QUALIFIED_DOMAIN",
+            mv.Domain(dtypes=(mx.bfloat16,), head_dim=16, gqa=(2,),
+                      device_classes=("applegpu_g17s",)))
+        monkeypatch.setattr(mv, "self_test_model", lambda *a, **k: [mv.SelfTestResult()])
+        lm = _tiny_lm()
+        model = SimpleNamespace(language_model=lm, config=lm.config)
+        monkeypatch.setattr(generation_module, "load_model_resources",
+                            lambda *a, **k: (model, SimpleNamespace(), lm.config))
+        monkeypatch.setattr(drafters, "load_drafter", lambda path, kind=None: resolved)
+        if compat_fails:
+            def bad(*a, **k):
+                raise ValueError("incompatible")
+            monkeypatch.setattr(drafters, "validate_drafter_compatibility", bad)
+        else:
+            monkeypatch.setattr(drafters, "validate_drafter_compatibility", lambda *a, **k: None)
+        fake = SimpleNamespace(model_path="x", adapter_path=None, draft_kind_override=None,
+                               draft_model_path=None, apc_manager=None, kv_bits=None)
+        generation_module.ResponseGenerator._initialize_model(fake)
+
+    def test_b6_drafter_resolving_to_a_non_mtp_kind_refuses(self, monkeypatch, gpu, qualified):
+        with pytest.raises(mv.VerifyScanError, match="MTP drafter"):
+            self._init(monkeypatch, gpu, qualified, (SimpleNamespace(), "dflash"))
+
+    def test_b6_incompatibility_fallback_to_plain_decode_refuses(
+        self, monkeypatch, gpu, qualified
+    ):
+        monkeypatch.setenv("MLX_VLM_DRAFT_ALLOW_FALLBACK", "1")
+        with pytest.raises(mv.VerifyScanError, match="MTP drafter"):
+            self._init(monkeypatch, gpu, qualified, (SimpleNamespace(), "mtp"), compat_fails=True)
+
+
+# ------------------------------------------------------------------ B7 self-test validity
+class TestB7SelfTestValidity:
+    DIMS = TestSelfTest.DIMS
+
+    def test_b7_nan_at_the_straddle_cell_is_a_refusal_not_a_known_positive(
+        self, qualified, gpu, monkeypatch
+    ):
+        class NanOnStraddle:
+            def __call__(self, q, k, v, scale=None, mask=None, **kw):
+                if k.shape[2] <= 1025:
+                    return mx.full(q.shape, float("nan"), q.dtype)
+                return mx.zeros(q.shape, q.dtype)  # finite, identical at 2048 keys
+
+        monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", NanOnStraddle())
+        with pytest.raises(mv.VerifyScanError, match="non-finite"):
+            mv.self_test(mv.JointV1Policy(), **self.DIMS)
+
+    def test_b7_dtype_difference_always_rejects(self, qualified, gpu, monkeypatch):
+        calls = {"n": 0}
+
+        def odd(q, k, v, scale=None, mask=None, **kw):
+            calls["n"] += 1
+            dtype = mx.float32 if q.shape[2] == 1 else q.dtype  # per-query pieces differ in dtype
+            return mx.zeros(q.shape, dtype)
+
+        monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", odd)
+        with pytest.raises(mv.VerifyScanError, match="invalid output"):
+            mv.self_test(mv.JointV1Policy(), **self.DIMS)
+
+    def test_b7_nan_on_the_eligible_cell_rejects_as_invalid(self, qualified, gpu, monkeypatch):
+        monkeypatch.setattr(
+            mx.fast, "scaled_dot_product_attention",
+            lambda q, k, v, **kw: mx.full(q.shape, float("nan"), q.dtype))
+        with pytest.raises(mv.VerifyScanError, match="non-finite"):
+            mv.self_test(mv.JointV1Policy(), **self.DIMS)
+
+
+# ------------------------------------------------------------------ B8 AB finalization
+class TestB8ABFinalization:
+    def test_b8_counters_do_not_advance_before_materialisation(self, qualified, monkeypatch):
+        monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", ShapeRecorder())
+        policy = mv.JointV1Policy(ab=True)
+        attend(policy, *make_qkv(3, 4096))
+        attend(policy, *make_qkv(3, 1025))
+        assert policy._counts["verify_ab_blocks"] == 0
+        assert policy._counts["verify_ab_straddle_blocks"] == 0
+        policy.end_block()
+        assert policy._counts["verify_ab_blocks"] == 1
+        assert policy._counts["verify_ab_straddle_blocks"] == 1
+
+    def test_b8_discard_pending_drops_refs_and_leaves_counters_consistent(
+        self, qualified, monkeypatch
+    ):
+        monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", ShapeRecorder())
+        policy = mv.JointV1Policy(ab=True)
+        attend(policy, *make_qkv(3, 4096))
+        policy.discard_pending()
+        assert policy._pending == [] and policy._ordinal == 0
+        c = policy.counters()
+        assert c["verify_ab_blocks"] == 0 and c["verify_ab_mismatch"] == 0
+        assert c["verify_blocks_joint_v1"] == 1  # the block itself was served and counted
+
+    def test_b8_exception_mid_round_discards_and_keeps_the_original_exception(
+        self, qualified, monkeypatch
+    ):
+        monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", ShapeRecorder())
+        policy = mv.JointV1Policy(ab=True)
+        lm = SimpleNamespace(mtp_verify_policy=policy, model=object(),
+                             args=SimpleNamespace(tie_word_embeddings=True))
+        verifier = qwen_verifier.Qwen3_5BatchInvariantForward()
+
+        class Boom(RuntimeError):
+            pass
+
+        def model(*a, **k):
+            attend(policy, *make_qkv(3, 4096))  # an AB comparison is pending when it dies
+            raise Boom("mid-round")
+
+        verifier._model = model
+        with pytest.raises(Boom, match="mid-round"):
+            verifier(lm, mx.zeros((1, 3), dtype=mx.int32))
+        assert policy._pending == []
+        assert policy.counters()["verify_ab_blocks"] == 0
+
+    def test_b8_success_path_flushes_once_at_the_end_of_the_verifier_call(
+        self, qualified, monkeypatch
+    ):
+        monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", ShapeRecorder())
+        policy = mv.JointV1Policy(ab=True)
+        lm = SimpleNamespace(mtp_verify_policy=policy, model=SimpleNamespace(),
+                             args=SimpleNamespace(tie_word_embeddings=True))
+        verifier = qwen_verifier.Qwen3_5BatchInvariantForward()
+        verifier._model = lambda *a, **k: (attend(policy, *make_qkv(3, 4096)),
+                                           mx.zeros((1, 3, 4)))[1]
+        verifier._embedding_as_linear = lambda emb, h: h
+        lm.model.embed_tokens = None
+        verifier(lm, mx.zeros((1, 3), dtype=mx.int32))
+        assert policy._pending == []
+        assert policy._counts["verify_ab_blocks"] == 1
+
+
+# ------------------------------------------------------------------ B9 / B10 real plan mirror
+# Expectations transcribed from the STEP 1 microbench (MLX 0.32.2, applegpu_g17s, HQ 24 / HKV 4 /
+# D 256, bf16): per (qL, keys) cell the mismatching query positions of joint vs per-query. They are
+# independent of the fork's mirror; only cells listed here mismatch, every other sweep cell is
+# bitwise identical.
+STEP1_MISMATCH = {
+    (2, 1024): [0],
+    (3, 1024): [0, 1],
+    (4, 1024): [0, 1, 2],
+    (5, 1024): [0, 1, 2, 3],
+    (2, 1025): [0],
+    (3, 1025): [0, 1],
+    (4, 1025): [0, 1, 2],
+    (5, 1025): [0, 1, 2, 3],
+    (3, 1026): [0],
+    (4, 1026): [0, 1],
+    (5, 1026): [0, 1, 2],
+    (4, 1027): [0],
+    (5, 1027): [0, 1],
+    (5, 1028): [0],
+    (2, 8193): [0],
+    (3, 8193): [0, 1],
+    (4, 8193): [0, 1, 2],
+    (5, 8193): [0, 1, 2, 3],
+    (3, 8194): [0],
+    (4, 8194): [0, 1],
+    (5, 8194): [0, 1, 2],
+    (4, 8195): [0],
+    (5, 8195): [0, 1],
+    (5, 8196): [0],
+    (2, 32769): [0],
+    (3, 32769): [0, 1],
+    (4, 32769): [0, 1, 2],
+    (5, 32769): [0, 1, 2, 3],
+    (3, 32770): [0],
+    (4, 32770): [0, 1],
+    (5, 32770): [0, 1, 2],
+    (4, 32771): [0],
+    (5, 32771): [0, 1],
+    (5, 32772): [0],
+    (2, 65537): [0],
+    (3, 65537): [0, 1],
+    (4, 65537): [0, 1, 2],
+    (5, 65537): [0, 1, 2, 3],
+    (3, 65538): [0],
+    (4, 65538): [0, 1],
+    (5, 65538): [0, 1, 2],
+    (4, 65539): [0],
+    (5, 65539): [0, 1],
+    (5, 65540): [0],
+}
+SWEEP_KEYS = [1018, 1019, 1020, 1021, 1022, 1023, 1024, 1025, 1026, 1027, 1028, 1029, 1030, 8188, 8189, 8190, 8191, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 32764, 32765, 32766, 32767, 32768, 32769, 32770, 32771, 32772, 32773, 32774, 32775, 32776, 65532, 65533, 65534, 65535, 65536, 65537, 65538, 65539, 65540, 65541, 65542, 65543, 65544]
+
+
+@pytest.fixture
+def real_mirror(monkeypatch):
+    """The REAL plan mirror (language._qwen3_5_sdpa_vector_plan); only device discovery is mocked."""
+    info = {"architecture": "applegpu_g17s"}
+    monkeypatch.setattr(mv, "_gpu_enabled", lambda: True)
+    monkeypatch.setattr(mx, "device_info", lambda: dict(info), raising=False)
+    qwen_language._qwen3_5_device_arch_suffix.cache_clear()
+    yield info
+    monkeypatch.undo()
+    qwen_language._qwen3_5_device_arch_suffix.cache_clear()
+
+
+class TestB10RealMirror:
+    @pytest.mark.parametrize("q_len", [2, 3, 4, 5])
+    def test_b10_straddle_exactly_on_the_step1_mismatching_cells(
+        self, real_mirror, rec, q_len
+    ):
+        policy = mv.JointV1Policy()
+        for key_length in SWEEP_KEYS:
+            q, k, v = make_qkv(q_len, key_length)
+            route = policy.classify(q, k, v, NativeCache(), "causal").route
+            expected = "straddle" if (q_len, key_length) in STEP1_MISMATCH else "joint"
+            assert route == expected, (q_len, key_length)
+
+    def test_b10_mismatch_positions_are_the_first_qL_minus_d(self):
+        for (q_len, key_length), positions in STEP1_MISMATCH.items():
+            assert positions == list(range(len(positions)))  # leading positions only
+
+    def test_b10_the_length_two_straddle_at_1025_and_1024(self, real_mirror, rec):
+        policy = mv.JointV1Policy()
+        for key_length in (1024, 1025):
+            assert (2, key_length) in STEP1_MISMATCH
+            q, k, v = make_qkv(2, key_length)
+            assert attend(policy, q, k, v) is not None and len(rec.calls) == 2
+            rec.calls.clear()
+        assert policy.counters()["verify_blocks_straddle"] == 2
+        q, k, v = make_qkv(2, 1026)  # d = 1: no longer crosses
+        attend(policy, q, k, v)
+        assert policy.counters()["verify_blocks_joint_v1"] == 1
+
+    def test_b10_real_block_counts_differ_where_the_stub_did_not(self, real_mirror):
+        plan = qwen_language._qwen3_5_sdpa_vector_plan
+        assert plan(1023, 24, 4) == ("one_pass", 0)
+        assert plan(1024, 24, 4) == ("two_pass", 64)
+        assert plan(1025, 24, 4) == ("two_pass", 128)
+
+
+class TestB9DeviceDiscoveryConsistency:
+    def test_b9_stale_mirror_suffix_fails_closed(self, real_mirror, monkeypatch, rec):
+        qwen_language._qwen3_5_device_arch_suffix.cache_clear()
+        real_mirror["architecture"] = "applegpu_g17d"  # mirror caches 'd' ...
+        policy = mv.JointV1Policy()
+        q, k, v = make_qkv(3, 4096)
+        assert qwen_language._qwen3_5_device_arch_suffix() == "d"  # primes the cache with 'd'
+        monkeypatch.setattr(mv, "QUALIFIED_DOMAIN",
+                            mv.Domain(device_classes=("applegpu_g17d", "applegpu_g17s")))
+        real_mirror["architecture"] = "applegpu_g17s"  # ... the live device then reads 's'
+        d = policy.classify(q, k, v, NativeCache(), "causal")
+        assert (d.route, d.reason) == ("per_query", "domain")
+        qwen_language._qwen3_5_device_arch_suffix.cache_clear()
+        assert policy.classify(q, k, v, NativeCache(), "causal").route == "joint"
+
+    def test_b9_missing_architecture_fails_closed_in_the_domain_and_the_mirror(
+        self, real_mirror, rec
+    ):
+        del real_mirror["architecture"]
+        qwen_language._qwen3_5_device_arch_suffix.cache_clear()
+        assert mv._device_class() == ""
+        assert qwen_language._qwen3_5_device_arch_suffix() == ""
+        d = mv.JointV1Policy().classify(*make_qkv(3, 4096), NativeCache(), "causal")
+        assert (d.route, d.reason) == ("per_query", "domain")
+
+    def test_b9_unreadable_device_info_fails_closed(self, real_mirror, monkeypatch):
+        def boom():
+            raise RuntimeError("no device info")
+        monkeypatch.setattr(mx, "device_info", boom, raising=False)
+        qwen_language._qwen3_5_device_arch_suffix.cache_clear()
+        assert mv._device_class() is None
+        assert not mv._mirror_matches_live_device(None)
+        d = mv.JointV1Policy().classify(*make_qkv(3, 4096), NativeCache(), "causal")
+        assert d.reason == "domain"

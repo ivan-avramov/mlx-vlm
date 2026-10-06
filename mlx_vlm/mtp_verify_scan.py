@@ -85,8 +85,24 @@ def _gpu_enabled() -> bool:
 def _device_class() -> Optional[str]:
     if not _gpu_enabled():
         return None
-    info = mx.device_info() if hasattr(mx, "device_info") else mx.metal.device_info()
-    return str(info.get("architecture", ""))
+    try:
+        info = mx.device_info() if hasattr(mx, "device_info") else mx.metal.device_info()
+        return str(info.get("architecture", ""))
+    except Exception:  # noqa: BLE001 - undiscoverable device: fail closed (not in any domain)
+        return None
+
+
+def _mirror_matches_live_device(live_class) -> bool:
+    """The plan mirror reads a process-cached architecture suffix (`language.py`); the domain check
+    reads the device live. They must agree, else the mirror could model a different device class
+    than the one serving: fail closed."""
+    from .models.qwen3_5 import language as _language
+
+    try:
+        cached = _language._qwen3_5_device_arch_suffix()
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(live_class) and live_class[-1:] == cached
 
 
 def _fail(message: str):
@@ -140,16 +156,25 @@ def _bits(array):
     return array.view({1: mx.uint8, 2: mx.uint16, 4: mx.uint32, 8: mx.uint64}[array.dtype.size])
 
 
-def _differs(a, b):
-    """True or a lazy bool scalar: shape/dtype inequality, any non-finite value,
-    or any bit difference (array_equal is not enough: -0 == +0, NaN != NaN)."""
+def _invalid(a, b):
+    """True or a lazy bool scalar: shape/dtype inequality or any non-finite value in either."""
     if a.shape != b.shape or a.dtype != b.dtype:
         return True
-    return (
-        mx.any(_bits(a) != _bits(b))
-        | ~mx.all(mx.isfinite(a))
-        | ~mx.all(mx.isfinite(b))
-    )
+    return ~mx.all(mx.isfinite(a)) | ~mx.all(mx.isfinite(b))
+
+
+def _bits_differ(a, b):
+    """Lazy bool scalar: any representation-level difference (array_equal is not enough:
+    -0 == +0, NaN != NaN). Only meaningful when shapes and dtypes are equal."""
+    return mx.any(_bits(a) != _bits(b))
+
+
+def _differs(a, b):
+    """True or a lazy bool scalar: invalid (shape/dtype/non-finite) or any bit difference."""
+    invalid = _invalid(a, b)
+    if invalid is True:
+        return True
+    return _bits_differ(a, b) | invalid
 
 
 @dataclass
@@ -228,6 +253,7 @@ class JointV1Policy:
             or n_q % n_kv != 0
             or gqa not in domain.gqa
             or _device_class() not in domain.device_classes
+            or not _mirror_matches_live_device(_device_class())
         ):
             return Decision("per_query", "domain")
         joint_mask = "causal"
@@ -271,7 +297,7 @@ class JointV1Policy:
         return served
 
     def _shadow(self, straddle, joint, other, queries, keys):
-        self._counts["verify_ab_straddle_blocks" if straddle else "verify_ab_blocks"] += 1
+        # AB counters advance only in end_block(), after the flags are materialised.
         self._ordinal += 1
         self._pending.append(
             _Pending(
@@ -290,6 +316,7 @@ class JointV1Policy:
         if flags:
             mx.eval(flags)
         for entry in pending:
+            self._counts["verify_ab_straddle_blocks" if entry.straddle else "verify_ab_blocks"] += 1
             bad = entry.flag if isinstance(entry.flag, bool) else bool(entry.flag.item())
             if not bad:
                 continue
@@ -298,6 +325,12 @@ class JointV1Policy:
                 continue
             self._counts["verify_ab_mismatch"] += 1
             self._log_mismatch(entry)
+
+    def discard_pending(self):
+        """Drop this round's unmaterialised comparisons (an exception aborted the round): no
+        counter advances and no array references are retained."""
+        self._pending = []
+        self._ordinal = 0
 
     def _log_mismatch(self, entry):
         shape = (entry.length, entry.key_length, str(entry.joint.dtype))
@@ -386,6 +419,17 @@ def require_environment(*, draft_kind, kv_bits):
         _fail("MLX_SDPA_BLOCKS is set (libmlx honours it, the plan mirror does not)")
 
 
+def require_loaded_mtp_drafter(policy, draft_model, draft_kind):
+    """After drafter resolution/compatibility handling: ``joint_v1`` serves only with a LOADED
+    MTP drafter. A drafter that resolved to another kind, or the incompatibility fallback
+    ``(None, None)``, must stop the load before READY (the verifier also serves suffix decoding)."""
+    if policy is not None and (draft_model is None or draft_kind != "mtp"):
+        _fail(
+            f"requires a loaded MTP drafter after resolution (draft_model "
+            f"{'loaded' if draft_model is not None else 'absent'}, kind {draft_kind!r}); refusing"
+        )
+
+
 def apply_to_model(model, policy) -> int:
     """Stamp ``policy`` on ``model``, its language model and every qwen3_5
     attention module (the verifier reads the module). Refuses an unsupported
@@ -438,14 +482,21 @@ def self_test(
         return q, k, v, decision
 
     def both(q, k, v, length, key_length):
+        """True when the two paths differ at the representation level on VALID outputs. A shape or
+        dtype error or any non-finite value ALWAYS rejects (never a "difference")."""
         try:
             joint = joint_attention(q, k, v, cache=cache, scale=scale, mask="causal")
             other = per_query_attention(q, k, v, cache=cache, scale=scale, mask=None)
             mx.eval(joint, other)
         except Exception as exc:  # noqa: BLE001 - any raise is fatal
             _fail(f"self-test failed at length={length} keys={key_length}: {exc}")
-        flag = _differs(joint, other)
-        return flag if isinstance(flag, bool) else bool(flag.item())
+        bad = _invalid(joint, other)
+        if bad is True or bool(bad.item()):
+            _fail(
+                f"self-test: invalid output (shape/dtype/non-finite) at length={length} "
+                f"keys={key_length}"
+            )
+        return bool(_bits_differ(joint, other).item())
 
     q, k, v, decision = cell(max(longest, MIN_LENGTH), SELF_TEST_KEYS)
     if longest < MIN_LENGTH or decision.route != "joint":
