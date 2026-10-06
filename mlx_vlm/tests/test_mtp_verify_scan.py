@@ -560,75 +560,43 @@ class TestAC4Propagation:
 
 
 # ------------------------------------------------------------------ AC5
-ALLOWED = {
-    "mlx_vlm/mtp_verify_scan.py",
-    "mlx_vlm/models/qwen3_5/speculative_verifier.py",
-    "mlx_vlm/server/cli.py",
-    "mlx_vlm/server/generation.py",
-    "mlx_vlm/server/schemas.py",
-    "mlx_vlm/server/openai.py",
-    "mlx_vlm/server/anthropic.py",
-    ".github/workflows/tests.yml",  # CI runs the golden registry tests (MLX_REQUIRE_STACK_REGISTRY)
+# Fork (v0.7.6 sync): AC5 was M58's branch-scope criterion, checked as a diff against
+# the `main` branch -- vacuous once merged and false-failing on any other branch, and a
+# re-pin to M58's fixed range could never fail. Historical evidence of the original
+# scope lives in M58's review record; what stays testable is the CURRENT tree, so AC5
+# now pins invariants of the shipped verifier and of M58's markers.
+_VERIFIER = "mlx_vlm/models/qwen3_5/speculative_verifier.py"
+# Minimum `Fork (M58)` marker count per upstream-owned file M58 touched (as merged at
+# the v0.7.6 sync). A drop means M58 code was edited or lost without its marker.
+_M58_MARKERS = {
+    "mlx_vlm/models/qwen3_5/speculative_verifier.py": 7,
+    "mlx_vlm/server/cli.py": 4,
+    "mlx_vlm/server/generation.py": 14,
+    "mlx_vlm/server/schemas.py": 5,
+    "mlx_vlm/server/openai.py": 8,
+    "mlx_vlm/server/anthropic.py": 2,
 }
-UNTOUCHED = [
-    "mlx_vlm/models/nemotron_h",
-    "mlx_vlm/models/gemma4",
-    "mlx_vlm/models/lfm2",
-    "mlx_vlm/models/glm_moe_dsa",
-    "mlx_vlm/models/base.py",
-    "mlx_vlm/models/quantized_verifier.py",
-    "mlx_vlm/models/qwen3_5/language.py",
-]
-
-
-# Fork: AC5 is M58's scope criterion. It used to diff the working tree against the
-# `main` branch, which is vacuous on main and fails on every other branch (e.g. an
-# upstream-sync branch). Pin it to M58's own range instead: the commit before M58's
-# first change (fbe2775e, M57 round 2) and M58's last commit (664c2ead).
-_AC5_BASE = "fbe2775e393fdd2513a9cb30cafc5e97b71613e2"
-_AC5_HEAD = "664c2eade5ac726181157bbb3b01bdcafe27f457"
-
-
-def _git(*args):
-    return subprocess.run(
-        ["git", "-C", str(REPO), *args], capture_output=True, text=True, check=True
-    ).stdout
 
 
 class TestAC5Scope:
-    def test_ac5_diff_touches_only_the_listed_files(self):
-        changed = set(_git("diff", "--name-only", _AC5_BASE, _AC5_HEAD).split())
-        extra = {
-            f for f in changed
-            if f not in ALLOWED and not f.startswith("mlx_vlm/tests/")
-        }
-        assert not extra, extra
+    def test_ac5_verifier_keeps_its_three_sdpa_calls(self):
+        now = (REPO / _VERIFIER).read_text()
+        assert now.count("scaled_dot_product_attention(") == 3
 
-    def test_ac5_other_verifiers_helper_and_quantized_branches_are_untouched(self):
-        assert _git("diff", _AC5_BASE, _AC5_HEAD, "--", *UNTOUCHED) == ""
-
-    def test_ac5_every_hunk_in_upstream_owned_files_is_marked(self):
-        owned = sorted(ALLOWED - {"mlx_vlm/mtp_verify_scan.py"})
-        diff = _git("diff", "-U0", _AC5_BASE, _AC5_HEAD, "--", *owned)
-        hunks, current = [], None
-        for line in diff.splitlines():
-            if line.startswith("@@"):
-                current = []
-                hunks.append(current)
-            elif current is not None and line.startswith("+") and not line.startswith("+++"):
-                current.append(line)
-        # a hunk may be a pure deletion; every added-line hunk needs the marker
-        unmarked = [h for h in hunks if h and not any("Fork (M58)" in l for l in h)]
-        assert not unmarked, unmarked[:3]
-
-    def test_ac5_verifier_keeps_its_sdpa_calls_and_never_passes_policy_keywords(self):
-        path = "mlx_vlm/models/qwen3_5/speculative_verifier.py"
-        now = (REPO / path).read_text()
-        main = _git("show", f"main:{path}")
-        assert now.count("scaled_dot_product_attention(") == main.count(
-            "scaled_dot_product_attention("
-        )
+    def test_ac5_verifier_never_passes_policy_keywords(self):
+        now = (REPO / _VERIFIER).read_text()
         assert "force_fused" not in now and "policy=" not in now
+
+    @pytest.mark.parametrize("path,minimum", sorted(_M58_MARKERS.items()))
+    def test_ac5_m58_markers_are_present(self, path, minimum):
+        assert (REPO / path).read_text().count("Fork (M58)") >= minimum
+
+    def test_ac5_upstream_lines_in_the_verifier_are_attributed(self):
+        """Upstream code merged into the M58-scope verifier says so, so it is never
+        mistaken for M58 work (the MoE stop_gradient came with #2409)."""
+        lines = (REPO / _VERIFIER).read_text().splitlines()
+        stops = [l for l in lines if "mx.stop_gradient(" in l]
+        assert stops and all("upstream #2409" in l for l in stops), stops
 
 
 # ------------------------------------------------------------------ AC6

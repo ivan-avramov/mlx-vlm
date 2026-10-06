@@ -1,3 +1,4 @@
+# Fork: the docstring documents the optional cryptography dependency and the chat switch.
 """Conversation compaction and stateless replay.
 
 Fork: the encrypted capsules need the OPTIONAL ``cryptography`` package
