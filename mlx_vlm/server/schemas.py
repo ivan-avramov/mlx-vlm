@@ -486,6 +486,7 @@ class GenerationTimings(BaseModel):
     draft_n_accepted: Optional[int] = None
     sdpa_forced: Optional[int] = None  # Fork (M57): fused_v1 request counters
     sdpa_auto: Optional[int] = None  # Fork (M57)
+    verify_counters: Optional[dict] = None  # Fork (M58): joint_v1 request counters
 
     @model_serializer(mode="wrap")  # Fork (M57): omitted (not null) under `auto`
     def _omit_unset_sdpa(self, handler):
@@ -493,6 +494,9 @@ class GenerationTimings(BaseModel):
         for key in ("sdpa_forced", "sdpa_auto"):
             if data.get(key) is None:
                 data.pop(key, None)
+        _verify = data.pop("verify_counters", None)  # Fork (M58): flattened
+        if _verify:
+            data.update(_verify)
         return data
 
     @staticmethod
@@ -540,6 +544,7 @@ class GenerationTimings(BaseModel):
             draft_n_accepted=getattr(metrics, "draft_n_accepted", None),
             sdpa_forced=getattr(metrics, "sdpa_forced", None),  # Fork (M57)
             sdpa_auto=getattr(metrics, "sdpa_auto", None),  # Fork (M57)
+            verify_counters=getattr(metrics, "verify_counters", None),  # Fork (M58)
         )
 
 
@@ -549,6 +554,7 @@ class StreamingTimings(BaseModel):
     predicted_per_second: Optional[float] = None
     sdpa_forced: Optional[int] = None  # Fork (M57)
     sdpa_auto: Optional[int] = None  # Fork (M57)
+    verify_counters: Optional[dict] = None  # Fork (M58)
 
     @model_serializer(mode="wrap")  # Fork (M57): omitted (not null) under `auto`
     def _omit_unset_sdpa(self, handler):
@@ -556,6 +562,9 @@ class StreamingTimings(BaseModel):
         for key in ("sdpa_forced", "sdpa_auto"):
             if data.get(key) is None:
                 data.pop(key, None)
+        _verify = data.pop("verify_counters", None)  # Fork (M58): flattened
+        if _verify:
+            data.update(_verify)
         return data
 
 

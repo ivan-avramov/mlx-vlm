@@ -208,6 +208,32 @@ def _apply_attention_policy_from_env(model):
     return policy
 
 
+def _apply_mtp_verify_from_env(model, *, draft_kind, kv_bits):
+    # Fork (M58): resolved ONCE at load, stamped on the instance; never re-read.
+    from .. import mtp_verify_scan as _mv
+
+    try:
+        policy = _mv.resolve_policy(
+            os.environ.get(_mv.ENV_SCAN), ab=os.environ.get(_mv.ENV_AB, "0") == "1"
+        )
+    except ValueError as exc:
+        _mv._fail(str(exc))
+    if policy is None:
+        return None
+    _mv.require_environment(draft_kind=draft_kind, kv_bits=kv_bits)
+    _mv.require_gpu()
+    _mv.apply_to_model(model, policy)
+    results = _mv.self_test_model(model, policy)
+    line = (
+        f"mtp_verify_scan={policy.name}{'+ab' if policy.ab else ''} self-test: "
+        f"{sum(r.ran for r in results)} cells in "
+        f"{sum(r.elapsed_s for r in results):.2f}s"
+    )
+    logger.info(line)
+    print(line, file=sys.stderr, flush=True)
+    return policy
+
+
 def _apply_lazy_embeddings_from_env(model):
     # Fork (M57): `--lazy-prompt-embeddings`, resolved ONCE at load onto the model.
     on = os.environ.get("MLX_VLM_LAZY_PROMPT_EMBEDDINGS", "0") == "1"
@@ -619,6 +645,10 @@ class ServerMetricsStore:
         if payload.get("sdpa_forced") is not None:
             _sdpa_fmt = " sdpa_forced=%d sdpa_auto=%d"
             _sdpa_args = (payload["sdpa_forced"], payload.get("sdpa_auto") or 0)
+        _verify_text = _format_verify_counters(payload)  # Fork (M58)
+        if _verify_text:  # Fork (M58): only under a non-default scan policy
+            _sdpa_fmt += " %s"
+            _sdpa_args += (_verify_text,)
         logger.info(
             "Request completed: endpoint=%s model=%s stream=%s backend=%s "
             "session=%s cached_tokens=%d "
@@ -731,6 +761,18 @@ def _decode_elapsed_from_metrics(
     return None
 
 
+def _format_verify_counters(payload: dict) -> str:  # Fork (M58)
+    import json
+
+    parts = []
+    for key in sorted(k for k in payload if k.startswith("verify_")):
+        value = payload[key]
+        if isinstance(value, dict):
+            value = json.dumps(value, sort_keys=True, separators=(",", ":"))
+        parts.append(f"{key}={value}")
+    return " ".join(parts)
+
+
 def _build_metrics_envelope(
     *,
     endpoint: str,
@@ -763,6 +805,7 @@ def _build_metrics_envelope(
     cached_tokens: int = 0,
     sdpa_forced: Optional[int] = None,  # Fork (M57): fused_v1 request counters
     sdpa_auto: Optional[int] = None,  # Fork (M57)
+    verify_counters: Optional[dict] = None,  # Fork (M58): joint_v1 request counters
 ) -> dict:
     token_times = token_times or []
     ttft_s = max(0.0, token_times[0] - request_started_s) if token_times else None
@@ -826,6 +869,8 @@ def _build_metrics_envelope(
     if sdpa_forced is not None:  # Fork (M57): absent under auto (byte-identical)
         envelope["sdpa_forced"] = int(sdpa_forced)
         envelope["sdpa_auto"] = int(sdpa_auto or 0)
+    if verify_counters:  # Fork (M58): absent under per_query (byte-identical)
+        envelope.update(verify_counters)
     return envelope
 
 
@@ -1065,6 +1110,7 @@ class GenerationMetrics:
     draft_n: Optional[int] = None
     sdpa_forced: Optional[int] = None  # Fork (M57)
     sdpa_auto: Optional[int] = None  # Fork (M57)
+    verify_counters: Optional[dict] = None  # Fork (M58)
 
     def record_chunk(self, chunk) -> Optional[float]:
         now = getattr(chunk, "emitted_at", None) or time.perf_counter()
@@ -1126,6 +1172,9 @@ class GenerationMetrics:
             _value = getattr(result, _name, None)
             if _value is not None:
                 setattr(self, _name, int(_value))
+        _verify = getattr(result, "verify_counters", None)  # Fork (M58)
+        if _verify is not None:
+            self.verify_counters = dict(_verify)
 
 
 @dataclass
@@ -1153,6 +1202,7 @@ class StreamingToken:
     emitted_at: Optional[float] = None
     sdpa_forced: Optional[int] = None  # Fork (M57): fused_v1 request counters
     sdpa_auto: Optional[int] = None  # Fork (M57)
+    verify_counters: Optional[dict] = None  # Fork (M58): joint_v1 request counters
 
 
 class _DiffusionBlockEmitter:
@@ -1393,6 +1443,11 @@ class ResponseGenerator:
             _apply_moe_expand_and_log(model, moe_expand_spec)
 
         self.attention_policy = _apply_attention_policy_from_env(model)  # Fork (M57)
+        self.mtp_verify_policy = _apply_mtp_verify_from_env(  # Fork (M58)
+            model,
+            draft_kind=self.draft_kind_override or os.environ.get("MLX_VLM_DRAFT_KIND"),
+            kv_bits=self.kv_bits,
+        )
         _apply_lazy_embeddings_from_env(model)  # Fork (M57)
 
         stop_tokens = set(
@@ -1740,6 +1795,11 @@ class ResponseGenerator:
         # Fork (M57): per-request sdpa decision counters (None under auto).
         _attn_policy = getattr(self, "attention_policy", None)
         _attn_snapshot = _attn_policy.snapshot() if _attn_policy is not None else None
+        # Fork (M58): per-request verification-scan counters (None under per_query).
+        _verify_policy = getattr(self, "mtp_verify_policy", None)
+        _verify_snapshot = (
+            _verify_policy.snapshot() if _verify_policy is not None else None
+        )
         if self.kv_bits is not None:
             gen_kwargs["kv_bits"] = self.kv_bits
             gen_kwargs["kv_group_size"] = self.kv_group_size
@@ -1894,10 +1954,14 @@ class ResponseGenerator:
                 _sdpa = (None, None)  # Fork (M57)
                 if chunk.finish_reason is not None and _attn_snapshot is not None:
                     _sdpa = _attn_policy.since(_attn_snapshot)
+                _verify = None  # Fork (M58)
+                if chunk.finish_reason is not None and _verify_snapshot is not None:
+                    _verify = _verify_policy.since(_verify_snapshot)
                 rqueue.put(
                     StreamingToken(
                         sdpa_forced=_sdpa[0],  # Fork (M57)
                         sdpa_auto=_sdpa[1],  # Fork (M57)
+                        verify_counters=_verify,  # Fork (M58)
                         text=chunk.text,
                         token=token_id,
                         logprobs=lp_scalar,

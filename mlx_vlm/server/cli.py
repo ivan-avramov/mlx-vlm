@@ -628,6 +628,19 @@ def main():
         help="Fused-attention dispatch policy for native-KV full attention "
         "(qwen3_5 only). auto = unchanged behaviour. Env: MLX_VLM_ATTENTION_POLICY.",
     )
+    parser.add_argument(  # Fork (M58)
+        "--mtp-verify-scan",
+        choices=["per_query", "joint_v1"],
+        default="per_query",
+        help="MTP verification scan for qwen3_5 native-KV blocks (requires "
+        "--draft-kind mtp). per_query = unchanged. Env: MLX_VLM_MTP_VERIFY_SCAN.",
+    )
+    parser.add_argument(  # Fork (M58)
+        "--mtp-verify-ab",
+        action="store_true",
+        help="Gate-1 instrument (requires --mtp-verify-scan joint_v1): compute both "
+        "paths per block, serve the joint one, count bitwise mismatches.",
+    )
     parser.add_argument(  # Fork (M57)
         "--lazy-prompt-embeddings",
         action="store_true",
@@ -649,6 +662,8 @@ def main():
         "Env: MLX_VLM_LOG_FILE (default: <stdout>).",
     )
     args = parser.parse_args()
+    if args.mtp_verify_ab and args.mtp_verify_scan != "joint_v1":  # Fork (M58)
+        parser.error("--mtp-verify-ab requires --mtp-verify-scan joint_v1")
 
     # Configure logging — CLI args override env vars, env vars override defaults
     log_level_str = args.log_level or os.environ.get("MLX_VLM_LOG_LEVEL", "INFO")
@@ -719,6 +734,8 @@ def main():
     _configure_moe_expand(args.moe_expand)
     # Fork (M57): always written (like moe_expand) so a stale export cannot leak.
     os.environ["MLX_VLM_ATTENTION_POLICY"] = args.attention_policy
+    os.environ["MLX_VLM_MTP_VERIFY_SCAN"] = args.mtp_verify_scan  # Fork (M58)
+    os.environ["MLX_VLM_MTP_VERIFY_AB"] = "1" if args.mtp_verify_ab else "0"
     os.environ["MLX_VLM_LAZY_PROMPT_EMBEDDINGS"] = (
         "1" if args.lazy_prompt_embeddings else "0"
     )

@@ -886,6 +886,7 @@ async def anthropic_messages_endpoint(http_request: Request):
                         cached_tokens=metrics.cached_tokens,  # Fork: fork-only field
                         sdpa_forced=metrics.sdpa_forced,  # Fork (M57)
                         sdpa_auto=metrics.sdpa_auto,  # Fork (M57)
+                        verify_counters=metrics.verify_counters,  # Fork (M58)
                         prompt_tokens=prompt_tokens,
                         completion_tokens=completion_tokens,
                         generated_tokens=output_tokens,
@@ -1096,6 +1097,7 @@ async def anthropic_messages_endpoint(http_request: Request):
                 cached_tokens=metrics.cached_tokens,
                 sdpa_forced=metrics.sdpa_forced,  # Fork (M57)
                 sdpa_auto=metrics.sdpa_auto,  # Fork (M57)
+                verify_counters=metrics.verify_counters,  # Fork (M58)
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 generated_tokens=output_tokens,

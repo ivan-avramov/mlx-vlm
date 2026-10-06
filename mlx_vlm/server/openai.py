@@ -641,6 +641,7 @@ def _streaming_timings(rate, metrics=None) -> StreamingTimings:
         predicted_per_second=rate,
         sdpa_forced=getattr(metrics, "sdpa_forced", None),
         sdpa_auto=getattr(metrics, "sdpa_auto", None),
+        verify_counters=getattr(metrics, "verify_counters", None),  # Fork (M58)
     )
 
 
@@ -732,7 +733,11 @@ def _completion_final_chunk(
         created=created,
         model=model,
         choices=[CompletionStreamChoice(text="", index=0, finish_reason=finish_reason)],
-        timings=timings if timings.sdpa_forced is not None else None,  # Fork (M57)
+        timings=(  # Fork (M58): also when only verify counters are set
+            timings
+            if timings.sdpa_forced is not None or timings.verify_counters is not None
+            else None
+        ),
     )
 
 
@@ -1767,6 +1772,7 @@ async def responses_endpoint(request: Request):
                         cached_tokens=metrics.cached_tokens,
                         sdpa_forced=metrics.sdpa_forced,  # Fork (M57)
                         sdpa_auto=metrics.sdpa_auto,  # Fork (M57)
+                        verify_counters=metrics.verify_counters,  # Fork (M58)
                         prompt_tokens=usage_stats["input_tokens"],
                         completion_tokens=usage_stats["output_tokens"],
                         generated_tokens=usage_stats["output_tokens"],
@@ -1988,6 +1994,7 @@ async def responses_endpoint(request: Request):
                     cached_tokens=metrics.cached_tokens,
                     sdpa_forced=metrics.sdpa_forced,  # Fork (M57)
                     sdpa_auto=metrics.sdpa_auto,  # Fork (M57)
+                    verify_counters=metrics.verify_counters,  # Fork (M58)
                     prompt_tokens=prompt_tokens,
                     completion_tokens=output_tokens,
                     generated_tokens=output_tokens,
@@ -2734,6 +2741,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         cached_tokens=metrics.cached_tokens,
                         sdpa_forced=metrics.sdpa_forced,  # Fork (M57)
                         sdpa_auto=metrics.sdpa_auto,  # Fork (M57)
+                        verify_counters=metrics.verify_counters,  # Fork (M58)
                         prompt_tokens=(
                             ctx.prompt_tokens
                             if runtime.response_generator is not None
@@ -3053,6 +3061,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     cached_tokens=metrics.cached_tokens,
                     sdpa_forced=metrics.sdpa_forced,  # Fork (M57)
                     sdpa_auto=metrics.sdpa_auto,  # Fork (M57)
+                    verify_counters=metrics.verify_counters,  # Fork (M58)
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     generated_tokens=output_tokens,
@@ -3358,6 +3367,7 @@ async def completions_endpoint(request: Request):
                         cached_tokens=metrics.cached_tokens,
                         sdpa_forced=metrics.sdpa_forced,  # Fork (M57)
                         sdpa_auto=metrics.sdpa_auto,  # Fork (M57)
+                        verify_counters=metrics.verify_counters,  # Fork (M58)
                         prompt_tokens=prompt_tokens,
                         completion_tokens=completion_tokens,
                         generated_tokens=output_tokens,
@@ -3530,6 +3540,7 @@ async def completions_endpoint(request: Request):
                 cached_tokens=metrics.cached_tokens,
                 sdpa_forced=metrics.sdpa_forced,  # Fork (M57)
                 sdpa_auto=metrics.sdpa_auto,  # Fork (M57)
+                verify_counters=metrics.verify_counters,  # Fork (M58)
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 generated_tokens=output_tokens,
