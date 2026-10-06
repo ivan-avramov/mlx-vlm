@@ -315,11 +315,43 @@ class TestExclusionsFileParsing:
         No runtime file may appear here.
         """
         parsed = cbd.load_exclusions()
-        assert all(
-            p in ("mlx_vlm/tests/test_generate.py", "mlx_vlm/tests/test_server.py")
-            and r.startswith("C104(c) port:")
-            for p, _s, r in parsed
-        ), parsed
+        root = Path(__file__).resolve().parents[2]
+        for path, symbol, reason in parsed:
+            assert path in (
+                "mlx_vlm/tests/test_generate.py",
+                "mlx_vlm/tests/test_server.py",
+            ) and reason.startswith("C104(c) port @"), (path, symbol, reason)
+            # Re-verify the claim: the body is byte-identical to the pinned upstream
+            # revision, so the entry excuses ordering only, never content.
+            upstream = _pinned_upstream_source(_pinned_rev(reason), path)
+            ours = cbd.definition_bodies((root / path).read_text())[0]
+            theirs = cbd.definition_bodies(upstream)[0]
+            assert symbol in ours and ours[symbol] == theirs.get(symbol), (path, symbol)
+
+
+# Fork (v0.7.6 sync, cold review): admitted entries are RE-VERIFIED against the
+# upstream revision recorded in each entry (`@<rev>`), not trusted by reason prefix.
+def _pinned_upstream_source(rev, path):
+    import subprocess
+
+    root = Path(__file__).resolve().parents[2]
+    if subprocess.run(
+        ["git", "-C", str(root), "cat-file", "-e", f"{rev}^{{commit}}"],
+        capture_output=True,
+    ).returncode:
+        pytest.skip(f"pinned upstream revision {rev} is not in this clone")
+    return subprocess.run(
+        ["git", "-C", str(root), "show", f"{rev}:{path}"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+
+
+def _pinned_rev(reason):
+    import re
+
+    match = re.search(r"@([0-9a-f]{7,40})\b", reason)
+    assert match, f"entry reason must record the upstream revision: {reason!r}"
+    return match.group(1)
 
 
 class TestAbsentUpstreamLines:

@@ -100,6 +100,56 @@ def defined_names(source: str) -> set[str]:
     }
 
 
+def defined_qualnames(source: str) -> dict[str, set[str]]:
+    """Fork (v0.7.6 sync): {bare name: {dotted scope paths}} for every def/class.
+
+    `TestA.verify`, `helper.verify` -- lets an exclusion name ONE scope, so a generic
+    name (`verify`, `forward`) excused in one class does not also excuse a future
+    dropped def of the same name elsewhere in the file.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return {}
+    out: dict[str, set[str]] = {}
+
+    def walk(node, prefix):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                qual = prefix + child.name
+                out.setdefault(child.name, set()).add(qual)
+                walk(child, qual + ".")
+            else:
+                walk(child, prefix)
+
+    walk(tree, "")
+    return out
+
+
+def scoped_excuse(path, name, quals, exclusions):
+    """Fork (v0.7.6 sync): the exclusion entries that excuse `name` in `path`, or
+    None. A bare entry (no dot) excuses the name in every scope, as before; a dotted
+    entry excuses only matching scopes (`.name` = module scope only), and every
+    scope of `name` must be excused."""
+    used = set()
+    for qual in quals or {name}:
+        for path_glob, sym_glob, _reason in exclusions:
+            if not fnmatch.fnmatch(path, path_glob):
+                continue
+            if sym_glob.startswith("."):  # `.name`: module scope only
+                matched = "." not in qual and fnmatch.fnmatch(qual, sym_glob[1:])
+            else:
+                matched = fnmatch.fnmatch(qual, sym_glob) or (
+                    "." not in sym_glob and fnmatch.fnmatch(name, sym_glob)
+                )
+            if matched:
+                used.add((path_glob, sym_glob))
+                break
+        else:
+            return None
+    return used
+
+
 def load_exclusions() -> list[tuple[str, str, str]]:
     """Return [(path_glob, symbol_glob, reason)] from .symbol-exclusions.
 
@@ -162,12 +212,13 @@ def main() -> int:
         if not local.exists():  # staged deletion
             continue
         our_names = defined_names(local.read_text())
+        up_quals = defined_qualnames(upstream_sources.get(path, ""))
         for name in sorted(up_names - our_names):
-            for path_glob, sym_glob, _reason in exclusions:
-                if fnmatch.fnmatch(path, path_glob) and fnmatch.fnmatch(name, sym_glob):
-                    excused += 1
-                    used.add((path_glob, sym_glob))
-                    break
+            # Fork (v0.7.6 sync): every upstream scope of `name` must be excused.
+            hit = scoped_excuse(path, name, up_quals.get(name), exclusions)
+            if hit is not None:
+                excused += 1
+                used |= hit
             else:
                 missing.append((path, name))
 

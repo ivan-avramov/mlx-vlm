@@ -54,6 +54,31 @@ def _symbols(findings, kind):
     return sorted(symbol for k, symbol, _d in findings if k == kind)
 
 
+# Fork (v0.7.6 sync, cold review): admitted entries are RE-VERIFIED against the
+# upstream revision recorded in each entry (`@<rev>`), not trusted by reason prefix.
+def _pinned_upstream_source(rev, path):
+    import subprocess
+
+    root = Path(__file__).resolve().parents[2]
+    if subprocess.run(
+        ["git", "-C", str(root), "cat-file", "-e", f"{rev}^{{commit}}"],
+        capture_output=True,
+    ).returncode:
+        pytest.skip(f"pinned upstream revision {rev} is not in this clone")
+    return subprocess.run(
+        ["git", "-C", str(root), "show", f"{rev}:{path}"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+
+
+def _pinned_rev(reason):
+    import re
+
+    match = re.search(r"@([0-9a-f]{7,40})\b", reason)
+    assert match, f"entry reason must record the upstream revision: {reason!r}"
+    return match.group(1)
+
+
 class TestContainerEntries:
     """Shape 1's parser. A form it does not recognise is a registry never compared."""
 
@@ -372,8 +397,19 @@ class TestExclusionsFileParsing:
         # by upstream tests the fork-owned copies do not carry. They stay confined to
         # test files and carry a `REVIEWED: C104` reason; the five runtime ones are pinned.
         parsed = cur.load_exclusions()
-        c104 = [e for e in parsed if e[2].startswith("REVIEWED: C104 unported:")]
+        c104 = [e for e in parsed if e[2].startswith("REVIEWED: C104 unported @")]
         assert c104 and all(p.startswith("mlx_vlm/tests/") for p, _s, _r in c104)
+        # Re-verify each admitted entry: at the recorded upstream revision the audit
+        # really reports that symbol missing from our copy (a live, test-file-only gap).
+        root = Path(__file__).resolve().parents[2]
+        for path, symbol, reason in c104:
+            upstream = _pinned_upstream_source(_pinned_rev(reason), path)
+            found = {
+                sym for _kind, sym, _detail in cur.findings_for_file(
+                    path, upstream, (root / path).read_text()
+                )
+            }
+            assert symbol in found, (path, symbol, "excused but not missing")
         parsed = [e for e in parsed if e not in c104]
 
         assert len(parsed) == 5

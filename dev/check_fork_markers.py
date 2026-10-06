@@ -129,6 +129,37 @@ def load_allowlist() -> list[tuple[str, str]]:
     return out
 
 
+_MIN_PIN = 7
+
+
+def parse_allowlist_rule(rule: str) -> tuple[str, str | None]:
+    """Fork (v0.7.6 sync): `path_glob` or `path_glob@<git blob prefix>`.
+
+    A pinned entry exempts the file only while its staged blob still starts with the
+    pin, so a later edit (marked or not) brings the file back under the gate until
+    it is reviewed and re-pinned. Whole-file entries without a pin exempt forever.
+    """
+    glob, sep, pin = rule.partition("@")
+    if not sep:
+        return rule, None
+    pin = pin.strip().lower()
+    if len(pin) < _MIN_PIN or any(c not in "0123456789abcdef" for c in pin):
+        sys.exit(f"{ALLOWLIST_FILE.name}: bad blob pin in {rule!r} (hex, >= {_MIN_PIN})")
+    return glob.strip(), pin
+
+
+def allowlist_entry_applies(path: str, glob: str, pin, blob_of) -> bool:
+    """Fork (v0.7.6 sync): whether an allowlist entry exempts `path` right now."""
+    if not fnmatch.fnmatch(path, glob):
+        return False
+    return pin is None or blob_of(path).startswith(pin)
+
+
+def staged_blob(path: str) -> str:
+    """Fork (v0.7.6 sync): the index blob id of `path` (the audits read the index)."""
+    return git("rev-parse", f":{path}").strip()
+
+
 def load_symbol_exclusions() -> list[tuple[str, str]]:
     """Return [(path_glob, symbol_glob)] from .symbol-exclusions.
 
@@ -180,7 +211,17 @@ def deletion_of_excused_symbols(
     names = [m.group(1) for l in body if (m := DELETED_DEF_RE.match(l))]
     if not names:
         return False, names
-    covered = all(any(n == g or fnmatch.fnmatch(n, g) for g in excused) for n in names)
+    # Fork (v0.7.6 sync): a scoped entry (`Class.method`) excuses its last component
+    # here -- the deleted line carries only the bare name.
+    covered = all(
+        any(
+            n == g
+            or fnmatch.fnmatch(n, g)
+            or ("." in g and fnmatch.fnmatch(n, g.rsplit(".", 1)[1]))
+            for g in excused
+        )
+        for n in names
+    )
     return covered, names
 
 
@@ -368,16 +409,33 @@ def main() -> int:
     # kept so --summary can rank the rollout. Discarding them here is what made
     # --summary structurally unable to show the only files that still need work.
     allowed_sites: dict = {}
+    pinned_out: list[str] = []
     for path in list(uncovered):
-        for glob, _reason in allowlist:
-            if fnmatch.fnmatch(path, glob):
-                used.add(glob)
+        for rule, _reason in allowlist:
+            glob, pin = parse_allowlist_rule(rule)
+            if pin is not None and fnmatch.fnmatch(path, glob) and not (
+                allowlist_entry_applies(path, glob, pin, staged_blob)
+            ):
+                pinned_out.append(f"{rule} (now {staged_blob(path)[:12]})")
+                continue
+            if allowlist_entry_applies(path, glob, pin, staged_blob):
+                used.add(rule)
                 allowed_files.append(path)
                 allowed_sites[path] = uncovered[path]
                 del uncovered[path]
                 break
 
     stale = [glob for glob, _ in allowlist if glob not in used]
+    if pinned_out:
+        # Fork (v0.7.6 sync): a pinned entry whose file changed no longer applies.
+        print(
+            f"\nnote: {len(pinned_out)} pinned {ALLOWLIST_FILE.name} entr(ies) no "
+            "longer match the staged file; its sites are gated until re-reviewed "
+            "and re-pinned:",
+            file=sys.stderr,
+        )
+        for entry in pinned_out:
+            print(f"      - {entry}", file=sys.stderr)
 
     if args.summary or uncovered:
         if allowed_files:

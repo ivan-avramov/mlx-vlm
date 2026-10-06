@@ -389,6 +389,10 @@
 # not per-definition, so they are allowlisted rather than marked. Recorded
 # 2026-10-06 (audit baseline before the v0.7.6 sync). Drain by porting upstream's
 # passing tests (150 of them pass against fork code; see .symbol-exclusions).
-mlx_vlm/tests/test_generate.py  # C104(a)/(c): fork-owned copy kept over upstream #2276 rewrite
-mlx_vlm/tests/test_server.py  # C104(a)/(c): fork-owned copy kept over upstream #2276 rewrite
-mlx_vlm/tests/test_speculative.py  # C104(a)/(c): fork-owned copy kept over upstream #2276 rewrite
+# Pinned (v0.7.6 sync, after cold review): each entry names the file's git blob
+# (`path@<blob>`), so ANY later edit brings the file back under the gate. After
+# reviewing that edit (and marking new fork sites), re-pin with
+# `git rev-parse :<path>` -- tests/test_audit_scoped_exclusions.py enforces it.
+mlx_vlm/tests/test_generate.py@c6b9c99f6110  # C104(a)/(c): fork-owned copy kept over upstream #2276 rewrite; pinned to this blob
+mlx_vlm/tests/test_server.py@f7b2f53f5b09  # C104(a)/(c): fork-owned copy kept over upstream #2276 rewrite; pinned to this blob
+mlx_vlm/tests/test_speculative.py@b3373b50b9e4  # C104(a)/(c): fork-owned copy kept over upstream #2276 rewrite; pinned to this blob

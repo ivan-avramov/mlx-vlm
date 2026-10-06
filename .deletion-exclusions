@@ -232,7 +232,7 @@ mlx_vlm/tests/test_generate.py::TestGenerationResult  # C104(a)/(c) retained in 
 mlx_vlm/tests/test_generate.py::TestSamplerArgs  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it
 mlx_vlm/tests/test_generate.py::capture_hash  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it
 mlx_vlm/tests/test_generate.py::extend  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it
-mlx_vlm/tests/test_generate.py::last_segment  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it
+mlx_vlm/tests/test_generate.py::test_stream_generate_forwards_verbose_to_generate_step.FakeDetokenizer.last_segment  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it [scope-qualified at the v0.7.6 sync]
 mlx_vlm/tests/test_generate.py::make_row  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it
 mlx_vlm/tests/test_generate.py::record_async_eval  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it
 mlx_vlm/tests/test_generate.py::test_arrays_cache_masks_the_declared_padding  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it
@@ -355,13 +355,16 @@ mlx_vlm/tests/test_server.py::fake_stream_diffusion_generate_from_kwargs  # C104
 mlx_vlm/tests/test_server.py::flush_bytes  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it
 mlx_vlm/tests/test_server.py::generate_one  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it
 mlx_vlm/tests/test_server.py::get_input_embeddings  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it
-mlx_vlm/tests/test_server.py::has_pending_prompts  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it
+mlx_vlm/tests/test_server.py::TestResponseGenerator.test_idle_batch_generator_is_recreated_for_new_sampler.FakeBatchGenerator.has_pending_prompts  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it [scope-qualified at the v0.7.6 sync]
+mlx_vlm/tests/test_server.py::TestResponseGenerator.test_run_batches_eight_streaming_requests.FakeBatchGenerator.has_pending_prompts  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it [scope-qualified at the v0.7.6 sync]
+mlx_vlm/tests/test_server.py::test_run_threads_per_request_seed_into_batch_insert.FakeBatchGenerator.has_pending_prompts  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it [scope-qualified at the v0.7.6 sync]
 mlx_vlm/tests/test_server.py::initialize_model  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it
 mlx_vlm/tests/test_server.py::make_criteria  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it
 mlx_vlm/tests/test_server.py::post  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it
 mlx_vlm/tests/test_server.py::run_lifespan  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it
 mlx_vlm/tests/test_server.py::run_request  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it
-mlx_vlm/tests/test_server.py::start  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it
+mlx_vlm/tests/test_server.py::TestCompaction.real_server.start  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it [scope-qualified at the v0.7.6 sync]
+mlx_vlm/tests/test_server.py::test_response_generator_prefill_step_override_wins_over_environment.DormantThread.start  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it [scope-qualified at the v0.7.6 sync]
 mlx_vlm/tests/test_server.py::test_accepts_assistant_with_tool_calls  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it
 mlx_vlm/tests/test_server.py::test_accepts_tool_role  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it
 mlx_vlm/tests/test_server.py::test_anthropic_messages_any_tool_choice_adds_instruction  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it
@@ -594,7 +597,9 @@ mlx_vlm/tests/test_server.py::test_vl_messages_preserve_content_order  # C104(a)
 mlx_vlm/tests/test_server.py::test_whisper_segments_unchanged  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it
 mlx_vlm/tests/test_server.py::to_dict  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it
 mlx_vlm/tests/test_server.py::tokenizer_work  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it
-mlx_vlm/tests/test_server.py::unprocessed_prompts  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it
+mlx_vlm/tests/test_server.py::TestResponseGenerator.test_idle_batch_generator_is_recreated_for_new_sampler.FakeBatchGenerator.unprocessed_prompts  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it [scope-qualified at the v0.7.6 sync]
+mlx_vlm/tests/test_server.py::TestResponseGenerator.test_run_batches_eight_streaming_requests.FakeBatchGenerator.unprocessed_prompts  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it [scope-qualified at the v0.7.6 sync]
+mlx_vlm/tests/test_server.py::test_run_threads_per_request_seed_into_batch_insert.FakeBatchGenerator.unprocessed_prompts  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it [scope-qualified at the v0.7.6 sync]
 mlx_vlm/tests/test_server.py::validate_context_budget  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it
 mlx_vlm/tests/test_speculative.py::Cache  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it
 mlx_vlm/tests/test_speculative.py::Draft  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it
@@ -637,7 +642,9 @@ mlx_vlm/tests/test_speculative.py::fake_update  # C104(a)/(c) retained in the fo
 mlx_vlm/tests/test_speculative.py::forward_tokens  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it
 mlx_vlm/tests/test_speculative.py::prefix_cache_reserve  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it
 mlx_vlm/tests/test_speculative.py::sample_target  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it
-mlx_vlm/tests/test_speculative.py::sampler  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it
+mlx_vlm/tests/test_speculative.py::test_eagle3_gemma4_verification_seeds_then_batches_tail.sampler  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it [scope-qualified at the v0.7.6 sync]
+mlx_vlm/tests/test_speculative.py::test_speculative_sampler_rng_can_resync_draft_after_rejected_draws.sampler  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it [scope-qualified at the v0.7.6 sync]
+mlx_vlm/tests/test_speculative.py::test_speculative_sampler_rng_keeps_draft_sampling_off_target_stream.sampler  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it [scope-qualified at the v0.7.6 sync]
 mlx_vlm/tests/test_speculative.py::speculative_argmax_from_hidden  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it
 mlx_vlm/tests/test_speculative.py::speculative_draft_hidden  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it
 mlx_vlm/tests/test_speculative.py::speculative_logits_from_hidden  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it
