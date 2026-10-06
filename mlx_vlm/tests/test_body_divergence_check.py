@@ -308,8 +308,18 @@ class TestExclusionsFileParsing:
         Every finding this script reports has a mechanical fix, so a non-empty
         baseline means someone claimed a misalignment was deliberate. That should
         require editing this test and saying why.
+
+        Fork: 2026-10-06 audit baseline -- the only allowed entries are C104(c) ports:
+        upstream tests/helpers copied byte-identically into the fork-owned test_generate /
+        test_server, which follow the fork's file layout rather than upstream's order.
+        No runtime file may appear here.
         """
-        assert cbd.load_exclusions() == []
+        parsed = cbd.load_exclusions()
+        assert all(
+            p in ("mlx_vlm/tests/test_generate.py", "mlx_vlm/tests/test_server.py")
+            and r.startswith("C104(c) port:")
+            for p, _s, r in parsed
+        ), parsed
 
 
 class TestAbsentUpstreamLines:

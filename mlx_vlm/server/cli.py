@@ -27,7 +27,7 @@ from .session_manager import (  # Fork: session manager is fork
     _env_int,
 )
 from .model_discovery import MODEL_PATHS_ENV
-from .session_manager import configure as _configure_session_manager
+from .session_manager import configure as _configure_session_manager  # Fork: session manager is fork
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080

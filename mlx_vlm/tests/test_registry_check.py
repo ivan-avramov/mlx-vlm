@@ -368,7 +368,13 @@ class TestExclusionsFileParsing:
         mixin's storage constant now owned by concrete cache classes. Restored
         top_p_sampling is no longer excluded. Any new entry requires review.
         """
+        # Fork: 2026-10-06 audit baseline adds C104 entries -- test-file imports used only
+        # by upstream tests the fork-owned copies do not carry. They stay confined to
+        # test files and carry a `REVIEWED: C104` reason; the five runtime ones are pinned.
         parsed = cur.load_exclusions()
+        c104 = [e for e in parsed if e[2].startswith("REVIEWED: C104 unported:")]
+        assert c104 and all(p.startswith("mlx_vlm/tests/") for p, _s, _r in c104)
+        parsed = [e for e in parsed if e not in c104]
 
         assert len(parsed) == 5
         assert all(reason.startswith("REVIEWED:") for _p, _s, reason in parsed)

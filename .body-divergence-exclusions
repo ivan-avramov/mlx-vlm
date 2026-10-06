@@ -49,3 +49,26 @@
 #   mlx_vlm/tests/test_server.py::test_metrics_endpoint_records_chat_completion_metrics
 #
 # Baseline: EMPTY. Keep it that way — every finding here has a mechanical fix.
+
+# --- C104 audit baseline, recorded 2026-10-06 before the v0.7.6 sync: upstream tests and
+# helpers PORTED byte-identically (C104(c)) into the fork-owned copies of test_generate /
+# test_server, placed in the fork's file layout. Ordering only; content matches upstream.
+mlx_vlm/tests/test_generate.py::test_prompt_processing_requests_only_required_trailing_logits  # C104(c) port: byte-identical to upstream; placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::TestModelDiscovery  # C104(c) port: byte-identical to upstream; placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::_assert_fields  # C104(c) port: byte-identical to upstream; placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::_deltas  # C104(c) port: byte-identical to upstream; placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::_endpoint  # C104(c) port: byte-identical to upstream; placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::_feed_thinking  # C104(c) port: byte-identical to upstream; placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::_joined  # C104(c) port: byte-identical to upstream; placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::_msg  # C104(c) port: byte-identical to upstream; placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::_post  # C104(c) port: byte-identical to upstream; placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::_reset_runtime  # C104(c) port: byte-identical to upstream; placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::_result  # C104(c) port: byte-identical to upstream; placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::_stream_response  # C104(c) port: byte-identical to upstream; placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::_streaming  # C104(c) port: byte-identical to upstream; placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::_thoughts  # C104(c) port: byte-identical to upstream; placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::_token  # C104(c) port: byte-identical to upstream; placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::_tool  # C104(c) port: byte-identical to upstream; placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::client  # C104(c) port: byte-identical to upstream; placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::test_anthropic_messages_streaming_emits_tool_use_events  # C104(c) port: byte-identical to upstream; placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::test_thinking_stream_strips_newlines_after_close  # C104(c) port: byte-identical to upstream; placed in the fork-owned copy's layout, not upstream's order

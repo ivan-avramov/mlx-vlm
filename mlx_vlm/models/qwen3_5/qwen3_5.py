@@ -81,6 +81,7 @@ class LazyTokenEmbeddings:  # Fork (M57)
 
 
 class Model(Qwen3VLModel):
+    # Fork (M57): get_lazy_text_embeddings and the lazy-embedding hooks below are fork-only.
 
     def __init__(self, config: ModelConfig):
         # only initialize nn.Module, skip the initialization of vision_tower and language_model in the parent class

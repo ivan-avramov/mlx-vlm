@@ -382,3 +382,13 @@
 # --- unexcused symbol still reports; `mlx_vlm/tests/test_fork_marker_check.py` is the
 # --- other file this unblocks — its `_check_configured_context_budget` is an existing
 # --- exclusion entry.
+
+# C104 (2026-09-28 v0.7.3 sync; RATIFIED 2026-09-29, P96): the fork kept its own
+# copies of these three test files over upstream #2276's rewrite, then ported a
+# subset of upstream's replacement tests. Their divergence is file-wide by policy,
+# not per-definition, so they are allowlisted rather than marked. Recorded
+# 2026-10-06 (audit baseline before the v0.7.6 sync). Drain by porting upstream's
+# passing tests (150 of them pass against fork code; see .symbol-exclusions).
+mlx_vlm/tests/test_generate.py  # C104(a)/(c): fork-owned copy kept over upstream #2276 rewrite
+mlx_vlm/tests/test_server.py  # C104(a)/(c): fork-owned copy kept over upstream #2276 rewrite
+mlx_vlm/tests/test_speculative.py  # C104(a)/(c): fork-owned copy kept over upstream #2276 rewrite

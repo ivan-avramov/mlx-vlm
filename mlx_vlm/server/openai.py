@@ -5,7 +5,7 @@ import gc
 import json
 import logging
 import random
-import re
+import re  # Fork: _strip_assistant_thinking's tag-regex stripping uses re
 import time
 import uuid
 from collections import OrderedDict  # Fork: _PREFILL_FLAG_CACHE LRU below

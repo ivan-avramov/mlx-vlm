@@ -77,3 +77,17 @@ mlx_vlm/models/qwen3_5/language.py::Qwen3_5Attention::arange  # REVIEWED 2026-08
 mlx_vlm/speculative/drafters/qwen3_5_mtp/split.py::Qwen3NextMTPSplitter::get  # REVIEWED 2026-09-13: 57177a21 hoisted postprocess into _stack_separate_experts, which still calls text_config.get("num_experts", 0). The remaining class-level get("quantization") is unchanged upstream behavior; the audit pairs unrelated get calls after extraction.
 
 mlx_vlm/turboquant.py::_TurboQuantAttentionMixin::max  # REVIEWED 2026-09-13: prefix_cache_merge moved to the concrete single cache; its max(prefix_lens, default=0) call is unchanged there. Remaining mixin max calls only clamp bit widths; this audit pairs calls across the removed storage method.
+
+# --- C104 audit baseline, recorded 2026-10-06 before the v0.7.6 sync: test-only calls
+# inside the fork-owned copies of test_generate/test_server (C104(a)/(c), RATIFIED
+# 2026-09-29) whose bodies differ from upstream #2276's rewrite. No runtime code path.
+mlx_vlm/tests/test_generate.py::TestBatchGenerate::_generate_batch  # C104 fork-owned test copy: test-only call differs from upstream's rewritten test body
+mlx_vlm/tests/test_generate.py::TestGenerationBatch::SimpleNamespace  # C104 fork-owned test copy: test-only call differs from upstream's rewritten test body
+mlx_vlm/tests/test_server.py::TestReranking::object  # C104 fork-owned test copy: test-only call differs from upstream's rewritten test body
+mlx_vlm/tests/test_server.py::TestResponseGenerator::MagicMock  # C104 fork-owned test copy: test-only call differs from upstream's rewritten test body
+mlx_vlm/tests/test_server.py::TestResponseGenerator::_assert_fields  # C104 fork-owned test copy: test-only call differs from upstream's rewritten test body
+mlx_vlm/tests/test_server.py::TestResponseGenerator::dict  # C104 fork-owned test copy: test-only call differs from upstream's rewritten test body
+mlx_vlm/tests/test_server.py::TestResponseGenerator::parametrize  # C104 fork-owned test copy: test-only call differs from upstream's rewritten test body
+mlx_vlm/tests/test_server.py::TestResponseGenerator::set  # C104 fork-owned test copy: test-only call differs from upstream's rewritten test body
+mlx_vlm/tests/test_server.py::_sse_events::split  # C104 fork-owned test copy: test-only call differs from upstream's rewritten test body
+mlx_vlm/tests/test_server.py::test_response_generator_diffusion_forwards_generation_options::dict  # C104 fork-owned test copy: test-only call differs from upstream's rewritten test body

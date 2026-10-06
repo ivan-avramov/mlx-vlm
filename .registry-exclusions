@@ -60,3 +60,58 @@ mlx_vlm/server/__init__.py::_check_configured_context_budget  # REVIEWED: supers
 # the server uses the shared generate/ar.py sampler implementation.
 
 mlx_vlm/turboquant.py::_TurboQuantAttentionMixin::cache_step  # REVIEWED: Storage stride belongs to concrete TurboQuantKVCache; both concrete caches own allocation. Retired with shadowed mixin storage methods; live storage-contract tests verify capacities.
+
+# --- C104 audit baseline, recorded 2026-10-06 before the v0.7.6 sync: imports and
+# containers used only by upstream tests that the fork-owned copies (C104(a)/(c),
+# RATIFIED 2026-09-29) do not carry; see the matching .symbol-exclusions block.
+mlx_vlm/tests/test_generate.py::StoppingCriteria  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_generate.py::ThinkingAwareLogitsProcessor  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_generate.py::annotations  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_generate.py::gc  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_generate.py::importlib  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_generate.py::load_processor  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_generate.py::np  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_generate.py::sampling  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_generate.py::structured  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_generate.py::types  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_generate.py::weakref  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_server.py::_THINKING_CASES  # REVIEWED: C104 unported: registry used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_server.py::Args  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_server.py::Generator  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_server.py::HARMONY_RESPONSE_TEMPLATE  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_server.py::HTTPException  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_server.py::KVCache  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_server.py::Timer  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_server.py::_attach_harmony_template  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_server.py::_response_items_to_chat  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_server.py::annotations  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_server.py::anthropic  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_server.py::apc  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_server.py::copy  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_server.py::count  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_server.py::generation  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_server.py::mlx_audio_utils  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_server.py::mlx_utils  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_server.py::openai  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_server.py::realtime  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_server.py::reranking  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_server.py::server_audio  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_server.py::video  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_speculative.py::InputEmbeddingsFeatures  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_speculative.py::LanguageModelOutput  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_speculative.py::Mock  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_speculative.py::NS  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_speculative.py::TINY_DEFAULTS  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_speculative.py::TINY_MODELS  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_speculative.py::build_config  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_speculative.py::common  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_speculative.py::deepcopy  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_speculative.py::generate_step  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_speculative.py::mtp  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_speculative.py::nullcontext  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_speculative.py::prod  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_speculative.py::product  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_speculative.py::quantized  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_speculative.py::speculative  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_speculative.py::start_speculative_cache  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_speculative.py::tiny_config  # REVIEWED: C104 unported: re-export used only by upstream tests not carried in the fork-owned copy

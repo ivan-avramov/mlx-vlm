@@ -1532,7 +1532,7 @@ def stream_generate(
         mx.clear_cache()
 
 
-_CANONICAL_PREFILL_KWARGS = (
+_CANONICAL_PREFILL_KWARGS = (  # Fork (M48): kwargs threaded into the canonical-suffix prefill
     "max_kv_size", "kv_bits", "kv_key_bits", "kv_value_bits", "kv_key_scheme",
     "kv_value_scheme", "kv_group_size", "kv_quant_scheme", "quantized_kv_start",
     "kv_prealloc_tokens", "prefill_step_size", "serialize_kv_quantization",

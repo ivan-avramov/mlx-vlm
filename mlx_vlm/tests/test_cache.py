@@ -25,7 +25,7 @@ import pytest
 
 import mlx_vlm.models as models
 import mlx_vlm.turboquant as tq
-from mlx_vlm.models.epicache import EpiCacheKVCache  # Fork
+from mlx_vlm.models.epicache import EpiCacheKVCache  # Fork: EpiCache in the contract sampler
 from mlx_vlm import apc as P
 from mlx_vlm import apc_adapters as A
 from mlx_vlm.apc import harvest_blocks_from_batch_cache as harvest

@@ -620,6 +620,7 @@ def _assert_attrs(obj, **expected):
 @pytest.mark.parametrize(
     "model_type,module_path,class_name",
     [
+        # Fork: C104(d) box-local xfail for the qwen4_exp route (see reason string).
         pytest.param(
             *route,
             marks=pytest.mark.xfail(

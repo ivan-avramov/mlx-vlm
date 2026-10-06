@@ -581,6 +581,14 @@ UNTOUCHED = [
 ]
 
 
+# Fork: AC5 is M58's scope criterion. It used to diff the working tree against the
+# `main` branch, which is vacuous on main and fails on every other branch (e.g. an
+# upstream-sync branch). Pin it to M58's own range instead: the commit before M58's
+# first change (fbe2775e, M57 round 2) and M58's last commit (664c2ead).
+_AC5_BASE = "fbe2775e393fdd2513a9cb30cafc5e97b71613e2"
+_AC5_HEAD = "664c2eade5ac726181157bbb3b01bdcafe27f457"
+
+
 def _git(*args):
     return subprocess.run(
         ["git", "-C", str(REPO), *args], capture_output=True, text=True, check=True
@@ -589,7 +597,7 @@ def _git(*args):
 
 class TestAC5Scope:
     def test_ac5_diff_touches_only_the_listed_files(self):
-        changed = set(_git("diff", "--name-only", "main").split())
+        changed = set(_git("diff", "--name-only", _AC5_BASE, _AC5_HEAD).split())
         extra = {
             f for f in changed
             if f not in ALLOWED and not f.startswith("mlx_vlm/tests/")
@@ -597,11 +605,11 @@ class TestAC5Scope:
         assert not extra, extra
 
     def test_ac5_other_verifiers_helper_and_quantized_branches_are_untouched(self):
-        assert _git("diff", "main", "--", *UNTOUCHED) == ""
+        assert _git("diff", _AC5_BASE, _AC5_HEAD, "--", *UNTOUCHED) == ""
 
     def test_ac5_every_hunk_in_upstream_owned_files_is_marked(self):
         owned = sorted(ALLOWED - {"mlx_vlm/mtp_verify_scan.py"})
-        diff = _git("diff", "-U0", "main", "--", *owned)
+        diff = _git("diff", "-U0", _AC5_BASE, _AC5_HEAD, "--", *owned)
         hunks, current = [], None
         for line in diff.splitlines():
             if line.startswith("@@"):
