@@ -360,7 +360,11 @@ def _run_cli(monkeypatch, *extra):
     from mlx_vlm.server import cli
 
     monkeypatch.setattr(sys, "argv", ["mlx_vlm.server", "--port", "8080", *extra])
-    with patch.dict(os.environ), patch.object(cli.uvicorn, "run"):
+    # cli.main() also publishes process-wide session-manager config; keep it out of
+    # the other tests (it turned anonymous sessions on for later streaming tests).
+    with patch.dict(os.environ), patch.object(cli.uvicorn, "run"), patch.object(
+        cli, "_configure_session_manager"
+    ):
         for key in ("MLX_VLM_CHAT_COMPACTION", "MLX_VLM_GENERATION_DEFAULTS"):
             os.environ.pop(key, None)
         cli.main()
