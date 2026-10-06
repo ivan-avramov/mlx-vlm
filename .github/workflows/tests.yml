@@ -42,8 +42,6 @@ jobs:
           python -m pip install -e .
 
       - name: Run Python tests
-        env:
-          MLX_REQUIRE_STACK_REGISTRY: "1"   # Fork (M58): golden registry tests must run (pinned fixture), never skip
         run: |
           cd mlx_vlm/
           pytest -s ./tests

@@ -54,6 +54,10 @@ BLOCK_KEYS = (
     "verify_blocks_per_query",
     "verify_blocks_straddle",
     "verify_blocks_len1",
+    # subset of verify_blocks_straddle: length-2 blocks that straddled a threshold. Under joint_v1
+    # they run per-query (C120) while `per_query` serves the shipped length-2 joint call, so they
+    # may legitimately differ from a per_query row; G1b lists such rows separately.
+    "verify_blocks_straddle_len2",
 )
 AB_KEYS = (
     "verify_ab_blocks",
@@ -335,6 +339,8 @@ class JointV1Policy:
                 self._shadow(False, joint, other, queries, keys)
             return joint
         self._counts["verify_blocks_straddle"] += 1
+        if queries.shape[2] == 2:
+            self._counts["verify_blocks_straddle_len2"] += 1
         served = per_query_attention(queries, keys, values, mask=mask, **args)
         if self.ab:
             joint = joint_attention(queries, keys, values, mask=decision.joint_mask, **args)

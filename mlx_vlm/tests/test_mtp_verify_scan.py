@@ -1515,21 +1515,38 @@ FIXTURE_SHA256 = "323ee54aa5ddc1cea312bd0729079f7a7a45d6b57b6370747b741d9bb734f6
 
 
 def _stack_registry():
-    """Resolve the stack registry for the golden tests: env MLX_STACK_REGISTRY (a set-but-absent
-    value FAILS), else the sibling stack checkout, else the PINNED fixture copy (so CI always runs
-    them; the workflows also set MLX_REQUIRE_STACK_REGISTRY=1). The fixture is a verbatim copy of
-    main_models.yaml, see its header for the refresh procedure."""
+    """Resolve the stack registry for the golden tests.
+
+    Default: env MLX_STACK_REGISTRY (set-but-absent FAILS), else the sibling stack checkout, else
+    the PINNED fixture (a verbatim copy; CI has no sibling), warning when the sibling is absent.
+    With MLX_REQUIRE_STACK_REGISTRY=1 (operator machines) the LIVE registry is mandatory: the env
+    path or the sibling must exist AND equal the pinned fixture, else FAIL (refresh the fixture)."""
+    import warnings
+
     env = os.environ.get("MLX_STACK_REGISTRY")
+    required = os.environ.get("MLX_REQUIRE_STACK_REGISTRY") == "1"
     if env:
         if not Path(env).exists():
             pytest.fail(f"MLX_STACK_REGISTRY={env!r} does not exist")
-        return Path(env)
-    sibling = SIBLING_REGISTRY
-    if sibling.exists():
-        return sibling
-    if FIXTURE_REGISTRY.exists():
-        return FIXTURE_REGISTRY
-    pytest.fail(f"no stack registry: no MLX_STACK_REGISTRY, no {sibling}, no fixture {FIXTURE_REGISTRY}")
+        live = Path(env)
+    elif SIBLING_REGISTRY.exists():
+        live = SIBLING_REGISTRY
+    else:
+        live = None
+    if required:
+        if live is None:
+            pytest.fail("MLX_REQUIRE_STACK_REGISTRY=1 but no live stack registry (MLX_STACK_REGISTRY "
+                        f"or {SIBLING_REGISTRY}) exists")
+        if live.read_text() != _fixture_verbatim():
+            pytest.fail(f"the live registry {live} differs from the pinned golden fixture; "
+                        "refresh stack_registry_golden.yaml (see its header)")
+        return live
+    if live is not None:
+        return live
+    if not FIXTURE_REGISTRY.exists():
+        pytest.fail(f"no stack registry and no fixture {FIXTURE_REGISTRY}")
+    warnings.warn("no live stack registry; golden tests run against the PINNED fixture", stacklevel=2)
+    return FIXTURE_REGISTRY
 
 
 def _fixture_verbatim() -> str:
@@ -1563,7 +1580,26 @@ def test_golden_registry_resolution_rules(monkeypatch, tmp_path):
     assert _stack_registry() == present
     monkeypatch.delenv("MLX_STACK_REGISTRY")
     monkeypatch.setattr(sys.modules[__name__], "SIBLING_REGISTRY", tmp_path / "absent.yaml")
-    assert _stack_registry() == FIXTURE_REGISTRY
+    monkeypatch.delenv("MLX_REQUIRE_STACK_REGISTRY", raising=False)
+    with pytest.warns(UserWarning, match="PINNED fixture"):
+        assert _stack_registry() == FIXTURE_REGISTRY
+
+
+def test_e3_require_mode_demands_a_live_registry_equal_to_the_fixture(monkeypatch, tmp_path):
+    monkeypatch.setenv("MLX_REQUIRE_STACK_REGISTRY", "1")
+    monkeypatch.delenv("MLX_STACK_REGISTRY", raising=False)
+    monkeypatch.setattr(sys.modules[__name__], "SIBLING_REGISTRY", tmp_path / "absent.yaml")
+    with pytest.raises(pytest.fail.Exception, match="no live stack registry"):
+        _stack_registry()
+    drifted = tmp_path / "live.yaml"
+    drifted.write_text(_fixture_verbatim() + "# edited\n")
+    monkeypatch.setenv("MLX_STACK_REGISTRY", str(drifted))
+    with pytest.raises(pytest.fail.Exception, match="differs from the pinned golden fixture"):
+        _stack_registry()
+    same = tmp_path / "same.yaml"
+    same.write_text(_fixture_verbatim())
+    monkeypatch.setenv("MLX_STACK_REGISTRY", str(same))
+    assert _stack_registry() == same
 
 
 @pytest.mark.requires_stack_registry
@@ -1810,3 +1846,66 @@ class TestRound2Gaps:
         with pytest.raises(mv.VerifyScanError, match="GPU"):
             generation_module._apply_mtp_verify_from_env(
                 SimpleNamespace(language_model=lm, config=lm.config), draft_kind="mtp", kv_bits=None)
+
+
+# ------------------------------------------------------------------ round 3: E1 / E2
+class TestE1StraddleLen2Counter:
+    def test_e1_length_two_straddles_are_counted_as_a_subset_of_straddle(self, qualified, rec):
+        policy = mv.JointV1Policy()
+        attend(policy, *make_qkv(2, 1024))      # length 2: keys 1023 | 1024 straddle
+        attend(policy, *make_qkv(3, 1025))      # length 3 straddling
+        attend(policy, *make_qkv(2, 4096))      # length 2, no straddle: joint
+        c = policy.counters()
+        assert c["verify_blocks_straddle"] == 2 and c["verify_blocks_straddle_len2"] == 1
+        assert c["verify_blocks_joint_v1"] == 1
+
+    def test_e1_the_counter_is_scoped_per_request_and_reaches_the_timings(self, qualified, rec):
+        from mlx_vlm.server.schemas import GenerationTimings
+
+        policy = mv.JointV1Policy()
+        attend(policy, *make_qkv(2, 1024))
+        snap = policy.snapshot()
+        attend(policy, *make_qkv(2, 1024))
+        delta = policy.since(snap)
+        assert delta["verify_blocks_straddle_len2"] == 1
+        metrics = generation_module.GenerationMetrics()
+        metrics.verify_counters = delta
+        dumped = json.loads(GenerationTimings.from_metrics(metrics, 4, 2).model_dump_json())
+        assert dumped["verify_blocks_straddle_len2"] == 1
+
+
+class TestE2MutationGaps:
+    def test_e2a_the_self_test_compares_the_LARGEST_eligible_length(self, qualified, gpu, monkeypatch):
+        plan = TestSelfTest.FakeSdpa()
+        longest = mv.VECTOR_QUERY_BOUND // 6
+
+        def kernel(q, k, v, scale=None, mask=None, **kw):
+            if k.shape[2] > 1100:                          # the eligible cell: only qL == longest differs
+                return mx.full(q.shape, 1.0 if q.shape[2] == longest else 0.0, q.dtype)
+            return plan(q, k, v, scale=scale, mask=mask, **kw)
+
+        monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", kernel)
+        with pytest.raises(mv.VerifyScanError, match="NOT bitwise identical"):
+            mv.self_test(mv.JointV1Policy(), **TestSelfTest.DIMS)
+
+    def test_e2b_ab_flags_non_finite_values_even_when_both_outputs_carry_the_same_nan(
+        self, qualified, monkeypatch
+    ):
+        monkeypatch.setattr(mx.fast, "scaled_dot_product_attention", ShapeRecorder())
+        nan = mx.full((1, 6, 3, D), float("nan"), dtype=mx.bfloat16)
+        monkeypatch.setattr(mv, "joint_attention", lambda *a, **k: nan)
+        monkeypatch.setattr(mv, "per_query_attention", lambda *a, **k: nan)
+        policy = mv.JointV1Policy(ab=True)
+        attend(policy, *_two_pass_cells())
+        policy.end_block()
+        assert policy.counters()["verify_ab_mismatch"] == 1     # bit-identical, still invalid
+
+    def test_e2c_since_resets_the_reason_histogram_when_reasons_pre_exist(self, qualified, rec):
+        policy = mv.JointV1Policy()
+        attend(policy, *make_qkv(6, 4096))                       # gqa_bound reason pre-exists
+        attend(policy, *make_qkv(3, 4096, dtype=mx.float16))     # domain reason pre-exists
+        snap = policy.snapshot()
+        assert policy.since(snap)["verify_fallback_reasons"] == {}
+        attend(policy, *make_qkv(6, 4096))
+        assert policy.since(snap)["verify_fallback_reasons"] == {"gqa_bound": 1}
+        assert policy.counters()["verify_fallback_reasons"] == {"gqa_bound": 2, "domain": 1}
