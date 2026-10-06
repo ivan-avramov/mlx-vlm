@@ -111,6 +111,19 @@ class Qwen3_5BatchInvariantForward:
                 mask=mask,
             )
 
+        # Fork (M58): joint_v1 serves the block with one joint call (or a straddling
+        # block per query); None means "not eligible": the code below runs unchanged.
+        verify_policy = getattr(attention, "mtp_verify_policy", None)  # Fork (M58)
+        if verify_policy is not None and output is None:  # Fork (M58)
+            output = verify_policy.attend(  # Fork (M58)
+                queries=queries,
+                keys=keys,
+                values=values,
+                cache=cache,
+                scale=attention.scale,
+                mask=mask,
+            )
+
         if output is None and length == 2:
             if isinstance(mask, str) and mask == "causal":
                 key_length = kv_sequence_length(keys)
@@ -399,6 +412,9 @@ class Qwen3_5BatchInvariantForward:
             capture_layer_ids,
             hidden_sink,
         )
+        verify_policy = getattr(language_model, "mtp_verify_policy", None)  # Fork (M58)
+        if verify_policy is not None:  # Fork (M58): one AB materialisation per round
+            verify_policy.end_block()
         if return_hidden:
             if hidden_sink is None:
                 hidden_sink = []
