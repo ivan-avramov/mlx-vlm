@@ -28,6 +28,10 @@ from .session_manager import (  # Fork: session manager is fork
 )
 from .model_discovery import MODEL_PATHS_ENV
 from .session_manager import configure as _configure_session_manager  # Fork: session manager is fork
+from .request_normalization import (  # Fork: chat compaction switch (v0.7.6 sync)
+    CHAT_COMPACTION_ENV,
+    chat_compaction_enabled,
+)
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
@@ -579,6 +583,19 @@ def main():
         ),
     )
     parser.add_argument(
+        "--chat-compaction",
+        type=str,
+        # Fork: v0.7.6 sync. Accepts the env forms chat_compaction_enabled() accepts.
+        default="on" if chat_compaction_enabled() else "off",
+        choices=["on", "off"],
+        help=(
+            "Let /v1/chat/completions honour `context_management` (upstream's "
+            "server-side conversation compaction). Default: off -- the field is "
+            "ignored and over-long prompts take the soft clamp. Env fallback: "
+            "MLX_VLM_CHAT_COMPACTION (1/on/true)."
+        ),
+    )
+    parser.add_argument(
         "--cache-session-retain-prompt-end",
         type=str,
         default=_env_choice("MLX_VLM_SESSION_RETAIN_PROMPT_END", "on", ["on", "off"]),
@@ -760,6 +777,15 @@ def main():
         os.environ["MLX_VLM_GENERATION_DEFAULTS"] = args.generation_defaults
         # Fail loud and fast at startup (not per-request) on invalid JSON / unknown keys.
         get_server_generation_defaults()
+    # Fork: typical_p != 1 changes sampling and only --generation-defaults can set a
+    # server-wide value; log the effective one so a stray default is visible.
+    _defaults = get_server_generation_defaults()
+    logger.info(
+        "Effective sampling default: typical_p=%s (%s)",
+        _defaults.get("typical_p", 1.0),
+        "--generation-defaults" if "typical_p" in _defaults else "default",
+    )
+    os.environ[CHAT_COMPACTION_ENV] = args.chat_compaction  # Fork: chat compaction switch
     if args.kv_bits is not None:
         os.environ["KV_BITS"] = str(args.kv_bits)
     if args.kv_key_bits is not None:

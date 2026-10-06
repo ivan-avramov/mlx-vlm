@@ -921,7 +921,11 @@ class StreamOptions(BaseModel):
 
 class ChatRequest(GenerationRequest):
     messages: List[ChatMessage]
-    context_management: Optional[List[CompactionControl]] = Field(None, max_length=1)
+    # Fork: accepted as-is and NOT validated here. Chat compaction is a server switch
+    # (MLX_VLM_CHAT_COMPACTION / --chat-compaction, default off): off, the field is
+    # ignored whatever it holds (as before the v0.7.6 sync); on, the endpoint validates
+    # it as upstream's Optional[List[CompactionControl]] (max one entry) -> 422.
+    context_management: Optional[Any] = None
     stream_options: Optional[StreamOptions] = None
     tools: Optional[List[Any]] = Field(None, description="Tools the model may call.")
     tool_choice: Optional[Any] = Field(

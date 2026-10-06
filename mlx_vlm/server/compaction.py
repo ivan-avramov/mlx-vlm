@@ -1,4 +1,11 @@
-"""Conversation compaction and stateless replay."""
+"""Conversation compaction and stateless replay.
+
+Fork: the encrypted capsules need the OPTIONAL ``cryptography`` package
+(``cryptography>=43.0.0``). It is imported lazily (see ``_fernet``), so the server
+imports and serves without it; a request that needs a capsule then gets HTTP 400.
+Chat Completions compaction is additionally gated by ``MLX_VLM_CHAT_COMPACTION``
+(default off; see request_normalization.chat_compaction_enabled).
+"""
 
 from __future__ import annotations
 
@@ -125,9 +132,14 @@ def _fernet():
     try:
         from cryptography.fernet import Fernet
     except ImportError as exc:
-        raise RuntimeError(
-            "Conversation compaction capsules need the 'cryptography' package "
-            "(cryptography>=43.0.0), which is not installed."
+        # HTTPException, not RuntimeError: every endpoint re-raises HTTPException,
+        # so a capsule request answers 400 instead of escaping as a 500.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Conversation compaction capsules need the optional 'cryptography' "
+                "package (cryptography>=43.0.0), which is not installed on this server."
+            ),
         ) from exc
     return Fernet
 

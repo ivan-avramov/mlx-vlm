@@ -10911,6 +10911,9 @@ class TestCompaction:
     @pytest.fixture(autouse=True)
     def isolated_state(self, tmp_path, monkeypatch):
         monkeypatch.setenv("MLX_VLM_COMPACTION_KEY_FILE", str(tmp_path / "key"))
+        # Fork: chat compaction is a server switch (default off); upstream's
+        # contracts are exercised with it on.
+        monkeypatch.setenv("MLX_VLM_CHAT_COMPACTION", "1")
         monkeypatch.setattr(server.runtime.config, "max_kv_size", None)
         server.response_store.clear()
         server.response_store_order.clear()

@@ -51,6 +51,8 @@ from .request_normalization import (  # Fork: _strip_assistant_thinking lives wi
     _chat_message_to_prompt,
     _normalize_instruction_messages,
     _strip_assistant_thinking,  # noqa: F401  (re-exported by mlx_vlm.server)
+    chat_compaction_enabled,
+    validate_chat_context_management,
 )
 from .responses_state import (  # Fork: _CONTENT_MARKERS is fork-only (08723a3f's marker-set union)
     _CONTENT_MARKERS,
@@ -2318,13 +2320,28 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             else _INHERIT_ADAPTER
         )
 
-        # Fork: compaction is OPT-IN. Upstream compacts automatically whenever the
-        # rendered prompt exceeds limit - max_tokens, which re-renders and
-        # re-tokenizes every request and would summarize 160K-260K prompts that the
-        # fork serves via its soft clamp (_apply_generation_budget). Only an explicit,
-        # non-empty context_management list reaches compaction (tests:
-        # test_chat_request_contracts.py).
-        if request.context_management:
+        # Fork: chat compaction is a server switch, default OFF (MLX_VLM_CHAT_COMPACTION /
+        # --chat-compaction). Upstream compacts automatically whenever the rendered
+        # prompt exceeds limit - max_tokens, which re-renders and re-tokenizes every
+        # request and would summarize 160K-260K prompts that the fork serves via its
+        # soft clamp (_apply_generation_budget). Off: context_management is never read.
+        # On: it is validated as upstream does (422) and only a non-empty list reaches
+        # compaction. Tests: test_chat_request_contracts.py.
+        if chat_compaction_enabled():
+            try:
+                context_management = validate_chat_context_management(
+                    request.context_management
+                )
+            except ValidationError as exc:
+                raise HTTPException(
+                    status_code=422, detail=json.loads(exc.json(include_url=False))
+                ) from exc
+            request = request.model_copy(
+                update={"context_management": context_management}
+            )
+        else:
+            context_management = None
+        if context_management:
             _prepare_chat_tool_choice([], request.tools, request.tool_choice)
             model, processor, config = get_cached_model(request.model, adapter_path)
             result = await compaction.compact_response_context(

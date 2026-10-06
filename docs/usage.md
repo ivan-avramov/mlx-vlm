@@ -37,6 +37,13 @@ print(output)
 
 ## Conversation compaction and APC
 
+> **Fork note:** Responses-API compaction capsules are encrypted and need the
+> optional `cryptography` package (`pip install "cryptography>=43.0.0"`); without it
+> the server still starts and capsule requests return HTTP 400. Chat Completions
+> compaction is OFF by default in this fork: enable it with
+> `MLX_VLM_CHAT_COMPACTION=1` or `--chat-compaction on`, otherwise
+> `context_management` is ignored on `/v1/chat/completions`.
+
 Compaction replaces older conversation turns with a model-generated handoff and
 retains recent turns. Automatic Prefix Caching (APC) then matches the actual
 rendered prompt. Only an unchanged prefix can reuse KV state: retained messages
@@ -117,8 +124,8 @@ works while that response is stored. `/v1/responses/input_tokens` counts the
 decoded context, not the encrypted payload's string length. Normal response
 usage counts the final inference; explicit compact usage counts the summary pass.
 
-Chat Completions automatically compacts supported history when the full input
-plus requested output exceeds the context limit. No threshold setting is needed.
+Chat Completions (when enabled -- see the fork note above) automatically compacts
+supported history when the full input plus requested output exceeds the context limit. No threshold setting is needed.
 The optional `context_management` field enables earlier compaction; an empty list
 explicitly disables compaction. Recovery supports text, images, and tool history;
 audio/video requests keep their existing behavior. Compaction finishes before the

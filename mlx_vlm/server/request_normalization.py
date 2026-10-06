@@ -2,8 +2,12 @@
 
 import json
 import logging  # Fork: for the resolved-sampling log in _build_gen_args
+import os  # Fork: MLX_VLM_CHAT_COMPACTION switch
 import re  # Fork: _strip_assistant_thinking's tag-regex stripping
-from typing import List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
+
+from pydantic import Field, TypeAdapter  # Fork: gated context_management validation
+from typing_extensions import Annotated
 
 from ..generate import (
     DEFAULT_REPETITION_CONTEXT_SIZE,
@@ -32,6 +36,32 @@ from .runtime import runtime
 logger = logging.getLogger("mlx_vlm.server")
 
 _DISABLED_REASONING_EFFORTS = {"none", "off", "disabled", "false", "0"}
+
+# Fork: chat compaction switch. Default OFF so a chat request is served exactly as
+# before the v0.7.6 sync; see chat_compaction_enabled().
+CHAT_COMPACTION_ENV = "MLX_VLM_CHAT_COMPACTION"
+_ENABLED_VALUES = {"1", "on", "true", "yes"}
+
+
+def chat_compaction_enabled() -> bool:
+    # Fork: read per request so the CLI flag (exported to the env) and the env agree.
+    """Whether /v1/chat/completions may honour ``context_management`` (default off)."""
+    return os.environ.get(CHAT_COMPACTION_ENV, "off").strip().lower() in _ENABLED_VALUES
+
+
+def _context_management_adapter():
+    # Fork: upstream's ChatRequest field type, applied only when the switch is on.
+    from .schemas import CompactionControl
+
+    return TypeAdapter(
+        Optional[Annotated[List[CompactionControl], Field(max_length=1)]]
+    )
+
+
+def validate_chat_context_management(value: Any):
+    # Fork: strict upstream validation for the gated chat path; raises ValidationError.
+    """Validate a chat request's ``context_management`` as upstream's schema does."""
+    return _context_management_adapter().validate_python(value)
 
 
 def _strip_assistant_thinking(content: str) -> str:
