@@ -48,6 +48,7 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
             inds, scores = expand_route(gates, k, exp.n, exp.t, exp.d)
         else:
             inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+            inds = mx.stop_gradient(inds)
             scores = mx.take_along_axis(gates, inds, axis=-1)
             scores = scores / scores.sum(axis=-1, keepdims=True)
 

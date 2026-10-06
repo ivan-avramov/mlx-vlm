@@ -1,0 +1,578 @@
+{
+ "_about": "Chat-completions messages handed to apply_chat_template, captured from fork 664c2ead (pre v0.7.6 sync) on 2026-10-06. The post-merge request path must reproduce them exactly.",
+ "cases": {
+  "assistant_list_content_with_think": {
+   "expected": {
+    "calls": 1,
+    "messages": [
+     {
+      "content": "x",
+      "role": "user"
+     },
+     {
+      "content": "visible",
+      "role": "assistant"
+     },
+     {
+      "content": "y",
+      "role": "user"
+     }
+    ],
+    "num_images": 0,
+    "tools": null
+   },
+   "request": {
+    "messages": [
+     {
+      "content": "x",
+      "role": "user"
+     },
+     {
+      "content": [
+       {
+        "text": "<think>t</think>visible",
+        "type": "text"
+       }
+      ],
+      "role": "assistant"
+     },
+     {
+      "content": "y",
+      "role": "user"
+     }
+    ]
+   }
+  },
+  "closer_only_think": {
+   "expected": {
+    "calls": 1,
+    "messages": [
+     {
+      "content": "x",
+      "role": "user"
+     },
+     {
+      "content": "answer",
+      "role": "assistant"
+     },
+     {
+      "content": "y",
+      "role": "user"
+     }
+    ],
+    "num_images": 0,
+    "tools": null
+   },
+   "request": {
+    "messages": [
+     {
+      "content": "x",
+      "role": "user"
+     },
+     {
+      "content": "thought text</think>\n\nanswer",
+      "role": "assistant"
+     },
+     {
+      "content": "y",
+      "role": "user"
+     }
+    ]
+   }
+  },
+  "developer_and_system_merge": {
+   "expected": {
+    "calls": 1,
+    "messages": [
+     {
+      "content": "Rule one.\n\nRule two.",
+      "role": "system"
+     },
+     {
+      "content": "Go",
+      "role": "user"
+     }
+    ],
+    "num_images": 0,
+    "tools": null
+   },
+   "request": {
+    "messages": [
+     {
+      "content": "Rule one.",
+      "role": "system"
+     },
+     {
+      "content": "Rule two.",
+      "role": "developer"
+     },
+     {
+      "content": "Go",
+      "role": "user"
+     }
+    ]
+   }
+  },
+  "image_parts": {
+   "expected": {
+    "calls": 1,
+    "messages": [
+     {
+      "content": [
+       {
+        "text": "What is this?",
+        "type": "text"
+       },
+       {
+        "type": "image"
+       }
+      ],
+      "role": "user"
+     },
+     {
+      "content": "A red circle.",
+      "role": "assistant"
+     },
+     {
+      "content": [
+       {
+        "type": "image"
+       },
+       {
+        "text": "And this?",
+        "type": "text"
+       }
+      ],
+      "role": "user"
+     }
+    ],
+    "num_images": 2,
+    "tools": null
+   },
+   "request": {
+    "messages": [
+     {
+      "content": [
+       {
+        "text": "What is this?",
+        "type": "text"
+       },
+       {
+        "image_url": {
+         "url": "data:image/png;base64,iVBORw0KGgo="
+        },
+        "type": "image_url"
+       }
+      ],
+      "role": "user"
+     },
+     {
+      "content": "<think>looks red</think>A red circle.",
+      "role": "assistant"
+     },
+     {
+      "content": [
+       {
+        "image_url": {
+         "url": "data:image/png;base64,iVBORw0KGgo="
+        },
+        "type": "image_url"
+       },
+       {
+        "text": "And this?",
+        "type": "text"
+       }
+      ],
+      "role": "user"
+     }
+    ]
+   }
+  },
+  "inline_think_tags": {
+   "expected": {
+    "calls": 1,
+    "messages": [
+     {
+      "content": "2+2?",
+      "role": "user"
+     },
+     {
+      "content": "4",
+      "role": "assistant"
+     },
+     {
+      "content": "again",
+      "role": "user"
+     }
+    ],
+    "num_images": 0,
+    "tools": null
+   },
+   "request": {
+    "messages": [
+     {
+      "content": "2+2?",
+      "role": "user"
+     },
+     {
+      "content": "<think>\nadd them\n</think>\n\n4",
+      "role": "assistant"
+     },
+     {
+      "content": "again",
+      "role": "user"
+     }
+    ]
+   }
+  },
+  "null_content_assistant": {
+   "expected": {
+    "calls": 1,
+    "messages": [
+     {
+      "content": "x",
+      "role": "user"
+     },
+     {
+      "content": null,
+      "role": "assistant",
+      "tool_calls": [
+       {
+        "function": {
+         "arguments": {},
+         "name": "f"
+        },
+        "id": "c",
+        "type": "function"
+       }
+      ]
+     },
+     {
+      "content": "ok",
+      "role": "tool",
+      "tool_call_id": "c"
+     }
+    ],
+    "num_images": 0,
+    "tools": null
+   },
+   "request": {
+    "messages": [
+     {
+      "content": "x",
+      "role": "user"
+     },
+     {
+      "content": null,
+      "role": "assistant",
+      "tool_calls": [
+       {
+        "function": {
+         "arguments": "{}",
+         "name": "f"
+        },
+        "id": "c",
+        "type": "function"
+       }
+      ]
+     },
+     {
+      "content": "ok",
+      "role": "tool",
+      "tool_call_id": "c"
+     }
+    ]
+   }
+  },
+  "reasoning_alias_field": {
+   "expected": {
+    "calls": 1,
+    "messages": [
+     {
+      "content": "q",
+      "role": "user"
+     },
+     {
+      "content": "a",
+      "reasoning": "r",
+      "reasoning_content": "r",
+      "role": "assistant"
+     },
+     {
+      "content": "q2",
+      "role": "user"
+     }
+    ],
+    "num_images": 0,
+    "tools": null
+   },
+   "request": {
+    "messages": [
+     {
+      "content": "q",
+      "role": "user"
+     },
+     {
+      "content": "a",
+      "reasoning": "r",
+      "role": "assistant"
+     },
+     {
+      "content": "q2",
+      "role": "user"
+     }
+    ]
+   }
+  },
+  "reasoning_content_field": {
+   "expected": {
+    "calls": 1,
+    "messages": [
+     {
+      "content": "2+2?",
+      "role": "user"
+     },
+     {
+      "content": "4",
+      "reasoning": "add them",
+      "reasoning_content": "add them",
+      "role": "assistant"
+     },
+     {
+      "content": "and 3+3?",
+      "role": "user"
+     }
+    ],
+    "num_images": 0,
+    "tools": null
+   },
+   "request": {
+    "messages": [
+     {
+      "content": "2+2?",
+      "role": "user"
+     },
+     {
+      "content": "4",
+      "reasoning_content": "add them",
+      "role": "assistant"
+     },
+     {
+      "content": "and 3+3?",
+      "role": "user"
+     }
+    ]
+   }
+  },
+  "system_user": {
+   "expected": {
+    "calls": 1,
+    "messages": [
+     {
+      "content": "You are terse.",
+      "role": "system"
+     },
+     {
+      "content": "Hi",
+      "role": "user"
+     }
+    ],
+    "num_images": 0,
+    "tools": null
+   },
+   "request": {
+    "messages": [
+     {
+      "content": "You are terse.",
+      "role": "system"
+     },
+     {
+      "content": "Hi",
+      "role": "user"
+     }
+    ]
+   }
+  },
+  "thinking_controls": {
+   "expected": {
+    "calls": 1,
+    "messages": [
+     {
+      "content": "Plan it",
+      "role": "user"
+     }
+    ],
+    "num_images": 0,
+    "tools": null
+   },
+   "request": {
+    "enable_thinking": true,
+    "messages": [
+     {
+      "content": "Plan it",
+      "role": "user"
+     }
+    ],
+    "reasoning_effort": "medium"
+   }
+  },
+  "tools_calls_and_results": {
+   "expected": {
+    "calls": 1,
+    "messages": [
+     {
+      "content": "Weather in Paris and Rome?",
+      "role": "user"
+     },
+     {
+      "content": "",
+      "reasoning": "two calls",
+      "reasoning_content": "two calls",
+      "role": "assistant",
+      "tool_calls": [
+       {
+        "function": {
+         "arguments": {
+          "city": "Paris"
+         },
+         "name": "get_weather"
+        },
+        "id": "call_1",
+        "type": "function"
+       },
+       {
+        "function": {
+         "arguments": {
+          "city": "Rome"
+         },
+         "name": "get_weather"
+        },
+        "id": "call_2",
+        "type": "function"
+       },
+       {
+        "function": {
+         "arguments": {},
+         "name": "get_weather"
+        },
+        "id": "call_3",
+        "type": "function"
+       }
+      ]
+     },
+     {
+      "content": "sunny",
+      "name": "get_weather",
+      "role": "tool",
+      "tool_call_id": "call_1"
+     },
+     {
+      "content": "rain",
+      "role": "tool",
+      "tool_call_id": "call_2"
+     },
+     {
+      "content": "Thanks",
+      "role": "user"
+     }
+    ],
+    "num_images": 0,
+    "tools": [
+     {
+      "function": {
+       "description": "Get weather",
+       "name": "get_weather",
+       "parameters": {
+        "properties": {
+         "city": {
+          "type": "string"
+         }
+        },
+        "type": "object"
+       }
+      },
+      "type": "function"
+     }
+    ]
+   },
+   "request": {
+    "messages": [
+     {
+      "content": "Weather in Paris and Rome?",
+      "role": "user"
+     },
+     {
+      "content": "<think>call tools</think>",
+      "reasoning_content": "two calls",
+      "role": "assistant",
+      "tool_calls": [
+       {
+        "function": {
+         "arguments": "{\"city\": \"Paris\"}",
+         "name": "get_weather"
+        },
+        "id": "call_1",
+        "type": "function"
+       },
+       {
+        "function": {
+         "arguments": {
+          "city": "Rome"
+         },
+         "name": "get_weather"
+        },
+        "id": "call_2",
+        "type": "function"
+       },
+       {
+        "function": {
+         "arguments": "not json",
+         "name": "get_weather"
+        },
+        "id": "call_3",
+        "type": "function"
+       }
+      ]
+     },
+     {
+      "content": "sunny",
+      "name": "get_weather",
+      "role": "tool",
+      "tool_call_id": "call_1"
+     },
+     {
+      "content": [
+       {
+        "text": "rain",
+        "type": "text"
+       }
+      ],
+      "role": "tool",
+      "tool_call_id": "call_2"
+     },
+     {
+      "content": "Thanks",
+      "role": "user"
+     }
+    ],
+    "tools": [
+     {
+      "function": {
+       "description": "Get weather",
+       "name": "get_weather",
+       "parameters": {
+        "properties": {
+         "city": {
+          "type": "string"
+         }
+        },
+        "type": "object"
+       }
+      },
+      "type": "function"
+     }
+    ]
+   }
+  }
+ }
+}

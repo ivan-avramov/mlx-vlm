@@ -201,11 +201,8 @@ mlx_vlm/tests/test_server.py::_chat_request  # C104 unported: helper/fixture of 
 mlx_vlm/tests/test_server.py::_drain  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
 mlx_vlm/tests/test_server.py::_enqueue  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
 mlx_vlm/tests/test_server.py::_fake_audio_write  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
-mlx_vlm/tests/test_server.py::_function_result  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
 mlx_vlm/tests/test_server.py::_generator  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy (same name also defined in mlx_vlm/tests/test_cached_tokens_reporting.py,mlx_vlm/tests/test_generate.py)
 mlx_vlm/tests/test_server.py::_harmony_processor  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
-mlx_vlm/tests/test_server.py::_input_image  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
-mlx_vlm/tests/test_server.py::_input_message  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
 mlx_vlm/tests/test_server.py::_make  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
 mlx_vlm/tests/test_server.py::_normalized  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
 mlx_vlm/tests/test_server.py::_ready_generator  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
@@ -217,7 +214,6 @@ mlx_vlm/tests/test_server.py::_upload  # C104 unported: helper/fixture of upstre
 mlx_vlm/tests/test_server.py::_voice_session  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
 mlx_vlm/tests/test_server.py::_worker_setup  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
 mlx_vlm/tests/test_server.py::audio_client  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
-mlx_vlm/tests/test_server.py::cancel  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy (same name also defined in mlx_vlm/models/nemotron_voicechat/streaming.py,mlx_vlm/server/audio.py,mlx_vlm/server/realtime.py)
 mlx_vlm/tests/test_server.py::create_session  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy (same name also defined in mlx_vlm/models/nemotron_voicechat/model.py)
 mlx_vlm/tests/test_server.py::create_streaming_session  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy (same name also defined in mlx_vlm/models/nemotron_voicechat/session.py)
 mlx_vlm/tests/test_server.py::criteria  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
@@ -229,14 +225,12 @@ mlx_vlm/tests/test_server.py::finish_request  # C104 unported: helper/fixture of
 mlx_vlm/tests/test_server.py::flush  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy (same name also defined in mlx_vlm/apc.py,mlx_vlm/models/nemotron_voicechat/streaming.py,mlx_vlm/server/realtime.py,mlx_vlm/utils.py)
 mlx_vlm/tests/test_server.py::image  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy (same name also defined in mlx_vlm/generate/image.py)
 mlx_vlm/tests/test_server.py::image_part  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
-mlx_vlm/tests/test_server.py::load  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy (same name also defined in mlx_vlm/chat_ui.py,mlx_vlm/models/bonsai/model.py,mlx_vlm/models/ernie_image/model.py,mlx_vlm/models/falcon_ocr/layout.py,mlx_vlm/models/flux2/model.py,mlx_vlm/models/ideogram4/model.py,mlx_vlm/models/llada_image/model.py,mlx_vlm/models/mage_flow/model.py,mlx_vlm/models/ming_image/model.py,mlx_vlm/models/minimax_h3/model.py,mlx_vlm/models/sam3d_body/config.py,mlx_vlm/models/sam3d_objects/config.py,mlx_vlm/models/z_image/config.py,mlx_vlm/models/z_image/model.py,mlx_vlm/tests/test_processors.py,mlx_vlm/utils.py)
 mlx_vlm/tests/test_server.py::make  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy (same name also defined in mlx_vlm/tests/test_cache.py)
 mlx_vlm/tests/test_server.py::make_batch  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy (same name also defined in mlx_vlm/tests/test_generate.py)
 mlx_vlm/tests/test_server.py::push_audio  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy (same name also defined in mlx_vlm/models/nemotron_voicechat/streaming.py)
 mlx_vlm/tests/test_server.py::raise_not_found  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
 mlx_vlm/tests/test_server.py::realtime_client  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
 mlx_vlm/tests/test_server.py::reset_audio_runtime  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
-mlx_vlm/tests/test_server.py::run  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy (same name also defined in mlx_vlm/convert.py,mlx_vlm/models/indic_ocr/pipeline.py,mlx_vlm/models/sam3d_objects/generate.py,mlx_vlm/tests/test_attention_policy.py,mlx_vlm/tests/test_extraction_models.py,mlx_vlm/tests/test_prompt_cache_lifetime.py,mlx_vlm/tests/test_turboquant_decode_2pass_toggle.py)
 mlx_vlm/tests/test_server.py::run_worker  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy (same name also defined in mlx_vlm/tests/test_apc_settings.py)
 mlx_vlm/tests/test_server.py::score  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy (same name also defined in mlx_vlm/turboquant.py)
 mlx_vlm/tests/test_server.py::settings_client  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy (same name also defined in mlx_vlm/tests/test_apc_settings.py)

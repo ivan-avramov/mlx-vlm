@@ -1,12 +1,19 @@
 """Normalize compatible API requests into server generation arguments."""
 
+import json
 import logging  # Fork: for the resolved-sampling log in _build_gen_args
-from typing import Optional, Tuple, Union
+import re  # Fork: _strip_assistant_thinking's tag-regex stripping
+from typing import List, Optional, Tuple, Union
 
 from ..generate import (
     DEFAULT_REPETITION_CONTEXT_SIZE,
     DEFAULT_TEMPERATURE,
     DEFAULT_TOP_P,
+)
+from ..prompt_utils import (  # Fork: THINKING_FORMATS registry for the assistant-thinking strip
+    THINKING_FORMATS,
+    extract_text_from_content,
+    normalize_image_content,
 )
 from ..structured import build_json_schema_logits_processor
 from .generation import (  # Fork: the registry generation_defaults overlay in _build_gen_args.
@@ -25,6 +32,95 @@ from .runtime import runtime
 logger = logging.getLogger("mlx_vlm.server")
 
 _DISABLED_REASONING_EFFORTS = {"none", "off", "disabled", "false", "0"}
+
+
+def _strip_assistant_thinking(content: str) -> str:
+    # Fork: moved from server/openai.py at the v0.7.6 sync (one normalizer path).
+    """Remove reasoning blocks from a prior assistant message's content.
+
+    Strips complete ``opener...closer`` blocks for every family in
+    THINKING_FORMATS, plus stray closer-only blocks (the prefilled-opener
+    case where the model emitted only the closer in its reply).
+    """
+    for fmt in THINKING_FORMATS:
+        for op in fmt.openers:
+            for cl in fmt.closers:
+                pattern = re.escape(op) + r".*?" + re.escape(cl) + r"\n*"
+                content = re.sub(pattern, "", content, flags=re.DOTALL)
+    for fmt in THINKING_FORMATS:
+        for cl in fmt.closers:
+            if cl in content and not any(op in content for op in fmt.openers):
+                content = content.split(cl, 1)[1]
+    return content.strip()
+
+
+def _chat_message_to_prompt(message):
+    content = message.get("content")
+    if isinstance(content, list):
+        content = (
+            normalize_image_content(content)
+            if message["role"] == "user"
+            else extract_text_from_content(content)
+        )
+    # Fork: strip thinking blocks from prior assistant turns (token bloat across
+    # multi-turn chats). Done here so the endpoint and compaction's renderer share
+    # one path; pinned by tests/test_chat_request_contracts.py.
+    if message["role"] == "assistant" and isinstance(content, str):
+        content = _strip_assistant_thinking(content)
+    msg = {"role": message["role"], "content": content}
+    # Preserve tool-calling metadata.
+    # Ensure arguments are dicts (not JSON strings) for Jinja templates
+    # that iterate them with |items (e.g. Qwen3.5).
+    if message.get("tool_calls") is not None:
+        normalized_calls = []
+        for tc in message.get("tool_calls"):
+            tc = dict(tc) if isinstance(tc, dict) else tc
+            if isinstance(tc, dict) and "function" in tc:
+                fn = dict(tc["function"])
+                args = fn.get("arguments", {})
+                if isinstance(args, str):
+                    try:
+                        fn["arguments"] = json.loads(args)
+                    except (json.JSONDecodeError, TypeError):
+                        fn["arguments"] = {}
+                tc["function"] = fn
+            normalized_calls.append(tc)
+        msg["tool_calls"] = normalized_calls
+    if message.get("tool_call_id") is not None:
+        msg["tool_call_id"] = message.get("tool_call_id")
+    if message.get("name") is not None:
+        msg["name"] = message.get("name")
+    if message.get("reasoning_content") is not None:
+        msg["reasoning_content"] = message.get("reasoning_content")
+        msg["reasoning"] = message.get("reasoning_content")
+
+    return msg
+
+
+def _normalize_instruction_messages(
+    chat_messages: List[dict],
+    instructions: Optional[str] = None,
+) -> Optional[str]:
+    """Combine API instructions into the leading system message for templates."""
+    instruction_parts = [instructions] if instructions else []
+    conversation = []
+
+    for message in chat_messages:
+        if message.get("role") in ("system", "developer"):
+            content = message.get("content")
+            if content:
+                instruction_parts.append(str(content))
+        else:
+            conversation.append(message)
+
+    normalized_instructions = "\n\n".join(instruction_parts) or None
+    if normalized_instructions:
+        conversation.insert(
+            0,
+            {"role": "system", "content": normalized_instructions},
+        )
+    chat_messages[:] = conversation
+    return normalized_instructions
 
 
 def _request_field_is_set(request, field_name: str) -> bool:

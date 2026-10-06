@@ -12,6 +12,7 @@ import mlx.core as mx
 import pytest
 
 from mlx_vlm import apc as apc_module
+from mlx_vlm import sample_utils as sampling  # Fork: for the ported typical-p test
 from mlx_vlm.generate import (
     BatchGenerationResult,
     BatchGenerator,
@@ -3545,6 +3546,24 @@ class TestTokenizerPaddedBatchRows:
         assert mask.shape == (2, 4)
         assert mask[0].tolist() == [False, False, True, True]
         assert mask[1].tolist() == [True] * 4
+
+
+# Fork: ported from upstream 2c54d499 (v0.7.6 sync); the fork keeps its own copy of
+# this file (C104), so upstream's new sampling test is carried explicitly.
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("typical_p", [0.2, 0.5, 0.9])
+def test_typical_p_low_precision_logprobs_match_float32(dtype, typical_p):
+    # A float16/bfloat16 running sum of many small probabilities stops growing
+    # below typical_p, which kept every token.
+    vocab_size = 32768
+    logits = mx.random.normal((1, vocab_size), key=mx.random.key(0)) * 2.0
+    logprobs = (logits - mx.logsumexp(logits, axis=-1, keepdims=True)).astype(dtype)
+    expected = sampling.apply_typical_p(logprobs.astype(mx.float32), typical_p)
+    actual = sampling.apply_typical_p(logprobs, typical_p)
+    assert actual.dtype == dtype
+    kept = actual > -mx.inf
+    assert kept.sum().item() < vocab_size
+    assert mx.array_equal(kept, expected > -mx.inf).item()
 
 
 def test_prompt_shorter_than_prefill_step_size_is_still_chunked():

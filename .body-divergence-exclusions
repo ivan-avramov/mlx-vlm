@@ -70,5 +70,24 @@ mlx_vlm/tests/test_server.py::_thoughts  # C104(c) port: byte-identical to upstr
 mlx_vlm/tests/test_server.py::_token  # C104(c) port: byte-identical to upstream; placed in the fork-owned copy's layout, not upstream's order
 mlx_vlm/tests/test_server.py::_tool  # C104(c) port: byte-identical to upstream; placed in the fork-owned copy's layout, not upstream's order
 mlx_vlm/tests/test_server.py::client  # C104(c) port: byte-identical to upstream; placed in the fork-owned copy's layout, not upstream's order
-mlx_vlm/tests/test_server.py::test_anthropic_messages_streaming_emits_tool_use_events  # C104(c) port: byte-identical to upstream; placed in the fork-owned copy's layout, not upstream's order
 mlx_vlm/tests/test_server.py::test_thinking_stream_strips_newlines_after_close  # C104(c) port: byte-identical to upstream; placed in the fork-owned copy's layout, not upstream's order
+
+# --- v0.7.6 sync (2026-10-06): same C104(c) situation after the merge; upstream tests ported
+# byte-identically, plus definitions whose relative order changed around them.
+mlx_vlm/tests/test_server.py::_FakeAlignedResult  # C104(c) port: byte-identical to upstream; placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::_completed_response  # C104(c) port: byte-identical to upstream; placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::_function_result  # C104(c) port: byte-identical to upstream; placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::_input_image  # C104(c) port: byte-identical to upstream; placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::_input_message  # C104(c) port: byte-identical to upstream; placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::_response  # C104(c) port: byte-identical to upstream; placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::test_chat_fallback_stream_parses_tool_calls  # C104(c) port: byte-identical to upstream; placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::test_responses_replay_ignores_empty_assistant_turns  # C104(c) port: byte-identical to upstream; placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::test_responses_replay_preserves_assistant_payloads_without_text  # C104(c) port: byte-identical to upstream; placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::test_responses_stream_items_match_completed_output  # C104(c) port: byte-identical to upstream; placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::test_responses_tool_arguments_are_normalized_without_mutating_input  # C104(c) port: byte-identical to upstream; placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::test_responses_truncated_preopened_reasoning  # C104(c) port: byte-identical to upstream; placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::test_runtime_config_enum_knobs_reject_invalid  # C104(c) port: byte-identical to upstream; placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::test_stream_without_finish_token_flushes_held_text  # C104(c) port: byte-identical to upstream; placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::test_tool_call_content_keeps_angle_bracket_text  # C104(c) port: byte-identical to upstream; placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::test_tool_stream_finalization  # C104(c) port: byte-identical to upstream; placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::test_tool_stream_matches_non_streamed_content  # C104(c) port: byte-identical to upstream; placed in the fork-owned copy's layout, not upstream's order

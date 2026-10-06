@@ -91,3 +91,4 @@ mlx_vlm/tests/test_server.py::TestResponseGenerator::parametrize  # C104 fork-ow
 mlx_vlm/tests/test_server.py::TestResponseGenerator::set  # C104 fork-owned test copy: test-only call differs from upstream's rewritten test body
 mlx_vlm/tests/test_server.py::_sse_events::split  # C104 fork-owned test copy: test-only call differs from upstream's rewritten test body
 mlx_vlm/tests/test_server.py::test_response_generator_diffusion_forwards_generation_options::dict  # C104 fork-owned test copy: test-only call differs from upstream's rewritten test body
+mlx_vlm/tests/test_server.py::TestResponseGenerator::NS  # C104 fork-owned test copy: test-only call differs from upstream's rewritten test body (v0.7.6 sync)

@@ -83,6 +83,46 @@ def _small_config(factory, **overrides):
     )
 
 
+def test_gemma4_audio_causal_mask_matches_transformers_predicate():
+    """Matches transformers' sliding_window_mask_function: a key is valid iff
+    0 <= (q_idx - kv_idx) < attention_context_left - 1, or
+    (kv_idx - q_idx) < attention_context_right."""
+    from mlx_vlm.models.gemma4.audio import AudioEncoder
+    from mlx_vlm.models.gemma4.config import AudioConfig
+
+    for chunk_size, context_left, context_right in [
+        (12, 13, 0),  # the shipped checkpoint's own config
+        (12, 1, 0),
+        (8, 6, 4),
+        (4, 2, 2),
+        (6, 4, 1),
+        (5, 1, 5),
+        (10, 10, 3),
+    ]:
+        max_past = max(0, context_left - 1)
+        max_future = context_right
+        context_size = chunk_size + max_past + max_future
+        encoder = SimpleNamespace(
+            config=AudioConfig(
+                attention_chunk_size=chunk_size,
+                attention_context_left=context_left,
+                attention_context_right=context_right,
+            )
+        )
+
+        mask = AudioEncoder._build_causal_valid_mask(encoder)
+
+        expected = [
+            [
+                (0 <= (q + max_past - c) < max_past)
+                or ((q + max_past - c) < 0 and -(q + max_past - c) < max_future)
+                for c in range(context_size)
+            ]
+            for q in range(chunk_size)
+        ]
+        assert mask.tolist() == expected, (chunk_size, context_left, context_right)
+
+
 class TestMiniCPMOTTS(unittest.TestCase):
     def test_reference_voice_prompt_preserves_messages_and_audio_order(self):
         from mlx_vlm.models.minicpmo.processing_minicpmo import MiniCPMOProcessor
@@ -938,6 +978,13 @@ def test_mog_head_inference_shapes_and_finite_values():
     assert logs.shape == (1, 1, 1)
     assert bool(mx.all(mx.isfinite(mean)))
     assert bool(mx.all(mx.isfinite(logs)))
+
+
+@pytest.mark.parametrize("top_p", [1e-8, 1e-3, 0.7])
+def test_mog_top_p_keeps_most_likely_component(top_p):
+    # 1 - 1e-8 rounds to 1.0 in float32, which used to mask every component.
+    filtered = voicechat_tts._top_p_logits(mx.array([[0.0, 1.0, 3.0, 2.0]]), top_p)
+    assert (filtered > -mx.inf).tolist() == [[False, False, True, top_p == 0.7]]
 
 
 def test_model_creates_session_from_wrapped_tokenizer():

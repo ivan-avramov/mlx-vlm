@@ -268,7 +268,20 @@ MODEL_CACHE_FACTORIES = _cache_factories_by_package()
 MODEL_CACHE_CONTRACTS = _all_generative_model_contracts(MODEL_CACHE_FACTORIES)
 # Synthetic cache hits depend only on the cache types, not the model name.
 # Keep discovery for every model, but exercise each distinct layout once.
-CACHE_CONTRACTS = sorted({names for _, names in MODEL_CACHE_CONTRACTS})
+# Fork (v0.7.6 sync): cache types upstream ships WITHOUT an APC adapter. Upstream
+# deleted this audit in #2276 (the fork keeps it, C104), so a new upstream model can
+# arrive APC-incompatible. Listed explicitly so the next one still fails loudly.
+NO_UPSTREAM_APC_ADAPTER = {
+    # c0039a0a (v0.7.4) DeepSeek V4.1: bespoke compressed cache, no APC layout upstream.
+    "DeepseekV41Cache",
+}
+CACHE_CONTRACTS = sorted(
+    {
+        names
+        for _, names in MODEL_CACHE_CONTRACTS
+        if not NO_UPSTREAM_APC_ADAPTER.intersection(names)
+    }
+)
 
 
 def test_all_generative_model_packages_discovered_without_weights():
@@ -285,7 +298,7 @@ def test_every_model_cache_factory_has_a_restorable_apc_adapter():
     by_package = MODEL_CACHE_FACTORIES
     discovered = set().union(*by_package.values())
     samples = _cache_samples()
-    unknown = discovered - samples.keys()
+    unknown = discovered - samples.keys() - NO_UPSTREAM_APC_ADAPTER  # Fork (v0.7.6 sync)
     assert not unknown, (
         "New model cache types need an APC adapter/sample: " f"{sorted(unknown)}"
     )
@@ -293,7 +306,7 @@ def test_every_model_cache_factory_has_a_restorable_apc_adapter():
     # Exercise planning and cloning, not just name registration. Empty caches
     # are sufficient because the protocol and constructor metadata are what
     # vary across architectures; populated round-trips live in the APC tests.
-    for name in sorted(discovered):
+    for name in sorted(discovered - NO_UPSTREAM_APC_ADAPTER):
         cache = samples[name]
         plan = build_prefix_cache_plan_from_caches([cache])
         assert plan.restorable, f"{name}: {plan.describe()}"
@@ -309,6 +322,8 @@ def test_every_model_cache_factory_has_a_restorable_apc_adapter():
     # future combination that is individually registered but cannot be
     # coordinated as one architecture.
     for package, names in by_package.items():
+        if NO_UPSTREAM_APC_ADAPTER.intersection(names):
+            continue
         if not names:
             continue
         plan = build_prefix_cache_plan_from_caches(
