@@ -5,6 +5,7 @@ CPU-pinned, no checkpoint: a tiny random-weight ``qwen3_5`` language model
 ``generate_step`` chunked-prefill loop.
 """
 
+import gc
 import re
 import threading
 from types import SimpleNamespace
@@ -477,11 +478,33 @@ def _wrap_terminal(lm, which):
         raise AssertionError(which)
 
 
-def _peak_of(fn):
+# Fork (CI, 2026-10-06): every sentinel reading is RELATIVE to the active memory at
+# the reset point, taken after the GPU is quiesced and cyclic garbage is collected.
+# Metal releases a dropped buffer only when the command buffer that used it
+# completes, so on a slow runner the PREVIOUS test's 128 MB sentinel was still
+# "active" when the next test reset the peak -- every quiet reading on the
+# macos-14 runner came back at ~147 MB and tripped THRESH (run 37558071759).
+_BASE = [0]
+
+
+def _reset_peak():
     mx.eval(mx.zeros(1))
+    mx.synchronize()
+    gc.collect()
+    mx.synchronize()
     mx.reset_peak_memory()
+    _BASE[0] = mx.get_active_memory()
+    return _BASE[0]
+
+
+def _peak_now():
+    return mx.get_peak_memory() - _BASE[0]
+
+
+def _peak_of(fn):
+    _reset_peak()
     fn()
-    return mx.get_peak_memory()
+    return _peak_now()
 
 
 class TestSentinelSelfCheck:
@@ -564,9 +587,9 @@ class TestTerminalProductionWorkIsEvaluated:
         real = prefill_profile.PrefillProfiler.mark
 
         def spy(self, phase, *outputs):
-            before = mx.get_peak_memory()
+            before = _peak_now()
             result = real(self, phase, *outputs)
-            seen.append((phase, before, mx.get_peak_memory()))
+            seen.append((phase, before, _peak_now()))
             return result
 
         monkeypatch.setattr(prefill_profile.PrefillProfiler, "mark", spy)
@@ -651,10 +674,10 @@ class TestTerminalStateEvaluatedBeforeGdnCloses:
         real_mark = prefill_profile.PrefillProfiler.mark
 
         def spy(self, phase, *outputs):
-            between = mx.get_peak_memory()
-            mx.reset_peak_memory()
+            between = _peak_now()
+            _reset_peak()
             result = real_mark(self, phase, *outputs)
-            peaks.append((phase, mx.get_peak_memory(), between))
+            peaks.append((phase, _peak_now(), between))
             return result
 
         monkeypatch.setattr(prefill_profile.PrefillProfiler, "mark", spy)

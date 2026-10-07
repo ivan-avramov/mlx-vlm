@@ -570,16 +570,12 @@ def beta(y):
         If the fork ever drops the `_legacy` sibling this fails, which is correct — the
         64 lines would then genuinely be gone and the count should say so.
         """
-        import subprocess
-
-        root = Path(__file__).resolve().parents[2]
+        # Fork (CI, 2026-10-06): a shallow `actions/checkout` clone has no `upstream`
+        # remote, so resolve it the way the pinned-revision helper does and skip
+        # when it is absent (run 37558071759 failed here with `git show` exit 128).
         path = "mlx_vlm/turboquant.py"
-        up = subprocess.run(
-            ["git", "-C", str(root), "show", f"upstream/main:{path}"],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout
+        root = Path(__file__).resolve().parents[2]
+        up = _pinned_upstream_source("upstream/main", path)
         ours = (root / path).read_text()
         cmp = cbd.FileComparison(path, up, ours)
         name = "_fused_mse_decode_2pass_1_kernel"
