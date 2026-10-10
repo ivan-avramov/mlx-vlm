@@ -34,7 +34,7 @@ on:
 
 env:
   # The upstream ref the fork last merged. Bump at every sync (see above).
-  UPSTREAM_SYNC_REF: v0.7.6
+  UPSTREAM_SYNC_REF: 952d4f6b
 
 jobs:
   parity:
