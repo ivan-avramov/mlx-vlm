@@ -12,7 +12,7 @@ Takes ~7 minutes (the suite is ~4 of them) and it has repeatedly been worth it. 
 number in this file goes stale eventually; the tree does not lie.
 
 ```bash
-cd /Users/ia87221/ws/mlx-vlm
+cd "$(git rev-parse --show-toplevel)"   # the fork checkout; never hard-code a home path
 git status --short                                           # expect clean
 git rev-parse origin/main                                    # expect == HEAD
 git fetch upstream && git log --oneline HEAD..upstream/main   # MUST be empty; merge if not
@@ -31,7 +31,7 @@ git fetch upstream && git log --oneline HEAD..upstream/main   # MUST be empty; m
 grep -cE '^mlx_vlm' .symbol-exclusions .deletion-exclusions .fork-marker-allowlist \
     .dead-helper-exclusions .body-divergence-exclusions .registry-exclusions \
     .call-argument-exclusions
-# expect 23, 0, 0, 0, 0, 5, 4 — see "Exclusion baselines" below
+# expect 269, 675, 3, 0, 34, 50, 16 (2026-10-10, sync 952d4f6b) — see "Exclusion baselines" below
 grep -cE '^mlx_vlm.*# baseline: pre-existing divergence, unreviewed' .symbol-exclusions
 # expect 0 — every remaining exclusion carries a real reason
 ```
@@ -42,17 +42,20 @@ The pytest `cd` **must** be in a subshell as written. After any bare `cd mlx_vlm
 ### Exclusion baselines
 
 Eight gating audits, each with its own reviewed baseline. **These are the progress
-signal, not any report's count.**
+signal, not any report's count.** Counts below are entry lines (`grep -cE '^mlx_vlm'`)
+as of the 2026-10-10 sync to upstream `952d4f6b`; every entry carries a reviewed reason
+and zero carry the "pre-existing divergence, unreviewed" tag. Re-count after every merge
+and update this table in the merge commit when a number moves.
 
 | file | baseline | meaning |
 |---|---|---|
-| `.symbol-exclusions` | **23** | upstream symbols we deliberately lack; zero unreviewed |
-| `.deletion-exclusions` | **0** | upstream deletions we deliberately kept |
-| `.fork-marker-allowlist` | **0** | files not yet under the `# Fork:` convention |
+| `.symbol-exclusions` | **269** | upstream symbols we deliberately lack; zero unreviewed |
+| `.deletion-exclusions` | **675** | upstream deletions we deliberately kept (fork-owned copies and their helpers) |
+| `.fork-marker-allowlist` | **3** | fork-owned test copies pinned by blob (`test_generate.py`, `test_server.py`, `test_speculative.py`; C104) |
 | `.dead-helper-exclusions` | **0** | upstream-called helpers unreachable here |
-| `.body-divergence-exclusions` | **0** | misalignments claimed deliberate |
-| `.registry-exclusions` | **5** | four API replacements and one retired mixin storage attribute, all reviewed |
-| `.call-argument-exclusions` | **4** | calls passing fewer args, reviewed (one `[**]`, one `[arity]`) |
+| `.body-divergence-exclusions` | **34** | misalignments claimed deliberate, each reviewed |
+| `.registry-exclusions` | **50** | API replacements, re-exports and retired fields, all reviewed |
+| `.call-argument-exclusions` | **16** | calls passing fewer args, reviewed (`[**]` / `[arity]` tagged) |
 
 An empty file is **not** a reason to delete it — each keeps its header and RESOLVED
 notes, and the next merge that adds a fork hunk to a shared file will need an entry.
@@ -587,8 +590,8 @@ is deliberate — values diverge legitimately across this fork (every tuned cons
 while keys almost never do. A wrong value is `check_body_divergence.py --file`'s job;
 that is the shape of #1402's test-certified cache-key bug.
 
-Reviewed hits go in `.registry-exclusions`, currently **5**, all re-exports the fork
-replaced (`generation_stream` ×3 for the lazy per-thread stream,
+Reviewed hits go in `.registry-exclusions` (**50** at the 2026-10-10 sync); the founding
+entries were re-exports the fork replaced (`generation_stream` ×3 for the lazy per-thread stream,
 `_check_configured_context_budget` for the clamp-instead-of-reject budget,
 `top_p_sampling` for the `_filter` that also applies min_p and top_k). Runs in ~13s.
 
@@ -645,7 +648,7 @@ dismissals rather than arguing them:
 ```bash
 uv pip install --python .venv/bin/python coverage
 cd mlx_vlm && ../.venv/bin/python -m coverage run \
-    --source=/Users/ia87221/ws/mlx-vlm/mlx_vlm --data-file=/tmp/cov.data \
+    --source="$(git rev-parse --show-toplevel)/mlx_vlm" --data-file=/tmp/cov.data \
     -m pytest -q ./tests --ignore=tests/test_smoke.py
 .venv/bin/python dev/fork_coverage_report.py --data-file=/tmp/cov.data [--all]
 ```
@@ -722,7 +725,7 @@ Three design rules, each paid for by a false positive in an earlier draft:
 the dict.** Those are tagged and still gate rather than being filtered — the founding
 bug is *adjacent* to that shape (its callee takes a `kwargs` dict positionally), and a
 check that goes quiet where the answer is hard is the failure mode `dev/` exists to
-prevent. The single baseline entry is one of these: `server/cli.py::main` really does
+prevent. The founding baseline entry is one of these: `server/cli.py::main` really does
 supply `level=` and `format=` via `basicConfig(**log_kwargs)`. Confirm which dict, and
 say so in the reason.
 
@@ -1166,7 +1169,7 @@ one and delete it on the same trigger.
 
 **Environment and tooling**
 
-1. **Always `git -C /Users/ia87221/ws/mlx-vlm`.** `cd` persists between tool calls, and
+1. **Always `git -C <fork checkout root>`.** `cd` persists between tool calls, and
    a wrong relative path returns **empty output, not an error** — three times that made
    a file look fork-only or look byte-identical to upstream. Same class: a zsh
    `--include=*.py` glob silently swallows a `grep`, and `| head` reports `exit=0` over
