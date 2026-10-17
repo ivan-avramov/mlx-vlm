@@ -1452,6 +1452,22 @@ def _resolve_seeds(
     return [default_seed if s is None else s for s in seeds]
 
 
+def _speculation_reproduces_plain(logits_processors, seeds, sampler) -> bool:
+    # Fork: fork-only helper (P369/M2, M5).
+    """Whether the batched speculative path decodes exactly as plain batching.
+
+    It applies no logits processor after the first token (M2), and it keys every
+    row's positioned draws by the batch sampler's own seed (M5). Any processor, or
+    a per-request seed the sampler does not carry, selects plain decoding.
+    """
+    if logits_processors and any(logits_processors):
+        return False
+    if not callable(getattr(sampler, "sample_target", None)):
+        return True  # unpositioned sampler: plain batching ignores seeds too
+    resolved = _resolve_seeds(seeds, sampler)
+    return resolved is None or all(seed == sampler.seed for seed in resolved)
+
+
 class GenerationBatch:
     """
     Batched token generator with double-buffered pipelining.
@@ -2571,9 +2587,24 @@ class PromptProcessingBatch:
         ]
 
     def generate(
-        self, sampler, stop_criteria, compute_logprobs=True, top_logprobs_k=0
+        self,
+        sampler,
+        stop_criteria,
+        compute_logprobs=True,
+        top_logprobs_k=0,
+        allow_speculative=True,  # Fork (P369): False while a plain batch decodes
     ) -> GenerationBatch:
         """Process final tokens and transition to GenerationBatch."""
+        # Fork (P369/M2, M5): speculate only where the speculative batch decodes
+        # exactly as plain batching; otherwise fall back to GenerationBatch.
+        is_speculative = (
+            allow_speculative
+            and self.draft_model is not None
+            and self.draft_kind is not None
+            and _speculation_reproduces_plain(
+                self.logits_processors, self.seeds, sampler
+            )
+        )
         call_kwargs = dict(self._prompt_kwargs)
         if self.draft_model is not None and self.draft_kind is not None:
             call_kwargs.update(
@@ -2627,8 +2658,7 @@ class PromptProcessingBatch:
 
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         # Fork (O30): per-row seeds apply to the plain (non-speculative) path
-        # only — the speculative/mtp path is untouched by this fix.
-        is_speculative = self.draft_model is not None and self.draft_kind is not None
+        # only; P369/M5 decodes a batch plainly when they would differ.
         first_tokens = _sample_with_positions(
             sampler,
             logprobs,
@@ -2665,7 +2695,7 @@ class PromptProcessingBatch:
                     self._suffix_lens,
                 )
 
-        if self.draft_model is not None and self.draft_kind is not None:
+        if is_speculative:
             gen_batch = SpeculativeGenerationBatch(
                 model=self.model,
                 draft_model=self.draft_model,
@@ -3444,6 +3474,12 @@ class BatchGenerator:
             return progress()
         return []
 
+    def _speculation_allowed(self) -> bool:
+        # Fork (P369/M2, M5): a plain batch that is decoding (a fallback) cannot
+        # be extended by a speculative one; new rows join it plainly.
+        batch = self._generation_batch
+        return len(batch) == 0 or getattr(batch, "is_speculative", False)
+
     def _extend_generation_batch(self, gen_batch) -> None:
         if len(self._generation_batch) == 0:
             self._generation_batch = gen_batch
@@ -3501,6 +3537,7 @@ class BatchGenerator:
                 self.tokenizer.stopping_criteria,
                 compute_logprobs=self.compute_logprobs,
                 top_logprobs_k=self.top_logprobs_k,
+                allow_speculative=self._speculation_allowed(),
             )
             elapsed = time.perf_counter() - tic
             self._prompt_time_counter += elapsed
@@ -3550,6 +3587,7 @@ class BatchGenerator:
                         self.tokenizer.stopping_criteria,
                         compute_logprobs=self.compute_logprobs,
                         top_logprobs_k=self.top_logprobs_k,
+                        allow_speculative=self._speculation_allowed(),
                     )
                     elapsed = time.perf_counter() - tic
                     self._prompt_time_counter += elapsed
@@ -3628,6 +3666,7 @@ class BatchGenerator:
                     self.tokenizer.stopping_criteria,
                     compute_logprobs=self.compute_logprobs,
                     top_logprobs_k=self.top_logprobs_k,
+                    allow_speculative=self._speculation_allowed(),
                 )
                 elapsed = time.perf_counter() - tic
                 self._prompt_time_counter += elapsed
