@@ -718,9 +718,13 @@ class _FakeBudgetCriteria:
         return None
 
 
-def test_suffix_forces_thinking_end_token_on_budget():
+def test_suffix_forces_thinking_end_token_on_budget_block_granular():
     # Greedy chain never emits the end token (99); the only way 99 appears is the
     # forced close. After the force, generation continues from 99 -> 50, 51, ...
+    # SUFFIX ONLY (P369): round-top forcing with <= one block of overshoot is the
+    # suffix drafter's documented contract; suffix is outside P369 and stays OFF /
+    # uncertified. MTP is held to plain decoding's exact forced sequence instead
+    # (test_mtp_thinking_budget.py), so this blessing must not spread to it.
     nxt = {i: i + 1 for i in range(60)}
     nxt[99] = 50
     lm = _MarkovLM(nxt, vocab=128)

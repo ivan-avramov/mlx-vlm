@@ -1,23 +1,18 @@
-"""thinking_budget support in the MTP round loop (campaign O40, 2026-08-24).
+"""thinking_budget in the MTP round loops (O40, 2026-08-24; P369 M3, 2026-10-17).
 
-Fork-only file. The gap these pin: `run_speculative_rounds` forwards
-`thinking_budget_criteria` ONLY to the suffix branch; the mtp branch drops it, which is
-half of why the server hard-rejects thinking_budget + a loaded drafter (HTTP 500 at
-`server/generation.py`) — and our deployed profile always sets a budget, so native MTP
-was undeployable on this stack.
-
-Contract (ported verbatim from `run_suffix_decoding_rounds`, the established design):
-the CALLER drives the criteria's `__call__` per yielded token, keeping
-`budget_exceeded` current; the round loop checks it at each round top and, when
-tripped, commits the pending bonus into the target cache with a single-token forward,
-then force-yields the criteria's `thinking_end_token_id` so generation leaves the
-thinking block and answers. Block granularity: <= one draft block of overshoot is
-accepted, exactly as suffix documents. Never fires without a criteria.
-
-The fakes mirror test_speculative.py's `_mtp_rounds` fixtures (patched
-`_mtp_verify_target` / `_mtp_acceptance_walk`; no real models). The criteria stub
-exposes only the two attributes the suffix loop reads (`budget_exceeded`,
-`thinking_end_token_id`) — the same duck-type contract.
+Fork-only file. Contract (P369/M3, replacing O40's "<= one draft block of overshoot"):
+MTP must emit plain decoding's exact sequence. Plain decoding (``generate_step``,
+``GenerationBatch``) lets the caller drive ``ThinkingBudgetCriteria`` with every
+emitted token and then pops ``pop_forced_token_id()``; a forced token REPLACES the
+next token, so the trip is followed immediately by the whole forced sequence
+(newline, then the closer). The MTP loops decide that cut on a copy of the criteria
+BEFORE the drafter and the target commit anything, commit through the token that
+precedes each forced token, and emit the forced tokens one by one. The E4 tests
+place the trip at every block position (an accepted draft, the verifier bonus, the
+prefill's first token) with a high-acceptance drafter (full accepts across the trip)
+and a low-acceptance one (mismatch every round), on the inline cached-session path
+and on the continuous-batching B == 1 path, and compare token ids, the session
+cache and the next turn with plain decoding.
 """
 
 from types import SimpleNamespace
@@ -25,14 +20,180 @@ from unittest.mock import patch
 
 import mlx.core as mx
 import pytest
+from test_mtp_exactness import (
+    BLOCK,
+    PICKS,
+    PROMPT,
+    deployed_sampling,
+    fake_model,
+    hybrid_lm,
+    mtp_drafter,
+    scripted,
+)
+from test_mtp_stop_state import Tokenizer, assert_same_cache, cache_snapshot, turn
 
 import mlx_vlm.speculative.mtp as mtp_utils
+from mlx_vlm.generate import ar
+from mlx_vlm.generate.common import PromptCacheState
 from mlx_vlm.speculative import utils as speculative_utils
-from mlx_vlm.speculative.utils import _mtp_rounds
+from mlx_vlm.speculative.utils import _mtp_rounds, _mtp_rounds_batch
+from mlx_vlm.utils import ThinkingBudgetCriteria
 
 END_ID = 42
+THINK, CLOSE, NEWLINE = 61, 62, 63
+SPECIAL = {THINK: "<think>", CLOSE: "</think>", NEWLINE: "\n"}
+N = 12
 
 
+class ThinkingTokenizer(Tokenizer):
+    """Ids as text, with the three thinking delimiters as single tokens."""
+
+    def decode(self, ids):
+        return " ".join(SPECIAL.get(int(i), str(int(i))) for i in ids)
+
+    def encode(self, text, add_special_tokens=False):
+        lookup = {v: k for k, v in SPECIAL.items()}
+        return [lookup[text]]
+
+
+THINKING_PROMPT = PROMPT + [THINK]
+
+
+# --------------------------------------------------------------------------- E4
+@pytest.fixture(scope="module")
+def setup():
+    lm = hybrid_lm(logit_scale=4.0)
+    model = fake_model(lm)
+    # The drafter proposes the UNBUDGETED continuation, so blocks are fully
+    # accepted across the trip (the M3 worst case).
+    free, _ = turn(model, THINKING_PROMPT, PromptCacheState(), n=N + 4)
+    return SimpleNamespace(lm=lm, model=model, free=list(free))
+
+
+def _budget_turn(setup, budget, state, drafter=None, ids=None, n=N, seed=5):
+    return turn(
+        setup.model,
+        ids or THINKING_PROMPT,
+        state,
+        drafter=drafter,
+        n=n,
+        seed=seed,
+        tokenizer=ThinkingTokenizer(),
+        thinking_budget=budget,
+        enable_thinking=True,
+    )
+
+
+def _trip(off):
+    """Index of the token after which plain decoding forced newline + closer."""
+    pairs = [i for i in range(len(off) - 1) if off[i : i + 2] == [NEWLINE, CLOSE]]
+    assert pairs, off  # the budget did trip inside the generated window
+    return pairs[0] - 1
+
+
+def _scripted_free(setup, high):
+    drafter = mtp_drafter(setup.lm)
+    free = setup.free
+    script = scripted(
+        drafter,
+        lambda pos: free[pos] if pos < len(free) else None,
+        high=high,
+        vocab=64,
+    )
+    return drafter, script
+
+
+@pytest.mark.parametrize("high", [True, False], ids=["full-accept", "mismatch"])
+def test_e4_budget_trip_at_every_block_position_emits_plain_sequence(setup, high):
+    failures = []
+    rounds = []
+    trips = set()
+    for budget in range(0, 8):  # the trip lands on every block position
+        off_state, on_state = PromptCacheState(), PromptCacheState()
+        off, _ = _budget_turn(setup, budget, off_state)
+        trips.add(_trip(off) % BLOCK)
+        drafter, script = _scripted_free(setup, high)
+        on, _ = _budget_turn(setup, budget, on_state, drafter=drafter)
+        rounds.extend(script.rounds)
+        if on != off:
+            failures.append((budget, "tokens", off, on))
+            continue
+        try:
+            assert on_state.token_ids == off_state.token_ids
+            assert_same_cache(cache_snapshot(on_state), cache_snapshot(off_state))
+        except AssertionError as e:
+            failures.append((budget, "state", str(e).splitlines()[0]))
+            continue
+        follow = off_state.token_ids + [21, 22, 23]
+        off2, _ = turn(setup.model, follow, off_state, n=6, seed=9)
+        on2, _ = turn(setup.model, follow, on_state, drafter=drafter, n=6, seed=9)
+        if on2 != off2:
+            failures.append((budget, "next-turn", off2, on2))
+    if high:
+        assert any(a == d for a, d in rounds), rounds
+    else:  # the scripted drafter never proposes the free path; it rarely hits
+        assert sum(a == 0 for a, _ in rounds) >= 0.8 * len(rounds), rounds
+    assert trips == set(range(BLOCK)), trips
+    assert failures == []
+
+
+def _batched(setup, budget, drafter):
+    """One request through BatchGenerator (continuous batching, B == 1)."""
+    params = deployed_sampling(PICKS[0])
+    sampler = ar._PositionedTargetSampler(seed=5, **params)
+    tokenizer = ThinkingTokenizer()
+    generator = ar.BatchGenerator(
+        setup.lm,
+        SimpleNamespace(tokenizer=tokenizer),
+        sampler=sampler,
+        prefill_step_size=None,
+        draft_model=drafter,
+        draft_kind="mtp" if drafter is not None else None,
+        draft_block_size=BLOCK,
+    )
+    criteria = ThinkingBudgetCriteria(
+        tokenizer,
+        thinking_budget=budget,
+        thinking_end_token="</think>",
+        thinking_start_token="<think>",
+        enable_thinking=True,
+        prompt_preopens_thinking=True,
+    )
+    generator.insert(
+        [THINKING_PROMPT],
+        max_tokens=N,
+        prompt_kwargs=[
+            {"inputs_embeds": setup.lm.model.embed_tokens(mx.array([THINKING_PROMPT]))}
+        ],
+        thinking_budget_criteria=[criteria],
+        seeds=[5],
+    )
+    tokens = []
+    try:
+        for _ in range(200):
+            _, responses = generator.next()
+            tokens += [int(r.token) for r in responses if r.token is not None]
+            if not generator.has_work:
+                break
+    finally:
+        generator.close()
+    return tokens
+
+
+@pytest.mark.parametrize("high", [True, False], ids=["full-accept", "mismatch"])
+def test_e4_continuous_batching_b1_budget_matches_plain(setup, high):
+    failures = []
+    for budget in range(0, 8):
+        off = _batched(setup, budget, None)
+        _trip(off)
+        drafter, _ = _scripted_free(setup, high)
+        on = _batched(setup, budget, drafter)
+        if on != off:
+            failures.append((budget, off, on))
+    assert failures == []
+
+
+# --------------------------------------------------------------------------- units
 class _Draft:
     def __init__(self):
         self.config = SimpleNamespace(block_size=3)
@@ -56,109 +217,21 @@ class _LM:
         pass
 
 
-class _Criteria:
-    """Duck-type stub: trips for the first `trip_reads` round-top checks, then clears
-    (the real ThinkingBudgetCriteria clears `budget_exceeded` when its __call__ sees
-    the end token — driven by the caller, which this unit test stands in for)."""
+class _ForcedCriteria:
+    """Plain decoding's contract: ``pop_forced_token_id`` hands out the token the
+    caller's last ``__call__`` scheduled. Armed: the first bonus already tripped."""
 
-    def __init__(self, trip_reads=1):
-        self._trips_left = trip_reads
-        self.thinking_end_token_id = END_ID
+    thinking_end_token_id = END_ID
 
-    @property
-    def budget_exceeded(self):
-        if self._trips_left > 0:
-            self._trips_left -= 1
-            return True
-        return False
+    def __init__(self, armed):
+        self.forced_token_id = END_ID if armed else None
 
+    def __call__(self, token_id):
+        return None
 
-def _verify(width):
-    return speculative_utils._MTPVerifyResult(
-        hidden=mx.zeros((1, width, 2), dtype=mx.float32),
-        shared_kv_states={},
-        rollback_state=None,
-    )
-
-
-def _run(criteria, max_tokens=4):
-    verify_widths = []
-
-    def fake_verify(lm, verify_input, *args, **kwargs):
-        verify_widths.append(int(verify_input.shape[1]))
-        return _verify(int(verify_input.shape[1]))
-
-    draft = _Draft()
-    model = SimpleNamespace(language_model=_LM())
-    with (
-        patch.object(mtp_utils, "_mtp_verify_target", side_effect=fake_verify),
-        patch.object(mtp_utils, "_mtp_acceptance_walk", return_value=(1, [9, 10])),
-    ):
-        toks = [
-            t
-            for t, _ in _mtp_rounds(
-                model,
-                draft,
-                [SimpleNamespace(offset=0)],
-                mx.zeros((1, 1, 2), dtype=mx.float32),
-                {},
-                first_bonus=1,
-                max_tokens=max_tokens,
-                sampler=lambda logits: mx.argmax(logits, axis=-1),
-                draft_block_size=3,
-                token_dtype=mx.int32,
-                greedy_sampling=True,
-                thinking_budget_criteria=criteria,
-            )
-        ]
-    return toks, verify_widths, draft
-
-
-def test_tripped_budget_forces_the_end_token_first():
-    toks, verify_widths, draft = _run(_Criteria(trip_reads=1))
-    assert toks[0] == END_ID, (
-        "with the budget already exceeded at the round top, the end-of-thinking token "
-        "must be forced before any further drafting"
-    )
-
-
-def test_tripped_budget_commits_the_pending_bonus_with_a_single_token_forward():
-    _toks, verify_widths, _draft = _run(_Criteria(trip_reads=1))
-    assert verify_widths[0] == 1, (
-        "the pending bonus must be committed into the target cache (width-1 forward) "
-        "before the forced end token, or the cache desyncs from the emitted stream"
-    )
-
-
-def test_drafting_resumes_after_the_forced_close():
-    toks, _verify_widths, draft = _run(_Criteria(trip_reads=1))
-    assert draft.draft_block_calls > 0, "after leaving thinking, normal rounds resume"
-    assert len(toks) > 1
-
-
-def test_untripped_criteria_changes_nothing():
-    toks_with, _, _ = _run(_Criteria(trip_reads=0))
-    with (
-        patch.object(mtp_utils, "_mtp_verify_target", return_value=_verify(3)),
-        patch.object(mtp_utils, "_mtp_acceptance_walk", return_value=(1, [9, 10])),
-    ):
-        toks_without = [
-            t
-            for t, _ in _mtp_rounds(
-                SimpleNamespace(language_model=_LM()),
-                _Draft(),
-                [SimpleNamespace(offset=0)],
-                mx.zeros((1, 1, 2), dtype=mx.float32),
-                {},
-                first_bonus=1,
-                max_tokens=4,
-                sampler=lambda logits: mx.argmax(logits, axis=-1),
-                draft_block_size=3,
-                token_dtype=mx.int32,
-                greedy_sampling=True,
-            )
-        ]
-    assert toks_with == toks_without
+    def pop_forced_token_id(self):
+        forced, self.forced_token_id = self.forced_token_id, None
+        return forced
 
 
 def test_run_speculative_rounds_forwards_criteria_to_the_mtp_branch():
@@ -169,7 +242,7 @@ def test_run_speculative_rounds_forwards_criteria_to_the_mtp_branch():
         seen["criteria"] = kwargs.get("thinking_budget_criteria")
         return iter(())
 
-    criteria = _Criteria(trip_reads=0)
+    criteria = _ForcedCriteria(armed=False)
     last_outputs = SimpleNamespace(
         shared_kv_states={}, hidden_states=[mx.zeros((1, 1, 2), dtype=mx.float32)]
     )
@@ -194,88 +267,28 @@ def test_run_speculative_rounds_forwards_criteria_to_the_mtp_branch():
     assert seen.get("criteria") is criteria
 
 
-# --------------------------------------------------------------------------- batched loop
-# The continuous-batching path (BatchGenerator -> SpeculativeGenerationBatch ->
-# run_speculative_server_rounds -> _mtp_rounds_batch) is where ALL anonymous server
-# traffic decodes — including benchmark generation, whose deployed profile always sets a
-# thinking budget. v1 scope mirrors suffix's: budget enforcement at B==1 (the campaign
-# runs --num-threads 1); criteria with B>1 refuses loudly rather than silently ignoring
-# the budget.
-
-from mlx_vlm.speculative.utils import _mtp_rounds_batch  # noqa: E402
-
-
-def _run_batch(criteria, B=1, max_tokens=4):
-    verify_widths = []
-
-    def fake_verify(lm, verify_input, *args, **kwargs):
-        verify_widths.append(int(verify_input.shape[1]))
-        w = int(verify_input.shape[1])
-        return speculative_utils._MTPVerifyResult(
-            hidden=mx.zeros((verify_input.shape[0], w, 2), dtype=mx.float32),
-            shared_kv_states={},
-            target_tokens=mx.zeros((verify_input.shape[0], w), dtype=mx.int32) + 9,
-            rollback_state=None,
+def test_batch_criteria_with_b_gt_1_refuses():
+    with pytest.raises(ValueError, match="batch"):
+        list(
+            _mtp_rounds_batch(
+                SimpleNamespace(language_model=_LM()),
+                _Draft(),
+                [SimpleNamespace(offset=0)],
+                mx.zeros((2, 1, 2), dtype=mx.float32),
+                {},
+                first_bonus=mx.array([1, 1], dtype=mx.int32),
+                max_tokens=4,
+                sampler=lambda logits: mx.argmax(logits, axis=-1),
+                draft_block_size=3,
+                greedy_sampling=True,
+                thinking_budget_criteria=[
+                    _ForcedCriteria(armed=False),
+                    _ForcedCriteria(armed=False),
+                ],
+            )
         )
 
-    def fake_draft_block_active(
-        draft_model, b_active, hidden, bs, sampler, dtype, positions, **kw
-    ):
-        return mx.array([[7, 8]] * len(b_active), dtype=mx.int32)
 
-    def fake_walk(draft_tokens, target_tokens, budgets):
-        n = draft_tokens.shape[0]
-        return [1] * n, [[9, 10]] * n
-
-    draft = _Draft()
-    model = SimpleNamespace(language_model=_LM())
-    with (
-        patch.object(mtp_utils, "_mtp_verify_target", side_effect=fake_verify),
-        patch.object(mtp_utils, "_mtp_draft_block_active", fake_draft_block_active),
-        patch.object(mtp_utils, "_speculative_walk_batch", side_effect=fake_walk),
-    ):
-        rounds = []
-        for tok_list, _meta in _mtp_rounds_batch(
-            model,
-            draft,
-            [SimpleNamespace(offset=0)],
-            mx.zeros((B, 1, 2), dtype=mx.float32),
-            {},
-            first_bonus=mx.array([1] * B, dtype=mx.int32),
-            max_tokens=max_tokens,
-            sampler=lambda logits: mx.argmax(logits, axis=-1),
-            draft_block_size=3,
-            token_dtype=mx.int32,
-            greedy_sampling=True,
-            thinking_budget_criteria=criteria,
-        ):
-            rounds.append(tok_list)
-    return rounds, verify_widths
-
-
-def test_batch_tripped_budget_forces_end_token_at_b1():
-    rounds, verify_widths = _run_batch([_Criteria(trip_reads=1)])
-    assert rounds[0] == [END_ID], (
-        "with the budget exceeded at the round top, the forced end token must be the "
-        "next emission for the row"
-    )
-    assert verify_widths[0] == 1, "pending bonus committed with a width-1 forward first"
-
-
-def test_batch_untripped_criteria_changes_nothing():
-    with_c, _ = _run_batch([_Criteria(trip_reads=0)])
-    without_c, _ = _run_batch(None)
-    assert with_c == without_c
-
-
-def test_batch_criteria_with_b_gt_1_refuses():
-    import pytest
-
-    with pytest.raises(ValueError, match="batch"):
-        _run_batch([_Criteria(trip_reads=0), _Criteria(trip_reads=0)], B=2)
-
-
-# --------------------------------------------------------------------------- plumbing
 def test_server_rounds_forwards_criteria_to_the_batch_loop():
     seen = {}
 
@@ -283,7 +296,7 @@ def test_server_rounds_forwards_criteria_to_the_batch_loop():
         seen["criteria"] = kwargs.get("thinking_budget_criteria")
         return iter(())
 
-    crit = [_Criteria(trip_reads=0)]
+    crit = [_ForcedCriteria(armed=False)]
     with patch.object(speculative_utils, "_mtp_rounds_batch", side_effect=fake_batch):
         list(
             speculative_utils.run_speculative_server_rounds(
@@ -303,18 +316,18 @@ def test_server_rounds_forwards_criteria_to_the_batch_loop():
 
 def test_speculative_generation_batch_drives_and_forwards_criteria():
     """The wrapper must (a) drive the criteria's __call__ on every emitted token —
-    that is what keeps `budget_exceeded` current, the round loop only reads it —
-    and (b) hand the criteria list to run_speculative_server_rounds."""
-    from mlx_vlm.generate import ar
-
+    the round loop pops the scheduled forced token after each yield, as plain
+    decoding does — and (b) hand the criteria list to run_speculative_server_rounds."""
     calls = []
 
     class _RecordingCriteria:
         thinking_end_token_id = END_ID
-        budget_exceeded = False
 
         def __call__(self, token_id):
             calls.append(token_id)
+            return None
+
+        def pop_forced_token_id(self):
             return None
 
     seen = {}
@@ -351,8 +364,10 @@ def test_speculative_generation_batch_drives_and_forwards_criteria():
 
 
 @pytest.mark.parametrize("batched", [False, True])
-def test_forced_close_commits_transaction_before_yield(batched):
-    """A consumer can stop at the forced close without leaving pending state."""
+def test_forced_token_after_first_bonus_commits_bonus_before_yield(batched):
+    """A forced token pending after the first bonus: the bonus is committed with a
+    width-1 forward BEFORE the forced token is yielded, so a consumer that stops
+    there leaves no pending state, and no drafting happened."""
     from mlx_vlm.speculative.cache_state import start_speculative_cache
 
     class PositionCache:
@@ -383,9 +398,9 @@ def test_forced_close_commits_transaction_before_yield(batched):
         )
 
     draft = _Draft()
-    criteria = _Criteria(trip_reads=1)
+    criteria = _ForcedCriteria(armed=True)
     kwargs = dict(
-        max_tokens=2,
+        max_tokens=4,
         sampler=lambda logits: mx.argmax(logits, axis=-1),
         draft_block_size=3,
         greedy_sampling=True,
@@ -412,3 +427,36 @@ def test_forced_close_commits_transaction_before_yield(batched):
         finally:
             stream.close()
     assert entry.offset == 1, "closing the consumer must preserve committed bonus"
+
+
+def test_no_pending_forced_token_changes_nothing():
+    def run(criteria):
+        with (
+            patch.object(
+                mtp_utils,
+                "_mtp_verify_target",
+                return_value=speculative_utils._MTPVerifyResult(
+                    hidden=mx.zeros((1, 3, 2)), shared_kv_states={}, rollback_state=None
+                ),
+            ),
+            patch.object(mtp_utils, "_mtp_acceptance_walk", return_value=(1, [9, 10])),
+        ):
+            return [
+                t
+                for t, _ in _mtp_rounds(
+                    SimpleNamespace(language_model=_LM()),
+                    _Draft(),
+                    [SimpleNamespace(offset=0)],
+                    mx.zeros((1, 1, 2), dtype=mx.float32),
+                    {},
+                    first_bonus=1,
+                    max_tokens=4,
+                    sampler=lambda logits: mx.argmax(logits, axis=-1),
+                    draft_block_size=3,
+                    token_dtype=mx.int32,
+                    greedy_sampling=True,
+                    thinking_budget_criteria=criteria,
+                )
+            ]
+
+    assert run(_ForcedCriteria(armed=False)) == run(None)

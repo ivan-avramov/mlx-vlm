@@ -444,6 +444,9 @@ def generate_step(
     target_sample_position = 0
 
     thinking_budget_criteria = kwargs.pop("thinking_budget_criteria", None)
+    # Fork (P369/M4): the caller's pure stop predicate, so inline MTP can cut a
+    # block at the stop token before it commits; plain decoding ignores it.
+    speculative_stop_check = kwargs.pop("speculative_stop_check", None)
 
     # Create the KV cache for generation
     if prompt_cache is None:
@@ -845,6 +848,7 @@ def generate_step(
             sampler_is_greedy=sampler_is_greedy,
             prompt_token_ids=suffix_prompt_token_ids,
             thinking_budget_criteria=thinking_budget_criteria,
+            stop_check=speculative_stop_check,  # Fork (P369/M4)
         )
         return
 

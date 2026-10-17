@@ -1169,6 +1169,18 @@ def stream_generate(
     else:
         tokenizer.thinking_budget_criteria = None
 
+    # Fork (P369/M4): inline MTP decides a block's emitted prefix BEFORE it commits,
+    # so it needs the stop decision made below (``tokenizer.stopping_criteria``) as a
+    # pure predicate. A custom criteria may be stateful and cannot be evaluated
+    # twice per token: such a request decodes plainly instead.
+    if kwargs.get("draft_model") is not None and kwargs.get("draft_kind") == "mtp":
+        _stop = tokenizer.stopping_criteria
+        if type(_stop).__call__ is StoppingCriteria.__call__:
+            kwargs["speculative_stop_check"] = lambda token_id: bool(_stop(token_id))
+        else:
+            kwargs.pop("draft_model")
+            kwargs.pop("draft_kind")
+
     # Ensure we have a prompt_cache we can track for reuse.
     if "prompt_cache" not in kwargs:
         kwargs["prompt_cache"] = cache.make_prompt_cache(

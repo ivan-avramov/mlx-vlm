@@ -1,3 +1,4 @@
+import copy  # Fork (P369): pre-commit criteria simulation
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Generator, List, Optional, Tuple
 
@@ -585,6 +586,62 @@ def _buffer_mtp_target_cache(
         prompt_cache[idx] = buffer_entry(entry)
 
 
+# Fork (P369/M3, M4): plain decoding's emission decision for one verified block,
+# taken BEFORE the drafter acceptance and the target transaction commit.
+def _mtp_pop_forced(criteria) -> Optional[int]:
+    """Pop a pending thinking-budget forced token exactly as plain decoding does.
+
+    Plain decoding (``generate_step``) calls ``pop_forced_token_id()`` after every
+    yielded token, once the caller has driven the criteria with that token.
+    """
+    if criteria is None:
+        return None
+    return criteria.pop_forced_token_id()
+
+
+def _mtp_plain_emission(
+    tokens: List[int],
+    *,
+    budget: int,
+    stop_check: Optional[Callable[[int], bool]] = None,
+    criteria: Optional[Any] = None,
+) -> Tuple[int, bool, Optional[int]]:
+    """Return ``(n_emit, terminal, forced)`` for a verified block.
+
+    ``tokens`` are the verified tokens (accepted drafts, then the verifier bonus).
+    Plain decoding emits ``tokens[:n_emit]`` and then either stops (``terminal``:
+    stop token or ``budget`` exhausted) or replaces the next token with ``forced``
+    (thinking budget). The criteria is advanced on a shallow copy only; the caller
+    still drives the real one per yielded token.
+    """
+    sim = copy.copy(criteria) if criteria is not None else None
+    for index, token in enumerate(tokens):
+        if index + 1 >= budget:
+            return index + 1, True, None
+        if stop_check is not None and stop_check(int(token)):
+            return index + 1, True, None
+        if sim is not None:
+            sim(int(token))
+            forced = sim.pop_forced_token_id()
+            if forced is not None:
+                return index + 1, False, int(forced)
+    return len(tokens), False, None
+
+
+def _mtp_commit_pending_token(lm, prompt_cache, token, sampler, token_dtype):
+    """Write one emitted-but-uncached token into the target cache (width-1 verify)."""
+    with mx.stream(generation_stream):
+        verify = _mtp_verify_target(
+            lm,
+            mx.array([[int(token)]], dtype=token_dtype),
+            prompt_cache,
+            sampler,
+            sample_target_tokens=False,
+        )
+    verify.commit(lm, prompt_cache, 0, 1)
+    return verify
+
+
 def _mtp_rounds(
     model: nn.Module,
     draft_model: nn.Module,
@@ -600,8 +657,17 @@ def _mtp_rounds(
     token_dtype: mx.Dtype = mx.int32,
     greedy_sampling: bool = False,
     thinking_budget_criteria: Optional[Any] = None,
+    stop_check: Optional[Callable[[int], bool]] = None,
 ) -> Generator[Tuple[int, None], None, None]:
-    """Verify autoregressive MTP drafts and commit accepted state before emission."""
+    """Verify autoregressive MTP drafts and commit accepted state before emission.
+
+    Fork (P369/M3, M4): every block is cut to plain decoding's emitted prefix before
+    anything commits — at a stop token or the length budget (``stop_check`` /
+    ``max_tokens``), or where a thinking-budget forced token would replace the next
+    token. The target cache then holds exactly the emitted tokens plain decoding has
+    written: a terminal token is committed too, and a forced sequence is emitted one
+    token at a time after the token preceding it.
+    """
     lm = model.language_model if hasattr(model, "language_model") else model
 
     block_total = _dflash_block_total(draft_model, draft_block_size)
@@ -646,7 +712,10 @@ def _mtp_rounds(
     )
 
     b = first_bonus
+    b_cached = False  # the last emitted token is not yet in the target cache
     emitted = 1  # caller already yielded the first bonus
+    # Fork (P369/M3): the caller drove the criteria with the first bonus.
+    forced = _mtp_pop_forced(thinking_budget_criteria)
 
     # Fork: profiling is off unless MLX_VLM_MTP_PROFILE is set.
     prof = mtp_profile.round_profiler_from_env()
@@ -654,41 +723,35 @@ def _mtp_rounds(
         prof.begin()
     try:
         while emitted < max_tokens:
-            # Fork (O40): thinking budget, ported verbatim in contract from
-            # run_suffix_decoding_rounds — the caller (stream_generate) drives the
-            # criteria's __call__ per yielded token; this loop only checks
-            # ``budget_exceeded`` at the round top and forces the model's real
-            # end-of-thinking token so generation leaves the block and answers.
-            # Block granularity (<= one draft block of overshoot); never fires
-            # without a criteria. The pending bonus is committed with a width-1
-            # verify forward FIRST — it was yielded but is not yet in the target
-            # cache, and the forced token must land after it, not instead of it.
-            # (No profiler marks in this branch; its cost lands in the next
-            # normal round's ``other`` phase.)
-            if thinking_budget_criteria is not None and getattr(
-                thinking_budget_criteria, "budget_exceeded", False
-            ):
-                with mx.stream(generation_stream):
-                    verify = _mtp_verify_target(
-                        lm,
-                        mx.array([[b]], dtype=token_dtype),
-                        prompt_cache,
-                        sampler,
-                        sample_target_tokens=False,
+            # Fork (O40, P369/M3): plain decoding replaces the token after ``b``
+            # with the criteria's forced token. Commit ``b`` first if it is still
+            # pending (it was yielded but is not in the target cache), then emit the
+            # forced token; it becomes the pending bonus. (No profiler marks in this
+            # branch; its cost lands in the next normal round's ``other`` phase.)
+            if forced is not None:
+                if not b_cached:
+                    verify = _mtp_commit_pending_token(
+                        lm, prompt_cache, b, sampler, token_dtype
                     )
-                verify.commit(lm, prompt_cache, 0, 1)
-                hidden = _mtp_draft_hidden(lm, verify.hidden[:, -1:, :])
-                kv_offset += 1
-                draft_model.set_shared_kv(
-                    _slice_shared_kv_after_reject(verify.shared_kv_states, 0),
-                    kv_offset,
-                    position=_mtp_draft_position(kv_offset),
-                    kv_valid_len=kv_offset,
+                    hidden = _mtp_draft_hidden(lm, verify.hidden[:, -1:, :])
+                    kv_offset += 1
+                    draft_model.set_shared_kv(
+                        _slice_shared_kv_after_reject(verify.shared_kv_states, 0),
+                        kv_offset,
+                        position=_mtp_draft_position(kv_offset),
+                        kv_valid_len=kv_offset,
+                    )
+                b, b_cached = int(forced), False
+                terminal = emitted + 1 >= max_tokens or (
+                    stop_check is not None and stop_check(b)
                 )
-                end_id = int(thinking_budget_criteria.thinking_end_token_id)
-                yield end_id, None
+                if terminal:
+                    _mtp_commit_pending_token(lm, prompt_cache, b, sampler, token_dtype)
+                yield b, None
                 emitted += 1
-                b = end_id
+                if terminal:
+                    return
+                forced = _mtp_pop_forced(thinking_budget_criteria)
                 continue
 
             bs = _mtp_next_block_size(
@@ -744,7 +807,32 @@ def _mtp_rounds(
                 sampler_rng.target_sampled(
                     sync_draft=not _sampler_supports_positioned_target(sampler)
                 )
-                _record_speculative_round(draft_model, accepted, bs - 1)
+
+                # Fork (P369/M3, M4): cut to plain decoding's emitted prefix
+                # before the drafter and the target commit anything. A cut on
+                # an accepted draft keeps that draft as a verified input (it is
+                # emitted and, as in plain decoding, in the cache); a cut on the
+                # bonus keeps the bonus pending.
+                n_emit, terminal, next_forced = _mtp_plain_emission(
+                    new_tokens,
+                    budget=max_tokens - emitted,
+                    stop_check=stop_check,
+                    criteria=thinking_budget_criteria,
+                )
+                new_tokens = list(new_tokens[:n_emit])
+                if n_emit <= accepted:
+                    accepted_draft, accepted_commit, last_cached = (
+                        n_emit - 1,
+                        n_emit,
+                        True,
+                    )
+                else:
+                    accepted_draft, accepted_commit, last_cached = (
+                        accepted,
+                        accepted,
+                        False,
+                    )
+                _record_speculative_round(draft_model, accepted_draft, bs - 1)
 
                 accept_verified = getattr(draft_model, "accept_verified_tokens", None)
                 if callable(accept_verified):
@@ -752,7 +840,7 @@ def _mtp_rounds(
                         accept_verified,
                         verify.hidden,
                         draft_tokens,
-                        accepted,
+                        accepted_draft,
                         new_tokens,
                         sampler,
                         token_dtype,
@@ -761,7 +849,11 @@ def _mtp_rounds(
 
                 if prof is not None:
                     prof.mark("accept")
-                verify.commit(lm, prompt_cache, accepted, bs)
+                verify.commit(lm, prompt_cache, accepted_commit, bs)
+                if terminal and not last_cached:
+                    _mtp_commit_pending_token(
+                        lm, prompt_cache, new_tokens[-1], sampler, token_dtype
+                    )
                 if prof is not None:
                     prof.mark("rollback", mtp_profile.cache_state_arrays(prompt_cache))
             except BaseException:
@@ -775,26 +867,39 @@ def _mtp_rounds(
             for i, tok in enumerate(new_tokens):
                 yield tok, None
                 emitted += 1
-                if emitted >= max_tokens:
-                    if prof is not None:
-                        prof.mark("yield")
-                        prof.end_unit(accepted=accepted, n_draft=bs - 1, emitted=i + 1)
-                    return
+                popped = _mtp_pop_forced(thinking_budget_criteria)
+                expected = next_forced if i == len(new_tokens) - 1 else None
+                if not terminal and popped != expected:
+                    raise RuntimeError(
+                        "thinking-budget criteria diverged from the pre-commit "
+                        f"emission decision (expected {expected}, got {popped})."
+                    )
+            if terminal:
+                if prof is not None:
+                    prof.mark("yield")
+                    prof.end_unit(
+                        accepted=accepted_draft, n_draft=bs - 1, emitted=n_emit
+                    )
+                return
+            forced = next_forced
 
             if prof is not None:
                 prof.mark("yield")
                 prof.end_unit(
-                    accepted=accepted, n_draft=bs - 1, emitted=len(new_tokens)
+                    accepted=accepted_draft, n_draft=bs - 1, emitted=len(new_tokens)
                 )
 
-            # Hidden for next round: pick the slot of the newly accepted bonus.
-            hidden = _mtp_draft_hidden(lm, verify.hidden[:, accepted : accepted + 1, :])
-            b = new_tokens[-1] if new_tokens else b
+            # Hidden for next round: the slot whose input is the last committed
+            # token, i.e. the one that predicted the pending token after it.
+            hidden = _mtp_draft_hidden(
+                lm, verify.hidden[:, accepted_commit : accepted_commit + 1, :]
+            )
+            b, b_cached = new_tokens[-1], last_cached
 
             next_shared_kv = _slice_shared_kv_after_reject(
-                verify.shared_kv_states, bs - (accepted + 1)
+                verify.shared_kv_states, bs - (accepted_commit + 1)
             )
-            kv_offset += accepted + 1
+            kv_offset += accepted_commit + 1
             draft_model.set_shared_kv(
                 next_shared_kv,
                 kv_offset,
@@ -1041,50 +1146,54 @@ def _mtp_rounds_batch(
     )
 
     b = first_bonus.tolist()
+    b_cached = [False] * B  # Fork (P369): last emitted token not yet in the cache
     emitted = [1] * B
     finished = [False] * B
     active_idx = list(range(B))
 
+    # Fork (P369/M4): plain decoding's stop decision for one row, as a predicate.
+    def _row_stops(row: int, token: int) -> bool:
+        return (eos_token_ids is not None and token in eos_token_ids) or (
+            stop_check is not None and stop_check(row, token)
+        )
+
+    # Fork (P369/M3): the wrapper drove the criteria with the first token.
+    forced = _mtp_pop_forced(_criteria)
+
     while len(active_idx) > 0:
-        # Fork (O40): budget check at the round top — same contract as the
-        # singleton `_mtp_rounds` (caller drives the criteria per yielded token;
-        # <= one draft block of overshoot). Commit the pending bonus with a
-        # width-1 verify forward, force the end-of-thinking token, rebind the
-        # drafter's shared KV at the advanced position, and resume rounds.
-        if _criteria is not None and getattr(_criteria, "budget_exceeded", False):
+        # Fork (O40, P369/M3): plain decoding replaces the token after the
+        # pending bonus with the criteria's forced token (B == 1 only). Commit the
+        # bonus first if it is not yet in the target cache, rebind the drafter's
+        # shared KV at the advanced position, emit the forced token; it becomes
+        # the pending bonus.
+        if forced is not None:
             row = active_idx[0]
-            with mx.stream(generation_stream):
-                verify = _mtp_verify_target(
-                    lm,
-                    mx.array([[b[row]]], dtype=token_dtype),
-                    prompt_cache,
-                    sampler,
-                    sample_target_tokens=False,
+            if not b_cached[row]:
+                verify = _mtp_commit_pending_token(
+                    lm, prompt_cache, b[row], sampler, token_dtype
                 )
-            verify.commit(lm, prompt_cache, 0, 1)
-            hidden = _mtp_draft_hidden(lm, verify.hidden[:, -1:, :])
-            positions[row] = positions[row] + 1
-            draft_model.set_shared_kv(
-                _slice_shared_kv_after_reject(verify.shared_kv_states, 0),
-                kv_offset=positions[row],
-                position=_mtp_draft_position(mx.array([positions[row]])),
-                kv_valid_len=mx.array([positions[row]]),
-                left_padding=_batch_cache_left_padding(prompt_cache),
-            )
-            end_id = int(_criteria.thinking_end_token_id)
+                hidden = _mtp_draft_hidden(lm, verify.hidden[:, -1:, :])
+                positions[row] = positions[row] + 1
+                draft_model.set_shared_kv(
+                    _slice_shared_kv_after_reject(verify.shared_kv_states, 0),
+                    kv_offset=positions[row],
+                    position=_mtp_draft_position(mx.array([positions[row]])),
+                    kv_valid_len=mx.array([positions[row]]),
+                    left_padding=_batch_cache_left_padding(prompt_cache),
+                )
+            b[row], b_cached[row] = int(forced), False
             tokens_out: List[Optional[int]] = [None] * B
-            tokens_out[row] = end_id
+            tokens_out[row] = b[row]
             emitted[row] += 1
-            if emitted[row] >= max_tokens:
+            if emitted[row] >= max_tokens or _row_stops(row, b[row]):
                 finished[row] = True
-            if eos_token_ids is not None and end_id in eos_token_ids:
-                finished[row] = True
-            if stop_check is not None and stop_check(row, end_id):
-                finished[row] = True
+                _mtp_commit_pending_token(
+                    lm, prompt_cache, b[row], sampler, token_dtype
+                )
             yield tokens_out, {"round_pos": 0, "round_len": 1}
-            b[row] = end_id
             if finished[row]:
                 break
+            forced = _mtp_pop_forced(_criteria)
             continue
 
         remaining = [
@@ -1179,12 +1288,44 @@ def _mtp_rounds_batch(
                 sampler_rng.target_sampled(
                     sync_draft=not _sampler_supports_positioned_target(sampler)
                 )
+            # Fork (P369/M3, M4): cut each row to plain decoding's emitted prefix
+            # before the drafter and the target commit (see ``_mtp_rounds``). A
+            # lockstep drafter keeps uniform commits at B > 1: there only
+            # finished rows are cut, and their state is never read again.
+            lockstep = n_active > 1 and _requires_uniform_batch_acceptance(
+                draft_model, lm
+            )
+            accepted_draft_list = list(accepted_list)
+            drafter_tokens_list = list(new_tokens_list)
+            last_cached = [False] * n_active
+            terminal = [False] * n_active
+            next_forced = None
+            for j in range(n_active):
+                orig = active_idx[j]
+                if not new_tokens_list[j]:
+                    continue  # a finished row still riding an unfilterable cache
+                n_emit, terminal[j], row_forced = _mtp_plain_emission(
+                    new_tokens_list[j],
+                    budget=max_tokens - emitted[orig],
+                    stop_check=lambda token, row=orig: _row_stops(row, token),
+                    criteria=_criteria,
+                )
+                new_tokens_list[j] = list(new_tokens_list[j][:n_emit])
+                next_forced = row_forced if n_active == 1 else None
+                if lockstep:
+                    continue
+                drafter_tokens_list[j] = new_tokens_list[j]
+                if n_emit <= accepted_list[j]:
+                    accepted_draft_list[j] = n_emit - 1
+                    accepted_list[j] = n_emit  # commit the cut token too
+                    last_cached[j] = True
+
             # Keep the adaptive block-size history on a per-round basis so
             # batched MTP reacts like the singleton loop instead of letting
             # batch size change the controller signal.
             _record_speculative_round(
                 draft_model,
-                sum(accepted_list) / len(accepted_list),
+                sum(accepted_draft_list) / len(accepted_draft_list),
                 bs - 1,
             )
 
@@ -1196,14 +1337,18 @@ def _mtp_rounds_batch(
                     accept_verified,
                     hidden_full,
                     draft_tokens,
-                    accepted_list,
-                    new_tokens_list,
+                    accepted_draft_list,
+                    drafter_tokens_list,
                     sampler,
                     token_dtype,
                     **_mtp_draft_kwargs(draft_model, greedy_sampling, sampler),
                 )
 
             verify.commit(lm, prompt_cache, accepted_list, bs)
+            if n_active == 1 and terminal[0] and not last_cached[0]:
+                _mtp_commit_pending_token(
+                    lm, prompt_cache, new_tokens_list[0][-1], sampler, token_dtype
+                )
         except BaseException:
             if verify is not None:
                 verify.abort()
@@ -1241,12 +1386,23 @@ def _mtp_rounds_batch(
                     if stop_check is not None and stop_check(orig, tok):
                         finished[orig] = True
             yield tokens_out, {"round_pos": pos, "round_len": max_new}
+            # Fork (P369/M3): pop after every yield, as plain decoding does.
+            if _criteria is not None and not finished[active_idx[0]]:
+                popped = _mtp_pop_forced(_criteria)
+                expected = next_forced if pos == max_new - 1 else None
+                if popped != expected:
+                    raise RuntimeError(
+                        "thinking-budget criteria diverged from the pre-commit "
+                        f"emission decision (expected {expected}, got {popped})."
+                    )
+        forced = next_forced
 
         # Update bonus tokens and per-row positions
         for j in range(n_active):
             orig = active_idx[j]
             if new_tokens_list[j]:
                 b[orig] = new_tokens_list[j][-1]
+                b_cached[orig] = last_cached[j]
             positions[orig] = positions[orig] + accepted_list[j] + 1
 
         # Slice + tail-zero ``verify.shared_kv_states`` to match the

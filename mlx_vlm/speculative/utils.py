@@ -20,9 +20,10 @@ from .dflash import (
     _reserve_dflash_target_cache,
 )
 from .eagle3 import _eagle3_capture_layer_ids, _eagle3_rounds, _eagle3_rounds_batch
-from .mtp import (
+from .mtp import (  # Fork: + _mtp_commit_pending_token (P369/M4)
     _buffer_mtp_target_cache,
     _effective_mtp_block_size,
+    _mtp_commit_pending_token,
     _mtp_draft_block_active,
     _mtp_draft_hidden,
     _mtp_next_block_size,
@@ -350,10 +351,12 @@ def run_speculative_rounds(
     sampler_is_greedy: bool = False,
     prompt_token_ids: Optional[List[int]] = None,
     thinking_budget_criteria: Optional[Any] = None,
+    stop_check: Optional[Callable[[int], bool]] = None,
 ) -> Generator[Tuple[Any, mx.array], None, None]:
     # Fork: dispatches draft_kind == "suffix" to the fork's drafter-free
     # n-gram / prompt-lookup speculation (863441c9), which upstream does not
-    # have at all. Every other branch is upstream's, unchanged.
+    # have at all. The mtp B == 1 branch also takes the caller's pure stop
+    # predicate (P369/M4); every other branch is upstream's, unchanged.
     B = input_ids.shape[0]
     _validate_speculative_sampling(draft_model, sampler_is_greedy)
 
@@ -389,6 +392,15 @@ def run_speculative_rounds(
             _buffer_mtp_target_cache(prompt_cache, draft_model, draft_block_size)
             mx.eval(first_token)
             bonus = first_token.item()
+            # Fork (P369/M4): plain decoding writes a terminal first token into
+            # the cache before yielding it; so must MTP.
+            if max_tokens <= 1 or (stop_check is not None and stop_check(bonus)):
+                lm = model.language_model if hasattr(model, "language_model") else model
+                _mtp_commit_pending_token(
+                    lm, prompt_cache, bonus, sampler, input_ids.dtype
+                )
+                yield bonus, logprobs
+                return
             yield bonus, logprobs
             yield from _mtp_rounds(
                 model,
@@ -405,6 +417,7 @@ def run_speculative_rounds(
                 greedy_sampling=sampler_is_greedy,
                 # Fork (O40): budget support, suffix-parity (see _mtp_rounds).
                 thinking_budget_criteria=thinking_budget_criteria,
+                stop_check=stop_check,  # Fork (P369/M4)
             )
         else:
             mx.eval(first_token)
