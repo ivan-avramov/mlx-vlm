@@ -191,3 +191,69 @@ def test_f6_fallback_prefill_requests_no_speculative_outputs(lm, monkeypatch):
 def test_f6_control_the_gate_is_mtp_specific():
     """Other kinds keep their batched speculation."""
     assert ar._speculation_fallback_reason("dflash", None, None, None) is None
+
+
+# ------------------------------------------------------------------ round 3 / F7
+LONG = [(i * 7 + 3) % 60 + 1 for i in range(40)]
+
+
+def _prefill_forwards(lm, drafter, monkeypatch, step):
+    """Number of multi-token target forwards while a batched request prefills."""
+    cls = type(lm)
+    real = cls.__call__
+    lengths = []
+
+    def spy(self, inputs, *args, **kwargs):
+        if self is lm:
+            embeds = kwargs.get("inputs_embeds")
+            lengths.append(int(embeds.shape[1]) if embeds is not None else 0)
+        return real(self, inputs, *args, **kwargs)
+
+    monkeypatch.setattr(cls, "__call__", spy)
+    sampler = ar._PositionedTargetSampler(seed=0, **deployed_sampling(PICKS[1]))
+    processor = SimpleNamespace(
+        tokenizer=SimpleNamespace(stopping_criteria=StoppingCriteria([], None))
+    )
+    generator = ar.BatchGenerator(
+        lm,
+        processor,
+        sampler=sampler,
+        prefill_step_size=step,
+        draft_model=drafter,
+        draft_kind="mtp" if drafter is not None else None,
+        draft_block_size=BLOCK,
+    )
+    generator.insert(
+        [LONG, LONG[:30]],
+        max_tokens=[3, 3],
+        prompt_kwargs=[
+            {"inputs_embeds": lm.model.embed_tokens(mx.array([p]))}
+            for p in (LONG, LONG[:30])
+        ],
+    )
+    try:
+        for _ in range(50):
+            generator.next()
+            if not generator.has_work:
+                break
+    finally:
+        generator.close()
+        monkeypatch.setattr(cls, "__call__", real)
+    return [n for n in lengths if n > 1]
+
+
+def test_f7_fallback_prefill_is_chunked_exactly_like_plain(lm, monkeypatch):
+    """The chunked-prefill policy must see the EFFECTIVE (plain) configuration: a
+    batched MTP request that decodes plainly must not lose chunking (a dense N x N
+    mask at long context)."""
+    plain = _prefill_forwards(lm, None, monkeypatch, 8)
+    on = _prefill_forwards(lm, mtp_drafter(lm), monkeypatch, 8)
+    assert len(plain) > 2, plain  # the control really chunks
+    assert on == plain
+
+
+def test_f7_effective_policy_draft_helper():
+    drafter = object()
+    assert ar._effective_prefill_draft(drafter, "mtp") == (None, None)
+    assert ar._effective_prefill_draft(drafter, "dflash") == (drafter, "dflash")
+    assert ar._effective_prefill_draft(None, None) == (None, None)
