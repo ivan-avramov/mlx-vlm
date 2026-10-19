@@ -66,3 +66,21 @@ def test_session_scoped_setup_is_seeded_even_when_requested_late(_session_scoped
     draw, session_id = _session_scoped_draw
     want = _draws(fixture_seed("session", session_id, "_session_scoped_draw"))[0]
     assert draw == want
+
+
+@pytest.fixture
+def _scope_overridden_draw(request):
+    # Declared function-scoped; the parametrize below makes it MODULE-scoped.
+    return mx.random.normal((3,)).tolist(), request.node.nodeid, request.scope
+
+
+@pytest.mark.parametrize("_scope_overridden_draw", [0], indirect=True, scope="module")
+def test_a_parametrize_scope_override_is_seeded_from_the_effective_scope(
+    _scope_overridden_draw,
+):
+    """Round 7 F30: parametrization can override a fixture's declared scope; the
+    setup is seeded from the scope it really runs under (``request.scope``)."""
+    draw, node_id, scope = _scope_overridden_draw
+    assert scope == "module"
+    want = _draws(fixture_seed("module", node_id, "_scope_overridden_draw"))[0]
+    assert draw == want
