@@ -759,3 +759,46 @@ def test_overlay_restores_the_fixture_entries_from_the_expected_interim():
         text, _ = orchestrate.overlay_registry(expected_interim(fixture), pick)
         got = {e["name"]: e for e in yaml.safe_load(text)["models"]}
         assert got[pick] == want[pick], pick
+
+
+# ------------------------------------------------------------------ code round 2 H14: an flock run lock
+def test_the_run_lock_is_exclusive_and_released_with_its_descriptor(tmp_path):
+    import os
+
+    lock = tmp_path / ".lock"
+    fd = orchestrate.acquire_lock(lock)
+    try:
+        with pytest.raises(SystemExit, match="held"):
+            orchestrate.acquire_lock(lock)
+        assert json.loads(lock.read_text())["pid"] == os.getpid()
+    finally:
+        orchestrate.release_lock(fd)
+    assert lock.exists()  # never unlinked: no pathname to race on
+    orchestrate.release_lock(orchestrate.acquire_lock(lock))
+
+
+def test_a_killed_owners_lock_is_free_without_any_reclaim(tmp_path):
+    import subprocess
+
+    lock = tmp_path / ".lock"
+    code = (
+        "import fcntl, os, sys, time\n"
+        "fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT)\n"
+        "fcntl.flock(fd, fcntl.LOCK_EX)\n"
+        "print('locked', flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", code, str(lock)], stdout=subprocess.PIPE, text=True
+    )
+    try:
+        assert proc.stdout.readline().strip() == "locked"
+        with pytest.raises(SystemExit, match="held"):
+            orchestrate.acquire_lock(lock)
+        proc.kill()
+        proc.wait()
+        orchestrate.release_lock(orchestrate.acquire_lock(lock))
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()

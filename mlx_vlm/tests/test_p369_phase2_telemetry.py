@@ -303,3 +303,20 @@ def test_the_verdict_fails_when_the_optimized_kernels_decline():
     verdict = telemetry.verdict(tel, telemetry.manifest_from_model(lm))
     assert not verdict["pass"]
     assert any("unexpected family" in p for p in verdict["problems"]), verdict
+
+
+# ------------------------------------------------------------------ code round 2 H2: the tuple kernel is expected
+@metal
+def test_the_verdict_fails_when_only_the_tuple_kernel_declines():
+    from mlx_vlm.speculative.ops import linear as ops_linear
+
+    real = ops_linear._target_verify_quantized_linears
+    ops_linear._target_verify_quantized_linears = lambda *a, **k: None
+    try:
+        lm, _, tel, emitted, plain = _on_run(PICKS[1])
+    finally:
+        ops_linear._target_verify_quantized_linears = real
+    assert emitted == plain  # the per-module optimized kernels keep the tokens
+    verdict = telemetry.verdict(tel, telemetry.manifest_from_model(lm))
+    assert not verdict["pass"], verdict
+    assert any("tuple kernel" in p for p in verdict["problems"]), verdict
