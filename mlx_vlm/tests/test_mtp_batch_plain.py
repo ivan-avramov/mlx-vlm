@@ -139,6 +139,7 @@ def test_f2_first_token_stop_single_row_matches_plain(lm, no_speculative_batch):
 
 
 def test_batched_mtp_fallback_is_counted_with_its_reason(lm, caplog):
+    ar.SPECULATION_FALLBACKS.clear()  # the first occurrence per reason logs
     before = ar.SPECULATION_FALLBACKS["mtp_batched"]
     with caplog.at_level("WARNING"):
         _, _, rounds = _drive(lm, mtp_drafter(lm), [PROMPT, OTHER], (N, N))

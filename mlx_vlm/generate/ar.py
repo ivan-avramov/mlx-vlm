@@ -32,6 +32,9 @@ from ..sample_utils import (  # Fork: isort regrouping around the fork's sampler
 from ..sample_utils import (
     top_p_sampling as top_p_sampling,  # Fork: explicit compatibility re-export
 )
+from ..speculative.common import (  # Fork (P369): fallback counter
+    SPECULATION_FALLBACKS as SPECULATION_FALLBACKS,
+)
 from ..speculative.utils import (
     SpeculativePrefill,
     make_speculative_prompt_cache,
@@ -1452,20 +1455,40 @@ def _resolve_seeds(
     return [default_seed if s is None else s for s in seeds]
 
 
-def _speculation_reproduces_plain(logits_processors, seeds, sampler) -> bool:
-    # Fork: fork-only helper (P369/M2, M5).
-    """Whether the batched speculative path decodes exactly as plain batching.
+def _speculation_fallback_reason(
+    draft_kind, logits_processors, seeds, sampler
+) -> Optional[str]:
+    # Fork: fork-only helper (P369/M2, M5, round-1 F1-F3).
+    """Why the batched speculative path cannot decode as plain batching, or None.
 
-    It applies no logits processor after the first token (M2), and it keys every
-    row's positioned draws by the batch sampler's own seed (M5). Any processor, or
-    a per-request seed the sampler does not carry, selects plain decoding.
+    mtp: its batched loop commits whole accepted blocks, so a row stopping or
+    exhausting its own budget mid-block keeps un-emitted state, and a first-token
+    stop is never written (round-1 F1-F3); plain decoding is exact. Any kind: it
+    applies no logits processor after the first token (M2) and keys every row's
+    positioned draws by the batch sampler's own seed (M5).
     """
+    if draft_kind == "mtp":
+        return "mtp_batched"
     if logits_processors and any(logits_processors):
-        return False
+        return "logits_processors"
     if not callable(getattr(sampler, "sample_target", None)):
-        return True  # unpositioned sampler: plain batching ignores seeds too
+        return None  # unpositioned sampler: plain batching ignores seeds too
     resolved = _resolve_seeds(seeds, sampler)
-    return resolved is None or all(seed == sampler.seed for seed in resolved)
+    if resolved is None or all(seed == sampler.seed for seed in resolved):
+        return None
+    return "request_seed"
+
+
+def _record_speculation_fallback(reason: str, draft_kind) -> None:
+    # Fork: fork-only helper (P369).
+    SPECULATION_FALLBACKS[reason] += 1
+    if SPECULATION_FALLBACKS[reason] == 1:
+        logger.warning(
+            "speculative %s decoding disabled for this batch (%s): decoding plainly; "
+            "counted in SPECULATION_FALLBACKS",
+            draft_kind,
+            reason,
+        )
 
 
 class GenerationBatch:
@@ -2597,14 +2620,19 @@ class PromptProcessingBatch:
         """Process final tokens and transition to GenerationBatch."""
         # Fork (P369/M2, M5): speculate only where the speculative batch decodes
         # exactly as plain batching; otherwise fall back to GenerationBatch.
-        is_speculative = (
-            allow_speculative
-            and self.draft_model is not None
-            and self.draft_kind is not None
-            and _speculation_reproduces_plain(
-                self.logits_processors, self.seeds, sampler
+        is_speculative = False
+        if self.draft_model is not None and self.draft_kind is not None:
+            reason = (
+                _speculation_fallback_reason(
+                    self.draft_kind, self.logits_processors, self.seeds, sampler
+                )
+                if allow_speculative
+                else "plain_batch_active"
             )
-        )
+            if reason is None:
+                is_speculative = True
+            else:
+                _record_speculation_fallback(reason, self.draft_kind)
         call_kwargs = dict(self._prompt_kwargs)
         if self.draft_model is not None and self.draft_kind is not None:
             call_kwargs.update(

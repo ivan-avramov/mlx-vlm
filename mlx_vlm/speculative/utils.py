@@ -3,7 +3,8 @@ from typing import Any, Callable, Generator, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from .common import (
+from .common import (  # Fork (P369): + SPECULATION_FALLBACKS
+    SPECULATION_FALLBACKS,
     _dflash_block_total,
     _format_speculative_stats,
     _speculative_walk,
@@ -420,32 +421,16 @@ def run_speculative_rounds(
                 stop_check=stop_check,  # Fork (P369/M4)
             )
         else:
-            mx.eval(first_token)
-            first_bonus = (
-                first_token if first_token.ndim == 1 else first_token.reshape(-1)
-            )
-            yield first_bonus.tolist(), logprobs
-            eos = getattr(model.config, "eos_token_id", None)
-            if isinstance(eos, int):
-                eos_set = {eos}
-            elif eos is None:
-                eos_set = None
-            else:
-                eos_set = set(int(x) for x in eos)
-            yield from _mtp_rounds_batch(
-                model,
-                draft_model,
-                prompt_cache,
-                hidden,
-                shared_kv_states,
-                prompt_tokens=input_ids,
-                first_bonus=first_bonus,
-                max_tokens=max_tokens,
-                sampler=sampler,
-                draft_block_size=draft_block_size,
-                token_dtype=input_ids.dtype,
-                eos_token_ids=eos_set,
-                greedy_sampling=sampler_is_greedy,
+            # Fork (P369 round-1 F1): lockstep B > 1 commits whole accepted blocks
+            # while emission stops per row, so a row stopping mid-block keeps
+            # un-emitted state; plain generate_step is single-sequence, so there is
+            # no plain path to fall back to: refuse (counted), never speculate.
+            SPECULATION_FALLBACKS["mtp_lockstep_refused"] += 1
+            raise NotImplementedError(
+                "MTP lockstep batched decoding (batch_size > 1 through "
+                "generate_step) is disabled: it cannot match plain decoding's "
+                f"per-row stop state; got batch_size={B}. Use continuous batching "
+                "(plain decoding) or batch_size == 1."
             )
         return
 

@@ -1,5 +1,7 @@
 """P369 E5 / E5b (M2) and E6 (M5): MTP falls back to plain decoding where it
-cannot reproduce plain decoding's law.
+cannot reproduce plain decoding's law. (Round 1: batched MTP now ALWAYS decodes plainly,
+see test_mtp_batch_plain.py; the processor / seed cases below stay as regression pins
+for the any-kind reasons, and their controls assert the batched-MTP reason.)
 
 Fork-only file. Continuous batching built ``SpeculativeGenerationBatch`` without
 the requests' logits processors (repetition / presence / frequency penalties,
@@ -115,11 +117,15 @@ def test_e5_processor_row_admitted_with_a_plain_row(lm):
     assert on == plain and rounds == 0
 
 
-def test_e5_control_without_processors_still_speculates(lm):
+def test_e5_control_without_processors_decodes_plain_too(lm):
+    # P369 round 1: batched MTP never speculates (F1-F3), so the old "control still
+    # speculates" arm is gone; the reason recorded is the batched-MTP one.
+    ar.SPECULATION_FALLBACKS.clear()
     request = [(PROMPT, {}, 0)]
     plain, _ = _run(lm, None, request)
     on, rounds = _run(lm, mtp_drafter(lm), request)
-    assert on == plain and rounds > 0
+    assert on == plain and rounds == 0
+    assert ar.SPECULATION_FALLBACKS["mtp_batched"] == 1
 
 
 # --------------------------------------------------------------------------- E5b
@@ -180,9 +186,12 @@ def test_e6_late_speculation_eligible_row_joins_the_active_plain_batch(lm):
     assert on == plain and rounds == 0
 
 
-def test_e6_control_default_seed_keeps_speculating(lm):
-    """Unseeded server traffic carries DEFAULT_SEED == the sampler's seed."""
+def test_e6_control_default_seed_decodes_plain_for_the_batched_mtp_reason(lm):
+    """Unseeded server traffic carries DEFAULT_SEED == the sampler's seed; batched
+    MTP no longer speculates at all (P369 round 1), whatever the seed."""
+    ar.SPECULATION_FALLBACKS.clear()
     request = [(PROMPT, {"seeds": [0]}, 0)]
     plain, _ = _run(lm, None, request)
     on, rounds = _run(lm, mtp_drafter(lm), request)
-    assert on == plain and rounds > 0
+    assert on == plain and rounds == 0
+    assert ar.SPECULATION_FALLBACKS["mtp_batched"] == 1

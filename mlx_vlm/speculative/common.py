@@ -9,6 +9,18 @@ from .cache_state import start_speculative_cache
 
 generation_stream = mx.new_thread_local_stream(mx.default_device())
 
+# Fork (P369): how often a configured drafter was NOT used, by reason, so a
+# performance cliff (e.g. every batched MTP request decoding plainly) is visible.
+class _FallbackCounter(dict):
+    """reason -> count; a missing reason reads 0 (collections.Counter without an
+    import, which would add an unmarked line to this shared file's header)."""
+
+    def __missing__(self, reason):
+        return 0
+
+
+SPECULATION_FALLBACKS = _FallbackCounter()
+
 
 def verify_forward(model, inputs, cache, **kwargs):
     """Run ordinary short-block forwards inside one cache transaction."""
