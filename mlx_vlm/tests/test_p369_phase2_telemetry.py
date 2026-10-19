@@ -105,8 +105,6 @@ def test_greedy_runs_the_argmax_readout(pick):
 
 
 def test_probe_calls_are_tagged_and_excluded(monkeypatch):
-    calls = []
-
     class Lm:
         def named_modules(self):
             return []
@@ -117,6 +115,7 @@ def test_probe_calls_are_tagged_and_excluded(monkeypatch):
             tel._record("_target_verify_linear", "plain", 1, "float32", ["x"])
         tel._record("_target_verify_linear", "plain", 1, "float32", ["x"])
     assert len(tel.calls) == 1 and len(tel.probe_calls) == 1
+    assert len(tel.attributions) == 1  # probe calls attribute nothing (code round 1 H2)
 
 
 def test_uninstall_restores_every_attribute():

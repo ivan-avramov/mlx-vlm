@@ -8,6 +8,7 @@ inside a block) run in two ISOLATED checkouts, each in a fresh ``python -I`` int
 the pre-fix defects of each case (class, M4a's committed-past count, M3's overshoot).
 """
 
+import os
 import subprocess
 import sys
 from collections import Counter
@@ -31,10 +32,17 @@ def _has(commit):
     )
 
 
-pytestmark = pytest.mark.skipif(
-    not (_has(oracle.PRE_FIX) and _has(oracle.FIX)),
-    reason="git history lacks the P369 commits (shallow clone): the oracle needs both trees",
-)
+def _oracle_gate(available, *, required):
+    """Only the tests that run the two pre-fix trees depend on git history: skip them in a shallow clone,
+    or FAIL when ``MLX_REQUIRE_P369_ORACLE=1`` (a gating job must prove the M3 / M4 binding).
+    """
+    if available:
+        return
+    reason = "git history lacks the P369 commits (shallow clone): the oracle needs both trees"
+    if required:
+        pytest.fail(f"MLX_REQUIRE_P369_ORACLE=1 but {reason}")
+    pytest.skip(reason)
+
 
 EXPECT_PRE_FIX = {
     "first_draft": dict(
@@ -56,6 +64,10 @@ EXPECT_PRE_FIX = {
 
 @pytest.fixture(scope="module")
 def measured(tmp_path_factory):
+    _oracle_gate(
+        _has(oracle.PRE_FIX) and _has(oracle.FIX),
+        required=os.environ.get("MLX_REQUIRE_P369_ORACLE") == "1",
+    )
     work = tmp_path_factory.mktemp("p369-oracle")
     return {
         commit: {
