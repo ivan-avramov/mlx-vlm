@@ -22,7 +22,8 @@ float32, and bfloat16 affine 4-bit (uniform pick) / mixed 4+8-bit (mixed pick,
 some modules left dense) quantized targets and drafters, sized so the exact affine
 verifier kernels are eligible, with spies proving both the ``quantized_verifier``
 and the dense ``exact_speculative_verify`` kernels ran. Sampling transforms are
-the two picks' deployed ``generation_defaults`` from the stack registry.
+the two picks' deployed ``generation_defaults`` from the pinned certified registry
+(P387: the last MTP-ON stack registry; the live registry never changes these tests).
 """
 
 import copy
@@ -31,8 +32,7 @@ from types import SimpleNamespace
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
-import yaml
-from test_mtp_verify_scan import _stack_registry
+from test_mtp_verify_scan import certified_registry
 
 from mlx_vlm.generate import ar
 from mlx_vlm.models.qwen3_5.config import ModelConfig, TextConfig, VisionConfig
@@ -50,9 +50,8 @@ BLOCK = 3  # two drafts + the verifier bonus per round
 
 
 def deployed_sampling(name):
-    """The pick's deployed temperature / top_p / top_k / min_p (stack registry)."""
-    registry = yaml.safe_load(_stack_registry().read_text())
-    entry = next(m for m in registry["models"] if m.get("name") == name)
+    """The pick's deployed temperature / top_p / top_k / min_p (the pinned certified registry)."""
+    entry = next(m for m in certified_registry()["models"] if m.get("name") == name)
     assert entry.get("draft_kind") == "mtp", f"{name} no longer ships MTP"
     defaults = entry["generation_defaults"]
     return {key: defaults[key] for key in ("temperature", "top_p", "top_k", "min_p")}

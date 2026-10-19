@@ -83,16 +83,27 @@ def test_overlay_refuses_a_registry_without_the_marked_lines():
         orchestrate.overlay_registry(REGISTRY, "Missing-Model")
 
 
+@pytest.mark.requires_stack_registry
 def test_overlay_on_the_live_stack_registry():
-    live = DEV.parents[1] / "mlx_local_stack" / "main_models.yaml"
-    if not live.exists():
-        pytest.skip(
-            "no sibling stack checkout: the live C177 registry is not available here"
-        )
-    text = live.read_text()
+    # P387: opt-in (MLX_REQUIRE_STACK_REGISTRY=1), the same resolution as the golden live check (K1)
+    import yaml
+
+    sys.path.insert(0, str(DEV.parent / "mlx_vlm" / "tests"))
+    from test_mtp_verify_scan import _fixture_verbatim, live_registry
+
+    path, state = live_registry()
+    text = path.read_text()
+    want = {e["name"]: e for e in yaml.safe_load(_fixture_verbatim())["models"]}
     for pick in orchestrate.PICKS:
-        new, restored = orchestrate.overlay_registry(text, pick)
-        assert any(r.startswith("draft_model: caslca/") for r in restored)
+        if (
+            state == "mtp_on"
+        ):  # nothing to restore: the live registry IS the certified one
+            with pytest.raises(ValueError, match="C177 lines"):
+                orchestrate.overlay_registry(text, pick)
+            continue
+        new, _ = orchestrate.overlay_registry(text, pick)
+        got = {e["name"]: e for e in yaml.safe_load(new)["models"]}
+        assert got[pick] == want[pick], pick
 
 
 def test_worker_env_drops_conditional_knobs_and_sets_the_session_max():

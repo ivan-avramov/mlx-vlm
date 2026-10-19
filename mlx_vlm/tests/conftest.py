@@ -147,6 +147,7 @@ def pytest_configure(config):  # M58 D5
     _register_fixture_seeding(config)  # P369 round-6 F25
     config.addinivalue_line(
         "markers",
-        "requires_stack_registry: golden test over the stack's real main_models.yaml; CI must "
-        "enforce it (MLX_REQUIRE_STACK_REGISTRY=1 turns the machine-without-checkout skip into a failure)",
+        "requires_stack_registry: opt-in check of the stack's LIVE main_models.yaml against the pinned "
+        "fixture (P387): skipped unless MLX_REQUIRE_STACK_REGISTRY=1, which makes a missing registry or "
+        "any state other than the fixture / its C177 interim a failure",
     )

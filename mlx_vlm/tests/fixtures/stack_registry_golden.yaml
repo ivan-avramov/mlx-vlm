@@ -1,8 +1,10 @@
-# PINNED COPY of the stack's main_models.yaml, used by the M58 golden tests (CI has no sibling
-# stack checkout). Everything after the BEGIN marker is a VERBATIM copy; its sha256 is recorded in
-# the golden test. REFRESH when the stack registry changes: copy the file below the marker, update
-# the recorded sha in the test, and re-check the first-pick expectations. The tests FAIL when the
-# recorded sha does not match this file, and only WARN when a sibling registry differs from it.
+# PINNED COPY of the stack's main_models.yaml at stack 7021bdbb — the LAST MTP-ON registry (the parent of
+# the C177 commit that turned MTP off on the daily driver), i.e. the shipped-when-ON tuple the P369 tests
+# certify (P387). Everything after the BEGIN marker is a VERBATIM copy; its sha256 is recorded in the golden
+# test. The ordinary suite reads ONLY this file; the opt-in live check (MLX_REQUIRE_STACK_REGISTRY=1) accepts
+# a live registry that equals it or equals its C177 interim (test_mtp_verify_scan.INTERIM_LINES). REFRESH
+# when the shipped-when-ON registry changes: copy it below the marker, update the recorded sha, the source
+# commit above and INTERIM_LINES, and re-check the first-pick expectations.
 # ---- BEGIN VERBATIM main_models.yaml ----
 # APPROVED C57 2026-09-09: PROVISIONAL B order (model, tune, predictor):
 # 1 Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed @t0.5 medium, certified MTP (C61/M36 2026-09-10).
@@ -10,7 +12,7 @@
 # 3 Ornith-1.0-35B-mlx-uniform-4bit @t0.4 native routing, certified MTP.
 # 4 Qwen3.6-27B-Opus-Distill-OptiQ-4bit @deployed, certified MTP.
 # C ORDER RULED C70 2026-09-12 (amends C69 after the length-controlled re-analysis: the two Qwen3.8-27B checkpoints are  # allow-shorthand
-# EQUIVALENT at equal length, adjusted +0.25 CI [-0.76, +0.91]; every other M38 panel ordering survives adjustment):
+# a WASH at equal length (adjusted +0.25 CI [-0.76, +0.91] includes 0; directional pick only, not a shown difference); every other M38 panel ordering survives adjustment):
 # 1 Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed @t0.5 medium, repaired MTP (also B 1st: one resident model; 0.6x tokens, 0.7x latency).
 # 2 Qwen3.8-27B-mlx-uniform-4bit @t0.6 medium, certified MTP (the pick when longer, more elaborated answers are wanted by default).
 # C shortlist (not picks): 3 Ornith-1.0-35B-mlx-uniform-4bit, 4 NVIDIA-Nemotron-3.5-Lightning-30B-A3B-4bit (last on the
@@ -158,13 +160,13 @@ models:
     # triple): the fine-tune dropped its base's MTP head, so the Qwen/Qwen3.5-35B-A3B head
     # (1 layer, 256 experts + shared, shards 13–14) was split via --model-type qwen3_next,
     # int4/g64. Paired ON/OFF humanevalplus n=164 (seed-39 draw), acc 92.07 vs 92.68, delta
-    # -0.61pp CI [-4.3,+3.0pp], TOST ±5pp verdict EQUIVALENT (p_d=0.055, 4:5); strict
-    # inconclusive 12:13 (runaway placement, rate unchanged 7.9 vs 7.3 %); engagement 164/164,
+    # -0.61pp CI [-4.3,+3.0pp], wash (MDE 9.8 pp; directional: OFF, not a shown difference; 4:5); strict
+    # wash 12:13 (runaway placement, rate unchanged 7.9 vs 7.3 %); engagement 164/164,
     # mean acceptance 0.778 (k=2), decode 1.56× paired mean (160.5 vs 102.8 tok/s), corpus
     # wall 3.28h vs 4.65h; probe GO 1.72×. Serving-only: MEASUREMENT STAYS DRAFT-OFF
     # (fingerprint v3 + compare refusal police the boundary). Fork ab5708a5. M28 dormant.
     draft_kind: mtp
-    draft_model: caslca/Ornith-1.0-35B-mlx-uniform-4bit-mtp-drafter  # UPLOADED 2026-08-31 (public); this box overrides with the local extracted dir
+    draft_model: caslca/Ornith-1.0-35B-mlx-uniform-4bit-mtp-drafter  # UPLOADED 2026-08-31 (public)
     # Registry-side generation defaults — the tuned sampling reaches ALL clients (incl.
     # vscode/zed, which carry no sampling). Applied only when a request omits the field.
     # Coding op-temp 0.4. presence_penalty 0.0 lets suffix engage. See docs FU-2.
@@ -240,12 +242,12 @@ models:
     # suffix_min_match: 2  # suffix WITHDRAWN 2026-08-16
     # CERTIFIED M6b 2026-08-25 — native-MTP predictor (the pick's shipped triple):
     # paired ON/OFF humanevalplus n=63 seeded, acc 0.9524 vs 0.9365 (delta +1.6pp CI
-    # [0.0,+4.8pp], TOST ±5pp verdict EQUIVALENT, p_d=0.016, powered n_for=50), 100%
+    # [0.0,+4.8pp], wash (MDE 15.8 pp; directional: ON, not a shown difference)), 100%
     # engagement (per-row tripwire), mean acceptance 0.923, ~2x decode / 1.67x wall,
     # 0 degeneracy both arms. Serving-only: MEASUREMENT STAYS DRAFT-OFF (fingerprint v3
     # + compare refusal police the boundary). Fork sha 61845457.
     draft_kind: mtp
-    draft_model: caslca/Qwen3.6-27B-Opus-Distill-OptiQ-4bit-mtp-drafter  # UPLOADED 2026-08-25 (public, anonymous download verified): extracted native sidecar drafter; this box overrides with a local workdir path to avoid a re-download
+    draft_model: caslca/Qwen3.6-27B-Opus-Distill-OptiQ-4bit-mtp-drafter  # UPLOADED 2026-08-25 (public, anonymous download verified): extracted native sidecar drafter
 
   # ── CANDIDATE, added 2026-08-14. Operator-approved in the 2026-08-13 candidate scan
   # (docs/campaign-queue.md) and then LOST from the executable queue — this entry lands it.
@@ -357,18 +359,18 @@ models:
     prefill_step_size: 512
     # CERTIFIED M6d 2026-08-30 — native-MTP predictor (the B 3rd choice's shipped triple):
     # paired ON/OFF humanevalplus n=164 (seed-39 draw), acc 94.5 both arms, delta 0.0pp
-    # CI [-3.0,+3.0pp], TOST ±5pp verdict EQUIVALENT, p_d=0.037, powered (n_for=115);
+    # CI [-3.0,+3.0pp], wash (MDE 9.8 pp; directional: tie);
     # engagement 164/164, mean acceptance 0.674 (k=2, emitted 2.35 tok/round), decode
     # 1.60× paired mean (38.7 vs 24.0 tok/s), corpus wall 5.16h vs 10.52h. Extended from
-    # an inconclusive n=63 per O25 precedent. Serving-only: MEASUREMENT STAYS DRAFT-OFF
+    # a wash at n=63 (MDE 15.8 pp) per O25 precedent. Serving-only: MEASUREMENT STAYS DRAFT-OFF
     # (fingerprint v3 + compare refusal police the boundary). Fork ab5708a5.
     draft_kind: mtp
-    draft_model: caslca/Qwen3.8-27B-mlx-uniform-4bit-mtp-drafter  # UPLOADED 2026-08-26 (public; card still says PROBE-ONLY — needs the certified update); this box overrides with the local extracted dir
+    draft_model: caslca/Qwen3.8-27B-mlx-uniform-4bit-mtp-drafter  # UPLOADED 2026-08-26 (public; card still says PROBE-ONLY — needs the certified update)
     generation_defaults:
       # CERTIFIED C84 runtime 2026-09-14: 522671c4/b632280; tool/vision smoke PASS; 20 paired outputs unchanged.
       # Bounded integration scope; measured timing costs and broader-quality limits: docs/stack-certification-2026-09-14.md.
       # CERTIFIED M40 2026-09-13: predictor-ON certified on EVERY axis backing the B and C picks (C71 rule) — Math500 99 % both
-      #   states (0 discordant), judge OFF-pref 0.56 [0.45,0.68] Holm p=.28, hep +1pp [0,+3], mbpp -1pp [-6,+3] INCONCLUSIVE (not
+      #   states (0 discordant: wash, MDE 12.5 pp, directional: tie, loss bound 3.0 pp <=10 pp so the lever ships, P359/C173; not a FAIL), judge OFF-pref 0.56 [0.45,0.68] Holm p=.28 (wash, MDE 20 pp; directional: OFF), hep +1pp [0,+3] (wash, MDE 12.5 pp; directional: ON), mbpp -1pp [-6,+3] wash (MDE 12.5 pp; directional: OFF) (not
       #   FAIL; C74), depth 128K 3/3 both, vision 19/20 both; decode x1.8 code+math / x1.4 prose. SHIPS ON; Phase 2 runs ON.
       temperature: 0.6  # CERTIFIED 2026-08-17 capped-scan + n=15 rung (conv 100%, pass@1 1.0)
       top_p: 0.95
@@ -380,7 +382,7 @@ models:
       enable_thinking: true
       reasoning_effort: medium  # CERTIFIED C51 2026-09-09: M24 quality + medium MTP 1.644x, acceptance 0.848
     presentation:
-      # PROVISIONAL C 2ND CHOICE since C70 2026-09-12 (length-controlled re-analysis: equivalent to the C 1st at equal length;
+      # PROVISIONAL C 2ND CHOICE since C70 2026-09-12 (length-controlled re-analysis: a wash vs the C 1st at equal length;
       # it was the LONGER answer in all 38 head-to-head items). History: C 1ST under C69 (M38 three-judge panel, gate PASS): first on every pair —
       # 0.684 [0.579, 0.789] vs Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed, >=0.88 vs the other three; Math500 99 % strict;
       # vision gate 19/20 (M39). Caveats on record: longest writer (1.7x the mixed), the one family-split pair. Slowest decode.
@@ -465,7 +467,7 @@ models:
   - name: Qwen3.8-27B-Fable-Distill-mlx-uniform-4bit
     type: vision
     on_demand: true
-    hf_path: caslca/Qwen3.8-27B-Fable-Distill-mlx-uniform-4bit  # UPLOADED 2026-08-23 (public); this box overrides with a local workdir path to avoid a 15G re-download
+    hf_path: caslca/Qwen3.8-27B-Fable-Distill-mlx-uniform-4bit  # UPLOADED 2026-08-23 (public)
     max_kv_cache_size: 262144
     kv_prealloc_tokens: 262144   # standing rule: prealloc = cap
     kv_quant_scheme: turboquant
@@ -514,14 +516,20 @@ models:
     # (force MLX's fused SDPA kernel for native-KV full attention from 128 queries or a 256 MB unfused score tensor; single-sequence
     # path only) + per-chunk prompt embeddings for text prompts. Qualified vs `auto` in matched machine state, two sessions each:
     # prefill -14.6 % at 128K / -24.9 % at 256K; MLX peak 47.14 -> 37.97 GB at 256K (flat from 8K); decode, retrieval, MTP acceptance
-    # unchanged; humanevalplus/mbppplus strict +2 pp / 0 (n=100 per session); long-context retrieval + chain-4 12/12 everywhere; lazy
+    # unchanged; humanevalplus/mbppplus strict +2 pp / 0 (n=100 per session; a wash, MDE 12.5 pp; directional: fused_v1 on humanevalplus, tie on mbppplus, not shown differences; P359); long-context retrieval + chain-4 12/12 everywhere; lazy
     # embeddings byte-identical on 200/200 coding outputs; vision gate 20/20 in the adopted state. Structural (registry -> worker
     # only, no client carrier). Fingerprint v7 records both. docs/campaign-results.md 2026-10-05; docs/specs/m57-attention-policy.md.
     attention_policy: fused_v1
     lazy_prompt_embeddings: true
+    # PROVISIONAL M58 2026-10-06 (operator C126 ruling): joint MTP verification scan. Gate 1 bitwise identity PASSED on the live GPU
+    # (0 mismatches over ~170K shadow-compared blocks; 20/20 cross-load replay identical, reload control 20/20); sustained decode
+    # +14.8 % at 128K (CI95 +13.3..+16.1), +19.7 % at 240K, +8.1 % at 64K, 8K within +1 %; prefill/peak/acceptance unchanged;
+    # verify 110 -> 96 ms per round at 128K. Structural (registry -> worker only). Fingerprint v8 records it.
+    # docs/campaign-results.md 2026-10-06; docs/specs/m58-joint-verification-scan.md.
+    mtp_verify_scan: joint_v1
     # CERTIFIED M32/M32b/S2b 2026-09-07 — PROMOTED to B 3RD CHOICE (operator C50 ruling 2026-09-07, C48 logic:
     # tied quality, usability decides): vs Qwen3.8-27B-mlx-uniform-4bit at medium-vs-medium pooled hep+mbpp n=214
-    # strict +0.8pp CI [-1.2, +3.0] EQUIVALENT; opencode python 22/22 with ZERO stall-kills (vs 19/22 with 3, 3:0 on
+    # strict +0.8pp CI [-1.2, +3.0] wash (MDE 8.6 pp; directional: the mixed checkpoint, not a shown difference); opencode python 22/22 with ZERO stall-kills (vs 19/22 with 3, 3:0 on
     # its stall items), go 20/22 (vs 16/22, measured at xhigh); 3 stall-kills in 66 agentic items vs 11 in 88.
     # C61/M36 2026-09-10: operator approved repaired MTP after matched quality validation.
     # Pooled strict delta -0.33pp CI[-3.0,+2.33], n100x3; all600 converge; wall ratio0.417 CI[0.238,0.603].
@@ -537,7 +545,7 @@ models:
       # CERTIFIED M40 2026-09-13: predictor-ON certified on EVERY axis backing the B and C picks (C71 rule) — Math500 strict
       #   99 % ON vs 97 % OFF (+2pp CI [0,+5], no OFF-only wins, C72 read), judge panel OFF-pref 0.40 [0.29,0.53] Holm p=.10,
       #   depth 128K 3/3 both states, vision 20/20 both; decode x1.9 math / x1.5 prose / x2.5 @128K. SHIPS ON; Phase 2 runs ON.
-      temperature: 0.5  # CERTIFIED M21b 2026-09-03 (own ladder t0.4-0.7 n=50, then k=3 hep+mbpp vs Qwen3.8-27B-Fable-Distill-mlx-uniform-4bit @t0.6: strict EQUIVALENT pooled n=100, tokens-per-task ratio 0.65 CI [0.46, 0.88]) — the (recipe, tune) PAIR is what is certified
+      temperature: 0.5  # CERTIFIED M21b 2026-09-03 (own ladder t0.4-0.7 n=50, then k=3 hep+mbpp vs Qwen3.8-27B-Fable-Distill-mlx-uniform-4bit @t0.6: strict wash pooled n=100 (MDE 12.5 pp; directional pick and numbers in docs/campaign-results.md M21b; not a shown difference), tokens-per-task ratio 0.65 CI [0.46, 0.88]) — the (recipe, tune) PAIR is what is certified
       top_p: 0.95
       top_k: 20
       min_p: 0.0
@@ -545,11 +553,11 @@ models:
       max_tokens: 102400
       thinking_budget: 81920
       enable_thinking: true
-      reasoning_effort: medium  # CERTIFIED S2b 2026-09-07 (operator C51 ruling): vs own xhigh pooled hep+mbpp n=214 strict +0.6pp CI [-2.5, +3.7] EQUIVALENT at 0.42x/0.32x tokens, 0 loops in 464 rows, opencode 22/22 — the M24 pre-registered rule fired; carriers omit the field and the worker applies this default (FU-2)
+      reasoning_effort: medium  # CERTIFIED S2b 2026-09-07 (operator C51 ruling): vs own xhigh pooled hep+mbpp n=214 strict +0.6pp CI [-2.5, +3.7] wash (MDE 8.6 pp; directional: medium, not a shown difference) at 0.42x/0.32x tokens, 0 loops in 464 rows, opencode 22/22 — the M24 pre-registered rule fired; carriers omit the field and the worker applies this default (FU-2)
     draft_kind: mtp
     draft_model: caslca/Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed-mtp-drafter
     presentation:
-      # PROVISIONAL C 1ST CHOICE since C70 2026-09-12 (amends C69: equivalent to Qwen3.8-27B-mlx-uniform-4bit at equal length,
+      # PROVISIONAL C 1ST CHOICE since C70 2026-09-12 (amends C69: a wash vs Qwen3.8-27B-mlx-uniform-4bit at equal length,
       # adjusted +0.25 CI [-0.76, +0.91]; cheaper; vision gate 20/20; one resident model). Under C69 it was C 2ND: >=0.76 vs the
       # three non-Qwen3.8 contenders at 0.6x the tokens / 0.7x the latency of the C 1st; still the B 1st.
       # History: PROVISIONAL C 1ST CHOICE since C67 (operator 2026-09-11, vision-gated reorder): sees (bf16 vision sidecar), matched
@@ -568,7 +576,7 @@ models:
   - name: Qwen3.8-27B-Opus-Distill-v2-mlx-uniform-4bit
     type: vision
     on_demand: true
-    hf_path: caslca/Qwen3.8-27B-Opus-Distill-v2-mlx-uniform-4bit  # UPLOADED 2026-08-23 (public); this box overrides with a local workdir path to avoid a 15G re-download
+    hf_path: caslca/Qwen3.8-27B-Opus-Distill-v2-mlx-uniform-4bit  # UPLOADED 2026-08-23 (public)
     max_kv_cache_size: 262144
     kv_prealloc_tokens: 262144   # standing rule: prealloc = cap
     kv_quant_scheme: turboquant

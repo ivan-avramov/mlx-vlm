@@ -1722,54 +1722,105 @@ FIXTURE_REGISTRY = (
     Path(__file__).resolve().parent / "fixtures" / "stack_registry_golden.yaml"
 )
 FIXTURE_MARKER = "# ---- BEGIN VERBATIM main_models.yaml ----\n"
-FIXTURE_SHA256 = "323ee54aa5ddc1cea312bd0729079f7a7a45d6b57b6370747b741d9bb734f64f"
-
-
-def _stack_registry():
-    """Resolve the stack registry for the golden tests.
-
-    Default: env MLX_STACK_REGISTRY (set-but-absent FAILS), else the sibling stack checkout, else
-    the PINNED fixture (a verbatim copy; CI has no sibling), warning when the sibling is absent.
-    With MLX_REQUIRE_STACK_REGISTRY=1 (operator machines) the LIVE registry is mandatory: the env
-    path or the sibling must exist AND equal the pinned fixture, else FAIL (refresh the fixture).
-    """
-    import warnings
-
-    env = os.environ.get("MLX_STACK_REGISTRY")
-    required = os.environ.get("MLX_REQUIRE_STACK_REGISTRY") == "1"
-    if env:
-        if not Path(env).exists():
-            pytest.fail(f"MLX_STACK_REGISTRY={env!r} does not exist")
-        live = Path(env)
-    elif SIBLING_REGISTRY.exists():
-        live = SIBLING_REGISTRY
-    else:
-        live = None
-    if required:
-        if live is None:
-            pytest.fail(
-                "MLX_REQUIRE_STACK_REGISTRY=1 but no live stack registry (MLX_STACK_REGISTRY "
-                f"or {SIBLING_REGISTRY}) exists"
-            )
-        if live.read_text() != _fixture_verbatim():
-            pytest.fail(
-                f"the live registry {live} differs from the pinned golden fixture; "
-                "refresh stack_registry_golden.yaml (see its header)"
-            )
-        return live
-    if live is not None:
-        return live
-    if not FIXTURE_REGISTRY.exists():
-        pytest.fail(f"no stack registry and no fixture {FIXTURE_REGISTRY}")
-    warnings.warn(
-        "no live stack registry; golden tests run against the PINNED fixture",
-        stacklevel=2,
-    )
-    return FIXTURE_REGISTRY
+FIXTURE_SHA256 = "1d07c9dd0ebf5058b526e1d78fee2a88f8e92976323ddf0e8d5503dcaa18253d"
+UNIFORM_PICK = "Qwen3.8-27B-mlx-uniform-4bit"
+FIXTURE_SOURCE = (
+    "7021bdbb"  # the last MTP-ON stack registry (= the parent of the C177 commit)
+)
+_C177 = "  # P369 INTERIM (C177 2026-10-17): MTP OFF on the daily driver until the MTP EOS/budget fixes ship and are re-certified"
+# Per pick, (fixture line, its C177 interim line), verbatim — the ONLY lines the interim may change (K2).
+INTERIM_LINES = {
+    UNIFORM_PICK: (
+        ("    draft_kind: mtp", "    # draft_kind: mtp" + _C177),
+        (
+            "    draft_model: caslca/Qwen3.8-27B-mlx-uniform-4bit-mtp-drafter  # UPLOADED 2026-08-26 (public; card still says PROBE-ONLY — needs the certified update)",
+            "    # draft_model: caslca/Qwen3.8-27B-mlx-uniform-4bit-mtp-drafter  # UPLOADED 2026-08-26 (public; card still says PROBE-ONLY — needs the certified update)",
+        ),
+    ),
+    FIRST_PICK: (
+        (
+            "    mtp_verify_scan: joint_v1",
+            "    # mtp_verify_scan: joint_v1"
+            + _C177
+            + " (joint_v1 requires draft_kind mtp)",
+        ),
+        ("    draft_kind: mtp", "    # draft_kind: mtp" + _C177),
+        (
+            "    draft_model: caslca/Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed-mtp-drafter",
+            "    # draft_model: caslca/Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed-mtp-drafter",
+        ),
+    ),
+}
+OPT_IN_SKIP = (
+    "live stack registry check is opt-in: set MLX_REQUIRE_STACK_REGISTRY=1 "
+    "(P387: the ordinary suite reads only the pinned fixture)"
+)
 
 
 def _fixture_verbatim() -> str:
     return FIXTURE_REGISTRY.read_text().split(FIXTURE_MARKER, 1)[1]
+
+
+def certified_registry():
+    """The certified (shipped-when-ON) registry: the PINNED fixture, parsed. P387: ordinary tests never
+    read the live registry, so a sibling checkout or ``MLX_STACK_REGISTRY`` cannot change them.
+    """
+    import yaml
+
+    return yaml.safe_load(_fixture_verbatim())
+
+
+def expected_interim(fixture):
+    """The fixture with exactly the C177 interim lines of ``INTERIM_LINES`` substituted, per pick block;
+    each fixture line must occur exactly once in its pick's block."""
+    lines = fixture.split("\n")
+    starts = [i for i, line in enumerate(lines) if line.startswith("  - name: ")]
+    for pick, pairs in INTERIM_LINES.items():
+        start = next(i for i in starts if lines[i] == f"  - name: {pick}")
+        end = next((i for i in starts if i > start), len(lines))
+        for old, new in pairs:
+            hits = [i for i in range(start, end) if lines[i] == old]
+            if len(hits) != 1:
+                raise ValueError(f"{pick}: {old!r} occurs {len(hits)} times")
+            lines[hits[0]] = new
+    return "\n".join(lines)
+
+
+def live_registry_state(text):
+    """``"mtp_on"`` (the fixture verbatim), ``"c177_interim"`` (exactly the expected interim), else None."""
+    fixture = _fixture_verbatim()
+    if text == fixture:
+        return "mtp_on"
+    if text == expected_interim(fixture):
+        return "c177_interim"
+    return None
+
+
+def live_registry():
+    """Opt-in (``MLX_REQUIRE_STACK_REGISTRY=1``, else skip with ``OPT_IN_SKIP``): the live registry —
+    ``MLX_STACK_REGISTRY`` (set-but-absent FAILS), else the sibling checkout, else FAIL — and its state;
+    any state other than the fixture or the C177 interim FAILS."""
+    if os.environ.get("MLX_REQUIRE_STACK_REGISTRY") != "1":
+        pytest.skip(OPT_IN_SKIP)
+    env = os.environ.get("MLX_STACK_REGISTRY")
+    if env:
+        if not Path(env).exists():
+            pytest.fail(f"MLX_STACK_REGISTRY={env!r} does not exist")
+        path = Path(env)
+    elif SIBLING_REGISTRY.exists():
+        path = SIBLING_REGISTRY
+    else:
+        pytest.fail(
+            "MLX_REQUIRE_STACK_REGISTRY=1 but no live stack registry (MLX_STACK_REGISTRY "
+            f"or {SIBLING_REGISTRY}) exists"
+        )
+    state = live_registry_state(path.read_text())
+    if state is None:
+        pytest.fail(
+            f"the live registry {path} is neither the pinned fixture nor the C177 interim; "
+            "refresh stack_registry_golden.yaml (see its header)"
+        )
+    return path, state
 
 
 def test_golden_fixture_matches_its_recorded_sha():
@@ -1780,77 +1831,131 @@ def test_golden_fixture_matches_its_recorded_sha():
     ), "stack_registry_golden.yaml changed: refresh procedure is in its header (update the sha)"
 
 
-def test_golden_sibling_registry_drift_warns_but_does_not_fail():
-    import warnings
+def test_p387_the_interim_constants_differ_from_the_fixture_only_in_the_c177_fields():
+    import yaml
 
-    if not SIBLING_REGISTRY.exists():
-        pytest.skip("no sibling stack checkout on this machine")
-    if SIBLING_REGISTRY.read_text() != _fixture_verbatim():
-        warnings.warn(
-            "the sibling stack registry differs from the pinned golden fixture; "
-            "refresh tests/fixtures/stack_registry_golden.yaml",
-            stacklevel=1,
-        )
+    fixture = yaml.safe_load(_fixture_verbatim())
+    interim = yaml.safe_load(expected_interim(_fixture_verbatim()))
+    dropped = {"draft_kind", "draft_model", "mtp_verify_scan"}
+    for a, b in zip(fixture["models"], interim["models"]):
+        if a["name"] in INTERIM_LINES:
+            assert set(a) - set(b) == (dropped & set(a)) and set(b) <= set(a)
+            assert {k: v for k, v in a.items() if k not in dropped} == b
+        else:
+            assert a == b
+    assert {k: v for k, v in fixture.items() if k != "models"} == {
+        k: v for k, v in interim.items() if k != "models"
+    }
 
 
-def test_golden_registry_resolution_rules(monkeypatch, tmp_path):
-    monkeypatch.setenv("MLX_STACK_REGISTRY", str(tmp_path / "nope.yaml"))
-    with pytest.raises(pytest.fail.Exception, match="does not exist"):
-        _stack_registry()
-    present = tmp_path / "r.yaml"
-    present.write_text("models: []")
-    monkeypatch.setenv("MLX_STACK_REGISTRY", str(present))
-    assert _stack_registry() == present
-    monkeypatch.delenv("MLX_STACK_REGISTRY")
+def _interim_variant(change):
+    return change(expected_interim(_fixture_verbatim()))
+
+
+@pytest.mark.parametrize(
+    ("label", "change"),
+    [
+        (
+            "four of five lines",
+            lambda t: t.replace(
+                INTERIM_LINES[FIRST_PICK][0][1], INTERIM_LINES[FIRST_PICK][0][0]
+            ),
+        ),
+        (
+            "an unmarked draft_kind",
+            lambda t: t.replace(
+                INTERIM_LINES[UNIFORM_PICK][0][1], "    # draft_kind: mtp", 1
+            ),
+        ),
+        (
+            "a changed marker suffix",
+            lambda t: t.replace("are re-certified\n", "are re-certified soon\n", 1),
+        ),
+        (
+            "a changed commented draft_model path",
+            lambda t: t.replace(
+                "# draft_model: caslca/Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed-mtp-drafter",
+                "# draft_model: caslca/other-drafter",
+            ),
+        ),
+        (
+            "a changed commented draft_model comment",
+            lambda t: t.replace("needs the certified update)", "certified)", 1),
+        ),
+        (
+            "a non-adjacent draft_model",
+            lambda t: t.replace(
+                INTERIM_LINES[FIRST_PICK][2][1] + "\n",
+                "    # moved\n" + INTERIM_LINES[FIRST_PICK][2][1] + "\n",
+            ),
+        ),
+        ("another edited line", lambda t: t + "# edited\n"),
+        ("CRLF", lambda t: t.replace("\n", "\r\n")),
+        ("a missing trailing newline", lambda t: t.rstrip("\n")),
+    ],
+)
+def test_p387_the_classifier_refuses_every_other_state(label, change):
+    # Guard (characterizes the classifier; the old require mode refused these too).
+    assert live_registry_state(_interim_variant(change)) is None, label
+
+
+def test_p387_live_registry_resolution(monkeypatch, tmp_path):
     monkeypatch.setattr(
         sys.modules[__name__], "SIBLING_REGISTRY", tmp_path / "absent.yaml"
     )
     monkeypatch.delenv("MLX_REQUIRE_STACK_REGISTRY", raising=False)
-    with pytest.warns(UserWarning, match="PINNED fixture"):
-        assert _stack_registry() == FIXTURE_REGISTRY
-
-
-def test_e3_require_mode_demands_a_live_registry_equal_to_the_fixture(
-    monkeypatch, tmp_path
-):
+    monkeypatch.setenv("MLX_STACK_REGISTRY", str(tmp_path / "nope.yaml"))
+    with pytest.raises(pytest.skip.Exception, match="opt-in"):
+        live_registry()  # without the env the opt-in check skips, whatever else is set
     monkeypatch.setenv("MLX_REQUIRE_STACK_REGISTRY", "1")
-    monkeypatch.delenv("MLX_STACK_REGISTRY", raising=False)
-    monkeypatch.setattr(
-        sys.modules[__name__], "SIBLING_REGISTRY", tmp_path / "absent.yaml"
-    )
+    with pytest.raises(pytest.fail.Exception, match="does not exist"):
+        live_registry()
+    monkeypatch.delenv("MLX_STACK_REGISTRY")
     with pytest.raises(pytest.fail.Exception, match="no live stack registry"):
-        _stack_registry()
-    drifted = tmp_path / "live.yaml"
+        live_registry()
+    for text, state in [
+        (_fixture_verbatim(), "mtp_on"),
+        (expected_interim(_fixture_verbatim()), "c177_interim"),
+    ]:
+        live = tmp_path / f"{state}.yaml"
+        live.write_text(text)
+        monkeypatch.setenv("MLX_STACK_REGISTRY", str(live))
+        assert live_registry() == (live, state)
+        monkeypatch.delenv("MLX_STACK_REGISTRY")
+        monkeypatch.setattr(sys.modules[__name__], "SIBLING_REGISTRY", live)
+        assert live_registry() == (live, state)
+        monkeypatch.setattr(
+            sys.modules[__name__], "SIBLING_REGISTRY", tmp_path / "absent.yaml"
+        )
+    drifted = tmp_path / "drifted.yaml"
     drifted.write_text(_fixture_verbatim() + "# edited\n")
     monkeypatch.setenv("MLX_STACK_REGISTRY", str(drifted))
-    with pytest.raises(
-        pytest.fail.Exception, match="differs from the pinned golden fixture"
-    ):
-        _stack_registry()
-    same = tmp_path / "same.yaml"
-    same.write_text(_fixture_verbatim())
-    monkeypatch.setenv("MLX_STACK_REGISTRY", str(same))
-    assert _stack_registry() == same
+    with pytest.raises(pytest.fail.Exception, match="refresh"):
+        live_registry()
 
 
 @pytest.mark.requires_stack_registry
+def test_p387_the_live_registry_is_the_fixture_or_the_c177_interim():
+    path, state = live_registry()
+    assert state in ("mtp_on", "c177_interim"), (path, state)
+
+
 def test_golden_the_shipped_first_pick_passes_every_load_time_refusal(
     monkeypatch, gpu, qualified
 ):
-    import yaml
-
-    entries = yaml.safe_load(_stack_registry().read_text())["models"]
+    entries = certified_registry()["models"]
     pick = next(e for e in entries if e["name"] == FIRST_PICK)
-    assert (pick["kv_bits"], pick.get("kv_quant_scheme"), pick["draft_kind"]) == (
-        0,
-        "turboquant",
-        "mtp",
-    )
+    assert (
+        pick["kv_bits"],
+        pick.get("kv_quant_scheme"),
+        pick["draft_kind"],
+        pick["mtp_verify_scan"],
+    ) == (0, "turboquant", "mtp", "joint_v1")
     # what the worker resolves for that entry: KV_BITS=0 -> None (native), scheme passed through
     monkeypatch.setenv("KV_BITS", str(pick["kv_bits"]))
     kv_bits = generation_module.get_quantized_kv_bits()
     assert kv_bits is None
-    monkeypatch.setenv("MLX_VLM_MTP_VERIFY_SCAN", "joint_v1")
+    monkeypatch.setenv("MLX_VLM_MTP_VERIFY_SCAN", pick["mtp_verify_scan"])
     monkeypatch.setenv("MLX_VLM_MTP_VERIFY_AB", "0")
     monkeypatch.delenv("MLX_SDPA_BLOCKS", raising=False)
     monkeypatch.setattr(
@@ -1882,36 +1987,6 @@ def test_golden_the_shipped_first_pick_passes_every_load_time_refusal(
 
 
 # ------------------------------------------------------------------ P387 (C183 (3), stack build note v2)
-UNIFORM_PICK = "Qwen3.8-27B-mlx-uniform-4bit"
-FIXTURE_SOURCE = (
-    "7021bdbb"  # the last MTP-ON stack registry (= the parent of the C177 commit)
-)
-_C177 = "  # P369 INTERIM (C177 2026-10-17): MTP OFF on the daily driver until the MTP EOS/budget fixes ship and are re-certified"
-# Per pick, (fixture line, its C177 interim line), verbatim — the ONLY lines the interim may change (K2).
-INTERIM_LINES = {
-    UNIFORM_PICK: (
-        ("    draft_kind: mtp", "    # draft_kind: mtp" + _C177),
-        (
-            "    draft_model: caslca/Qwen3.8-27B-mlx-uniform-4bit-mtp-drafter  # UPLOADED 2026-08-26 (public; card still says PROBE-ONLY — needs the certified update)",
-            "    # draft_model: caslca/Qwen3.8-27B-mlx-uniform-4bit-mtp-drafter  # UPLOADED 2026-08-26 (public; card still says PROBE-ONLY — needs the certified update)",
-        ),
-    ),
-    FIRST_PICK: (
-        (
-            "    mtp_verify_scan: joint_v1",
-            "    # mtp_verify_scan: joint_v1"
-            + _C177
-            + " (joint_v1 requires draft_kind mtp)",
-        ),
-        ("    draft_kind: mtp", "    # draft_kind: mtp" + _C177),
-        (
-            "    draft_model: caslca/Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed-mtp-drafter",
-            "    # draft_model: caslca/Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed-mtp-drafter",
-        ),
-    ),
-}
-
-
 def _without_draft_lines(text):
     """A registry whose picks have no ``draft_kind`` / ``draft_model`` (what C177 serves), field level."""
     import yaml
