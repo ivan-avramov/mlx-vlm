@@ -87,9 +87,13 @@ def test_an_out_of_support_change_is_raw_only():
 def test_a_support_change_is_counted():
     rows = [(0, _row(7))]
     off = [(0, rows[0][1].copy())]
-    order = np.argsort(-off[0][1])
-    k_in, k_out = int(order[PARAMS["top_k"] - 1]), int(order[PARAMS["top_k"]])
-    off[0][1][k_out] = off[0][1][k_in] + np.float32(1e-3)  # swaps the k-th token
+    # The real support boundary (top_p may cut before top_k): lift the best excluded
+    # token just above the weakest included one.
+    p = compare.canonical(rows[0][1], PARAMS)
+    included, excluded = np.flatnonzero(p > 0), np.flatnonzero(p == 0)
+    k_in = int(included[np.argmin(off[0][1][included])])
+    k_out = int(excluded[np.argmax(off[0][1][excluded])])
+    off[0][1][k_out] = off[0][1][k_in] + np.float32(1e-3)
     rep = compare.compare_streams(rows, off, 1, PARAMS)
     assert not rep["pass"] and rep["support_changes"] == 1
     assert (
