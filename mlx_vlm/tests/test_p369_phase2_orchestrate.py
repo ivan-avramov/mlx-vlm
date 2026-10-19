@@ -180,3 +180,23 @@ def test_e1c_verdict_needs_the_policy_specific_straddle_evidence():
     assert not orchestrate.e1c_verdict(
         on, off, threshold=8192, verify_policy="joint_v1"
     )["pass_"]
+
+
+# ------------------------------------------------------------------ round 5 precedence (Q37)
+def _v(pass_=True, c1=True, c2=True):
+    return dict(pass_=pass_, c1=dict(identical=c1), c2=dict(identical=c2), problems=[])
+
+
+def test_pick_outcome_precedence():
+    assert orchestrate.pick_outcome({"a": _v(), "b": _v()}) == dict(
+        e1c="PASS", run_e2_e7=True, cross_load="identical"
+    )
+    assert orchestrate.pick_outcome({"a": _v(), "b": _v(c2=False)}) == dict(
+        e1c="PASS", run_e2_e7=True, cross_load="unestablished"
+    )
+    assert orchestrate.pick_outcome({"a": _v(pass_=False), "b": _v()}) == dict(
+        e1c="FAIL", run_e2_e7=False, cross_load="identical"
+    )
+    assert orchestrate.pick_outcome(
+        {"a": _v(pass_=False, c1=False), "b": _v()}
+    ) == dict(e1c="ABORT", run_e2_e7=False, cross_load="identical")

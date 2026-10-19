@@ -256,3 +256,67 @@ def test_snapshot_holder_splits_prompt_end_and_commits(tmp_path):
         8,
         11,
     ]
+
+
+# ------------------------------------------------------------------ round 5 (Q35 / Q37 / Q38)
+def test_wait_idle_waits_for_the_queue_and_in_flight_and_times_out():
+    calls = {"n": 0}
+
+    class Q:
+        def qsize(self):
+            calls["n"] += 1
+            return 0 if calls["n"] > 2 else 1
+
+    metrics = types.SimpleNamespace(_in_flight=0)
+    worker.wait_idle(
+        types.SimpleNamespace(requests=Q()), metrics, timeout_s=2, poll_s=0.001
+    )
+    assert calls["n"] >= 3
+    busy = types.SimpleNamespace(_in_flight=1)
+    with pytest.raises(RuntimeError, match="did not go idle"):
+        worker.wait_idle(
+            types.SimpleNamespace(requests=types.SimpleNamespace(qsize=lambda: 0)),
+            busy,
+            timeout_s=0.01,
+            poll_s=0.001,
+        )
+
+
+def test_detached_guard_refuses_draft_kwargs_or_speculative_prefill():
+    from mlx_vlm.generate import ar
+    from mlx_vlm.server import generation
+
+    with worker.DetachedGuard() as guard:
+        assert generation._inline_draft_kwargs(None, None, None) == {}
+    assert guard.problems == []
+    with worker.DetachedGuard() as guard:
+        ar.speculative_prefill_kwargs("mtp", None)
+    assert any("speculative prefill" in p for p in guard.problems)
+
+
+def _part(tokens, finish="length", cached=0):
+    return dict(
+        final=dict(token_ids=list(tokens), finish_reason=finish, cached_tokens=cached)
+    )
+
+
+def test_c1_acceptance():
+    ok = dict(rows={"pass": True}, states={"pass": True})
+    on, offs = _part([1, 2, 3]), [_part([1, 2, 3]), _part([1, 2, 3])]
+    assert worker.c1_acceptance(on, offs, ok, cache_ids=[1, 2, 3])["pass"]
+    cases = [
+        (on, [_part([1, 2]), _part([1, 2, 3])], ok, [1, 2, 3], "forced tokens"),
+        (
+            on,
+            [_part([1, 2, 3], finish="stop"), _part([1, 2, 3])],
+            ok,
+            [1, 2, 3],
+            "finish",
+        ),
+        (on, [_part([1, 2, 3], cached=4), _part([1, 2, 3])], ok, [1, 2, 3], "reused"),
+        (on, offs, dict(ok, states={"pass": False}), [1, 2, 3], "states"),
+        (on, offs, ok, [1, 1, 3], "cache trees"),
+    ]
+    for on_, offs_, cmp_, ids, why in cases:
+        got = worker.c1_acceptance(on_, offs_, cmp_, cache_ids=ids)
+        assert not got["pass"] and any(why in p for p in got["problems"]), (why, got)
