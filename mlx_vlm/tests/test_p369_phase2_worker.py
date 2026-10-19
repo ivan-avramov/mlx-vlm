@@ -448,3 +448,76 @@ def test_progress_records_the_request_and_its_deadline_atomically(tmp_path):
     assert (got["index"], got["name"], got["deadline_s"]) == (3, "e7a/x", 120.0)
     assert before <= got["started"] <= time.time()
     assert sorted(p.name for p in tmp_path.iterdir()) == ["progress.json"]
+
+
+# ------------------------------------------------------------------ code round 1 H6 H7: prompt digests, E7b continuity
+def test_token_digest_is_exact_over_order_values_and_length():
+    d = worker.token_digest
+    assert d([1, 2, 3]) == d(np.array([[1, 2, 3]])) == d(mx.array([1, 2, 3]))
+    assert len({d([1, 2, 3]), d([1, 2, 4]), d([1, 2]), d([2, 1, 3])}) == 4
+
+
+def test_capture_records_each_requests_prompt_digest(monkeypatch):
+    from mlx_vlm.server import generation
+
+    monkeypatch.setattr(
+        generation.ResponseGenerator,
+        "_preprocess_request",
+        lambda rg, prompt, *a, **k: dict(input_ids=np.array([[5, 6, 7]])),
+    )
+    with worker.Capture() as capture:
+        generation.ResponseGenerator._preprocess_request(object(), "p")
+        assert capture.prompt == dict(
+            tokens=3, sha256=worker.token_digest([5, 6, 7]), ids=[5, 6, 7]
+        )
+        capture.reset()
+        assert capture.prompt is None
+
+
+def test_assistant_echo_returns_the_complete_turn():
+    full = dict(role="assistant", content="A", reasoning_content="R", tool_calls=None)
+    assert worker.assistant_echo(full) == dict(
+        role="assistant", content="A", reasoning_content="R"
+    )
+    assert worker.assistant_echo(dict(content=None)) == dict(
+        role="assistant", content=""
+    )
+    calls = [dict(id="c1", type="function", function=dict(name="f", arguments="{}"))]
+    assert (
+        worker.assistant_echo(dict(content="", tool_calls=calls))["tool_calls"] == calls
+    )
+
+
+def test_turn_continuity():
+    prev = [1, 2, 3, 4, 5, 6]  # prompt 1..4, generated 5, 6
+    hashes = ["h0", "h1"]
+    ok = worker.turn_continuity(
+        prev_ids=prev,
+        prev_hashes=hashes,
+        prev_prompt_tokens=4,
+        new_ids=prev + [7, 8],
+        new_hashes=hashes + ["h2", "h3"],
+        cached_tokens=5,
+    )
+    assert ok["continuity"] and (ok["lcp"], ok["boundary"], ok["generated_prev"]) == (
+        6,
+        6,
+        2,
+    )
+    cases = [
+        (dict(new_ids=[1, 2, 3, 4, 9, 6, 7]), "does not reproduce"),
+        (dict(new_hashes=["h0", "hX", "h2"]), "hash chain"),
+        (dict(cached_tokens=3), "reuse stops"),
+        (dict(prev_ids=[1, 2, 3, 4], new_ids=[1, 2, 3, 4, 7]), "no generated tokens"),
+    ]
+    base = dict(
+        prev_ids=prev,
+        prev_hashes=hashes,
+        prev_prompt_tokens=4,
+        new_ids=prev + [7, 8],
+        new_hashes=hashes + ["h2", "h3"],
+        cached_tokens=5,
+    )
+    for change, why in cases:
+        got = worker.turn_continuity(**dict(base, **change))
+        assert not got["continuity"] and why in got["reason"], (change, got)

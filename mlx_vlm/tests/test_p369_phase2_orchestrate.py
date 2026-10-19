@@ -465,3 +465,110 @@ def test_run_with_censoring_never_absorbs_other_failures():
 
     with pytest.raises(orchestrate.JobTimeout):
         orchestrate.run_with_censoring(run, [dict(name="r0")])
+
+
+# ------------------------------------------------------------------ code round 1 H5 H6 H7 H10
+@pytest.mark.parametrize(
+    ("identical", "control", "engaged", "want"),
+    [
+        (True, True, True, "PASS"),
+        (False, True, True, "FAIL"),
+        (True, False, True, "INFORMATIVE_ONLY"),
+        (False, False, True, "INFORMATIVE_ONLY"),
+        (True, True, False, "INCOMPLETE"),
+        (True, None, True, "PASS"),  # the smoke: no reload control
+        (False, None, True, "FAIL"),
+    ],
+)
+def test_e2_verdict(identical, control, engaged, want):
+    assert (
+        orchestrate.e2_verdict(
+            all_identical=identical, control_identical=control, engaged=engaged
+        )
+        == want
+    )
+
+
+def _e7_entry(rounds, events=(), n=40, finish="stop"):
+    return dict(
+        turns=[
+            dict(
+                mtp_rounds=rounds,
+                events=[dict(cls=c) for c in events],
+                final=dict(generation_tokens=n, finish_reason=finish),
+            )
+        ]
+    )
+
+
+def test_e7a_stats_count_only_engaged_uncensored_requests():
+    done = {
+        "r0": _e7_entry(3),
+        "r1": _e7_entry(5, ["M4a"]),
+        "r2": _e7_entry(0),  # MTP never engaged: not an event-free observation
+        "r3": _e7_entry(0, ["M4b_first"], n=1),  # a terminal first token is an event
+    }
+    got = orchestrate.e7a_stats(done, censored=["r4"])
+    assert got["requests"] == 3 and got["not_engaged"] == ["r2"]
+    assert got["censored"] == ["r4"]
+    assert got["classes"]["M4a"]["requests_with_event"] == 1
+    assert got["classes"]["M4b_first"]["requests_with_event"] == 1
+    assert got["classes"]["M3"]["requests_with_event"] == 0
+    assert got["classes"]["M3"]["ci95"] == orchestrate.clopper_pearson(0, 3)
+
+
+def test_e7b_session_is_censored_unless_every_follow_up_is_continuous():
+    turn = lambda ok, why="": dict(  # noqa: E731
+        events=[], mtp_rounds=2, continuity=dict(continuity=ok, reason=why)
+    )
+    first = dict(events=[], mtp_rounds=2, continuity=None)
+    good = orchestrate.e7b_session("s", [first, turn(True), turn(True)])
+    assert good["continuity"] and not good["censored"]
+    bad = orchestrate.e7b_session("s", [first, turn(True), turn(False, "reuse stops")])
+    assert bad["censored"] and "reuse stops" in bad["reason"]
+
+
+def test_prompt_digest_problems_bind_every_request_to_the_reconstruction():
+    want = {"math500/1": "a", "cjudge/2": "b"}
+    entries = {
+        "math500/1": dict(turns=[dict(prompt=dict(sha256="a"))]),
+        "cjudge/2": dict(turns=[dict(prompt=dict(sha256="b"))]),
+    }
+    assert orchestrate.prompt_digest_problems(want, entries) == []
+    entries["cjudge/2"]["turns"][0]["prompt"]["sha256"] = "x"
+    assert orchestrate.prompt_digest_problems(want, entries)
+    del entries["cjudge/2"]["turns"][0]["prompt"]
+    assert orchestrate.prompt_digest_problems(want, entries)
+
+
+def test_overall_status_and_exit_code():
+    passing = dict(
+        phase="full",
+        picks={
+            FABLE: dict(outcome=dict(e1c="PASS"), e2=dict(verdict="PASS")),
+            UNIFORM: dict(outcome=dict(e1c="PASS"), e2=dict(verdict="PASS")),
+        },
+    )
+    assert orchestrate.overall_status(passing) == ("PASS", 0)
+    failing = dict(
+        passing,
+        picks=dict(passing["picks"], **{UNIFORM: dict(outcome=dict(e1c="FAIL"))}),
+    )
+    status, code = orchestrate.overall_status(failing)
+    assert status == "NOT_PASS" and code == 2
+    informative = dict(
+        passing,
+        picks=dict(
+            passing["picks"],
+            **{
+                UNIFORM: dict(
+                    outcome=dict(e1c="PASS"), e2=dict(verdict="INFORMATIVE_ONLY")
+                )
+            },
+        ),
+    )
+    assert orchestrate.overall_status(informative) == ("NOT_PASS", 2)
+    smoke = dict(phase="smoke", picks={}, smoke_gate=dict(pass_=True, fits=True))
+    assert orchestrate.overall_status(smoke) == ("SMOKE_PASS", 0)
+    smoke_bad = dict(smoke, smoke_gate=dict(pass_=True, fits=False))
+    assert orchestrate.overall_status(smoke_bad) == ("SMOKE_NOT_PASS", 2)
