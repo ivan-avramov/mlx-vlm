@@ -158,11 +158,16 @@ def _fake(calls, manifest):
             return []
 
     tel = telemetry.KernelTelemetry(Lm())
+    tel.attributions = [
+        dict(c, module=m, kind=c.get("kind", "linear"))
+        for c in calls
+        for m in c["modules"]
+    ]
     tel.calls = calls
     return telemetry.verdict(tel, manifest)
 
 
-def _call(family, module="layers.0.mlp", width=3, scope="verify"):
+def _call(family, module="model.layers.0.mlp", width=3, scope="verify"):
     return dict(
         entry="_target_verify_linear",
         family=family,
@@ -173,8 +178,18 @@ def _call(family, module="layers.0.mlp", width=3, scope="verify"):
     )
 
 
-QUANT = {"layers.0.mlp": {"kind": "quantized", "bits": 4, "group_size": 64}}
-DENSE = {"layers.0.mlp": {"kind": "dense"}}
+OPTIMIZED = ["quantized_affine_optimized", "quantized_linears_optimized"]
+QUANT = {
+    "model.layers.0.mlp": {
+        "kind": "quantized",
+        "bits": 4,
+        "group_size": 64,
+        "expected": {"linear": OPTIMIZED, "argmax": ["argmax_affine_optimized"]},
+    }
+}
+DENSE = {
+    "model.layers.0.mlp": {"kind": "dense", "expected": {"linear": ["dense_exact"]}}
+}
 
 
 @pytest.mark.parametrize("family", ["plain_wide", "declined", "error"])
@@ -192,3 +207,100 @@ def test_the_verdict_refuses_a_family_inconsistent_with_the_manifest():
 def test_the_verdict_refuses_an_unknown_module_and_no_verify_calls():
     assert not _fake([_call("quantized_affine_optimized", module="?")], QUANT)["pass"]
     assert not _fake([_call("plain", width=1, scope="other")], QUANT)["pass"]
+
+
+# ------------------------------------------------------------------ code round 1 H2: expected families + coverage
+def test_the_verdict_refuses_a_fallback_where_the_manifest_expects_an_exact_kernel():
+    for family in ("fallback_singletons", "fallback_timewise", "quantized_singleton"):
+        got = _fake([_call(family)], QUANT)
+        assert not got["pass"] and any(
+            "unexpected family" in p for p in got["problems"]
+        ), (family, got)
+    expected_fallback = {
+        "model.layers.0.mlp": {
+            "kind": "dense",
+            "expected": {"linear": ["fallback_singletons"]},
+        }
+    }
+    assert _fake([_call("fallback_singletons")], expected_fallback)["pass"]
+    assert not _fake([_call("dense_exact")], expected_fallback)["pass"]
+
+
+def test_the_verdict_requires_every_on_path_projection_in_a_verify_block():
+    two = dict(QUANT, **{"model.layers.1.mlp": QUANT["model.layers.0.mlp"]})
+    got = _fake([_call("quantized_affine_optimized")], two)
+    assert not got["pass"] and any("never observed" in p for p in got["problems"])
+    assert _fake(
+        [
+            _call("quantized_affine_optimized"),
+            _call("quantized_linears_optimized", module="model.layers.1.mlp"),
+        ],
+        two,
+    )["pass"]
+    # a width-1 call does not cover a projection; an off-path module is reported, not required
+    got = _fake(
+        [
+            _call("quantized_affine_optimized"),
+            _call("plain", module="model.layers.1.mlp", width=1),
+        ],
+        two,
+    )
+    assert not got["pass"]
+    off_path = dict(QUANT, **{"model.embed_tokens": {"kind": "quantized", "bits": 4}})
+    got = _fake([_call("quantized_affine_optimized")], off_path)
+    assert got["pass"] and "model.embed_tokens" in got["not_on_path"]
+
+
+@metal
+@pytest.mark.parametrize("pick", PICKS)
+def test_tuple_fallbacks_are_attributed_per_module_and_reconcile_with_the_manifest(
+    pick,
+):
+    lm, _, tel, _, _ = _on_run(pick)
+    wide = [c for c in tel.calls if c["width"] > 1]
+    assert not [c for c in wide if "+" in c["family"]], [
+        c for c in wide if "+" in c["family"]
+    ]
+    manifest = telemetry.manifest_from_model(lm)
+    seen = {}
+    for a in tel.attributions:
+        if a["scope"] == "verify" and a["width"] > 1:
+            seen.setdefault(a["module"], set()).add(a["family"])
+    for module, families in seen.items():
+        kinds = manifest[module]["expected"]
+        allowed = set().union(*kinds.values())
+        assert families <= allowed, (module, families, kinds)
+    if (
+        pick == PICKS[0]
+    ):  # the mixed recipe: dense in_proj_a / b decline the dense kernel by shape
+        assert seen["model.layers.0.linear_attn.in_proj_a"] == {"fallback_singletons"}
+        assert seen["model.layers.0.linear_attn.in_proj_qkv"] == {
+            "quantized_affine_optimized"
+        }
+        assert seen["model.layers.1.self_attn.o_proj"] == {"dense_exact"}
+    verdict = telemetry.verdict(tel, manifest)
+    assert verdict["pass"], verdict
+    assert not verdict["missing_coverage"]
+
+
+@metal
+def test_the_verdict_fails_when_the_optimized_kernels_decline():
+    from mlx_vlm.speculative.ops import linear as ops_linear
+
+    real = (
+        ops_linear._target_verify_optimized_affine_linear,
+        ops_linear._target_verify_quantized_linears,
+    )
+    ops_linear._target_verify_optimized_affine_linear = lambda *a, **k: None
+    ops_linear._target_verify_quantized_linears = lambda *a, **k: None
+    try:
+        lm, _, tel, emitted, plain = _on_run(PICKS[1])
+    finally:
+        (
+            ops_linear._target_verify_optimized_affine_linear,
+            ops_linear._target_verify_quantized_linears,
+        ) = real
+    assert emitted == plain  # the exact-by-construction fallbacks keep the tokens
+    verdict = telemetry.verdict(tel, telemetry.manifest_from_model(lm))
+    assert not verdict["pass"]
+    assert any("unexpected family" in p for p in verdict["problems"]), verdict
