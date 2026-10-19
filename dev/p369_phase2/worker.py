@@ -211,17 +211,13 @@ def release_trajectory(recorder, chat_id):
     import gc
     import weakref
 
-    from mlx_vlm.server import session_manager
     from mlx_vlm.speculative.cache_state import iter_leaf_caches
 
     caches = recorder._cache
     refs = [weakref.ref(leaf) for leaf in iter_leaf_caches(caches or [])]
-    with session_manager._session_caches_lock:
-        state = session_manager._session_caches.pop(chat_id, None)
-    if state is not None:
-        state.clear()
+    release_session(chat_id)
     recorder._cache = None
-    del caches, state
+    del caches
     gc.collect()
     alive = sum(1 for r in refs if r() is not None)
     if alive:
@@ -231,12 +227,20 @@ def release_trajectory(recorder, chat_id):
 
 
 def release_session(chat_id):
+    """Drop the chat's production session entry (``{"state", "last_used", "turn_hashes"}``) and clear its
+    ``PromptCacheState`` (cache, token ids, snapshot ring); any other entry shape refuses.
+    """
     from mlx_vlm.server import session_manager
 
     with session_manager._session_caches_lock:
-        state = session_manager._session_caches.pop(chat_id, None)
-    if state is not None:
-        state.clear()
+        entry = session_manager._session_caches.pop(chat_id, None)
+    if entry is None:
+        return
+    if not isinstance(entry, dict) or "state" not in entry:
+        raise RuntimeError(
+            f"unexpected session entry for {chat_id}: {type(entry).__name__}"
+        )
+    entry["state"].clear()
 
 
 def post(client, payload, chat_id, capture, timeout_s):
@@ -580,13 +584,20 @@ class DetachedGuard:
         return False
 
 
-def c1_acceptance(on_part, off_parts, c1, *, retired):
+def c1_acceptance(on_part, off_parts, c1, *, retired, expected_offsets, replay_offsets):
     """Q37: the within-instance control is complete and identical — every replay emitted exactly the forced
-    tokens with ON's finish reason and no reused prefix, each trajectory's cache tree was retired before the
-    next one started (Q35; ``retired``, from ``release_trajectory``), and OFF1 vs OFF2 rows (raw +
-    transformed) and states (hashes + probes) are equal.
+    tokens with ON's finish reason and no reused prefix, each replay snapshotted EXACTLY the ON offsets
+    (``expected_offsets``; code round 1 H4: a recorder gap common to both replays is a C1 failure, never
+    an E1c FAIL), each trajectory's cache tree was retired before the next one started (Q35; ``retired``,
+    from ``release_trajectory``), and OFF1 vs OFF2 rows (raw + transformed) and states (hashes + probes)
+    are equal.
     """
     problems = []
+    for k, offsets in enumerate(replay_offsets, 1):
+        if sorted(offsets) != sorted(expected_offsets):
+            missing = sorted(set(expected_offsets) - set(offsets))
+            extra = sorted(set(offsets) - set(expected_offsets))
+            problems.append(f"OFF{k} offsets: missing {missing}, extra {extra}")
     want = on_part["final"]["token_ids"]
     for k, part in enumerate(off_parts, 1):
         final = part["final"]
@@ -796,7 +807,12 @@ def run_job(job, out_dir, result):
                 entry["c1"] = dict(
                     c1,
                     acceptance=c1_acceptance(
-                        part, [off1_part, off2_part], c1, retired=True
+                        part,
+                        [off1_part, off2_part],
+                        c1,
+                        retired=True,
+                        expected_offsets=part["offsets"],
+                        replay_offsets=[sorted(off1.states), sorted(off2.states)],
                     ),
                 )
             elif (

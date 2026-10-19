@@ -1,10 +1,14 @@
 """E1c in-process observers: full-state hash, neutral probe, ON / OFF recorders.
 
 - ``state_hash(caches)``: ONE SHA-256 over the complete logical valid state of a cache list. Per leaf (in
-  ``iter_leaf_caches`` order): its type, ``offset``, ``meta_state``, then every array of its VALID state
-  (``.state``, which slices KV caches to ``offset``; TurboQuant sliced with ``_slice_state`` directly so its
-  ``_cached_state`` is never touched) with dtype, shape and exact bytes. Preallocated tails are never hashed;
-  an unknown state element raises (fail closed).
+  ``iter_leaf_caches`` order): its type, ``offset``, ``meta_state``, its type-specific logical metadata
+  (``ArraysCache``: the effective ``left_padding`` / ``lengths`` mask inputs; ``TurboQuantKVCache``: the codec
+  mode and each codec's kind, bits and ``_snapshot_kv_codec`` coordinates — dim and split ``low_idx`` /
+  ``high_idx``), then every array of its VALID state (``.state``, which slices KV caches to ``offset``;
+  TurboQuant sliced with ``_slice_state`` directly so its ``_cached_state`` is never touched) with dtype, shape
+  and exact bytes. Preallocated tails are never hashed; an unknown state element or an open speculative
+  transaction raises (fail closed). ``ArraysCache.metadata_revision`` is NOT hashed: it is a derived-metadata
+  invalidation counter that every speculative commit / abort bumps (every ON block, every probe), not state.
 - ``probe(lm, caches, token)``: a transactional width-one verify forward of ``token`` (the production
   ``_mtp_verify_target``), its full logit row, then ``abort()``.
 - ``Recorder(mode)``: patches the production sampler (``_PositionedTargetSampler.sample_target``) to record
@@ -43,8 +47,35 @@ def _flatten(obj, out):
         out.append(("dataclass", type(obj).__qualname__))
         for name in obj.__dataclass_fields__:
             _flatten(getattr(obj, name), out)
+    elif type(obj) in (bool, int, float, str):
+        out.append(("scalar", type(obj).__name__, repr(obj)))
     else:
         raise TypeError(f"unknown cache state element {type(obj).__qualname__}")
+
+
+def _logical_metadata(leaf):
+    """Type-specific logical metadata outside ``state`` / ``meta_state`` (see the module docstring)."""
+    from mlx_vlm.models.cache import ArraysCache
+
+    tq = sys.modules.get("mlx_vlm.turboquant")
+    if tq is not None and isinstance(leaf, tq.TurboQuantKVCache):
+
+        def codec(c):
+            if c is None:
+                return None
+            return (type(c).__qualname__, c.bits, tq._snapshot_kv_codec(c))
+
+        return (
+            "turboquant",
+            leaf._kv_quant_mode,
+            codec(leaf.key_codec),
+            codec(leaf.value_codec),
+        )
+    if isinstance(leaf, ArraysCache):
+        if leaf.is_speculating:
+            raise RuntimeError("state_hash: active speculative transaction on a leaf")
+        return ("arrays", leaf.left_padding, leaf.lengths)
+    return None
 
 
 def _valid_state(leaf):
@@ -93,6 +124,7 @@ def state_hash(caches):
         meta = getattr(leaf, "meta_state", None)
         h.update(f"L|{index}|{kind}|{offset!r}|{meta!r}|".encode())
         parts = []
+        _flatten(_logical_metadata(leaf), parts)
         _flatten(_valid_state(leaf), parts)
         for part in parts:
             if isinstance(part, tuple):

@@ -387,7 +387,9 @@ def test_release_trajectory_retires_the_cache_tree(monkeypatch):
     from mlx_vlm.server import session_manager
 
     monkeypatch.setattr(session_manager, "_session_cache_max", 4)
-    monkeypatch.setattr(session_manager, "_session_caches", type(session_manager._session_caches)())
+    monkeypatch.setattr(
+        session_manager, "_session_caches", type(session_manager._session_caches)()
+    )
     cleared = []
     real_clear = PromptCacheState.clear
     monkeypatch.setattr(
@@ -398,7 +400,9 @@ def test_release_trajectory_retires_the_cache_tree(monkeypatch):
     rec = types.SimpleNamespace(_cache=state.cache)
     worker.release_trajectory(rec, "p369-x")
     assert "p369-x" not in session_manager._session_caches
-    assert cleared == [state]  # code round 1 H13: the PromptCacheState itself is cleared
+    assert cleared == [
+        state
+    ]  # code round 1 H13: the PromptCacheState itself is cleared
     assert rec._cache is None and state.cache is None and state.token_ids is None
     held = _production_session("p369-y")
     lingering = held.cache  # someone else still holds the tree
@@ -412,7 +416,9 @@ def test_release_session_clears_the_production_entry(monkeypatch):
     from mlx_vlm.server import session_manager
 
     monkeypatch.setattr(session_manager, "_session_cache_max", 4)
-    monkeypatch.setattr(session_manager, "_session_caches", type(session_manager._session_caches)())
+    monkeypatch.setattr(
+        session_manager, "_session_caches", type(session_manager._session_caches)()
+    )
     state = _production_session("p369-z")
     worker.release_session("p369-z")
     assert "p369-z" not in session_manager._session_caches
@@ -422,7 +428,11 @@ def test_release_session_clears_the_production_entry(monkeypatch):
 def test_release_refuses_an_unexpected_session_entry_shape(monkeypatch):
     from mlx_vlm.server import session_manager
 
-    monkeypatch.setattr(session_manager, "_session_caches", type(session_manager._session_caches)())
-    session_manager._session_caches["p369-odd"] = PromptCacheState()  # not the production shape
+    monkeypatch.setattr(
+        session_manager, "_session_caches", type(session_manager._session_caches)()
+    )
+    session_manager._session_caches["p369-odd"] = (
+        PromptCacheState()
+    )  # not the production shape
     with pytest.raises(RuntimeError, match="unexpected session entry"):
         worker.release_session("p369-odd")
