@@ -2524,3 +2524,30 @@ class TestR4InvalidIsNotAKnownPositive:
         assert len(evals) == 1
         assert "verify_ab_invalid" in policy.counters()
         assert "verify_ab_invalid" not in mv.JointV1Policy(ab=False).counters()
+
+
+# ------------------------------------------------------------------ P387 code round 3 H19 / H26
+def test_p387_the_live_check_compares_raw_bytes(monkeypatch, tmp_path):
+    monkeypatch.setenv("MLX_REQUIRE_STACK_REGISTRY", "1")
+    monkeypatch.setattr(
+        sys.modules[__name__], "SIBLING_REGISTRY", tmp_path / "absent.yaml"
+    )
+    for name, payload in [
+        ("crlf", expected_interim(_fixture_verbatim()).replace("\n", "\r\n")),
+        ("cr", _fixture_verbatim().replace("\n", "\r")),
+    ]:
+        live = tmp_path / f"{name}.yaml"
+        live.write_bytes(payload.encode())
+        monkeypatch.setenv("MLX_STACK_REGISTRY", str(live))
+        with pytest.raises(pytest.fail.Exception, match="refresh"):
+            live_registry()  # universal-newline reading must not normalize these to LF
+
+
+def test_p387_an_empty_registry_variable_fails(monkeypatch, tmp_path):
+    monkeypatch.setenv("MLX_REQUIRE_STACK_REGISTRY", "1")
+    monkeypatch.setenv("MLX_STACK_REGISTRY", "")
+    sibling = tmp_path / "main_models.yaml"
+    sibling.write_text(_fixture_verbatim())
+    monkeypatch.setattr(sys.modules[__name__], "SIBLING_REGISTRY", sibling)
+    with pytest.raises(pytest.fail.Exception, match="empty"):
+        live_registry()  # set-but-empty is a configuration error, never "fall back to the sibling"
