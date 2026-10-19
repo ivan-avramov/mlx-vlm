@@ -324,8 +324,15 @@ def test_e1c_verdict_needs_the_policy_specific_straddle_evidence():
 
 
 # ------------------------------------------------------------------ round 5 precedence (Q37)
-def _v(pass_=True, c1=True, c2=True):
-    return dict(pass_=pass_, c1=dict(identical=c1), c2=dict(identical=c2), problems=[])
+def _v(pass_=True, c1=True, c2=True, evidence=True):
+    return dict(
+        pass_=pass_ and evidence,
+        neutral=pass_,
+        evidence_ok=evidence,
+        c1=dict(identical=c1),
+        c2=dict(identical=c2),
+        problems=[],
+    )
 
 
 def test_pick_outcome_precedence():
@@ -341,6 +348,36 @@ def test_pick_outcome_precedence():
     assert orchestrate.pick_outcome(
         {"a": _v(pass_=False, c1=False), "b": _v()}
     ) == dict(e1c="ABORT", run_e2_e7=False, cross_load="identical")
+
+
+# ------------------------------------------------------------------ code round 2 H15: evidence vs neutrality
+@pytest.mark.parametrize(
+    ("change", "kind"),
+    [
+        (dict(rows=dict(**{"pass": False})), "neutrality"),
+        (dict(states=dict(**{"pass": False})), "neutrality"),
+        (dict(verdict=dict(**{"pass": False})), "evidence"),
+        (dict(draft_rounds=0), "evidence"),
+        (dict(prompt_end=8000), "evidence"),
+        (dict(straddle=False), "evidence"),
+    ],
+)
+def test_e1c_verdict_separates_evidence_from_neutrality(change, kind):
+    on, off = _entries(**change)
+    got = orchestrate.e1c_verdict(on, off, threshold=8192, verify_policy=None)
+    assert not got["pass_"]
+    assert got["neutral"] is (kind != "neutrality"), got
+    assert got["evidence_ok"] is (kind != "evidence"), got
+
+
+def test_pick_outcome_never_reports_invalid_evidence_as_non_neutrality():
+    po = orchestrate.pick_outcome
+    assert po({"a": _v(evidence=False), "b": _v()})["e1c"] == "INCOMPLETE"
+    assert not po({"a": _v(evidence=False), "b": _v()})["run_e2_e7"]
+    # an established difference outranks invalid evidence elsewhere; C1 outranks both
+    assert po({"a": _v(evidence=False), "b": _v(pass_=False)})["e1c"] == "FAIL"
+    assert po({"a": _v(pass_=False), "b": _v(c1=False)})["e1c"] == "ABORT"
+    assert po({"a": _v(), "b": _v()})["e1c"] == "PASS"
 
 
 # ------------------------------------------------------------------ code round 1 H8: watchdogs
@@ -500,15 +537,17 @@ def test_e2_verdict(identical, control, engaged, want):
     )
 
 
-def _e7_entry(rounds, events=(), n=40, finish="stop"):
+def _e7_entry(rounds, events=(), n=40, finish="stop", verdict=True, sha="d"):
     return dict(
+        verdict={"pass": verdict},
         turns=[
             dict(
                 mtp_rounds=rounds,
                 events=[dict(cls=c) for c in events],
+                prompt=dict(sha256=sha),
                 final=dict(generation_tokens=n, finish_reason=finish),
             )
-        ]
+        ],
     )
 
 
@@ -528,15 +567,66 @@ def test_e7a_stats_count_only_engaged_uncensored_requests():
     assert got["classes"]["M3"]["ci95"] == orchestrate.clopper_pearson(0, 3)
 
 
-def test_e7b_session_is_censored_unless_every_follow_up_is_continuous():
-    turn = lambda ok, why="": dict(  # noqa: E731
-        events=[], mtp_rounds=2, continuity=dict(continuity=ok, reason=why)
+def _e7b_turn(ok=True, why="", rounds=2, first=False):
+    return dict(
+        events=[],
+        mtp_rounds=rounds,
+        prompt=dict(sha256="d"),
+        continuity=None if first else dict(continuity=ok, reason=why),
     )
-    first = dict(events=[], mtp_rounds=2, continuity=None)
-    good = orchestrate.e7b_session("s", [first, turn(True), turn(True)])
+
+
+def _e7b_entry(*turns, verdict=True):
+    return dict(turns=list(turns), verdict={"pass": verdict})
+
+
+def test_e7b_session_is_censored_unless_every_follow_up_is_continuous():
+    first = _e7b_turn(first=True)
+    good = orchestrate.e7b_session(
+        "s", _e7b_entry(first, _e7b_turn(), _e7b_turn()), digest="d"
+    )
     assert good["continuity"] and not good["censored"]
-    bad = orchestrate.e7b_session("s", [first, turn(True), turn(False, "reuse stops")])
+    bad = orchestrate.e7b_session(
+        "s",
+        _e7b_entry(first, _e7b_turn(), _e7b_turn(False, "reuse stops")),
+        digest="d",
+    )
     assert bad["censored"] and "reuse stops" in bad["reason"]
+
+
+def test_e7b_session_needs_mtp_rounds_the_kernel_verdict_and_the_digest():
+    # code round 2 H18 / H6
+    first = _e7b_turn(first=True)
+    ok = _e7b_entry(first, _e7b_turn(), _e7b_turn())
+    assert not orchestrate.e7b_session("s", ok, digest="d")["censored"]
+    plain = _e7b_entry(first, _e7b_turn(rounds=0), _e7b_turn())
+    assert orchestrate.e7b_session("s", plain, digest="d")["censored"]
+    kernel = _e7b_entry(first, _e7b_turn(), _e7b_turn(), verdict=False)
+    assert orchestrate.e7b_session("s", kernel, digest="d")["censored"]
+    assert orchestrate.e7b_session("s", ok, digest="x")["censored"]
+    assert (
+        orchestrate.e7b_status([dict(censored=True), dict(censored=False)])
+        == "OBSERVED"
+    )
+    assert orchestrate.e7b_status([dict(censored=True)]) == "INCOMPLETE"
+
+
+def test_e7a_observation_needs_engagement_a_kernel_verdict_and_the_prompt_digest():
+    # code round 2 H6 / H10
+    done = {
+        "ok": _e7_entry(3),
+        "kernel": _e7_entry(3, verdict=False),
+        "digest": _e7_entry(3, sha="x"),
+        "first": _e7_entry(0, ["M4b_first"], n=1, verdict=False),  # no verify block ran
+        "plain": _e7_entry(0),
+    }
+    got = orchestrate.e7a_stats(done, censored=["late"], digests={k: "d" for k in done})
+    assert got["requests"] == 2 and got["status"] == "OBSERVED"
+    assert got["invalid"] == ["digest", "kernel"] and got["not_engaged"] == ["plain"]
+    none = orchestrate.e7a_stats(
+        {"plain": _e7_entry(0)}, censored=["x"], digests={"plain": "d"}
+    )
+    assert none["status"] == "INCOMPLETE"
 
 
 def test_prompt_digest_problems_bind_every_request_to_the_reconstruction():
@@ -552,15 +642,33 @@ def test_prompt_digest_problems_bind_every_request_to_the_reconstruction():
     assert orchestrate.prompt_digest_problems(want, entries)
 
 
+OBSERVED = dict(e7a=dict(status="OBSERVED"), e7b=dict(status="OBSERVED"))
+
+
 def test_overall_status_and_exit_code():
     passing = dict(
         phase="full",
         picks={
-            FABLE: dict(outcome=dict(e1c="PASS"), e2=dict(verdict="PASS")),
-            UNIFORM: dict(outcome=dict(e1c="PASS"), e2=dict(verdict="PASS")),
+            FABLE: dict(outcome=dict(e1c="PASS"), e2=dict(verdict="PASS"), **OBSERVED),
+            UNIFORM: dict(
+                outcome=dict(e1c="PASS"), e2=dict(verdict="PASS"), **OBSERVED
+            ),
         },
     )
     assert orchestrate.overall_status(passing) == ("PASS", 0)
+    for key in ("e7a", "e7b"):  # code round 2 H10: E7 must be observed for a full PASS
+        thin = dict(
+            passing,
+            picks=dict(
+                passing["picks"],
+                **{
+                    FABLE: dict(
+                        passing["picks"][FABLE], **{key: dict(status="INCOMPLETE")}
+                    )
+                },
+            ),
+        )
+        assert orchestrate.overall_status(thin) == ("NOT_PASS", 2), key
     failing = dict(
         passing,
         picks=dict(passing["picks"], **{UNIFORM: dict(outcome=dict(e1c="FAIL"))}),
@@ -604,17 +712,40 @@ def test_run_pick_saves_each_step_as_it_finishes(monkeypatch):
         "T1024": dict(pass_=True, c1=dict(identical=True), c2=dict(identical=True))
     }
     camp.e2 = lambda pick, items, prompts, smoke: dict(verdict="PASS")
+    camp.e7a = lambda pick, items: dict(status="OBSERVED")
 
-    def e7(pick, items):
+    def e7b(pick, items):
         raise RuntimeError("worker crashed")
 
-    camp.e7 = e7
+    camp.e7b = e7b
     camp.summary = dict(picks={})
     camp.write_summary = lambda: saved.append(json.loads(json.dumps(camp.summary)))
     with pytest.raises(RuntimeError, match="worker crashed"):
         camp.run_pick(FABLE, smoke=False)
     last = saved[-1]["picks"][FABLE]
     assert last["outcome"]["e1c"] == "PASS" and last["e2"]["verdict"] == "PASS"
+    assert (
+        last["e7a"]["status"] == "OBSERVED"
+    )  # code round 2 H16: E7a saved before E7b runs
+
+
+def test_a_harness_error_is_recorded_before_it_propagates(tmp_path):
+    saved = []
+    camp = object.__new__(orchestrate.Campaign)
+    camp.args = type("A", (), dict(smoke_summary=None, phase="smoke"))()
+    camp.out, camp.picks = tmp_path, [FABLE]
+    camp.prepare = lambda: _binding()
+    camp.summary = dict(picks={})
+    camp.write_summary = lambda: saved.append(json.loads(json.dumps(camp.summary)))
+
+    def boom(pick, smoke):
+        raise RuntimeError("size job failed")
+
+    camp.run_pick = boom
+    with pytest.raises(RuntimeError, match="size job failed"):
+        camp.execute()
+    assert saved[-1]["status"] == "HARNESS_ERROR"
+    assert "size job failed" in saved[-1]["error"]
 
 
 # ------------------------------------------------------------------ P387 (K1): the ON overlay restores the certified tuple
