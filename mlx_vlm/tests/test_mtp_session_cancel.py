@@ -135,8 +135,11 @@ def test_f5_cancel_a_warm_session_at_every_position_matches_a_fresh_session(
         state = _cancelled_state = _serve_cancelled(
             rg, TURN2, chat_id, N, 7, k, monkeypatch
         )
-        if state.token_ids is not None or state.cache is not None:
-            failures.append((k, "session not retired", state.token_ids))
+        if k < N:
+            if state.token_ids is not None or state.cache is not None:
+                failures.append((k, "session not retired", state.token_ids))
+        elif state.token_ids is None:  # round 3 F8: cancelled AFTER the terminal chunk
+            failures.append((k, "completed session lost"))
         _, third, state3 = _serve_turn(rg, TURN3, chat_id, [], 6, 9)
         try:
             assert third == setup.fresh3
@@ -176,3 +179,68 @@ def test_f5_a_completed_stream_still_publishes_its_session(setup):
     state = PromptCacheState()
     turn(setup.model, PROMPT, state, n=N, seed=5)
     assert state.token_ids is not None and state.cache is not None
+
+
+@pytest.mark.parametrize("arm", ["off", "on"])
+def test_f8_closing_right_after_the_terminal_chunk_keeps_the_session(setup, arm):
+    """Round 3 F8: a consumer that closes on ``finish_reason`` must not lose a valid
+    session; the published state and the next turn equal a fully drained stream's."""
+
+    def run(close_after_terminal):
+        drafter = _drafter(setup, arm)
+        state = PromptCacheState()
+        turn(setup.model, PROMPT, state, drafter=drafter, n=N, seed=5)
+        kwargs = dict(
+            input_ids=mx.array([TURN2]),
+            prompt_cache_state=state,
+            max_tokens=N,
+            prefill_step_size=None,
+            seed=7,
+            **deployed_sampling(PICKS[0]),
+        )
+        if drafter is not None:
+            kwargs.update(
+                draft_model=drafter, draft_kind="mtp", draft_block_size=BLOCK
+            )
+        stream = stream_generate(setup.model, Tokenizer(()), "", **kwargs)
+        if close_after_terminal:
+            for chunk in stream:
+                if chunk.finish_reason is not None:
+                    break
+            stream.close()
+        else:
+            list(stream)
+        follow = list(state.token_ids or []) + [41, 42]
+        second, _ = turn(
+            setup.model, follow, state, drafter=drafter, n=6, seed=9
+        )
+        return state, second
+
+    drained_state, drained_next = run(False)
+    closed_state, closed_next = run(True)
+    assert drained_state.token_ids is not None
+    assert closed_next == drained_next
+    assert list(closed_state.token_ids) == list(drained_state.token_ids)
+    assert_same_cache(cache_snapshot(closed_state), cache_snapshot(drained_state))
+
+
+@pytest.mark.parametrize("arm", ["off", "on"])
+def test_f8_closed_after_terminal_session_is_published_before_next_turn(setup, arm):
+    drafter = _drafter(setup, arm)
+    state = PromptCacheState()
+    turn(setup.model, PROMPT, state, drafter=drafter, n=N, seed=5)
+    kwargs = dict(
+        input_ids=mx.array([TURN2]),
+        prompt_cache_state=state,
+        max_tokens=N,
+        prefill_step_size=None,
+        seed=7,
+        **deployed_sampling(PICKS[0]),
+    )
+    stream = stream_generate(setup.model, Tokenizer(()), "", **kwargs)
+    for chunk in stream:
+        if chunk.finish_reason is not None:
+            break
+    stream.close()
+    assert state.token_ids is not None and state.cache is not None
+    assert list(state.token_ids)[: len(TURN2)] == TURN2
