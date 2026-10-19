@@ -2773,7 +2773,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             if (
                                 request.logprobs
                                 and token.finish_reason != "stop"
-                                and getattr(token, "token_count", 1) > 0  # Fork (P369 round-6 F21)
+                                and getattr(token, "token_count", 1)
+                                > 0  # Fork (P369 round-6 F21)
                             ):
                                 req_top_k = int(request.top_logprobs or 0)
                                 chunk_logprobs = ChatLogprobs(
@@ -3195,7 +3196,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             if (
                                 request.logprobs
                                 and token.finish_reason != "stop"
-                                and getattr(token, "token_count", 1) > 0  # Fork (P369 round-6 F21)
+                                and getattr(token, "token_count", 1)
+                                > 0  # Fork (P369 round-6 F21)
                             ):
                                 logprobs.append(
                                     (token.token, token.logprobs, token.top_logprobs)

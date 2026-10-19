@@ -10,7 +10,13 @@ from unittest.mock import patch
 
 import mlx.core as mx
 import pytest
-from test_mtp_exactness import PICKS, deployed_sampling, fake_model, hybrid_lm, mtp_drafter
+from test_mtp_exactness import (
+    PICKS,
+    deployed_sampling,
+    fake_model,
+    hybrid_lm,
+    mtp_drafter,
+)
 
 from mlx_vlm.generate import ar
 from mlx_vlm.utils import StoppingCriteria

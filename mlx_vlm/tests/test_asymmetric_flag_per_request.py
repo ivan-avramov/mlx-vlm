@@ -14,7 +14,6 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import mlx.core as mx
-import pytest
 from fastapi.testclient import TestClient
 from test_cached_tokens_reporting import _bare_response_generator
 from test_zero_budget_logprobs import REAL
@@ -43,7 +42,9 @@ def test_f23_process_cached_request_forwards_the_flag_and_leaves_the_state_alone
         return iter(())
 
     monkeypatch.setattr(
-        sys.modules["mlx_vlm.generate"], "stream_generate", lambda **kw: fake_stream(**kw)
+        sys.modules["mlx_vlm.generate"],
+        "stream_generate",
+        lambda **kw: fake_stream(**kw),
     )
     rg = _bare_response_generator()
     state = SimpleNamespace(is_asymmetric_rendering=False)
@@ -80,7 +81,9 @@ def test_f23_handler_does_not_mutate_the_shared_session(monkeypatch):
             calls.append(
                 (
                     kw.get("is_asymmetric_rendering"),
-                    getattr(kw.get("prompt_cache_state"), "is_asymmetric_rendering", None),
+                    getattr(
+                        kw.get("prompt_cache_state"), "is_asymmetric_rendering", None
+                    ),
                 )
             )
             ctx = server_generation.GenerationContext(

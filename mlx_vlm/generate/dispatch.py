@@ -1574,7 +1574,7 @@ def stream_generate(
 
 # Fork: fork-only helper (P369 round-2 F5).
 def _retire_session_on_abnormal_exit(fn):
-    # Fork: fork-only helper (P369 round-2 F5).
+    # Fork: fork-only helper (P369 round-2 F5, round-3 F8, round-5 F18, round-6 F22).
     """Clear the request's ``PromptCacheState`` unless the stream ran to completion.
 
     The session cache is mutated in place while the label (``token_ids``) is only
@@ -1582,7 +1582,17 @@ def _retire_session_on_abnormal_exit(fn):
     ``close()``), or an exception, would leave the old label over a cache holding the
     prompt and decoded tokens; MTP additionally commits whole verified blocks before
     yielding. Retiring the session on every such exit, for every draft kind, makes the
-    next turn re-prefill from scratch (identical for MTP-ON and OFF).
+    next turn re-prefill from scratch (identical for MTP-ON and OFF). The terminal
+    chunk is held until the session has been published, so a publication failure
+    reaches the caller as an exception and a close right after the terminal chunk
+    finds nothing left to do.
+
+    A per-session epoch makes an older, abandoned stream a no-op once a newer one
+    started on the same session. THREADING: sessions are single-threaded. The epoch
+    checks are plain attribute reads and writes, not atomic; the server serializes all
+    GPU work (and therefore every session's streams) on one worker thread, and a
+    direct multi-threaded caller sharing one ``PromptCacheState`` must serialize
+    itself. There is deliberately no lock.
     """
 
     def wrapper(*args, **kwargs):
