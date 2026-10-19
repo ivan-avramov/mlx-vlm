@@ -328,9 +328,9 @@ def test_an_untracked_worker_is_a_harness_error(tmp_path, owned, monkeypatch):
         )  # never "exited" without proven cleanup (H31)
 
 
-def test_cleanup_completes_before_a_second_interruption_is_replayed(tmp_path, owned):
-    import threading
-
+def test_cleanup_completes_before_a_second_interruption_is_replayed(
+    tmp_path, owned, monkeypatch
+):
     proc = _leaver(owned, tmp_path)
     tracker = orchestrate.Descendants(proc.pid)
     deadline = time.monotonic() + 10
@@ -339,26 +339,30 @@ def test_cleanup_completes_before_a_second_interruption_is_replayed(tmp_path, ow
     member = int((tmp_path / "member.pid").read_text())
     tracker.scan()
 
-    def raise_exit(signum, frame):
+    def raise_exit(signum, frame):  # what main() installs for SIGTERM
         raise SystemExit(128 + signum)
 
+    real = orchestrate._signal_each
+    sent = []
+
+    def interrupting(
+        pids, sig
+    ):  # deterministic: the TERM arrives IN the middle of the cleanup
+        if not sent:
+            sent.append(sig)
+            os.kill(os.getpid(), signal.SIGTERM)
+        return real(pids, sig)
+
+    monkeypatch.setattr(orchestrate, "_signal_each", interrupting)
     old = signal.signal(signal.SIGTERM, raise_exit)
-    timer = threading.Timer(0.05, os.kill, (os.getpid(), signal.SIGTERM))
     try:
-        timer.start()
         with pytest.raises(SystemExit):
             orchestrate.stop_worker(proc, tracker, grace_s=0.5)
+        assert sent  # the interruption really happened during the cleanup
         assert (
             _gone(member) and proc.returncode is not None
         )  # extinction FIRST, then the replay
     finally:
-        # never let the timer's SIGTERM reach this process after the default handler is back
-        timer.cancel()
-        timer.join()
-        try:
-            time.sleep(0.2)  # a signal already delivered is handled here, by raise_exit
-        except SystemExit:
-            pass
         signal.signal(signal.SIGTERM, old)
 
 
