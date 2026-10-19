@@ -429,6 +429,7 @@ class Monitor:
         self.path, self.estimate_s = Path(path), estimate_s
         self.started = time.monotonic()
         self.current = "-"
+        self.current_dir = None
         self.errors = []
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -448,6 +449,11 @@ class Monitor:
                         estimate_s=self.estimate_s,
                         eta_s=max(0, round(self.estimate_s - elapsed)),
                         job=self.current,
+                        request=(
+                            _read_json(self.current_dir / "progress.json")
+                            if self.current_dir
+                            else None
+                        ),
                         errors=self.errors[-3:],
                         power=power_state(),
                     )
@@ -466,14 +472,121 @@ class Monitor:
         return False
 
 
-def run_job(job, fork_root, env, monitor):
+BOOT_TIMEOUT_S = 900  # model load + served-state checks until the first heartbeat
+
+
+class JobTimeout(RuntimeError):
+    """A worker was stopped by the supervisor (code round 1 H8). ``info``: the outcome (``request_timeout`` /
+    ``hang_after`` with the request index, ``boot_timeout``, ``job_timeout``); ``completed``: ``{index:
+    entry}`` of the requests that finished before it."""
+
+    def __init__(self, info, completed):
+        super().__init__(f"worker stopped: {info}")
+        self.info, self.completed = info, completed
+
+
+class WallLimit(RuntimeError):
+    """The campaign's total-wall limit was reached (the current worker was stopped)."""
+
+
+def _read_json(path):
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def _stop(proc, grace_s):
+    proc.terminate()
+    try:
+        proc.wait(grace_s)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
+def supervise(
+    proc,
+    job_dir,
+    *,
+    boot_timeout_s,
+    deadline,
+    job_deadline=None,
+    poll_s=2.0,
+    grace_s=30.0,
+):
+    """Watch one worker until it exits; stop it (SIGTERM, then SIGKILL after ``grace_s``) when its current
+    request (``progress.json``) overruns its deadline, when no heartbeat came within ``boot_timeout_s``, at
+    the job deadline or at the campaign ``deadline`` (monotonic). Every stop writes ``timeout.json``.
+    """
+    job_dir = Path(job_dir)
+    started = time.monotonic()
+    while True:
+        returncode = proc.poll()
+        if returncode is not None:
+            return dict(outcome="exited", returncode=returncode)
+        now = time.monotonic()
+        progress = _read_json(job_dir / "progress.json")
+        info = None
+        if now >= deadline:
+            info = dict(outcome="wall_limit")
+        elif job_deadline is not None and now >= job_deadline:
+            info = dict(outcome="job_timeout")
+        elif progress is None:
+            if now - started > boot_timeout_s:
+                info = dict(outcome="boot_timeout", waited_s=round(now - started, 1))
+        elif time.time() > progress["started"] + progress["deadline_s"]:
+            phase = progress.get("phase", "request")
+            info = dict(
+                outcome="request_timeout" if phase == "request" else "hang_after",
+                index=progress["index"],
+                name=progress["name"],
+                deadline_s=progress["deadline_s"],
+                elapsed_s=round(time.time() - progress["started"], 1),
+            )
+        if info is not None:
+            _stop(proc, grace_s)
+            (job_dir / "timeout.json").write_text(json.dumps(info, indent=1))
+            return info
+        time.sleep(poll_s)
+
+
+def run_with_censoring(run, requests):
+    """E7 under the per-request watchdog: ``run(batch) -> {index: entry}`` raises ``JobTimeout``; a
+    ``request_timeout`` censors that request, a ``hang_after`` censors none, and the requests after it are
+    relaunched in a fresh worker. Any other stop re-raises. Returns ``({name: entry}, [censored names])``.
+    """
+    done, censored = {}, []
+    pending = list(requests)
+    while pending:
+        try:
+            entries = run(pending)
+        except JobTimeout as exc:
+            if exc.info.get("outcome") not in ("request_timeout", "hang_after"):
+                raise
+            index = exc.info["index"]
+            stop = index if exc.info["outcome"] == "request_timeout" else index + 1
+            for k, entry in exc.completed.items():
+                if k < stop:
+                    done[pending[k]["name"]] = entry
+            if exc.info["outcome"] == "request_timeout":
+                censored.append(pending[index]["name"])
+            pending = pending[index + 1 :]
+            continue
+        for k, entry in entries.items():
+            done[pending[k]["name"]] = entry
+        pending = []
+    return done, censored
+
+
+def run_job(job, fork_root, env, monitor, *, deadline):
     job_dir = Path(job["out_dir"])
     job_dir.mkdir(parents=True, exist_ok=True)
     (job_dir / "job.json").write_text(json.dumps(job, indent=1))
-    monitor.current = job["name"]
+    monitor.current, monitor.current_dir = job["name"], job_dir
     python = str(Path(fork_root) / ".venv" / "bin" / "python")
     with (job_dir / "worker.log").open("w") as log:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             [
                 python,
                 "-I",
@@ -483,17 +596,34 @@ def run_job(job, fork_root, env, monitor):
             stdout=log,
             stderr=subprocess.STDOUT,
             env=env,
-            timeout=job["timeout_s"],
         )
-    result = (
-        json.loads((job_dir / "result.json").read_text())
-        if (job_dir / "result.json").exists()
-        else None
-    )
-    if proc.returncode != 0 or result is None or result.get("status") != "ok":
-        monitor.errors.append(f"{job['name']}: rc {proc.returncode}")
+        try:
+            outcome = supervise(
+                proc,
+                job_dir,
+                boot_timeout_s=BOOT_TIMEOUT_S,
+                deadline=deadline,
+                job_deadline=time.monotonic() + job["timeout_s"],
+            )
+        except BaseException:
+            _stop(proc, 5)
+            raise
+    if outcome["outcome"] != "exited":
+        monitor.errors.append(f"{job['name']}: {outcome}")
+        if outcome["outcome"] == "wall_limit":
+            raise WallLimit(f"campaign wall limit reached in {job['name']}")
+        completed = {}
+        for path in job_dir.glob("req-*.json"):
+            entry = _read_json(path)
+            if entry is not None:
+                completed[int(path.stem.split("-")[1])] = entry
+        raise JobTimeout(outcome, completed)
+    result = _read_json(job_dir / "result.json")
+    returncode = outcome["returncode"]
+    if returncode != 0 or result is None or result.get("status") != "ok":
+        monitor.errors.append(f"{job['name']}: rc {returncode}")
         raise RuntimeError(
-            f"job {job['name']} failed (rc {proc.returncode}); see {job_dir}/worker.log"
+            f"job {job['name']} failed (rc {returncode}); see {job_dir}/worker.log"
         )
     return result
 
@@ -520,6 +650,10 @@ SIZE_PREFIX = (
 SIZE_SUFFIX = "Now write the story."
 SHORT_PROMPT = "Explain, step by step, why the sum of two odd integers is even."
 ESTIMATE_LIMIT_S = 3.5 * 3600
+SMOKE_WALL_LIMIT_S = 90 * 60  # the smoke's hard stop (estimate ≈ 30 min)
+FULL_WALL_LIMIT_S = (
+    ESTIMATE_LIMIT_S + 3600
+)  # the operator budget + one hour of heavy tail (C183)
 
 
 def e1c_timeout(threshold):
@@ -634,8 +768,15 @@ class Campaign:
             for p in self.picks
         }
         self.env = worker_env(dict(os.environ))
+        self.wall_limit_s = args.wall_limit_s or (
+            SMOKE_WALL_LIMIT_S if args.phase == "smoke" else FULL_WALL_LIMIT_S
+        )
+        self.deadline = time.monotonic() + self.wall_limit_s
         self.summary = dict(
-            picks={}, started=time.strftime("%Y-%m-%dT%H:%M:%S"), phase=args.phase
+            picks={},
+            started=time.strftime("%Y-%m-%dT%H:%M:%S"),
+            phase=args.phase,
+            wall_limit_s=self.wall_limit_s,
         )
 
     # -- setup
@@ -704,7 +845,7 @@ class Campaign:
         )
 
     def run(self, job):
-        return run_job(job, self.fork, self.env, self.monitor)
+        return run_job(job, self.fork, self.env, self.monitor, deadline=self.deadline)
 
     # -- steps
     def size(self, pick, thresholds):
@@ -915,13 +1056,28 @@ class Campaign:
             argmax_and_kernels=argmax_ok,
         )
 
+    def batch_runner(self, pick, base, mode, arm):
+        """``run(batch) -> {index: entry}`` for ``run_with_censoring``: each (re)launch is a fresh worker job
+        ``<base>-w<k>``."""
+        launches = []
+
+        def run(batch):
+            name = f"{base}-w{len(launches)}"
+            launches.append(name)
+            self.run(self.job(pick, name, mode, arm, batch))
+            return {
+                i: json.loads((self.out / pick / name / f"req-{i}.json").read_text())
+                for i in range(len(batch))
+            }
+
+        return run
+
     def e7(self, pick, items):
         reqs = self.c84_payloads(pick, items, greedy=False)
-        self.run(self.job(pick, "e7a", "e7a", "on", reqs))
-        per = [
-            json.loads((self.out / pick / "e7a" / f"req-{i}.json").read_text())
-            for i in range(len(reqs))
-        ]
+        done, censored_a = run_with_censoring(
+            self.batch_runner(pick, "e7a", "e7a", "on"), reqs
+        )
+        per = [done[r["name"]] for r in reqs if r["name"] in done]
         n = len(per)
         classes = {}
         for cls in ("M4a", "M4b", "M4b_first", "M3"):
@@ -952,11 +1108,14 @@ class Campaign:
                     name=item["name"], turns=turns, timeout_s=e7_timeout() * len(turns)
                 )
             )
-        self.run(self.job(pick, "e7b", "e7b", "on", sessions))
-        e7b = []
-        for i, s in enumerate(sessions):
-            entry = json.loads((self.out / pick / "e7b" / f"req-{i}.json").read_text())
-            turns = entry["turns"]
+        done_b, censored_b = run_with_censoring(
+            self.batch_runner(pick, "e7b", "e7b", "on"), sessions
+        )
+        e7b = [dict(name=name, censored=True, reason="timeout") for name in censored_b]
+        for s in sessions:
+            if s["name"] not in done_b:
+                continue
+            turns = done_b[s["name"]]["turns"]
             continuity = all(
                 (turns[t]["final"]["cached_tokens"] or 0)
                 > (turns[t - 1]["final"]["prompt_tokens"] or 0)
@@ -970,9 +1129,38 @@ class Campaign:
                     events=[ev["cls"] for t in turns for ev in t["events"]],
                 )
             )
-        return dict(e7a=classes, e7b=e7b)
+        return dict(e7a=dict(classes=classes, censored=censored_a), e7b=e7b)
 
     # -- the whole run
+    def run_pick(self, pick, *, smoke):
+        """One pick under the Q37 precedence. A supervisor stop (``JobTimeout``) can never pass: in E1c the
+        pick ABORTs (no verdict, no bound), in E2 the identity is INCOMPLETE; E7 censors per request.
+        """
+        started = time.monotonic()
+        thresholds = (1024, 65536) if smoke else THRESHOLDS
+        prompts = self.size(pick, thresholds)
+        items = c84_items(self.stack, pick)
+        self.check_reconstruction(pick, items[:2] if smoke else items)
+        record = {}
+        try:
+            record["e1c"] = self.e1c(pick, prompts, smoke=smoke)
+            record["outcome"] = pick_outcome(record["e1c"])
+        except JobTimeout as exc:
+            record["outcome"] = dict(
+                e1c="ABORT", run_e2_e7=False, reason=f"E1c worker stopped: {exc.info}"
+            )
+        if record["outcome"]["run_e2_e7"]:  # Q37 precedence
+            try:
+                record["e2"] = self.e2(pick, items, prompts, smoke=smoke)
+            except JobTimeout as exc:
+                record["e2"] = dict(
+                    verdict="INCOMPLETE", reason=f"E2 worker stopped: {exc.info}"
+                )
+            if not smoke:
+                record.update(self.e7(pick, items))
+        record["wall_s"] = round(time.monotonic() - started)
+        return record
+
     def execute(self):
         manifest = self.prepare()
         self.summary["binding"] = binding(manifest)
@@ -984,21 +1172,16 @@ class Campaign:
         estimate = 20 * 60 if self.args.phase == "smoke" else int(ESTIMATE_LIMIT_S)
         smoke = self.args.phase == "smoke"
         with Monitor(self.out / "monitor.log", estimate) as self.monitor:
-            for pick in self.picks:
-                started = time.monotonic()
-                thresholds = (1024, 65536) if smoke else THRESHOLDS
-                prompts = self.size(pick, thresholds)
-                items = c84_items(self.stack, pick)
-                self.check_reconstruction(pick, items[:2] if smoke else items)
-                record = dict(e1c=self.e1c(pick, prompts, smoke=smoke))
-                record["outcome"] = pick_outcome(record["e1c"])
-                if record["outcome"]["run_e2_e7"]:  # Q37 precedence
-                    record["e2"] = self.e2(pick, items, prompts, smoke=smoke)
-                    if not smoke:
-                        record.update(self.e7(pick, items))
-                record["wall_s"] = round(time.monotonic() - started)
-                self.summary["picks"][pick] = record
+            try:
+                for pick in self.picks:
+                    self.summary["picks"][pick] = self.run_pick(pick, smoke=smoke)
+                    self.write_summary()
+            except (
+                WallLimit
+            ) as exc:  # code round 1 H8: the worker was stopped; nothing more runs
+                self.summary["aborted"] = f"wall_limit: {exc}"
                 self.write_summary()
+                raise
         self.summary["manifest"] = dict(
             fork_head=manifest["fork_head"], production=PRODUCTION
         )
@@ -1087,6 +1270,11 @@ def main(argv=None):
     ap.add_argument("--plan-only", action="store_true")
     ap.add_argument(
         "--smoke-summary", help="full runs refuse unless this passed smoke summary fits"
+    )
+    ap.add_argument(
+        "--wall-limit-s",
+        type=float,
+        help="the campaign's hard total-wall stop (default: 90 min smoke, 4.5 h full)",
     )
     args = ap.parse_args(argv)
     out = Path(args.out).resolve()
