@@ -297,6 +297,97 @@ def pick_outcome(verdicts):
     return dict(e1c=e1c, run_e2_e7=e1c == "PASS", cross_load=cross)
 
 
+def e2_verdict(*, all_identical, control_identical, engaged):
+    """Code round 1 H10 (plan §3 E2): INCOMPLETE without engagement on every ON request (verifier rounds,
+    argmax readout, kernel verdict); INFORMATIVE_ONLY when the OFF reload control differs; else PASS iff
+    every request is identical. ``control_identical`` None = no control (the smoke)."""
+    if not engaged:
+        return "INCOMPLETE"
+    if control_identical is False:
+        return "INFORMATIVE_ONLY"
+    return "PASS" if all_identical else "FAIL"
+
+
+E7_CLASSES = ("M4a", "M4b", "M4b_first", "M3")
+
+
+def e7a_stats(done, censored):
+    """Code round 1 H5: E7a's inferential unit is an ENGAGED, uncensored request — MTP rounds ran, or the
+    prefill's first token was terminal (an ``M4b_first`` event); an unengaged request is reported, never
+    counted event-free. Per class: requests with an event / n, with a Clopper–Pearson 95 % interval.
+    """
+    engaged, not_engaged = {}, []
+    for name, entry in done.items():
+        turn = entry["turns"][0]
+        kinds = {ev["cls"] for ev in turn["events"]}
+        if turn.get("mtp_rounds", 0) > 0 or "M4b_first" in kinds:
+            engaged[name] = kinds
+        else:
+            not_engaged.append(name)
+    n = len(engaged)
+    classes = {}
+    for cls in E7_CLASSES:
+        k = sum(1 for kinds in engaged.values() if cls in kinds)
+        classes[cls] = dict(
+            requests_with_event=k, requests=n, ci95=clopper_pearson(k, n)
+        )
+    return dict(
+        requests=n,
+        classes=classes,
+        not_engaged=sorted(not_engaged),
+        censored=list(censored),
+    )
+
+
+def e7b_session(name, turns):
+    """Code round 1 H7: a session is continuous iff every follow-up turn is (``worker.turn_continuity``);
+    else censored with the first reason. Events are reported per session, never pooled with E7a.
+    """
+    reasons = [
+        (t["continuity"] or {}).get("reason") or "no continuity record"
+        for t in turns[1:]
+        if not (t.get("continuity") or {}).get("continuity")
+    ]
+    return dict(
+        name=name,
+        continuity=not reasons,
+        censored=bool(reasons),
+        reason=reasons[0] if reasons else None,
+        events=[ev["cls"] for t in turns for ev in t["events"]],
+        mtp_rounds=[t.get("mtp_rounds") for t in turns],
+    )
+
+
+def prompt_digest_problems(want, entries):
+    """Code round 1 H6: every C84 request's templated prompt digest equals the reconstruction's."""
+    problems = []
+    for name, entry in entries.items():
+        if name not in want:
+            continue
+        got = (entry["turns"][0].get("prompt") or {}).get("sha256")
+        if got != want[name]:
+            problems.append(
+                f"{name}: prompt digest {got} != reconstruction {want[name]}"
+            )
+    return problems
+
+
+def overall_status(summary):
+    """Code round 1 H10: the phase status and the process exit code (0 = PASS, 2 = completed without PASS:
+    a verdict for the operator; harness errors raise and exit 1)."""
+    if summary.get("phase") == "smoke":
+        gate = summary.get("smoke_gate") or {}
+        ok = bool(gate.get("pass_") and gate.get("fits"))
+        return ("SMOKE_PASS", 0) if ok else ("SMOKE_NOT_PASS", 2)
+    picks = summary.get("picks") or {}
+    ok = bool(picks) and all(
+        (r.get("outcome") or {}).get("e1c") == "PASS"
+        and (r.get("e2") or {}).get("verdict") == "PASS"
+        for r in picks.values()
+    )
+    return ("PASS", 0) if ok else ("NOT_PASS", 2)
+
+
 def e1c_verdict(on_entry, off_entry, *, threshold, verify_policy):
     """Per-request E1c pass rule (plan §2.2): rows, state, kernels, engagement, exact prompt, straddle."""
     problems = []
@@ -768,6 +859,7 @@ class Campaign:
             for p in self.picks
         }
         self.env = worker_env(dict(os.environ))
+        self.digests = {}  # pick -> {C84 item: templated prompt digest} (H6)
         self.wall_limit_s = args.wall_limit_s or (
             SMOKE_WALL_LIMIT_S if args.phase == "smoke" else FULL_WALL_LIMIT_S
         )
@@ -999,6 +1091,13 @@ class Campaign:
             raise RuntimeError(
                 f"{pick}: C84-item reconstruction differs from the recorded counts: {bad}"
             )
+        # H6: the C84 bundles store counts only, so the link to the original runs is the count; every later
+        # E2 / E7 request is bound to THIS reconstruction by its templated token digest.
+        self.digests[pick] = {r["name"]: r["sha256"] for r in result["requests"]}
+        return {
+            r["name"]: dict(tokens=r["tokens"], sha256=r["sha256"])
+            for r in result["requests"]
+        }
 
     def e2(self, pick, items, prompts, *, smoke):
         reqs = self.c84_payloads(pick, items, greedy=True, limit=2 if smoke else None)
@@ -1047,13 +1146,26 @@ class Campaign:
         argmax_ok = all(
             on[n]["telemetry"]["speculative_argmax_from_hidden"] > 0
             and on[n]["verdict"]["pass"]
+            and on[n]["turns"][0]["mtp_rounds"] > 0
             for n in on
         )
+        digest_problems = [
+            p
+            for arm in results
+            for p in prompt_digest_problems(self.digests.get(pick, {}), arm)
+        ]
+        all_identical = all(identity.values())
         return dict(
             identity=identity,
-            all_identical=all(identity.values()),
+            all_identical=all_identical,
             control_identical=control_ok,
             argmax_and_kernels=argmax_ok,
+            prompt_digest_problems=digest_problems,
+            verdict=e2_verdict(
+                all_identical=all_identical,
+                control_identical=control_ok,
+                engaged=argmax_ok and not digest_problems,
+            ),
         )
 
     def batch_runner(self, pick, base, mode, arm):
@@ -1077,18 +1189,12 @@ class Campaign:
         done, censored_a = run_with_censoring(
             self.batch_runner(pick, "e7a", "e7a", "on"), reqs
         )
-        per = [done[r["name"]] for r in reqs if r["name"] in done]
-        n = len(per)
-        classes = {}
-        for cls in ("M4a", "M4b", "M4b_first", "M3"):
-            k = sum(
-                1
-                for e in per
-                if any(ev["cls"] == cls for ev in e["turns"][0]["events"])
-            )
-            classes[cls] = dict(
-                requests_with_event=k, requests=n, ci95=clopper_pearson(k, n)
-            )
+        e7a = dict(
+            e7a_stats(done, censored_a),
+            prompt_digest_problems=prompt_digest_problems(
+                self.digests.get(pick, {}), done
+            ),
+        )
         sessions = []
         for item in items[:5]:
             turns = [
@@ -1112,24 +1218,18 @@ class Campaign:
             self.batch_runner(pick, "e7b", "e7b", "on"), sessions
         )
         e7b = [dict(name=name, censored=True, reason="timeout") for name in censored_b]
-        for s in sessions:
-            if s["name"] not in done_b:
-                continue
-            turns = done_b[s["name"]]["turns"]
-            continuity = all(
-                (turns[t]["final"]["cached_tokens"] or 0)
-                > (turns[t - 1]["final"]["prompt_tokens"] or 0)
-                for t in range(1, len(turns))
-            )
-            e7b.append(
-                dict(
-                    name=s["name"],
-                    continuity=continuity,
-                    censored=not continuity,
-                    events=[ev["cls"] for t in turns for ev in t["events"]],
-                )
-            )
-        return dict(e7a=dict(classes=classes, censored=censored_a), e7b=e7b)
+        e7b += [
+            e7b_session(s["name"], done_b[s["name"]]["turns"])
+            for s in sessions
+            if s["name"] in done_b
+        ]
+        return dict(
+            e7a=e7a,
+            e7b=e7b,
+            e7b_prompt_digest_problems=prompt_digest_problems(
+                self.digests.get(pick, {}), done_b
+            ),
+        )
 
     # -- the whole run
     def run_pick(self, pick, *, smoke):
@@ -1140,8 +1240,11 @@ class Campaign:
         thresholds = (1024, 65536) if smoke else THRESHOLDS
         prompts = self.size(pick, thresholds)
         items = c84_items(self.stack, pick)
-        self.check_reconstruction(pick, items[:2] if smoke else items)
-        record = {}
+        record = dict(
+            reconstruction=self.check_reconstruction(
+                pick, items[:2] if smoke else items
+            )
+        )
         try:
             record["e1c"] = self.e1c(pick, prompts, smoke=smoke)
             record["outcome"] = pick_outcome(record["e1c"])
@@ -1187,6 +1290,7 @@ class Campaign:
         )
         if smoke:
             self.summary["smoke_gate"] = self.smoke_gate()
+        self.summary["status"], self.summary["exit_code"] = overall_status(self.summary)
         self.write_summary()
         return self.summary
 
@@ -1196,7 +1300,9 @@ class Campaign:
         problems = []
         projected = 0
         for pick, record in self.summary["picks"].items():
-            for name, v in record["e1c"].items():
+            if record["outcome"]["e1c"] != "PASS":
+                problems.append(f"{pick}: E1c {record['outcome']}")
+            for name, v in record.get("e1c", {}).items():
                 if not v["pass_"]:
                     problems.append(f"{pick} {name}: {v['problems']}")
                 sp = v.get("smoke_positives")
@@ -1211,7 +1317,7 @@ class Campaign:
                     }:
                         problems.append(f"{pick}: smoke positives {sp}")
             e2 = record.get("e2")
-            if e2 is None or not e2["all_identical"] or not e2["argmax_and_kernels"]:
+            if e2 is None or e2.get("verdict") != "PASS":
                 problems.append(f"{pick}: E2 smoke {e2}")
             projected += (
                 record["wall_s"] * 6
@@ -1298,7 +1404,14 @@ def main(argv=None):
     finally:
         os.close(fd)
         lock.unlink()
-    print(json.dumps(summary.get("smoke_gate", {}), indent=1))
+    print(
+        json.dumps(
+            dict(status=summary["status"], smoke_gate=summary.get("smoke_gate")),
+            indent=1,
+        )
+    )
+    if summary["exit_code"]:
+        raise SystemExit(summary["exit_code"])
 
 
 if __name__ == "__main__":

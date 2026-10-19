@@ -144,12 +144,30 @@ def assert_served(state, expect):
 
 
 # ------------------------------------------------------------------ request plumbing
+def token_digest(ids):
+    """SHA-256 of a prompt's token ids (flattened, int64 little-endian): order, values and length exact."""
+    import hashlib
+
+    import numpy as np
+
+    flat = np.asarray(ids, dtype=np.int64).reshape(-1)
+    return hashlib.sha256(flat.astype("<i8").tobytes()).hexdigest()
+
+
+def _ids_list(input_ids):
+    import numpy as np
+
+    return [int(t) for t in np.asarray(input_ids).reshape(-1)]
+
+
 class Capture:
-    """Final chunk (token ids, finish, counts) and backend of each request, from the production calls."""
+    """Final chunk (token ids, finish, counts), backend and templated prompt (``prompt``: token count,
+    digest, ids — code round 1 H6) of each request, from the production calls."""
 
     def __init__(self):
         self.final = None
         self.backend = None
+        self.prompt = None
         self.completed = (
             0  # Q38: exits of _process_cached_request seen on the GPU thread
         )
@@ -159,6 +177,14 @@ class Capture:
         from mlx_vlm.server import generation
 
         capture = self
+        preprocess = generation.ResponseGenerator._preprocess_request
+
+        def recording_preprocess(rg, *args, **kwargs):
+            raw = preprocess(rg, *args, **kwargs)
+            ids = _ids_list(raw["input_ids"])
+            capture.prompt = dict(tokens=len(ids), sha256=token_digest(ids), ids=ids)
+            return raw
+
         stream = sys.modules["mlx_vlm.generate"].stream_generate
 
         def capturing_stream(*args, **kwargs):
@@ -196,14 +222,16 @@ class Capture:
             (sys.modules["mlx_vlm.generate"], "stream_generate", stream),
             (generation.ResponseGenerator, "generate", generate_fn),
             (generation.ResponseGenerator, "_process_cached_request", process),
+            (generation.ResponseGenerator, "_preprocess_request", preprocess),
         ]
         sys.modules["mlx_vlm.generate"].stream_generate = capturing_stream
         generation.ResponseGenerator.generate = capturing_generate
         generation.ResponseGenerator._process_cached_request = acknowledged_process
+        generation.ResponseGenerator._preprocess_request = recording_preprocess
         return self
 
     def reset(self):
-        self.final, self.backend = None, None
+        self.final, self.backend, self.prompt = None, None, None
 
     def __exit__(self, *exc):
         while self._patched:
@@ -279,9 +307,77 @@ def post(client, payload, chat_id, capture, timeout_s):
         raise RuntimeError(f"backend {capture.backend!r}, expected cached_session")
     if capture.final is None:
         raise RuntimeError("no final chunk captured")
+    if capture.prompt is None:
+        raise RuntimeError("no templated prompt captured")
     return dict(
-        response=r.json(), final=dict(capture.final), wall_s=elapsed, chat_id=chat_id
+        response=r.json(),
+        final=dict(capture.final),
+        prompt={k: capture.prompt[k] for k in ("tokens", "sha256")},
+        wall_s=elapsed,
+        chat_id=chat_id,
     )
+
+
+def assistant_echo(message):
+    """Code round 1 H7: the model's COMPLETE previous assistant turn for the next request — content,
+    ``reasoning_content`` (both picks' templates re-render it by default) and tool calls when present.
+    """
+    echo = dict(role="assistant", content=message.get("content") or "")
+    if message.get("reasoning_content"):
+        echo["reasoning_content"] = message["reasoning_content"]
+    if message.get("tool_calls"):
+        echo["tool_calls"] = message["tool_calls"]
+    return echo
+
+
+def turn_continuity(
+    *, prev_ids, prev_hashes, prev_prompt_tokens, new_ids, new_hashes, cached_tokens
+):
+    """Code round 1 H7: a follow-up turn continues the session THROUGH the previous generated turn when the
+    request's message hash chain extends the session's recorded chain, the cached sequence after the previous
+    turn (``PromptCacheState.token_ids``) holds generated tokens beyond the previous prompt, the new prompt
+    reproduces that whole sequence, and the reuse reaches its end (one token of allowance for the
+    re-evaluated last position)."""
+    prev_ids = list(prev_ids or [])
+    lcp = 0
+    for a, b in zip(prev_ids, new_ids):
+        if a != b:
+            break
+        lcp += 1
+    boundary = len(prev_ids)
+    generated_prev = boundary - int(prev_prompt_tokens or 0)
+    reason = None
+    if list(new_hashes[: len(prev_hashes)]) != list(prev_hashes):
+        reason = "the request's message hash chain does not extend the session's"
+    elif generated_prev <= 0:
+        reason = "the cache holds no generated tokens beyond the previous prompt"
+    elif lcp < boundary:
+        reason = f"the new prompt does not reproduce the cached sequence (lcp {lcp} < {boundary})"
+    elif (cached_tokens or 0) < boundary - 1:
+        reason = f"cache reuse stops at {cached_tokens} before the boundary {boundary}"
+    return dict(
+        continuity=reason is None,
+        reason=reason,
+        lcp=lcp,
+        boundary=boundary,
+        generated_prev=generated_prev,
+        cached_tokens=cached_tokens,
+    )
+
+
+def session_snapshot(chat_id):
+    """The session's cached token sequence and recorded message hash chain (production entry)."""
+    from mlx_vlm.server import session_manager
+
+    with session_manager._session_caches_lock:
+        entry = session_manager._session_caches.get(chat_id)
+        if entry is None:
+            return None
+        ids = entry["state"].token_ids
+        return dict(
+            ids=list(ids) if ids is not None else None,
+            hashes=list(entry.get("turn_hashes") or []),
+        )
 
 
 @contextmanager
@@ -303,13 +399,21 @@ def probe_counters_frozen(policy):
 # ------------------------------------------------------------------ prompt sizing (dry runs)
 def prompt_tokens(client, messages, base_payload):
     """The endpoint's own prompt token count for ``messages`` (no generation)."""
+    return len(prompt_ids(client, messages, base_payload))
+
+
+def prompt_ids(client, messages, base_payload):
+    """The endpoint's own templated prompt token ids for ``messages`` (no generation)."""
     from mlx_vlm.server import generation
 
     real = generation.ResponseGenerator._preprocess_request
 
     def measuring(rg, *args, **kwargs):
         raw = real(rg, *args, **kwargs)
-        raise DryRun(generation._count_prompt_tokens(raw))
+        ids = _ids_list(raw["input_ids"])
+        if len(ids) != generation._count_prompt_tokens(raw):
+            raise RuntimeError("templated ids disagree with the production count")
+        raise DryRun(ids)
 
     generation.ResponseGenerator._preprocess_request = measuring
     try:
@@ -745,10 +849,10 @@ def run_job(job, out_dir, result):
                     name=spec["name"],
                     deadline_s=spec["timeout_s"],
                 )
-                tokens = prompt_tokens(
-                    client, spec["payload"]["messages"], spec["payload"]
+                ids = prompt_ids(client, spec["payload"]["messages"], spec["payload"])
+                result["requests"].append(
+                    dict(name=spec["name"], tokens=len(ids), sha256=token_digest(ids))
                 )
-                result["requests"].append(dict(name=spec["name"], tokens=tokens))
             return
         probe = dict(probe_token=int(job["probe_token"]))
         params = job["params"]
@@ -885,8 +989,10 @@ def run_job(job, out_dir, result):
                 history = []
                 entry["turns"] = []
                 for t, payload in enumerate(turns):
+                    before = None
                     if job["mode"] == "e7b" and t > 0:
                         payload = dict(payload, messages=history + payload["messages"])
+                        before = session_snapshot(chat_id)  # H7: before this turn runs
                     observer.begin_request(f"{spec['name']}#{t}")
                     with observer, tel:
                         got = post(
@@ -906,10 +1012,33 @@ def run_job(job, out_dir, result):
                         got["final"]["finish_reason"],
                     )
                     message = got["response"]["choices"][0]["message"]
-                    history = payload["messages"] + [
-                        dict(role="assistant", content=message.get("content") or "")
-                    ]
-                    entry["turns"].append(dict(got, events=events))
+                    continuity = None
+                    if before is not None:
+                        from mlx_vlm.server import session_manager
+
+                        continuity = turn_continuity(
+                            prev_ids=before["ids"],
+                            prev_hashes=before["hashes"],
+                            prev_prompt_tokens=entry["turns"][-1]["prompt"]["tokens"],
+                            new_ids=capture.prompt["ids"],
+                            new_hashes=session_manager._compute_turn_hashes(
+                                payload["messages"]
+                            ),
+                            cached_tokens=got["final"]["cached_tokens"],
+                        )
+                    elif job["mode"] == "e7b" and t > 0:
+                        continuity = dict(
+                            continuity=False, reason="no session entry before the turn"
+                        )
+                    history = payload["messages"] + [assistant_echo(message)]
+                    entry["turns"].append(
+                        dict(
+                            got,
+                            events=events,
+                            mtp_rounds=len(observer.requests[-1]["rounds"]),
+                            continuity=continuity,
+                        )
+                    )
                     if (
                         job["mode"] != "e7b"
                     ):  # e7b keeps its one session across the turns
