@@ -4168,7 +4168,8 @@ def _generate_batch(
     while gen.has_work:
         _, generation_responses = gen.next()
         for r in generation_responses:
-            if r.finish_reason != "stop":
+            # Fork (P369 round-6 F20): a zero-budget row finishes with token=None.
+            if r.finish_reason != "stop" and r.token is not None:
                 results[r.uid].append(r.token)
     total_time = time.perf_counter() - tic
 
