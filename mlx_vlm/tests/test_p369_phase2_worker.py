@@ -185,3 +185,41 @@ def test_key_lengths_records_every_verifier_block_span():
     t = first["first_key"]  # a threshold the first block spans
     assert observe.straddles(kl.blocks, t) or first["width"] == 1
     assert not observe.straddles(kl.blocks, 10_000)
+
+
+# ------------------------------------------------------------------ smoke positives (Q32)
+@metal
+@pytest.mark.parametrize("pick", PICKS)
+def test_smoke_positives_fire_on_live_data(pick):
+    lm, drafter = _quantized_pair(pick)
+    model, params = fake_model(lm), deployed_sampling(pick)
+    plain, _ = turn(model, PROMPT, PromptCacheState(), n=9, seed=5, params=params)
+    plain = list(plain)
+    scripted(
+        drafter, lambda p: plain[p] if p < len(plain) else None, high=True, vocab=64
+    )
+    with observe.Recorder(mode="on", lm=lm, probe_token=5) as on:
+        emitted, _ = turn(
+            model,
+            PROMPT,
+            PromptCacheState(),
+            drafter=drafter,
+            n=9,
+            seed=5,
+            params=params,
+        )
+    offsets = [on.prompt_end["offset"]] + [c["offset"] for c in on.commits]
+    with observe.Recorder(
+        mode="off",
+        force_tokens=list(emitted),
+        hash_offsets=offsets,
+        lm=lm,
+        probe_token=5,
+    ) as off:
+        turn(model, PROMPT, PromptCacheState(), n=len(emitted), seed=5, params=params)
+    got = worker.smoke_positives(on, off, len(emitted), params)
+    assert got["baseline_pass"], got
+    assert all(got["fired"].values()), got
+    assert {"raw_ulp", "in_support", "old_prefix_k", "recurrent", "probe_logit"} <= set(
+        got["fired"]
+    )
