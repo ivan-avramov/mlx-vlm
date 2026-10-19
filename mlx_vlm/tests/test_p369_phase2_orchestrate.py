@@ -708,9 +708,7 @@ def test_run_pick_saves_each_step_as_it_finishes(monkeypatch):
     monkeypatch.setattr(orchestrate, "c84_items", lambda stack, pick: [])
     camp.size = lambda pick, thresholds: {}
     camp.check_reconstruction = lambda pick, items: {}
-    camp.e1c = lambda pick, prompts, smoke: {
-        "T1024": dict(pass_=True, c1=dict(identical=True), c2=dict(identical=True))
-    }
+    camp.e1c = lambda pick, prompts, smoke: {"T1024": _v()}
     camp.e2 = lambda pick, items, prompts, smoke: dict(verdict="PASS")
     camp.e7a = lambda pick, items: dict(status="OBSERVED")
 

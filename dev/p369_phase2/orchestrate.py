@@ -280,15 +280,19 @@ def straddle_target(threshold):
 
 
 def pick_outcome(verdicts):
-    """Q37 precedence per pick: any C1 failure / incompleteness ABORTs (no E1c verdict, no bound); else any
-    same-instance pair difference FAILs (that pick's E1c finished for the bound, E2 / E7 skipped); else PASS.
-    The cross-load / configuration comparison (C2) never decides E1c: ``identical`` or ``unestablished``.
+    """Q37 precedence per pick (code round 2 H15): any C1 failure / incompleteness ABORTs (no E1c verdict,
+    no bound); else an ESTABLISHED same-instance row / state difference FAILs (that pick's E1c finished for
+    the bound, E2 / E7 skipped); else invalid evidence (kernels, engagement, prompt_end, straddle) is
+    INCOMPLETE — never reported as non-neutrality; else PASS. The cross-load / configuration comparison (C2)
+    never decides E1c: ``identical`` or ``unestablished``.
     """
     values = list(verdicts.values())
     if any(not v["c1"]["identical"] for v in values):
         e1c = "ABORT"
-    elif any(not v["pass_"] for v in values):
+    elif any(not v["neutral"] for v in values):
         e1c = "FAIL"
+    elif any(not v["evidence_ok"] or not v["pass_"] for v in values):
+        e1c = "INCOMPLETE"
     else:
         e1c = "PASS"
     cross = (
@@ -311,19 +315,33 @@ def e2_verdict(*, all_identical, control_identical, engaged):
 E7_CLASSES = ("M4a", "M4b", "M4b_first", "M3")
 
 
-def e7a_stats(done, censored):
-    """Code round 1 H5: E7a's inferential unit is an ENGAGED, uncensored request — MTP rounds ran, or the
-    prefill's first token was terminal (an ``M4b_first`` event); an unengaged request is reported, never
-    counted event-free. Per class: requests with an event / n, with a Clopper–Pearson 95 % interval.
-    """
-    engaged, not_engaged = {}, []
+def _first_terminal(turn):
+    """A turn whose prefill's first token was terminal: no MTP round can run (an ``M4b_first`` event)."""
+    kinds = {ev["cls"] for ev in turn["events"]}
+    return turn.get("mtp_rounds", 0) <= 0 and "M4b_first" in kinds
+
+
+def e7a_stats(done, censored, *, digests=None):
+    """E7a's inferential unit is an ENGAGED, VALID, uncensored request (code rounds 1 H5, 2 H6 / H10): MTP
+    rounds ran — or the prefill's first token was terminal — and (unless first-terminal) the kernel verdict
+    passed, and the templated prompt equals the reconstruction's digest (``digests``). Unengaged and
+    invalid requests are reported, never counted event-free. Per class: requests with an event / n, with a
+    Clopper–Pearson 95 % interval; ``status`` OBSERVED iff n >= 1, else INCOMPLETE."""
+    engaged, not_engaged, invalid = {}, [], []
     for name, entry in done.items():
         turn = entry["turns"][0]
-        kinds = {ev["cls"] for ev in turn["events"]}
-        if turn.get("mtp_rounds", 0) > 0 or "M4b_first" in kinds:
-            engaged[name] = kinds
-        else:
+        first = _first_terminal(turn)
+        if turn.get("mtp_rounds", 0) <= 0 and not first:
             not_engaged.append(name)
+            continue
+        digest_bad = digests is not None and (turn.get("prompt") or {}).get(
+            "sha256"
+        ) != digests.get(name)
+        kernel_bad = not first and not (entry.get("verdict") or {}).get("pass")
+        if digest_bad or kernel_bad:
+            invalid.append(name)
+            continue
+        engaged[name] = {ev["cls"] for ev in turn["events"]}
     n = len(engaged)
     classes = {}
     for cls in E7_CLASSES:
@@ -335,27 +353,47 @@ def e7a_stats(done, censored):
         requests=n,
         classes=classes,
         not_engaged=sorted(not_engaged),
+        invalid=sorted(invalid),
         censored=list(censored),
+        status="OBSERVED" if n else "INCOMPLETE",
     )
 
 
-def e7b_session(name, turns):
-    """Code round 1 H7: a session is continuous iff every follow-up turn is (``worker.turn_continuity``);
-    else censored with the first reason. Events are reported per session, never pooled with E7a.
-    """
-    reasons = [
+def e7b_session(name, entry, *, digest):
+    """A session is OBSERVED (uncensored) iff its first prompt equals the reconstruction's ``digest``, the
+    entry's kernel verdict passed, every turn ran MTP rounds (or was first-token terminal; code round 2 H18)
+    and every follow-up turn is continuous (``worker.turn_continuity``, code round 1 H7); else censored with
+    the first reason. Events are reported per session, never pooled with E7a."""
+    turns = entry["turns"]
+    reasons = []
+    if (turns[0].get("prompt") or {}).get("sha256") != digest:
+        reasons.append("the first prompt's digest differs from the reconstruction")
+    if not (entry.get("verdict") or {}).get("pass"):
+        reasons.append("the kernel verdict failed")
+    reasons += [
+        f"turn {t} ran no MTP rounds"
+        for t, turn in enumerate(turns)
+        if turn.get("mtp_rounds", 0) <= 0 and not _first_terminal(turn)
+    ]
+    reasons += [
         (t["continuity"] or {}).get("reason") or "no continuity record"
         for t in turns[1:]
         if not (t.get("continuity") or {}).get("continuity")
     ]
     return dict(
         name=name,
-        continuity=not reasons,
+        continuity=all(
+            (t.get("continuity") or {}).get("continuity") for t in turns[1:]
+        ),
         censored=bool(reasons),
         reason=reasons[0] if reasons else None,
         events=[ev["cls"] for t in turns for ev in t["events"]],
         mtp_rounds=[t.get("mtp_rounds") for t in turns],
     )
+
+
+def e7b_status(sessions):
+    return "OBSERVED" if any(not s["censored"] for s in sessions) else "INCOMPLETE"
 
 
 def prompt_digest_problems(want, entries):
@@ -373,8 +411,9 @@ def prompt_digest_problems(want, entries):
 
 
 def overall_status(summary):
-    """Code round 1 H10: the phase status and the process exit code (0 = PASS, 2 = completed without PASS:
-    a verdict for the operator; harness errors raise and exit 1)."""
+    """The phase status and the process exit code (code rounds 1 H10, 2 H10): 0 = PASS (full: every pick's
+    E1c PASS, E2 PASS, E7a and E7b OBSERVED), 2 = completed without PASS (a verdict for the operator);
+    harness errors record ``HARNESS_ERROR`` and exit 1."""
     if summary.get("phase") == "smoke":
         gate = summary.get("smoke_gate") or {}
         ok = bool(gate.get("pass_") and gate.get("fits"))
@@ -383,38 +422,49 @@ def overall_status(summary):
     ok = bool(picks) and all(
         (r.get("outcome") or {}).get("e1c") == "PASS"
         and (r.get("e2") or {}).get("verdict") == "PASS"
+        and (r.get("e7a") or {}).get("status") == "OBSERVED"
+        and (r.get("e7b") or {}).get("status") == "OBSERVED"
         for r in picks.values()
     )
     return ("PASS", 0) if ok else ("NOT_PASS", 2)
 
 
 def e1c_verdict(on_entry, off_entry, *, threshold, verify_policy):
-    """Per-request E1c pass rule (plan §2.2): rows, state, kernels, engagement, exact prompt, straddle."""
-    problems = []
+    """Per-request E1c rule (plan §2.2; code round 2 H15): NEUTRALITY = rows and states equal; EVIDENCE =
+    kernels, engagement, the exact prompt and the straddle. ``pass_`` needs both; ``pick_outcome`` reports
+    a neutrality failure as FAIL and an evidence-only failure as INCOMPLETE."""
+    neutrality, evidence = [], []
     if not off_entry.get("rows", {}).get("pass"):
-        problems.append("rows")
+        neutrality.append("rows")
     if not off_entry.get("states", {}).get("pass"):
-        problems.append("states")
+        neutrality.append("states")
     if not on_entry.get("verdict", {}).get("pass"):
-        problems.append("kernels")
+        evidence.append("kernels")
     if not on_entry.get("draft_rounds"):
-        problems.append("no MTP rounds")
+        evidence.append("no MTP rounds")
     if threshold is not None:
         if on_entry.get("prompt_end") != straddle_target(threshold):
-            problems.append(
+            evidence.append(
                 f"prompt_end {on_entry.get('prompt_end')} != {straddle_target(threshold)}"
             )
         if verify_policy == "joint_v1":
             timings = (on_entry.get("response") or {}).get("timings") or {}
             if not timings.get("verify_blocks_straddle"):
-                problems.append("no straddle counter")
+                evidence.append("no straddle counter")
             if timings.get("verify_fallback_reasons"):
-                problems.append(
+                evidence.append(
                     f"fallback reasons {timings['verify_fallback_reasons']}"
                 )
         elif not on_entry.get("straddle"):
-            problems.append("no observed per-query straddle")
-    return dict(pass_=not problems, problems=problems)
+            evidence.append("no observed per-query straddle")
+    return dict(
+        pass_=not (neutrality or evidence),
+        neutral=not neutrality,
+        evidence_ok=not evidence,
+        problems=neutrality + evidence,
+        neutrality_problems=neutrality,
+        evidence_problems=evidence,
+    )
 
 
 # ------------------------------------------------------------------ runtime parts
@@ -1184,17 +1234,18 @@ class Campaign:
 
         return run
 
-    def e7(self, pick, items):
+    def e7a(self, pick, items):
         reqs = self.c84_payloads(pick, items, greedy=False)
-        done, censored_a = run_with_censoring(
+        done, censored = run_with_censoring(
             self.batch_runner(pick, "e7a", "e7a", "on"), reqs
         )
-        e7a = dict(
-            e7a_stats(done, censored_a),
-            prompt_digest_problems=prompt_digest_problems(
-                self.digests.get(pick, {}), done
-            ),
+        digests = self.digests.get(pick, {})
+        return dict(
+            e7a_stats(done, censored, digests=digests),
+            prompt_digest_problems=prompt_digest_problems(digests, done),
         )
+
+    def e7b(self, pick, items):
         sessions = []
         for item in items[:5]:
             turns = [
@@ -1217,18 +1268,17 @@ class Campaign:
         done_b, censored_b = run_with_censoring(
             self.batch_runner(pick, "e7b", "e7b", "on"), sessions
         )
-        e7b = [dict(name=name, censored=True, reason="timeout") for name in censored_b]
-        e7b += [
-            e7b_session(s["name"], done_b[s["name"]]["turns"])
+        digests = self.digests.get(pick, {})
+        out = [dict(name=name, censored=True, reason="timeout") for name in censored_b]
+        out += [
+            e7b_session(s["name"], done_b[s["name"]], digest=digests.get(s["name"]))
             for s in sessions
             if s["name"] in done_b
         ]
         return dict(
-            e7a=e7a,
-            e7b=e7b,
-            e7b_prompt_digest_problems=prompt_digest_problems(
-                self.digests.get(pick, {}), done_b
-            ),
+            sessions=out,
+            status=e7b_status(out),
+            prompt_digest_problems=prompt_digest_problems(digests, done_b),
         )
 
     # -- the whole run
@@ -1266,8 +1316,12 @@ class Campaign:
                     verdict="INCOMPLETE", reason=f"E2 worker stopped: {exc.info}"
                 )
             save()
-            if not smoke:
-                record.update(self.e7(pick, items))
+            if (
+                not smoke
+            ):  # code round 2 H16: E7a reaches summary.json before E7b starts
+                record["e7a"] = self.e7a(pick, items)
+                save()
+                record["e7b"] = self.e7b(pick, items)
                 save()
         return record
 
@@ -1289,6 +1343,12 @@ class Campaign:
                 WallLimit
             ) as exc:  # code round 1 H8: the worker was stopped; nothing more runs
                 self.summary["aborted"] = f"wall_limit: {exc}"
+                self.summary["status"], self.summary["exit_code"] = "ABORTED", 1
+                self.write_summary()
+                raise
+            except Exception as exc:  # code round 2 H16: recorded before it propagates
+                self.summary["status"], self.summary["exit_code"] = "HARNESS_ERROR", 1
+                self.summary["error"] = f"{type(exc).__name__}: {exc}"
                 self.write_summary()
                 raise
         self.summary["manifest"] = dict(
