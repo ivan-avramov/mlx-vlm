@@ -572,3 +572,35 @@ def test_overall_status_and_exit_code():
     assert orchestrate.overall_status(smoke) == ("SMOKE_PASS", 0)
     smoke_bad = dict(smoke, smoke_gate=dict(pass_=True, fits=False))
     assert orchestrate.overall_status(smoke_bad) == ("SMOKE_NOT_PASS", 2)
+
+
+# ------------------------------------------------------------------ C184: no default hard stop, results saved per step
+def test_the_campaign_has_no_wall_limit_unless_the_operator_sets_one():
+    import math
+
+    assert orchestrate.campaign_deadline(None, now=100.0) == math.inf
+    assert orchestrate.campaign_deadline(60.0, now=100.0) == 160.0
+
+
+def test_run_pick_saves_each_step_as_it_finishes(monkeypatch):
+    saved = []
+    camp = object.__new__(orchestrate.Campaign)
+    camp.stack = None
+    monkeypatch.setattr(orchestrate, "c84_items", lambda stack, pick: [])
+    camp.size = lambda pick, thresholds: {}
+    camp.check_reconstruction = lambda pick, items: {}
+    camp.e1c = lambda pick, prompts, smoke: {
+        "T1024": dict(pass_=True, c1=dict(identical=True), c2=dict(identical=True))
+    }
+    camp.e2 = lambda pick, items, prompts, smoke: dict(verdict="PASS")
+
+    def e7(pick, items):
+        raise RuntimeError("worker crashed")
+
+    camp.e7 = e7
+    camp.summary = dict(picks={})
+    camp.write_summary = lambda: saved.append(json.loads(json.dumps(camp.summary)))
+    with pytest.raises(RuntimeError, match="worker crashed"):
+        camp.run_pick(FABLE, smoke=False)
+    last = saved[-1]["picks"][FABLE]
+    assert last["outcome"]["e1c"] == "PASS" and last["e2"]["verdict"] == "PASS"
