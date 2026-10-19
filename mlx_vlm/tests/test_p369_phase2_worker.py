@@ -541,3 +541,16 @@ def test_check_snapshots_compares_the_resolved_revision_of_each_model_flag(tmp_p
         worker.check_snapshots(
             ["--model", "o/m"], {"--model": "rev1", "--draft-model": "rev1"}, resolve
         )
+
+
+# ------------------------------------------------------------------ code round 2 H8: the observation lands before cleanup
+def test_finish_request_writes_the_entry_and_the_after_phase_before_cleanup(tmp_path):
+    seen = []
+
+    def cleanup():
+        progress = json.loads((tmp_path / "progress.json").read_text())
+        seen.append(((tmp_path / "req-2.json").exists(), progress["phase"]))
+
+    worker.finish_request(tmp_path, 2, dict(name="r2", x=1), "r2", [cleanup, cleanup])
+    assert seen == [(True, "after"), (True, "after")]
+    assert json.loads((tmp_path / "req-2.json").read_text())["x"] == 1

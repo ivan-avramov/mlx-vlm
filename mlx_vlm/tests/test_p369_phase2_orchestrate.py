@@ -884,3 +884,92 @@ def test_a_killed_owners_lock_is_free_without_any_reclaim(tmp_path):
         if proc.poll() is None:
             proc.kill()
             proc.wait()
+
+
+# ------------------------------------------------------------------ code round 2 H8 / H17: stop ordering, process groups
+GROUP_WORKER = """
+import json, os, signal, subprocess, sys, time
+from pathlib import Path
+out = Path(sys.argv[1])
+child = subprocess.Popen([sys.executable, "-c",
+    "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"])
+(out / "child.pid").write_text(str(child.pid))
+def on_term(*_):
+    (out / "saw_timeout.txt").write_text(str((out / "timeout.json").exists()))
+    sys.exit(0)
+signal.signal(signal.SIGTERM, on_term)
+tmp = out / ".progress.json.tmp"
+tmp.write_text(json.dumps(dict(index=0, name="r0", phase="request", started=time.time(), deadline_s=0.3)))
+os.replace(tmp, out / "progress.json")
+time.sleep(60)
+"""
+
+
+def _alive(pid):
+    import os
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def test_supervise_records_the_timeout_before_signalling_and_kills_the_group(tmp_path):
+    import os
+    import signal
+    import subprocess
+    import time
+
+    proc = (
+        subprocess.Popen(  # as launch_worker starts a worker: its own session / group
+            [sys.executable, "-c", GROUP_WORKER, str(tmp_path)],
+            stdout=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    )
+    child = None
+    try:
+        deadline = time.monotonic() + 10
+        while not (tmp_path / "child.pid").exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        child = int((tmp_path / "child.pid").read_text())
+        got = orchestrate.supervise(
+            proc,
+            tmp_path,
+            boot_timeout_s=30,
+            deadline=time.monotonic() + 30,
+            poll_s=0.05,
+            grace_s=0.5,
+        )
+        assert got["outcome"] == "request_timeout"
+        assert (
+            tmp_path / "saw_timeout.txt"
+        ).read_text() == "True"  # durable before the signal (H8)
+        deadline = time.monotonic() + 10
+        while _alive(child) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not _alive(child), "the worker's descendant survived the stop (H17)"
+    finally:
+        for pid in [proc.pid] + ([child] if child else []):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        proc.wait()
+
+
+def test_launch_worker_starts_its_own_process_group(tmp_path):
+    import os
+    import subprocess
+
+    proc = orchestrate.launch_worker(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdout=subprocess.DEVNULL,
+        env=dict(os.environ),
+    )
+    try:
+        assert os.getpgid(proc.pid) == proc.pid != os.getpgid(0)
+    finally:
+        proc.kill()
+        proc.wait()
