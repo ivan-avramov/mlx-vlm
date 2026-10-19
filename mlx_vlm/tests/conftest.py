@@ -54,25 +54,58 @@ def seed_for(nodeid: str) -> int:
     return int.from_bytes(hashlib.sha256(nodeid.encode()).digest()[:4], "big")
 
 
-@pytest.fixture(autouse=True)
-def _deterministic_random_state(request):
-    """Every test (and parametrization) starts from its own fixed random stream.
-
-    Unseeded draws made results depend on suite order and on which tests ran before
-    (a tolerance-edge test flaked in ~25% of runs); the operator requires zero
-    nondeterministic tests. The seed derives from the node id, so each test/param
-    sees a different but run-independent stream. A test that wants another stream
-    seeds itself.
-    """
+def _seed_all(seed: int) -> None:
     import random
 
     import mlx.core as mx
     import numpy as np
 
-    seed = seed_for(request.node.nodeid)
     mx.random.seed(seed)
     np.random.seed(seed)
     random.seed(seed)
+
+
+def fixture_seed(scope: str, nodeid: str, argname: str) -> int:
+    """The seed a non-function-scoped fixture's setup runs under."""
+    return seed_for(f"{scope}:{nodeid}:{argname}")
+
+
+class _FixtureSeeding:
+    """Seed the mx / numpy / python streams before every class-, module-, package-
+    or session-scoped fixture's setup, from (scope, node id, fixture name), so a
+    shared fixture's draws do not depend on which test happened to request it first.
+
+    Registered as a plugin (``pytest_configure``): hooks defined in a conftest are
+    path-scoped and a session-scoped fixture's hook proxy is the rootdir's, which
+    would not include this directory's conftest.
+    """
+
+    @pytest.hookimpl(tryfirst=True)
+    def pytest_fixture_setup(self, fixturedef, request):
+        if fixturedef.scope != "function":
+            _seed_all(
+                fixture_seed(fixturedef.scope, request.node.nodeid, fixturedef.argname)
+            )
+
+
+def _register_fixture_seeding(config):
+    if not config.pluginmanager.has_plugin("mlx_vlm_fixture_seeding"):
+        config.pluginmanager.register(_FixtureSeeding(), "mlx_vlm_fixture_seeding")
+
+
+@pytest.fixture(autouse=True)
+def _deterministic_random_state(request):
+    """Every test (and parametrization) starts from its own fixed random stream.
+
+    Seeded, all from a fixed hash of the node id: the start of each test function
+    (after any higher-scoped fixtures) and the setup of every class-, module-,
+    package- and session-scoped fixture (``pytest_fixture_setup``). Unseeded draws
+    made results depend on suite order (a tolerance-edge test flaked in ~25% of
+    runs); the operator requires zero nondeterministic tests. NOT seeded: draws at
+    import / collection time, and anything a test spawns on other threads or
+    processes. A test that wants another stream seeds itself.
+    """
+    _seed_all(seed_for(request.node.nodeid))
     yield
 
 
@@ -110,6 +143,7 @@ def pytest_report_collectionfinish() -> list[str]:
 
 
 def pytest_configure(config):  # M58 D5
+    _register_fixture_seeding(config)  # P369 round-6 F25
     config.addinivalue_line(
         "markers",
         "requires_stack_registry: golden test over the stack's real main_models.yaml; CI must "
