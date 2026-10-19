@@ -741,10 +741,12 @@ SIZE_PREFIX = (
 SIZE_SUFFIX = "Now write the story."
 SHORT_PROMPT = "Explain, step by step, why the sum of two odd integers is even."
 ESTIMATE_LIMIT_S = 3.5 * 3600
-SMOKE_WALL_LIMIT_S = 90 * 60  # the smoke's hard stop (estimate ≈ 30 min)
-FULL_WALL_LIMIT_S = (
-    ESTIMATE_LIMIT_S + 3600
-)  # the operator budget + one hour of heavy tail (C183)
+
+
+def campaign_deadline(wall_limit_s, *, now):
+    """C184: no campaign hard stop unless the operator sets ``--wall-limit-s``; the per-request watchdogs
+    (non-convergent / wedged requests) are the only automatic stops."""
+    return math.inf if wall_limit_s is None else now + wall_limit_s
 
 
 def e1c_timeout(threshold):
@@ -860,10 +862,8 @@ class Campaign:
         }
         self.env = worker_env(dict(os.environ))
         self.digests = {}  # pick -> {C84 item: templated prompt digest} (H6)
-        self.wall_limit_s = args.wall_limit_s or (
-            SMOKE_WALL_LIMIT_S if args.phase == "smoke" else FULL_WALL_LIMIT_S
-        )
-        self.deadline = time.monotonic() + self.wall_limit_s
+        self.wall_limit_s = args.wall_limit_s
+        self.deadline = campaign_deadline(self.wall_limit_s, now=time.monotonic())
         self.summary = dict(
             picks={},
             started=time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -1237,14 +1237,19 @@ class Campaign:
         pick ABORTs (no verdict, no bound), in E2 the identity is INCOMPLETE; E7 censors per request.
         """
         started = time.monotonic()
+        record = self.summary["picks"].setdefault(pick, {})
+
+        def save():  # C184: every finished step reaches summary.json at once
+            record["wall_s"] = round(time.monotonic() - started)
+            self.write_summary()
+
         thresholds = (1024, 65536) if smoke else THRESHOLDS
         prompts = self.size(pick, thresholds)
         items = c84_items(self.stack, pick)
-        record = dict(
-            reconstruction=self.check_reconstruction(
-                pick, items[:2] if smoke else items
-            )
+        record["reconstruction"] = self.check_reconstruction(
+            pick, items[:2] if smoke else items
         )
+        save()
         try:
             record["e1c"] = self.e1c(pick, prompts, smoke=smoke)
             record["outcome"] = pick_outcome(record["e1c"])
@@ -1252,6 +1257,7 @@ class Campaign:
             record["outcome"] = dict(
                 e1c="ABORT", run_e2_e7=False, reason=f"E1c worker stopped: {exc.info}"
             )
+        save()
         if record["outcome"]["run_e2_e7"]:  # Q37 precedence
             try:
                 record["e2"] = self.e2(pick, items, prompts, smoke=smoke)
@@ -1259,9 +1265,10 @@ class Campaign:
                 record["e2"] = dict(
                     verdict="INCOMPLETE", reason=f"E2 worker stopped: {exc.info}"
                 )
+            save()
             if not smoke:
                 record.update(self.e7(pick, items))
-        record["wall_s"] = round(time.monotonic() - started)
+                save()
         return record
 
     def execute(self):
@@ -1277,8 +1284,7 @@ class Campaign:
         with Monitor(self.out / "monitor.log", estimate) as self.monitor:
             try:
                 for pick in self.picks:
-                    self.summary["picks"][pick] = self.run_pick(pick, smoke=smoke)
-                    self.write_summary()
+                    self.run_pick(pick, smoke=smoke)
             except (
                 WallLimit
             ) as exc:  # code round 1 H8: the worker was stopped; nothing more runs
@@ -1380,7 +1386,7 @@ def main(argv=None):
     ap.add_argument(
         "--wall-limit-s",
         type=float,
-        help="the campaign's hard total-wall stop (default: 90 min smoke, 4.5 h full)",
+        help="an operator-set hard total-wall stop (default: none, C184)",
     )
     args = ap.parse_args(argv)
     out = Path(args.out).resolve()
