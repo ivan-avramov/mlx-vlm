@@ -61,15 +61,84 @@ C177_MARK = "# P369 INTERIM (C177"
 
 # ------------------------------------------------------------------ pure parts (tested)
 def overlay_registry(text, pick):
-    raise NotImplementedError
+    """Restore exactly the C177 lines of ``pick``'s block: its commented ``draft_kind: mtp`` (marked), the
+    commented ``draft_model`` on the next line, and (Fable) the marked ``mtp_verify_scan: joint_v1``.
+    Returns ``(new_text, restored_lines)``; refuses anything else."""
+    lines = text.split("\n")
+    start = next(
+        (
+            i
+            for i, line in enumerate(lines)
+            if re.match(rf"^\s*- name: {re.escape(pick)}\s*$", line)
+        ),
+        None,
+    )
+    if start is None:
+        raise ValueError(f"{pick}: no registry block")
+    end = next(
+        (
+            i
+            for i in range(start + 1, len(lines))
+            if re.match(r"^\s*- name: ", lines[i])
+        ),
+        len(lines),
+    )
+    restored = []
+    for i in range(start, end):
+        m = re.match(r"^(\s*)# (draft_kind: mtp)\s+" + re.escape(C177_MARK), lines[i])
+        if m:
+            nxt = re.match(r"^(\s*)# (draft_model: \S+)", lines[i + 1])
+            if nxt is None:
+                raise ValueError(
+                    f"{pick}: marked draft_kind without an adjacent draft_model"
+                )
+            lines[i] = m.group(1) + m.group(2)
+            lines[i + 1] = nxt.group(1) + nxt.group(2)
+            restored += [lines[i].strip(), lines[i + 1].strip()]
+            continue
+        m = re.match(
+            r"^(\s*)# (mtp_verify_scan: joint_v1)\s+" + re.escape(C177_MARK), lines[i]
+        )
+        if m:
+            lines[i] = m.group(1) + m.group(2)
+            restored.append(lines[i].strip())
+    want = 3 if PICKS[pick]["verify_policy"] == "joint_v1" else 2
+    if len(restored) != want:
+        raise ValueError(f"{pick}: restored {restored}, expected {want} C177 lines")
+    return "\n".join(lines), restored
 
 
 def worker_env(base):
-    raise NotImplementedError
+    env = {
+        k: v
+        for k, v in base.items()
+        if k not in DROP_ENV and not k.startswith(DROP_PREFIXES)
+    }
+    env["MLX_VLM_CACHE_SESSION_MAX"] = "1"
+    return env
 
 
 def clopper_pearson(k, n, alpha=0.05):
-    raise NotImplementedError
+    """Two-sided exact interval for k events in n independent trials (bisection on the binomial tail)."""
+    if n == 0:
+        return (0.0, 1.0)
+
+    def cdf(x, p):
+        return sum(math.comb(n, i) * p**i * (1 - p) ** (n - i) for i in range(0, x + 1))
+
+    def solve(f):
+        lo, hi = 0.0, 1.0
+        for _ in range(100):
+            mid = (lo + hi) / 2
+            if f(mid):
+                lo = mid
+            else:
+                hi = mid
+        return (lo + hi) / 2
+
+    lower = 0.0 if k == 0 else solve(lambda p: 1 - cdf(k - 1, p) < alpha / 2)
+    upper = 1.0 if k == n else solve(lambda p: cdf(k, p) > alpha / 2)
+    return (lower, upper)
 
 
 def straddle_target(threshold):
@@ -77,7 +146,32 @@ def straddle_target(threshold):
 
 
 def e1c_verdict(on_entry, off_entry, *, threshold, verify_policy):
-    raise NotImplementedError
+    """Per-request E1c pass rule (plan §2.2): rows, state, kernels, engagement, exact prompt, straddle."""
+    problems = []
+    if not off_entry.get("rows", {}).get("pass"):
+        problems.append("rows")
+    if not off_entry.get("states", {}).get("pass"):
+        problems.append("states")
+    if not on_entry.get("verdict", {}).get("pass"):
+        problems.append("kernels")
+    if not on_entry.get("draft_rounds"):
+        problems.append("no MTP rounds")
+    if threshold is not None:
+        if on_entry.get("prompt_end") != straddle_target(threshold):
+            problems.append(
+                f"prompt_end {on_entry.get('prompt_end')} != {straddle_target(threshold)}"
+            )
+        if verify_policy == "joint_v1":
+            timings = (on_entry.get("response") or {}).get("timings") or {}
+            if not timings.get("verify_blocks_straddle"):
+                problems.append("no straddle counter")
+            if timings.get("verify_fallback_reasons"):
+                problems.append(
+                    f"fallback reasons {timings['verify_fallback_reasons']}"
+                )
+        elif not on_entry.get("straddle"):
+            problems.append("no observed per-query straddle")
+    return dict(pass_=not problems, problems=problems)
 
 
 # ------------------------------------------------------------------ runtime parts
