@@ -468,6 +468,82 @@ def drafter_detached(rg):
         rg.draft_model, rg.draft_kind = saved
 
 
+def wait_idle(rg, metrics, *, timeout_s=60.0, poll_s=0.05):
+    """Q38: the request queue is empty and no endpoint request is in flight (the GPU thread is idle)."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if rg.requests.qsize() == 0 and getattr(metrics, "_in_flight", 0) == 0:
+            return
+        time.sleep(poll_s)
+    raise RuntimeError("the worker did not go idle")
+
+
+class DetachedGuard:
+    """Q38: during a detached replay ``_inline_draft_kwargs`` must return ``{}`` and no speculative prefill
+    capture may be requested; any violation is recorded (the job then fails)."""
+
+    def __init__(self):
+        self.problems = []
+        self._patched = []
+
+    def __enter__(self):
+        from mlx_vlm.generate import ar
+        from mlx_vlm.server import generation
+
+        guard = self
+        inline, prefill = generation._inline_draft_kwargs, ar.speculative_prefill_kwargs
+
+        def guarded_inline(*args, **kwargs):
+            out = inline(*args, **kwargs)
+            if out:
+                guard.problems.append(f"draft kwargs returned {sorted(out)}")
+            return out
+
+        def guarded_prefill(*args, **kwargs):
+            guard.problems.append("speculative prefill kwargs requested")
+            return prefill(*args, **kwargs)
+
+        self._patched = [
+            (generation, "_inline_draft_kwargs", inline),
+            (ar, "speculative_prefill_kwargs", prefill),
+        ]
+        generation._inline_draft_kwargs = guarded_inline
+        ar.speculative_prefill_kwargs = guarded_prefill
+        return self
+
+    def __exit__(self, *exc):
+        while self._patched:
+            owner, name, value = self._patched.pop()
+            setattr(owner, name, value)
+        return False
+
+
+def c1_acceptance(on_part, off_parts, c1, *, cache_ids):
+    """Q37: the within-instance control is complete and identical — every replay emitted exactly the forced
+    tokens with ON's finish reason and no reused prefix, ON / OFF1 / OFF2 ran on identity-disjoint cache
+    trees (Q35), and OFF1 vs OFF2 rows (raw + transformed) and states (hashes + probes) are equal.
+    """
+    problems = []
+    want = on_part["final"]["token_ids"]
+    for k, part in enumerate(off_parts, 1):
+        final = part["final"]
+        if final["token_ids"] != want:
+            problems.append(f"OFF{k} did not emit exactly the forced tokens")
+        if final["finish_reason"] != on_part["final"]["finish_reason"]:
+            problems.append(f"OFF{k} finish {final['finish_reason']} != ON")
+        if final.get("cached_tokens"):
+            problems.append(f"OFF{k} reused {final['cached_tokens']} cached tokens")
+    if on_part["final"].get("cached_tokens"):
+        problems.append(f"ON reused {on_part['final']['cached_tokens']} cached tokens")
+    if len(set(cache_ids)) != len(cache_ids):
+        problems.append("trajectories shared cache trees")
+    if not c1["rows"]["pass"]:
+        problems.append("C1 rows differ")
+    if not c1["states"]["pass"]:
+        problems.append("C1 states differ")
+    return dict(problems=problems, **{"pass": not problems})
+
+
 def snapshot_holder(snaps, rows=None):
     """A comparison reference from saved snapshots: ``prompt_end`` (if recorded) and the rest as commits."""
     from types import SimpleNamespace
@@ -597,22 +673,31 @@ def run_job(job, out_dir, result):
                 )
                 tokens, n = part["final"]["token_ids"], len(part["final"]["token_ids"])
                 same = dict(model=id(rg.model), policy=id(policy))
+                metrics = server.runtime.metrics
                 replays = []
+                wait_idle(rg, metrics)
+                # Detached from before submission through worker idle (Q38); the same-instance OFF replay,
+                # then control C1.
                 with drafter_detached(rg):
-                    for k in range(2):  # the same-instance OFF replay, then control C1
-                        off_part, off = e1c_request(
-                            client,
-                            capture,
-                            lm,
-                            policy,
-                            manifest,
-                            spec,
-                            "off",
-                            timeout,
-                            force_tokens=tokens,
-                            hash_offsets=part["offsets"],
-                            **probe,
-                        )
+                    for _ in range(2):
+                        guard = DetachedGuard()
+                        with guard:
+                            off_part, off = e1c_request(
+                                client,
+                                capture,
+                                lm,
+                                policy,
+                                manifest,
+                                spec,
+                                "off",
+                                timeout,
+                                force_tokens=tokens,
+                                hash_offsets=part["offsets"],
+                                **probe,
+                            )
+                            wait_idle(rg, metrics)
+                        if guard.problems:
+                            raise RuntimeError(f"detached replay: {guard.problems}")
                         if off_part["verify_scope_calls"] or off_part["draft_rounds"]:
                             raise RuntimeError(
                                 "a detached replay ran speculative rounds"
@@ -622,7 +707,7 @@ def run_job(job, out_dir, result):
                     raise RuntimeError(
                         "the target / verify policy changed during the pair"
                     )
-                (off1_part, off1), (_, off2) = replays
+                (off1_part, off1), (off2_part, off2) = replays
                 save_rows(out_dir / f"rows-off-{index}.npz", off1.rows)
                 save_snapshots(
                     out_dir / f"snaps-off-{index}.npz",
@@ -633,7 +718,16 @@ def run_job(job, out_dir, result):
                 c1_ref = snapshot_holder(
                     [off1.states[o] for o in sorted(off1.states)], rows=off1.rows
                 )
-                entry["c1"] = compare_pair(c1_ref, off2, n, params)
+                c1 = compare_pair(c1_ref, off2, n, params)
+                entry["c1"] = dict(
+                    c1,
+                    acceptance=c1_acceptance(
+                        part,
+                        [off1_part, off2_part],
+                        c1,
+                        cache_ids=[id(on._cache), id(off1._cache), id(off2._cache)],
+                    ),
+                )
                 if spec.get("smoke_positives"):
                     entry["smoke_positives"] = smoke_positives(on, off1, n, params)
             elif (

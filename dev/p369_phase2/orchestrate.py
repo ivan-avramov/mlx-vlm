@@ -144,6 +144,24 @@ def straddle_target(threshold):
     return threshold - 64
 
 
+def pick_outcome(verdicts):
+    """Q37 precedence per pick: any C1 failure / incompleteness ABORTs (no E1c verdict, no bound); else any
+    same-instance pair difference FAILs (that pick's E1c finished for the bound, E2 / E7 skipped); else PASS.
+    The cross-load / configuration comparison (C2) never decides E1c: ``identical`` or ``unestablished``.
+    """
+    values = list(verdicts.values())
+    if any(not v["c1"]["identical"] for v in values):
+        e1c = "ABORT"
+    elif any(not v["pass_"] for v in values):
+        e1c = "FAIL"
+    else:
+        e1c = "PASS"
+    cross = (
+        "identical" if all(v["c2"]["identical"] for v in values) else "unestablished"
+    )
+    return dict(e1c=e1c, run_e2_e7=e1c == "PASS", cross_load=cross)
+
+
 def e1c_verdict(on_entry, off_entry, *, threshold, verify_policy):
     """Per-request E1c pass rule (plan §2.2): rows, state, kernels, engagement, exact prompt, straddle."""
     problems = []
@@ -595,7 +613,7 @@ class Campaign:
                         seed=seed,
                         stream=False,
                     ),
-                    timeout_s=e1c_timeout(t),
+                    timeout_s=3 * e1c_timeout(t),  # ON + OFF1 + OFF2 (Q40)
                 )
                 for t, text in pending
             ]
@@ -647,10 +665,10 @@ class Campaign:
                 threshold=cell["threshold"],
                 verify_policy=PICKS[pick]["verify_policy"],
             )
-            c1_ok = on["c1"]["rows"]["pass"] and on["c1"]["states"]["pass"]
+            c1_ok = bool(on["c1"]["acceptance"]["pass"])
             if not c1_ok:
                 v["pass_"] = False
-                v["problems"].append("C1: two same-instance OFF replays differ (stop)")
+                v["problems"].append(f"C1: {on['c1']['acceptance']['problems']}")
             v.update(
                 pair=on["pair"],
                 c1=dict(identical=c1_ok, **on["c1"]),
@@ -829,9 +847,11 @@ class Campaign:
                 items = c84_items(self.stack, pick)
                 self.check_reconstruction(pick, items[:2] if smoke else items)
                 record = dict(e1c=self.e1c(pick, prompts, smoke=smoke))
-                record["e2"] = self.e2(pick, items, prompts, smoke=smoke)
-                if not smoke:
-                    record.update(self.e7(pick, items))
+                record["outcome"] = pick_outcome(record["e1c"])
+                if record["outcome"]["run_e2_e7"]:  # Q37 precedence
+                    record["e2"] = self.e2(pick, items, prompts, smoke=smoke)
+                    if not smoke:
+                        record.update(self.e7(pick, items))
                 record["wall_s"] = round(time.monotonic() - started)
                 self.summary["picks"][pick] = record
                 self.write_summary()
@@ -863,11 +883,9 @@ class Campaign:
                         k for k, ok in fired.items() if ok
                     }:
                         problems.append(f"{pick}: smoke positives {sp}")
-            if (
-                not record["e2"]["all_identical"]
-                or not record["e2"]["argmax_and_kernels"]
-            ):
-                problems.append(f"{pick}: E2 smoke {record['e2']}")
+            e2 = record.get("e2")
+            if e2 is None or not e2["all_identical"] or not e2["argmax_and_kernels"]:
+                problems.append(f"{pick}: E2 smoke {e2}")
             projected += (
                 record["wall_s"] * 6
             )  # the full run is ≈ 6× the smoke per pick (plan §4)
