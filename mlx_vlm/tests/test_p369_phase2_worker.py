@@ -554,3 +554,19 @@ def test_finish_request_writes_the_entry_and_the_after_phase_before_cleanup(tmp_
     worker.finish_request(tmp_path, 2, dict(name="r2", x=1), "r2", [cleanup, cleanup])
     assert seen == [(True, "after"), (True, "after")]
     assert json.loads((tmp_path / "req-2.json").read_text())["x"] == 1
+
+
+def test_check_snapshots_rehashes_the_loaded_files(tmp_path):
+    import hashlib
+
+    snap = tmp_path / "snapshots" / "rev1"
+    snap.mkdir(parents=True)
+    (snap / "model.safetensors").write_bytes(b"weights")
+    (snap / "config.json").write_bytes(b"{}")
+    files = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in snap.iterdir()}
+    argv = ["--model", "o/m"]
+    want = {"--model": dict(revision="rev1", files=files)}
+    assert worker.check_snapshots(argv, want, lambda repo: snap) == {"--model": "rev1"}
+    (snap / "model.safetensors").write_bytes(b"mutated, same revision")
+    with pytest.raises(RuntimeError, match="model.safetensors"):
+        worker.check_snapshots(argv, want, lambda repo: snap)

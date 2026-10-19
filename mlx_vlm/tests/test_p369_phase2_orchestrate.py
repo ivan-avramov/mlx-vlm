@@ -973,3 +973,79 @@ def test_launch_worker_starts_its_own_process_group(tmp_path):
     finally:
         proc.kill()
         proc.wait()
+
+
+# ------------------------------------------------------------------ code round 3 H9 / H21
+def _git_repo(path):
+    import subprocess
+
+    def git(*args):
+        return subprocess.run(
+            [
+                "git",
+                "-C",
+                str(path),
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.invalid",
+                *args,
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+    git("init", "-q")
+    return git
+
+
+def test_the_reviewed_head_is_a_resolved_full_commit_id(tmp_path):
+    git = _git_repo(tmp_path)
+    (tmp_path / "a").write_text("1")
+    git("add", "a")
+    git("commit", "-q", "-m", "one")
+    head = git("rev-parse", "HEAD")
+    assert orchestrate.resolve_commit(tmp_path, head[:8]) == head
+    with pytest.raises(SystemExit, match="not a commit"):
+        orchestrate.resolve_commit(tmp_path, "0000dead")
+    rh = orchestrate.reviewed_head_problems
+    assert rh("smoke", head[:1], head)  # a prefix never stands for the reviewed commit
+    assert rh("full", head, head) == []
+
+
+def test_hf_hub_cache_honours_xdg_cache_home():
+    from pathlib import Path
+
+    got = orchestrate.hf_hub_cache({"XDG_CACHE_HOME": "/x"}, Path("/h"))
+    assert got == Path("/x/huggingface/hub")
+    assert orchestrate.hf_hub_cache(
+        {"XDG_CACHE_HOME": "/x", "HF_HOME": "/y"}, Path("/h")
+    ) == Path("/y/hub")
+
+
+def test_stack_bench_problems_refuse_dirty_or_untracked_bench_inputs(tmp_path):
+    git = _git_repo(tmp_path)
+    bench = tmp_path / "benchmark" / "bench"
+    bench.mkdir(parents=True)
+    (bench / "benchmarks.py").write_text("x = 1\n")
+    git("add", ".")
+    git("commit", "-q", "-m", "one")
+    paths = ["benchmark/bench"]
+    assert orchestrate.stack_bench_problems(tmp_path, paths) == []
+    (bench / "benchmarks.py").write_text("x = 2\n")
+    assert orchestrate.stack_bench_problems(tmp_path, paths)
+    git("checkout", "-q", ".")
+    (bench / "new.py").write_text("")
+    assert orchestrate.stack_bench_problems(tmp_path, paths)
+
+
+def test_the_run_lock_and_outputs_live_under_the_stack_workdir(tmp_path):
+    from pathlib import Path
+
+    env = {"STACK_WORKDIR": str(tmp_path)}
+    assert orchestrate.lock_path(env) == tmp_path / "p369" / "phase2" / ".lock"
+    with pytest.raises(SystemExit, match="STACK_WORKDIR"):
+        orchestrate.lock_path({})
+    assert orchestrate.out_problems(tmp_path / "p369" / "phase2" / "run-1", env) == []
+    assert orchestrate.out_problems(Path("/elsewhere/run-1"), env)
