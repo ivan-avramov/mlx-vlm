@@ -1881,6 +1881,106 @@ def test_golden_the_shipped_first_pick_passes_every_load_time_refusal(
     )
 
 
+# ------------------------------------------------------------------ P387 (C183 (3), stack build note v2)
+UNIFORM_PICK = "Qwen3.8-27B-mlx-uniform-4bit"
+FIXTURE_SOURCE = (
+    "7021bdbb"  # the last MTP-ON stack registry (= the parent of the C177 commit)
+)
+_C177 = "  # P369 INTERIM (C177 2026-10-17): MTP OFF on the daily driver until the MTP EOS/budget fixes ship and are re-certified"
+# Per pick, (fixture line, its C177 interim line), verbatim — the ONLY lines the interim may change (K2).
+INTERIM_LINES = {
+    UNIFORM_PICK: (
+        ("    draft_kind: mtp", "    # draft_kind: mtp" + _C177),
+        (
+            "    draft_model: caslca/Qwen3.8-27B-mlx-uniform-4bit-mtp-drafter  # UPLOADED 2026-08-26 (public; card still says PROBE-ONLY — needs the certified update)",
+            "    # draft_model: caslca/Qwen3.8-27B-mlx-uniform-4bit-mtp-drafter  # UPLOADED 2026-08-26 (public; card still says PROBE-ONLY — needs the certified update)",
+        ),
+    ),
+    FIRST_PICK: (
+        (
+            "    mtp_verify_scan: joint_v1",
+            "    # mtp_verify_scan: joint_v1"
+            + _C177
+            + " (joint_v1 requires draft_kind mtp)",
+        ),
+        ("    draft_kind: mtp", "    # draft_kind: mtp" + _C177),
+        (
+            "    draft_model: caslca/Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed-mtp-drafter",
+            "    # draft_model: caslca/Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed-mtp-drafter",
+        ),
+    ),
+}
+
+
+def _without_draft_lines(text):
+    """A registry whose picks have no ``draft_kind`` / ``draft_model`` (what C177 serves), field level."""
+    import yaml
+
+    data = yaml.safe_load(text)
+    for entry in data["models"]:
+        if entry["name"] in (FIRST_PICK, UNIFORM_PICK):
+            entry.pop("draft_kind", None)
+            entry.pop("draft_model", None)
+            entry.pop("mtp_verify_scan", None)
+    return yaml.safe_dump(data, sort_keys=False)
+
+
+def _fixture_sampling(name):
+    import yaml
+
+    entry = next(
+        e for e in yaml.safe_load(_fixture_verbatim())["models"] if e["name"] == name
+    )
+    d = entry["generation_defaults"]
+    return {k: d[k] for k in ("temperature", "top_p", "top_k", "min_p")}
+
+
+def test_p387_deployed_sampling_ignores_an_env_registry(monkeypatch, tmp_path):
+    from test_mtp_exactness import PICKS, deployed_sampling
+
+    live = tmp_path / "live.yaml"
+    live.write_text(_without_draft_lines(_fixture_verbatim()))
+    monkeypatch.setenv("MLX_STACK_REGISTRY", str(live))
+    monkeypatch.delenv("MLX_REQUIRE_STACK_REGISTRY", raising=False)
+    monkeypatch.setattr(
+        sys.modules[__name__], "SIBLING_REGISTRY", tmp_path / "absent.yaml"
+    )
+    for pick in PICKS:
+        assert deployed_sampling(pick) == _fixture_sampling(pick)
+
+
+def test_p387_deployed_sampling_ignores_a_sibling_registry(monkeypatch, tmp_path):
+    from test_mtp_exactness import PICKS, deployed_sampling
+
+    sibling = tmp_path / "main_models.yaml"
+    sibling.write_text(_without_draft_lines(_fixture_verbatim()))
+    monkeypatch.delenv("MLX_STACK_REGISTRY", raising=False)
+    monkeypatch.delenv("MLX_REQUIRE_STACK_REGISTRY", raising=False)
+    monkeypatch.setattr(sys.modules[__name__], "SIBLING_REGISTRY", sibling)
+    for pick in PICKS:
+        assert deployed_sampling(pick) == _fixture_sampling(pick)
+
+
+def test_p387_the_fixture_is_the_last_mtp_on_registry():
+    import yaml
+
+    header = FIXTURE_REGISTRY.read_text().split(FIXTURE_MARKER, 1)[0]
+    assert f"stack {FIXTURE_SOURCE}" in header
+    entries = {e["name"]: e for e in yaml.safe_load(_fixture_verbatim())["models"]}
+    assert entries[FIRST_PICK]["mtp_verify_scan"] == "joint_v1"
+    assert (
+        entries[FIRST_PICK]["draft_kind"]
+        == entries[UNIFORM_PICK]["draft_kind"]
+        == "mtp"
+    )
+
+
+def test_p387_the_classifier_accepts_exactly_the_fixture_and_the_c177_interim():
+    fixture = _fixture_verbatim()
+    assert live_registry_state(fixture) == "mtp_on"
+    assert live_registry_state(expected_interim(fixture)) == "c177_interim"
+
+
 # ------------------------------------------------------------------ D6 default path imports nothing
 class TestD6DefaultPathIsInert:
     @pytest.fixture

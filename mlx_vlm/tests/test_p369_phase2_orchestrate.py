@@ -604,3 +604,18 @@ def test_run_pick_saves_each_step_as_it_finishes(monkeypatch):
         camp.run_pick(FABLE, smoke=False)
     last = saved[-1]["picks"][FABLE]
     assert last["outcome"]["e1c"] == "PASS" and last["e2"]["verdict"] == "PASS"
+
+
+# ------------------------------------------------------------------ P387 (K1): the ON overlay restores the certified tuple
+def test_overlay_restores_the_fixture_entries_from_the_expected_interim():
+    import yaml
+
+    sys.path.insert(0, str(DEV.parent / "mlx_vlm" / "tests"))
+    from test_mtp_verify_scan import _fixture_verbatim, expected_interim
+
+    fixture = _fixture_verbatim()
+    want = {e["name"]: e for e in yaml.safe_load(fixture)["models"]}
+    for pick in orchestrate.PICKS:
+        text, _ = orchestrate.overlay_registry(expected_interim(fixture), pick)
+        got = {e["name"]: e for e in yaml.safe_load(text)["models"]}
+        assert got[pick] == want[pick], pick
