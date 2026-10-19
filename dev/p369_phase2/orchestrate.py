@@ -565,9 +565,10 @@ def prompt_digest_problems(want, entries):
 
 
 def overall_status(summary):
-    """The phase status and the process exit code (code rounds 1 H10, 2 H10): 0 = PASS (full: every pick's
-    E1c PASS, E2 PASS, E7a and E7b OBSERVED), 2 = completed without PASS (a verdict for the operator);
-    harness errors record ``HARNESS_ERROR`` and exit 1."""
+    """The phase status and the process exit code (code rounds 1 H10, 2 H10; P394 (2) refined): 0 = PASS
+    (full: every pick's E1c PASS, E2 PASS and E7a OBSERVED; E7b — scripted chat continuity, descriptive by
+    design — is reported and never gates), 2 = completed without PASS (a verdict for the operator); harness
+    errors record ``HARNESS_ERROR`` and exit 1."""
     if summary.get("phase") == "smoke":
         gate = summary.get("smoke_gate") or {}
         ok = bool(gate.get("pass_") and gate.get("fits"))
@@ -577,7 +578,6 @@ def overall_status(summary):
         (r.get("outcome") or {}).get("e1c") == "PASS"
         and (r.get("e2") or {}).get("verdict") == "PASS"
         and (r.get("e7a") or {}).get("status") == "OBSERVED"
-        and (r.get("e7b") or {}).get("status") == "OBSERVED"
         for r in picks.values()
     )
     return ("PASS", 0) if ok else ("NOT_PASS", 2)
@@ -1726,9 +1726,12 @@ class Campaign:
             prompt_digest_problems=prompt_digest_problems(digests, done),
         )
 
-    def e7b(self, pick, items):
-        sessions = []
-        for item in items[:5]:
+    def e7b(self, pick, items, sessions=5):
+        """Scripted multi-turn chat continuity (plan §3 E7b, descriptive): ``sessions`` items, each followed by
+        the fixed follow-ups; the smoke runs one (P394 (2) refined) so the echo / re-tokenization / hash-chain
+        mechanics are exercised before the full run."""
+        count, sessions = sessions, []
+        for item in items[:count]:
             turns = [
                 dict(
                     model=pick,
@@ -1813,6 +1816,9 @@ class Campaign:
                 save()
                 record["e7b"] = self.e7b(pick, items)
                 save()
+            else:  # P394 (2) refined: one E7b session exercises the continuity mechanics in the smoke
+                record["e7b"] = self.e7b(pick, items, sessions=1)
+                save()
         return record
 
     def execute(self):
@@ -1874,8 +1880,9 @@ class Campaign:
 
     def smoke_gate(self):
         """Every live positive fired (TurboQuant's required where TurboQuant KV is served), every E1c cell
-        passed, and the projected full run fits ESTIMATE_LIMIT_S."""
-        problems = []
+        passed, E2 passed, the E7b session ran and reported (its continuity is descriptive), and the projected
+        full run fits ESTIMATE_LIMIT_S."""
+        problems, e7b_status = [], {}
         projected = 0
         for pick, record in self.summary["picks"].items():
             if record["outcome"]["e1c"] != "PASS":
@@ -1897,6 +1904,15 @@ class Campaign:
             e2 = record.get("e2")
             if e2 is None or e2.get("verdict") != "PASS":
                 problems.append(f"{pick}: E2 smoke {e2}")
+            e7b = record.get("e7b") or {}
+            if not e7b.get("sessions") or e7b.get("status") not in (
+                "OBSERVED",
+                "INCOMPLETE",
+            ):  # ran and reported; continuity itself is descriptive (P394 (2) refined)
+                problems.append(
+                    f"{pick}: E7b smoke session did not run / report: {e7b}"
+                )
+            e7b_status[pick] = e7b.get("status")
             projected += (
                 record["wall_s"] * 6
             )  # the full run is ≈ 6× the smoke per pick (plan §4)
@@ -1905,6 +1921,7 @@ class Campaign:
             projected_full_s=projected,
             fits=projected <= ESTIMATE_LIMIT_S,
             pass_=not problems,
+            e7b=e7b_status,
         )
 
     def write_summary(self):
