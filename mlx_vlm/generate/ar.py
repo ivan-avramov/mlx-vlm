@@ -2367,7 +2367,12 @@ class PromptProcessingBatch:
         )
         if self.prefill_step_size is not None:
             policy_kwargs = dict(self._prompt_kwargs)
-            if draft_model is not None and draft_kind is not None:
+            # Fork (P369 round-2 F6): batched mtp never speculates; no capture kwargs.
+            if (
+                draft_model is not None
+                and draft_kind is not None
+                and draft_kind != "mtp"
+            ):
                 policy_kwargs.update(
                     speculative_prefill_kwargs(draft_kind, draft_model)
                 )
@@ -2634,7 +2639,9 @@ class PromptProcessingBatch:
             else:
                 _record_speculation_fallback(reason, self.draft_kind)
         call_kwargs = dict(self._prompt_kwargs)
-        if self.draft_model is not None and self.draft_kind is not None:
+        # Fork (P369 round-2 F6): only a batch that WILL speculate asks the target
+        # for the drafter's hidden / shared-KV outputs.
+        if is_speculative:
             call_kwargs.update(
                 speculative_prefill_kwargs(self.draft_kind, self.draft_model)
             )

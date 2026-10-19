@@ -1873,15 +1873,18 @@ class ResponseGenerator:
         # over-counts length-terminated requests by one.
         counted_tokens = 0
 
+        # Fork (P369 round-2 F5): hold the stream so every exit closes it NOW; a
+        # closed (not exhausted) stream retires the session (see dispatch).
+        stream = _stream_generate(
+            model=self.model,
+            processor=self.processor,
+            prompt=prompt,
+            image=images if images else None,
+            vision_cache=self.vision_cache,
+            **gen_kwargs,
+        )
         try:
-            for chunk in _stream_generate(
-                model=self.model,
-                processor=self.processor,
-                prompt=prompt,
-                image=images if images else None,
-                vision_cache=self.vision_cache,
-                **gen_kwargs,
-            ):
+            for chunk in stream:
                 # Cooperative cancellation: drain any pending cancel for this
                 # uid and break early if matched.
                 with self._cancel_lock:
@@ -2017,6 +2020,7 @@ class ResponseGenerator:
             )
             rqueue.put(e)
         finally:
+            getattr(stream, "close", lambda: None)()  # Fork (P369 round-2 F5)
             # Stop the heartbeat watchdog before pushing the terminator so any
             # straggling KeepAlive lands BEFORE the None sentinel in the queue.
             heartbeat_done.set()
