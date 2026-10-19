@@ -5,6 +5,11 @@ Fork-only file. ``state_hash`` is ONE SHA-256 over the complete logical valid st
 effects). ``probe`` is a transactional width-one verify forward followed by ``abort()``. ``Recorder``
 records every row the production sampler sees (ON: prefill + verifier rows; OFF: plain rows, with the
 ON tokens forced), and the state at every ON commit / at the matching OFF offsets.
+
+The end-to-end E1c checks run on the bf16 affine-quantized pairs of ``test_mtp_exactness`` (the deployed
+kernel path: exact verifier kernels, Metal only). On the dense float32 fixture verifier rows and singleton
+rows are NOT bit-identical (measured 2026-10-19: |dlogprob| up to ~1e-2 at logit scale 4; E1a's 1e-5 law
+tolerance at scale 12 does not see it), which is why the exactness claim is about the deployed path.
 """
 
 import sys
@@ -13,7 +18,16 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 import pytest
-from test_mtp_exactness import PROMPT, fake_model, hybrid_lm, mtp_drafter, scripted
+from test_mtp_exactness import (
+    PICKS,
+    PROMPT,
+    _quantized_pair,
+    deployed_sampling,
+    fake_model,
+    hybrid_lm,
+    mtp_drafter,
+    scripted,
+)
 from test_mtp_stop_state import turn
 
 from mlx_vlm.generate.common import PromptCacheState
@@ -110,9 +124,8 @@ def test_probe_is_neutral_and_repeatable():
     first = observe.probe(LM, state.cache, PROBE)
     assert observe.state_hash(state.cache) == before
     second = observe.probe(LM, state.cache, PROBE)
-    assert compare._bits(first) == compare._bits(second) or np.array_equal(
-        compare._bits(first)[1], compare._bits(second)[1]
-    )
+    assert first["dtype"] == second["dtype"]
+    assert np.array_equal(first["bits"], second["bits"])
 
 
 # ------------------------------------------------------------------ Recorder
@@ -142,36 +155,61 @@ def test_on_recorder_sees_verifier_rows_and_hashes_every_commit():
     assert rec.draft_rounds > 0
 
 
-def _e1c():
+_QUANTIZED = {}
+metal = pytest.mark.skipif(
+    not mx.metal.is_available(), reason="exact kernels are Metal"
+)
+
+
+def _quantized(pick):
+    if pick not in _QUANTIZED:
+        _QUANTIZED[pick] = _quantized_pair(pick)
+    return _QUANTIZED[pick]
+
+
+def _e1c(pick, seed=5, n=12):
     """ON with recording, then the OFF replay forced along ON's tokens, hashing at ON's offsets."""
-    _, path = _warm(n=N)
-    with observe.Recorder(mode="on", lm=LM, probe_token=PROBE) as on:
+    lm, drafter = _quantized(pick)
+    model, params = fake_model(lm), deployed_sampling(pick)
+    plain, _ = turn(model, PROMPT, PromptCacheState(), n=n, seed=seed, params=params)
+    plain = list(plain)
+    scripted(
+        drafter, lambda p: plain[p] if p < len(plain) else None, high=True, vocab=64
+    )
+    with observe.Recorder(mode="on", lm=lm, probe_token=PROBE) as on:
         emitted, _ = turn(
-            MODEL, PROMPT, PromptCacheState(), drafter=_drafter(path), n=N, seed=5
+            model,
+            PROMPT,
+            PromptCacheState(),
+            drafter=drafter,
+            n=n,
+            seed=seed,
+            params=params,
         )
+    assert list(emitted) == plain and on.draft_rounds > 0
     offsets = [on.prompt_end["offset"]] + [c["offset"] for c in on.commits]
-    return on, emitted, offsets
+    return lm, model, params, on, list(emitted), offsets
 
 
-def test_tiny_e1c_on_equals_off_rows_states_and_probes():
-    on, emitted, offsets = _e1c()
+@metal
+@pytest.mark.parametrize("pick", PICKS)
+def test_quantized_e1c_on_equals_off_rows_states_and_probes(pick):
+    lm, model, params, on, emitted, offsets = _e1c(pick)
+    n = len(emitted)
     with observe.Recorder(
-        mode="off",
-        force_tokens=list(emitted),
-        hash_offsets=offsets,
-        lm=LM,
-        probe_token=PROBE,
+        mode="off", force_tokens=emitted, hash_offsets=offsets, lm=lm, probe_token=PROBE
     ) as off:
-        turn(MODEL, PROMPT, PromptCacheState(), n=N, seed=5)
-    rep = compare.compare_streams(on.rows, off.rows, N, PARAMS)
-    assert rep["pass"], rep
+        turn(model, PROMPT, PromptCacheState(), n=n, seed=5, params=params)
+    rep = compare.compare_streams(on.rows, off.rows, n, params)
+    assert rep["pass"] and rep["raw_equal"] == n, rep
     states = observe.compare_states(on, off)
-    assert states["pass"], states
-    assert states["compared"] == len(offsets)
+    assert states["pass"] and states["compared"] == len(offsets), states
 
 
-def test_tiny_e1c_detects_an_old_prefix_byte_flip_at_one_offset():
-    on, emitted, offsets = _e1c()
+@metal
+@pytest.mark.parametrize("pick", PICKS)
+def test_quantized_e1c_detects_an_old_prefix_byte_flip_at_one_offset(pick):
+    lm, model, params, on, emitted, offsets = _e1c(pick)
     target = offsets[len(offsets) // 2]
 
     def corrupt(caches, offset):
@@ -181,15 +219,30 @@ def test_tiny_e1c_detects_an_old_prefix_byte_flip_at_one_offset():
 
     with observe.Recorder(
         mode="off",
-        force_tokens=list(emitted),
+        force_tokens=emitted,
         hash_offsets=offsets,
-        lm=LM,
+        lm=lm,
         probe_token=PROBE,
         before_hash=corrupt,
     ) as off:
-        turn(MODEL, PROMPT, PromptCacheState(), n=N, seed=5)
+        turn(model, PROMPT, PromptCacheState(), n=len(emitted), seed=5, params=params)
     states = observe.compare_states(on, off)
     assert not states["pass"] and target in states["mismatched_offsets"]
+
+
+@metal
+def test_quantized_e1c_detects_an_in_support_change_of_one_verifier_row():
+    lm, model, params, on, emitted, offsets = _e1c(PICKS[0])
+    with observe.Recorder(mode="off", force_tokens=emitted) as off:
+        turn(model, PROMPT, PromptCacheState(), n=len(emitted), seed=5, params=params)
+    position = 3
+    index = max(i for i, (p, _) in enumerate(on.rows) if p == position)
+    row = compare.from_record(on.rows[index][1])
+    top = int(mx.argmax(row).item())
+    bumped = mx.where(mx.arange(row.size) == top, row + 0.01, row)
+    on.rows[index] = (position, compare.as_record(bumped.astype(row.dtype)))
+    rep = compare.compare_streams(on.rows, off.rows, len(emitted), params)
+    assert not rep["pass"] and [m["position"] for m in rep["mismatches"]] == [position]
 
 
 def test_recorder_uninstalls_everything():
