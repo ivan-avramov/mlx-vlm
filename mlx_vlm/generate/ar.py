@@ -2675,6 +2675,11 @@ class PromptProcessingBatch:
             inputs_embeds=self._inputs_embeds,
             **call_kwargs,
         )
+        if not is_speculative:
+            # Fork (P369 round-4 F11): this batch decodes plainly, so the chunks
+            # captured for the drafter during prefill are unused; drop them (the
+            # final forward above requested no capture, finish() would crash).
+            self._speculative_prefill.chunks.clear()
         output = self._speculative_prefill.finish(output)
         logits = output.logits if hasattr(output, "logits") else output
         if self._right_pad_per_row is not None and any(self._right_pad_per_row):
