@@ -77,14 +77,15 @@ class _FixtureSeeding:
 
     Registered as a plugin (``pytest_configure``): hooks defined in a conftest are
     path-scoped and a session-scoped fixture's hook proxy is the rootdir's, which
-    would not include this directory's conftest.
+    would not include this directory's conftest. The scope is the EFFECTIVE one
+    (``request.scope``): a parametrize ``scope=`` overrides the declared one.
     """
 
     @pytest.hookimpl(tryfirst=True)
     def pytest_fixture_setup(self, fixturedef, request):
-        if fixturedef.scope != "function":
+        if request.scope != "function":
             _seed_all(
-                fixture_seed(fixturedef.scope, request.node.nodeid, fixturedef.argname)
+                fixture_seed(request.scope, request.node.nodeid, fixturedef.argname)
             )
 
 
