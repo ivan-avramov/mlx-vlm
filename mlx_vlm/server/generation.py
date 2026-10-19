@@ -2636,6 +2636,29 @@ class ResponseGenerator:
                         )
                         continue
 
+                    if args.max_tokens is not None and int(args.max_tokens) <= 0:
+                        # Fork (P369 round-6 F26): a zero budget is answered
+                        # before any embedding / generator construction / prefill.
+                        rqueue.put(
+                            GenerationContext(
+                                uid=id(rqueue),
+                                prompt_tokens=prompt_tokens,
+                                backend=BACKEND_CONTINUOUS_BATCHING,
+                            )
+                        )
+                        rqueue.put(
+                            StreamingToken(
+                                text="",
+                                token=0,
+                                logprobs=0.0,
+                                finish_reason="length",
+                                token_count=0,
+                                emitted_at=time.perf_counter(),
+                            )
+                        )
+                        rqueue.put(None)
+                        continue
+
                     if batch_gen is None:
                         batch_gen = BatchGenerator(
                             self.model.language_model,
