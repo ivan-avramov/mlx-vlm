@@ -1588,26 +1588,45 @@ def _retire_session_on_abnormal_exit(fn):
     def wrapper(*args, **kwargs):
         state = kwargs.get("prompt_cache_state")
         inner = fn(*args, **kwargs)
+        epoch = None
+        if state is not None:
+            # Round 5 F18: a per-session epoch. An older stream still in flight
+            # (abandoned, never closed) left the shared cache mutated under the old
+            # label: retire it before this stream reads the session, and make the
+            # older stream a no-op (it can neither publish nor clear) from now on.
+            if getattr(state, "_inflight_epoch", None) is not None:
+                state.clear()
+            epoch = getattr(state, "_epoch", 0) + 1
+            state._epoch = epoch
+            state._inflight_epoch = epoch
+
+        def stale():
+            return state is not None and state._epoch != epoch
+
         completed = False
         terminal = False
         try:
             for chunk in inner:
                 terminal = getattr(chunk, "finish_reason", None) is not None
                 yield chunk
+                if stale():
+                    return
             completed = True
         except GeneratorExit:
             # Round 3 F8: publication runs after the terminal yield; a consumer
             # that closes on ``finish_reason`` has a complete, valid generation,
             # so finish the stream (no decoding is left, only the publication)
             # exactly as a drained consumer would, instead of dropping the session.
-            if terminal:
+            if terminal and not stale():
                 for _ in inner:
                     pass
                 completed = True
             raise
         finally:
-            if state is not None and not completed:
-                state.clear()
+            if state is not None and not stale():
+                if not completed:
+                    state.clear()
+                state._inflight_epoch = None
             inner.close()
 
     wrapper.__name__ = fn.__name__

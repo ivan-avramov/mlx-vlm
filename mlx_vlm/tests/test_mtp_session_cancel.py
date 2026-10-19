@@ -275,8 +275,8 @@ def test_f18_abandoned_unclosed_stream_cannot_corrupt_or_clear_a_newer_one(
     next(stream_a)
     next(stream_a)  # A in flight; its prefill extended the shared cache
     chunks_b = list(_start(setup, state, drafter))  # B on the same session
-    tokens_b = [c.token for c in chunks_b if c.token is not None]
-    assert tokens_b == setup.ref2[: len(tokens_b)] and len(tokens_b) == N
+    tokens_b = list(chunks_b[-1].token_ids)
+    assert tokens_b == setup.ref2 and len(tokens_b) == N
     published = (list(state.token_ids), cache_snapshot(state))
     # A comes back to life: it must be a no-op for the session.
     with pytest.raises(StopIteration):
