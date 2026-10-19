@@ -1050,3 +1050,171 @@ def test_the_run_lock_and_outputs_live_under_the_stack_workdir(tmp_path):
         orchestrate.lock_path({})
     assert orchestrate.out_problems(tmp_path / "p369" / "phase2" / "run-1", env) == []
     assert orchestrate.out_problems(Path("/elsewhere/run-1"), env)
+
+
+# ------------------------------------------------------------------ code round 3 H20 / H22 / H23 / H24
+COMPLETED_THEN_HUNG = """
+import json, os, sys, time
+from pathlib import Path
+out = Path(sys.argv[1])
+started = time.time()
+(out / "req-0.json").write_text(json.dumps(dict(name="r0", done=True)))  # the entry landed...
+tmp = out / ".progress.json.tmp"  # ...but the heartbeat still says "request" (the H20 window)
+tmp.write_text(json.dumps(dict(index=0, name="r0", phase="request", started=started, deadline_s=0.3)))
+os.replace(tmp, out / "progress.json")
+time.sleep(60)
+"""
+
+ESCAPING_WORKER = """
+import json, os, subprocess, sys, time
+from pathlib import Path
+out = Path(sys.argv[1])
+code = "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
+child = subprocess.Popen([sys.executable, "-c", code], start_new_session=True)  # leaves the group
+(out / "child.pid").write_text(str(child.pid))
+time.sleep(float(sys.argv[2]))
+if sys.argv[3] == "hang":
+    tmp = out / ".progress.json.tmp"
+    tmp.write_text(json.dumps(dict(index=0, name="r0", phase="request", started=time.time(), deadline_s=0.3)))
+    os.replace(tmp, out / "progress.json")
+    time.sleep(60)
+"""
+
+
+def _wait_dead(pid, seconds=10):
+    import time
+
+    deadline = time.monotonic() + seconds
+    while _alive(pid) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    return not _alive(pid)
+
+
+@pytest.fixture
+def owned(tmp_path):
+    """Processes a test starts: every one (and its group) is SIGKILLed at teardown (code round 3 H24)."""
+    import os
+    import signal
+
+    procs, pids = [], []
+    yield procs, pids
+    for proc in procs:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+    recorded = tmp_path / "child.pid"  # a child that escaped the group before the test read its pid
+    if recorded.exists() and recorded.read_text().strip().isdigit():
+        pids.append(int(recorded.read_text()))
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def _start(owned, code, *args):
+    import subprocess
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", code, *map(str, args)],
+        stdout=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    owned[0].append(proc)
+    return proc
+
+
+def test_a_completed_request_is_never_censored(tmp_path, owned):
+    import time
+
+    proc = _start(owned, COMPLETED_THEN_HUNG, tmp_path)
+    got = orchestrate.supervise(
+        proc,
+        tmp_path,
+        boot_timeout_s=30,
+        deadline=time.monotonic() + 30,
+        poll_s=0.05,
+        grace_s=0.5,
+    )
+    assert got["outcome"] == "hang_after" and got["index"] == 0, got
+
+
+def test_a_stop_reaches_a_descendant_that_left_the_group(tmp_path, owned):
+    import time
+
+    proc = _start(owned, ESCAPING_WORKER, tmp_path, 0.5, "hang")
+    deadline = time.monotonic() + 10
+    while not (tmp_path / "child.pid").exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    child = int((tmp_path / "child.pid").read_text())
+    owned[1].append(child)
+    tracker = orchestrate.Descendants(proc.pid)
+    got = orchestrate.supervise(
+        proc,
+        tmp_path,
+        boot_timeout_s=30,
+        deadline=time.monotonic() + 30,
+        poll_s=0.05,
+        grace_s=0.5,
+        tracker=tracker,
+    )
+    assert got["outcome"] == "request_timeout"
+    assert _wait_dead(child), "an escaped (setsid) descendant survived the stop (H22)"
+
+
+def test_a_normal_exit_leaves_no_descendant(tmp_path, owned):
+    import time
+
+    proc = _start(owned, ESCAPING_WORKER, tmp_path, 0.5, "exit")
+    tracker = orchestrate.Descendants(proc.pid)
+    got = orchestrate.supervise(
+        proc,
+        tmp_path,
+        boot_timeout_s=30,
+        deadline=time.monotonic() + 30,
+        poll_s=0.05,
+        grace_s=0.5,
+        tracker=tracker,
+    )
+    assert got["outcome"] == "exited"
+    child = int((tmp_path / "child.pid").read_text())
+    owned[1].append(child)
+    orchestrate.reap(proc, tracker)
+    assert _wait_dead(child), "a descendant outlived a worker's normal exit (H24)"
+
+
+def _lifecycle_camp(tmp_path, run_pick):
+    saved = []
+    camp = object.__new__(orchestrate.Campaign)
+    camp.args = type("A", (), dict(smoke_summary=None, phase="smoke"))()
+    camp.out, camp.picks, camp.fork, camp.head = tmp_path, [FABLE], tmp_path, "h"
+    camp.prepare = lambda: _binding()
+    camp.summary = dict(picks={})
+    camp.write_summary = lambda: saved.append(json.loads(json.dumps(camp.summary)))
+    camp.run_pick = run_pick
+    camp.smoke_gate = lambda: dict(pass_=True, fits=True)
+    return camp, saved
+
+
+def test_the_whole_lifecycle_is_one_persistence_boundary(tmp_path, monkeypatch):
+    camp, saved = _lifecycle_camp(tmp_path, lambda pick, smoke: None)
+
+    def moved(*a):
+        raise RuntimeError("fork HEAD moved during the campaign")
+
+    monkeypatch.setattr(orchestrate, "tree_guard", moved)
+    with pytest.raises(RuntimeError, match="HEAD moved"):
+        camp.execute()
+    assert saved[-1]["status"] == "HARNESS_ERROR" and "HEAD moved" in saved[-1]["error"]
+
+    def interrupted(pick, smoke):
+        raise SystemExit(143)
+
+    camp, saved = _lifecycle_camp(tmp_path, interrupted)
+    with pytest.raises(SystemExit):
+        camp.execute()
+    assert saved[-1]["status"] == "INTERRUPTED"
