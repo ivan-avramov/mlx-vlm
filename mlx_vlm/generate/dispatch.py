@@ -1576,7 +1576,8 @@ def stream_generate(
 
 # Fork: fork-only helper (P369 round-2 F5).
 def _retire_session_on_abnormal_exit(fn):
-    # Fork: fork-only helper (P369 round-2 F5, round-3 F8, round-5 F18, round-6 F22).
+    # Fork: fork-only helper (P369 round-2 F5, round-3 F8, round-5 F18, round-6 F22,
+    # round-7 F27 / F28).
     """Clear the request's ``PromptCacheState`` unless the stream ran to completion.
 
     The session cache is mutated in place while the label (``token_ids``) is only
@@ -1584,10 +1585,13 @@ def _retire_session_on_abnormal_exit(fn):
     ``close()``), or an exception, would leave the old label over a cache holding the
     prompt and decoded tokens; MTP additionally commits whole verified blocks before
     yielding. Retiring the session on every such exit, for every draft kind, makes the
-    next turn re-prefill from scratch (identical for MTP-ON and OFF). The terminal
-    chunk is held until the session has been published, so a publication failure
-    reaches the caller as an exception and a close right after the terminal chunk
-    finds nothing left to do.
+    next turn re-prefill from scratch (identical for MTP-ON and OFF). On a
+    session-backed stream the terminal chunk is held until the session has been
+    published, so a publication failure reaches the caller as an exception and a
+    close right after the terminal chunk finds nothing left to do; the stream stops
+    counting as in flight before that chunk is delivered, so a consumer that breaks
+    there without closing keeps the session. A stateless stream passes every chunk
+    through as upstream does (its cleanup runs on the next pull).
 
     A per-session epoch makes an older, abandoned stream a no-op once a newer one
     started on the same session. THREADING: sessions are single-threaded. The epoch
@@ -1618,7 +1622,11 @@ def _retire_session_on_abnormal_exit(fn):
         completed = False
         try:
             for chunk in inner:
-                if getattr(chunk, "finish_reason", None) is not None:
+                # Round 7 F28: only a session-backed stream holds its terminal chunk.
+                if (
+                    state is not None
+                    and getattr(chunk, "finish_reason", None) is not None
+                ):
                     # Round 6 F22 (supersedes round 3's drain-on-close): hold the
                     # terminal chunk until the session has been PUBLISHED. Nothing
                     # but publication runs after it, so the caller either gets a
@@ -1630,6 +1638,9 @@ def _retire_session_on_abnormal_exit(fn):
                     for _ in inner:
                         pass
                     completed = True
+                    # Round 7 F27: published; a consumer that breaks on the terminal
+                    # chunk without closing must not leave the session in flight.
+                    state._inflight_epoch = None
                     yield chunk
                     return
                 yield chunk
