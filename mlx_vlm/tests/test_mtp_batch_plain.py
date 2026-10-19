@@ -169,3 +169,25 @@ def test_f1_lockstep_b_gt_1_generate_step_refuses_mtp(lm):
             )
         )
     assert ar.SPECULATION_FALLBACKS["mtp_lockstep_refused"] == before + 1
+
+
+def test_f6_fallback_prefill_requests_no_speculative_outputs(lm, monkeypatch):
+    """The plain fallback must not ask the target for the drafter's hidden /
+    shared-KV outputs only to discard them."""
+    asked = []
+    real = ar.speculative_prefill_kwargs
+
+    def spy(kind, drafter):
+        asked.append(kind)
+        return real(kind, drafter)
+
+    monkeypatch.setattr(ar, "speculative_prefill_kwargs", spy)
+    on = _drive(lm, mtp_drafter(lm), [PROMPT, OTHER], (N, N))
+    plain = _drive(lm, None, [PROMPT, OTHER], (N, N))
+    assert on[:2] == plain[:2] and on[2] == 0
+    assert asked == []
+
+
+def test_f6_control_the_gate_is_mtp_specific():
+    """Other kinds keep their batched speculation."""
+    assert ar._speculation_fallback_reason("dflash", None, None, None) is None

@@ -304,8 +304,15 @@ def test_e3_two_turns_through_the_server_cached_session_path(setup, monkeypatch)
             follow = list(state.token_ids) + [21, 22, 23]
             _, second, state2 = _serve_turn(rg, follow, chat_id, [], 6, 9)
             assert state2 is state  # the forwarded session id resolved the same state
-            outputs[arm] = (first, second, cache_snapshot(state))
+            outputs[arm] = (first, second, cache_snapshot(state), list(state.token_ids))
         if outputs["on"][:2] != outputs["off"][:2]:
             failures.append((p, outputs["off"][:2], outputs["on"][:2]))
+        # P369 round 2: the recorded session state must match too, not only tokens.
+        if outputs["on"][3] != outputs["off"][3]:
+            failures.append((p, "session token_ids", outputs["off"][3]))
+        try:
+            assert_same_cache(outputs["on"][2], outputs["off"][2])
+        except AssertionError as e:
+            failures.append((p, "cache", str(e).splitlines()[0]))
     session_manager.clear_session_caches()
     assert stops and failures == []
