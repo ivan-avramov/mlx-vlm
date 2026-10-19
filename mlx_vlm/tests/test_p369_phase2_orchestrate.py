@@ -568,7 +568,10 @@ def test_supervise_returns_the_exit_of_a_finished_worker(tmp_path):
         poll_s=0.05,
         grace_s=0.5,
     )
-    assert got == dict(outcome="exited", returncode=3)
+    # code round 5 H30: the exit is observed without reaping; the code comes once reap proved extinction
+    assert got == dict(outcome="exited") and proc.returncode is None
+    orchestrate.reap(proc, proc.p369_tracker)
+    assert proc.returncode == 3
 
 
 def test_run_with_censoring_relaunches_the_rest_after_a_request_timeout():
@@ -895,9 +898,11 @@ GROUP_WORKER = """
 import json, os, signal, subprocess, sys, time
 from pathlib import Path
 out = Path(sys.argv[1])
-child = subprocess.Popen([sys.executable, "-c",
-    "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"])
-(out / "child.pid").write_text(str(child.pid))
+child = subprocess.Popen([sys.executable, "-c",  # the child records ITSELF (code round 5 H24)
+    "import os, signal, sys, time; open(sys.argv[1], 'w').write(str(os.getpid())); "
+    "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)", str(out / "child.pid")])
+while not (out / "child.pid").exists():
+    time.sleep(0.01)
 def on_term(*_):
     (out / "saw_timeout.txt").write_text(str((out / "timeout.json").exists()))
     sys.exit(0)
@@ -955,7 +960,14 @@ def test_supervise_records_the_timeout_before_signalling_and_kills_the_group(tmp
             time.sleep(0.05)
         assert not _alive(child), "the worker's descendant survived the stop (H17)"
     finally:
-        for pid in [proc.pid] + ([child] if child else []):
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)  # the whole test group (H24)
+        except (ProcessLookupError, PermissionError):
+            pass
+        recorded = tmp_path / "child.pid"
+        for pid in [proc.pid] + (
+            [int(recorded.read_text())] if recorded.exists() else []
+        ):
             try:
                 os.kill(pid, signal.SIGKILL)
             except ProcessLookupError:
@@ -1072,9 +1084,12 @@ ESCAPING_WORKER = """
 import json, os, subprocess, sys, time
 from pathlib import Path
 out = Path(sys.argv[1])
-code = "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
-child = subprocess.Popen([sys.executable, "-c", code], start_new_session=True)  # leaves the group
-(out / "child.pid").write_text(str(child.pid))
+# the child records ITSELF, then leaves the group (the handshake: recorded before it escapes; H24)
+code = ("import os, signal, sys, time; open(sys.argv[1], 'w').write(str(os.getpid())); os.setsid(); "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)")
+child = subprocess.Popen([sys.executable, "-c", code, str(out / "child.pid")])
+while not (out / "child.pid").exists():
+    time.sleep(0.01)
 time.sleep(float(sys.argv[2]))
 if sys.argv[3] == "hang":
     tmp = out / ".progress.json.tmp"

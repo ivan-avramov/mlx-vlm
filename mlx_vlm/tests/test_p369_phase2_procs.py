@@ -269,3 +269,140 @@ def test_a_preparation_refusal_is_recorded(tmp_path):
     with pytest.raises(SystemExit, match="not clean"):
         camp.execute()
     assert saved[-1]["status"] == "REFUSED"
+
+
+# ------------------------------------------------------------------ code round 5 H30 / H31 / H32 / H33 / H34 / H23
+LEAVES_A_MEMBER = (
+    "import os, subprocess, sys\n"
+    "code = \"import os, signal, sys, time; open(sys.argv[1], 'w').write(str(os.getpid())); "
+    'signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"\n'
+    "subprocess.Popen([sys.executable, '-c', code, sys.argv[1]])  # stays in the worker's group\n"
+    "import time\n"
+    "while not os.path.exists(sys.argv[1]): time.sleep(0.01)\n"
+    "raise SystemExit(3)\n"
+)
+
+
+def _leaver(owned, tmp_path):
+    proc = subprocess.Popen(
+        [sys.executable, "-c", LEAVES_A_MEMBER, str(tmp_path / "member.pid")],
+        start_new_session=True,
+    )
+    owned.append(proc)
+    return proc
+
+
+def test_supervise_detects_the_exit_without_reaping_the_leader(tmp_path, owned):
+    proc = _leaver(owned, tmp_path)
+    got = orchestrate.supervise(
+        proc, tmp_path, boot_timeout_s=30, deadline=time.monotonic() + 30, poll_s=0.05
+    )
+    assert got["outcome"] == "exited"
+    assert (
+        proc.returncode is None
+    )  # unreaped: the pid (and the group id) stay anchored (H30)
+    assert orchestrate.ps_table()[proc.pid]["stat"].startswith("Z")
+    member = int((tmp_path / "member.pid").read_text())
+    orchestrate.reap(proc, proc.p369_tracker, wait_s=10)
+    assert _gone(member) and proc.returncode == 3
+
+
+def test_an_untracked_worker_is_a_harness_error(tmp_path, owned, monkeypatch):
+    proc = _leaver(owned, tmp_path)
+    deadline = time.monotonic() + 10
+    while not (tmp_path / "member.pid").exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    time.sleep(0.3)  # the worker has exited
+
+    def no_tracker(*a, **k):
+        raise RuntimeError("ps failed")
+
+    monkeypatch.setattr(orchestrate, "Descendants", no_tracker)
+    with pytest.raises(RuntimeError, match="ps failed"):
+        orchestrate.supervise(
+            proc,
+            tmp_path,
+            boot_timeout_s=30,
+            deadline=time.monotonic() + 30,
+            poll_s=0.05,
+        )  # never "exited" without proven cleanup (H31)
+
+
+def test_cleanup_completes_before_a_second_interruption_is_replayed(tmp_path, owned):
+    import threading
+
+    proc = _leaver(owned, tmp_path)
+    tracker = orchestrate.Descendants(proc.pid)
+    deadline = time.monotonic() + 10
+    while not (tmp_path / "member.pid").exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    member = int((tmp_path / "member.pid").read_text())
+    tracker.scan()
+
+    def raise_exit(signum, frame):
+        raise SystemExit(128 + signum)
+
+    old = signal.signal(signal.SIGTERM, raise_exit)
+    timer = threading.Timer(0.05, os.kill, (os.getpid(), signal.SIGTERM))
+    try:
+        timer.start()
+        with pytest.raises(SystemExit):
+            orchestrate.stop_worker(proc, tracker, grace_s=0.5)
+        assert (
+            _gone(member) and proc.returncode is not None
+        )  # extinction FIRST, then the replay
+    finally:
+        # never let the timer's SIGTERM reach this process after the default handler is back
+        timer.cancel()
+        timer.join()
+        try:
+            time.sleep(0.2)  # a signal already delivered is handled here, by raise_exit
+        except SystemExit:
+            pass
+        signal.signal(signal.SIGTERM, old)
+
+
+def test_ps_table_respects_its_deadline(monkeypatch):
+    def failing(*args, **kwargs):
+        raise subprocess.CalledProcessError(1, args[0])
+
+    monkeypatch.setattr(orchestrate.subprocess, "run", failing)
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="ps"):
+        orchestrate.ps_table(retries=50, backoff_s=0.1, deadline=time.monotonic() + 0.3)
+    assert (
+        time.monotonic() - started < 1.5
+    )  # bounded by the deadline, not 50 retries (H33)
+
+
+@pytest.mark.parametrize(
+    "rows", [dict(), dict(**{"pass": "yes"}), dict(**{"pass": None})]
+)
+def test_malformed_comparator_evidence_is_a_harness_error(rows):
+    on = dict(verdict={"pass": True}, draft_rounds=3, prompt_end=None, straddle=True)
+    off = dict(rows=rows, states={"pass": True})
+    with pytest.raises(RuntimeError, match="malformed"):
+        orchestrate.e1c_verdict(
+            on, off, threshold=None, verify_policy=None
+        )  # never FAIL (H34)
+
+
+def test_constructing_a_campaign_reads_nothing(tmp_path):
+    args = type(
+        "A",
+        (),
+        dict(
+            stack_root=str(tmp_path / "missing-stack"),
+            fork_root=str(tmp_path / "missing-fork"),
+            out=str(tmp_path / "run"),
+            pick=None,
+            phase="smoke",
+            wall_limit_s=None,
+            reviewed_head=None,
+            smoke_summary=None,
+        ),
+    )()
+    camp = orchestrate.Campaign(
+        args
+    )  # side-effect free: registry and params load in prepare() (H23)
+    assert camp.summary["picks"] == {}
