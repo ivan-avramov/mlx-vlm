@@ -295,3 +295,63 @@ def test_f14_positioned_sampler_without_a_seed_attribute_does_not_raise():
     # No explicit seeds at all: nothing to honour, speculation may proceed.
     assert ar._speculation_fallback_reason("dflash", None, [None, None], sampler) is None
     assert ar._speculation_fallback_reason("dflash", None, None, sampler) is None
+
+
+# ------------------------------------------------------------------ round 5 / F17
+def _logprob_run(lm, drafter, apc_manager=None):
+    sampler = ar._PositionedTargetSampler(seed=0, **deployed_sampling(PICKS[1]))
+    processor = SimpleNamespace(
+        tokenizer=SimpleNamespace(stopping_criteria=StoppingCriteria([], None))
+    )
+    generator = ar.BatchGenerator(
+        lm,
+        processor,
+        sampler=sampler,
+        prefill_step_size=None,
+        compute_logprobs=True,
+        top_logprobs_k=2,
+        apc_manager=apc_manager,
+        draft_model=drafter,
+        draft_kind="mtp" if drafter is not None else None,
+        draft_block_size=BLOCK,
+    )
+    flags = (
+        generator.compute_logprobs,
+        generator.top_logprobs_k,
+        generator.apc is not None,
+    )
+    (uid,) = generator.insert(
+        [PROMPT],
+        max_tokens=[4],
+        prompt_kwargs=[{"inputs_embeds": lm.model.embed_tokens(mx.array([PROMPT]))}],
+    )
+    rows = []
+    try:
+        for _ in range(60):
+            _, responses = generator.next()
+            rows += [
+                (r.token, round(float(r.token_logprob), 5), r.top_logprobs)
+                for r in responses
+                if r.token is not None
+            ]
+            if not generator.has_work:
+                break
+    finally:
+        generator.close()
+    return flags, rows
+
+
+def test_f17_batched_mtp_keeps_real_logprobs_and_the_plain_restrictions(lm):
+    off_flags, off_rows = _logprob_run(lm, None)
+    on_flags, on_rows = _logprob_run(lm, mtp_drafter(lm))
+    assert on_flags == off_flags == (True, 2, off_flags[2])
+    assert any(lp != 0.0 for _, lp, _ in on_rows)
+    assert on_rows == off_rows
+
+
+def test_f17_batched_mtp_keeps_apc_like_plain(lm):
+    from mlx_vlm.apc import APCManager
+
+    off_flags, _ = _logprob_run(lm, None, apc_manager=APCManager(num_blocks=8))
+    on_flags, _ = _logprob_run(lm, mtp_drafter(lm), apc_manager=APCManager(num_blocks=8))
+    assert on_flags == off_flags
