@@ -521,3 +521,23 @@ def test_turn_continuity():
     for change, why in cases:
         got = worker.turn_continuity(**dict(base, **change))
         assert not got["continuity"] and why in got["reason"], (change, got)
+
+
+# ------------------------------------------------------------------ code round 2 H9: the snapshots the worker loaded
+def test_check_snapshots_compares_the_resolved_revision_of_each_model_flag(tmp_path):
+    snap = tmp_path / "models--o--m" / "snapshots" / "rev1"
+    snap.mkdir(parents=True)
+    resolve = lambda repo: snap  # noqa: E731
+    argv = ["--model", "o/m", "--draft-model", "o/m", "--port", "1"]
+    got = worker.check_snapshots(
+        argv, {"--model": "rev1", "--draft-model": "rev1"}, resolve
+    )
+    assert got == {"--model": "rev1", "--draft-model": "rev1"}
+    with pytest.raises(RuntimeError, match="snapshot"):
+        worker.check_snapshots(
+            argv, {"--model": "rev0", "--draft-model": "rev1"}, resolve
+        )
+    with pytest.raises(RuntimeError, match="snapshot"):
+        worker.check_snapshots(
+            ["--model", "o/m"], {"--model": "rev1", "--draft-model": "rev1"}, resolve
+        )

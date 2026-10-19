@@ -219,8 +219,100 @@ def _binding(**changes):
         production=orchestrate.PRODUCTION,
         fork_head="h",
         harness_tree="t",
+        reviewed_head="h",
+        versions={"mlx": "0.32.3", "mlx-metal": "0.32.3"},
+        env_digest=dict(names=["HOME", "PATH"], sha256="e"),
+        stack_bench=dict(tree="b", bundles={"x.jsonl": "1"}),
         picks={FABLE: pick},
     )
+
+
+# ------------------------------------------------------------------ code round 2 H9: reviewed head, tree, binding
+def test_reviewed_head_rules():
+    rh = orchestrate.reviewed_head_problems
+    assert (
+        rh("smoke", None, "h") == []
+    )  # smoke iterations may run unreviewed (P394 refined)
+    assert rh("smoke", "h", "h") == [] and rh("full", "h", "h") == []
+    assert rh("smoke", "x", "h") and rh("full", "x", "h")
+    assert rh("full", None, "h")  # the full run needs a reviewed head
+
+
+def test_binding_extends_to_versions_env_bench_and_a_reviewed_smoke():
+    manifest = _binding()
+    smoke = dict(binding=orchestrate.binding(manifest))
+    assert orchestrate.binding_problems(smoke, manifest) == []
+    for key, value in [
+        ("versions", {"mlx": "0.32.4", "mlx-metal": "0.32.3"}),
+        ("env_digest", dict(names=["HOME", "PATH"], sha256="other")),
+        ("stack_bench", dict(tree="b2", bundles={"x.jsonl": "1"})),
+        ("harness_tree", "t2"),
+    ]:
+        assert orchestrate.binding_problems(smoke, dict(manifest, **{key: value})), key
+    unreviewed = dict(binding=orchestrate.binding(dict(manifest, reviewed_head=None)))
+    problems = orchestrate.binding_problems(unreviewed, manifest)
+    assert any("unreviewed" in p for p in problems), problems
+
+
+def test_env_digest_hashes_values_without_recording_them():
+    a = orchestrate.env_digest({"HF_TOKEN": "s3cret", "PATH": "/b"})
+    assert a["names"] == ["HF_TOKEN", "PATH"] and "s3cret" not in json.dumps(a)
+    assert a != orchestrate.env_digest({"HF_TOKEN": "other", "PATH": "/b"})
+    assert a == orchestrate.env_digest({"PATH": "/b", "HF_TOKEN": "s3cret"})
+
+
+def test_hf_hub_cache_follows_huggingface_hub_precedence(tmp_path):
+    from pathlib import Path
+
+    home = Path("/h")
+    assert orchestrate.hf_hub_cache(
+        {"HF_HUB_CACHE": "/a", "HF_HOME": "/x"}, home
+    ) == Path("/a")
+    assert orchestrate.hf_hub_cache(
+        {"HUGGINGFACE_HUB_CACHE": "/b", "HF_HOME": "/x"}, home
+    ) == Path("/b")
+    assert orchestrate.hf_hub_cache({"HF_HOME": "/x"}, home) == Path("/x/hub")
+    assert orchestrate.hf_hub_cache({}, home) == Path("/h/.cache/huggingface/hub")
+
+
+def test_tree_guard_refuses_a_moved_head_or_any_change(tmp_path):
+    import subprocess
+
+    def git(*args):
+        return subprocess.run(
+            [
+                "git",
+                "-C",
+                str(tmp_path),
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.invalid",
+                *args,
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+    git("init", "-q")
+    (tmp_path / "a.py").write_text("x = 1\n")
+    git("add", "a.py")
+    git("commit", "-q", "-m", "one")
+    head = git("rev-parse", "HEAD")
+    orchestrate.tree_guard(tmp_path, head)
+    (tmp_path / "a.py").write_text("x = 2\n")
+    with pytest.raises(RuntimeError, match="not clean"):
+        orchestrate.tree_guard(tmp_path, head)
+    git("checkout", "-q", "a.py")
+    (tmp_path / "new.py").write_text("")
+    with pytest.raises(RuntimeError, match="not clean"):
+        orchestrate.tree_guard(tmp_path, head)
+    (tmp_path / "new.py").unlink()
+    (tmp_path / "a.py").write_text("x = 3\n")
+    git("commit", "-q", "-am", "two")
+    with pytest.raises(RuntimeError, match="HEAD moved"):
+        orchestrate.tree_guard(tmp_path, head)
 
 
 def test_binding_mismatch_refuses_the_full_run():
