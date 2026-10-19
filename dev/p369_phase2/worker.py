@@ -499,8 +499,8 @@ def run_job(job, out_dir, result):
             if job["mode"] in ("e1c_on", "e1c_off"):
                 rec_kwargs = dict(lm=lm, probe_token=int(job["probe_token"]))
                 if job["mode"] == "e1c_off":
-                    on_dir = Path(job["on_dir"])
-                    on_meta = json.loads((on_dir / f"req-{index}.json").read_text())
+                    # The ON artifacts are per request (a straddle cell may come from a re-seeded ON job).
+                    on_meta = json.loads(Path(spec["on_req"]).read_text())
                     rec_kwargs.update(
                         force_tokens=on_meta["final"]["token_ids"],
                         hash_offsets=on_meta["offsets"],
@@ -562,11 +562,11 @@ def run_job(job, out_dir, result):
                 save_snapshots(out_dir / f"snaps-{index}.npz", snaps)
                 if job["mode"] == "e1c_off":
                     n = len(on_meta["final"]["token_ids"])
-                    on_rows = load_rows(on_dir / f"rows-{index}.npz")
+                    on_rows = load_rows(spec["on_rows"])
                     entry["rows"] = compare.compare_streams(
                         on_rows, recorder.rows, n, job["params"]
                     )
-                    on_snaps = load_snapshots(on_dir / f"snaps-{index}.npz")
+                    on_snaps = load_snapshots(spec["on_snaps"])
                     holder = type("Snaps", (), {})()
                     holder.prompt_end = (
                         on_snaps[0]
@@ -577,6 +577,11 @@ def run_job(job, out_dir, result):
                     off_holder = type("Snaps", (), {})()
                     off_holder.states = dict(recorder.states)
                     entry["states"] = observe.compare_states(holder, off_holder)
+                    if spec.get("smoke_positives"):
+                        holder.rows = on_rows
+                        entry["smoke_positives"] = smoke_positives(
+                            holder, recorder, n, job["params"]
+                        )
                 atomic_write(out_dir / f"req-{index}.json", entry)
             elif job["mode"] in ("e2", "e7a", "e7b"):
                 from p369_phase2 import classes
