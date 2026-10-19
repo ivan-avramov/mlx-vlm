@@ -63,19 +63,32 @@ def _hf_snapshot(repo):
 
 
 def check_snapshots(argv, expected, resolve=_hf_snapshot):
-    """Code round 2 H9: the snapshot revision each model flag of ``argv`` resolves to (what the worker
-    loaded) must equal the orchestrator's attested revision; returns ``{flag: revision}``.
+    """Code rounds 2–3 H9: the snapshot each model flag of ``argv`` resolves to (what the worker loaded) must
+    be the orchestrator's attested one — its revision, and (``{revision, files}``) every attested file
+    re-hashed (a same-revision blob mutation is caught); returns ``{flag: revision}``.
     """
+    import hashlib
+
     got = {}
     for flag, want in expected.items():
         if flag not in argv:
             raise RuntimeError(f"snapshot check: {flag} absent from the worker argv")
-        revision = Path(resolve(argv[argv.index(flag) + 1])).name
-        if revision != want:
+        want = want if isinstance(want, dict) else dict(revision=want, files={})
+        snap = Path(resolve(argv[argv.index(flag) + 1]))
+        if snap.name != want["revision"]:
             raise RuntimeError(
-                f"snapshot {flag}: loaded revision {revision} != attested {want}"
+                f"snapshot {flag}: loaded revision {snap.name} != attested {want['revision']}"
             )
-        got[flag] = revision
+        for name, sha in sorted(want["files"].items()):
+            h = hashlib.sha256()
+            with open((snap / name).resolve(), "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 22), b""):
+                    h.update(chunk)
+            if h.hexdigest() != sha:
+                raise RuntimeError(
+                    f"snapshot {flag}: {name} differs from its attested sha256"
+                )
+        got[flag] = snap.name
     return got
 
 

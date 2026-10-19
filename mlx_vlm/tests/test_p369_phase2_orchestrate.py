@@ -786,8 +786,9 @@ def test_the_campaign_has_no_wall_limit_unless_the_operator_sets_one():
 def test_run_pick_saves_each_step_as_it_finishes(monkeypatch):
     saved = []
     camp = object.__new__(orchestrate.Campaign)
-    camp.stack = None
+    camp.stack, camp.bench_paths = None, []
     monkeypatch.setattr(orchestrate, "c84_items", lambda stack, pick: [])
+    monkeypatch.setattr(orchestrate, "stack_bench_problems", lambda stack, paths: [])
     camp.size = lambda pick, thresholds: {}
     camp.check_reconstruction = lambda pick, items: {}
     camp.e1c = lambda pick, prompts, smoke: {"T1024": _v()}

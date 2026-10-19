@@ -267,7 +267,9 @@ def reviewed_head_problems(phase, reviewed, head):
             if phase == "full"
             else []
         )
-    if reviewed != head and not head.startswith(reviewed):
+    if (
+        reviewed != head
+    ):  # code round 3 H9: full ids only (resolve_commit), never a prefix
         return [f"--reviewed-head {reviewed} is not HEAD {head}"]
     return []
 
@@ -278,15 +280,78 @@ def env_digest(env):
     return dict(names=sorted(env), sha256=hashlib.sha256(items.encode()).hexdigest())
 
 
+def resolve_commit(repo, value):
+    """``value`` (any commit-ish) as the full commit id in ``repo``; anything else refuses."""
+    out = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            f"{value}^{{commit}}",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if out.returncode != 0 or not out.stdout.strip():
+        raise SystemExit(f"--reviewed-head {value!r} is not a commit in {repo}")
+    return out.stdout.strip()
+
+
 def hf_hub_cache(env, home):
     """The Hugging Face hub cache as ``huggingface_hub`` resolves it: HF_HUB_CACHE, else
-    HUGGINGFACE_HUB_CACHE, else ``$HF_HOME/hub``, else ``~/.cache/huggingface/hub``."""
+    HUGGINGFACE_HUB_CACHE, else ``$HF_HOME/hub``, else ``$XDG_CACHE_HOME/huggingface/hub``, else
+    ``~/.cache/huggingface/hub``."""
     for key in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
         if env.get(key):
             return Path(env[key])
     if env.get("HF_HOME"):
         return Path(env["HF_HOME"]) / "hub"
+    if env.get("XDG_CACHE_HOME"):
+        return Path(env["XDG_CACHE_HOME"]) / "huggingface" / "hub"
     return Path(home) / ".cache" / "huggingface" / "hub"
+
+
+def stack_bench_problems(stack, paths):
+    """Code round 3 H9: the stack inputs the C84 reconstruction imports (``benchmark/bench``, the bundles)
+    must be clean in the worktree — the binding hashes their committed trees / files."""
+    porcelain = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(stack),
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--",
+            *paths,
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    lines = [line for line in porcelain.splitlines() if line.strip()]
+    return [f"stack bench inputs not clean: {lines[:10]}"] if lines else []
+
+
+def lock_path(env):
+    """Code round 3 H21: ONE canonical campaign lock, independent of ``--out``."""
+    if not env.get("STACK_WORKDIR"):
+        raise SystemExit("STACK_WORKDIR is not set (source the machine config)")
+    return Path(env["STACK_WORKDIR"]) / "p369" / "phase2" / ".lock"
+
+
+def out_problems(out, env):
+    """Out-of-repo artifacts belong under ``$STACK_WORKDIR`` (AGENTS.md); the campaign's under p369/phase2."""
+    root = (
+        Path(env.get("STACK_WORKDIR", "/nonexistent")) / "p369" / "phase2"
+    ).resolve()
+    out = Path(out).resolve()
+    if not out.is_relative_to(root) or out == root:
+        return [f"--out {out} is not a run directory under {root}"]
+    return []
 
 
 def tree_guard(fork_root, head):
@@ -1050,6 +1115,10 @@ class Campaign:
                 )
             )
         }
+        self.bench_paths = ["benchmark/bench", *sorted(bundles)]
+        problems = stack_bench_problems(self.stack, self.bench_paths)
+        if problems:  # code round 3 H9: the reconstruction imports these files
+            raise SystemExit(f"refused: {problems}")
         manifest = dict(
             production=PRODUCTION,
             fork_head=self.head,
@@ -1089,15 +1158,18 @@ class Campaign:
                 target=weights_record(model),
                 drafter=weights_record(drafter),
             )
-            self.attested[pick] = dict(
-                target=entry["target"]["revision"], drafter=entry["drafter"]["revision"]
-            )
+            self.attested[pick] = {
+                role: dict(revision=entry[role]["revision"], files=entry[role]["files"])
+                for role in ("target", "drafter")
+            }
         (self.out / "manifest.json").write_text(json.dumps(manifest, indent=1))
         return manifest
 
     def job(self, pick, name, mode, arm, requests, **extra):
         attested = self.attested[pick]
-        revisions = {"--model": attested["target"]}
+        revisions = {
+            "--model": attested["target"]
+        }  # {revision, files}: re-hashed by the worker
         if arm == "on":
             revisions["--draft-model"] = attested["drafter"]
         expect = dict(
@@ -1431,6 +1503,9 @@ class Campaign:
 
         thresholds = (1024, 65536) if smoke else THRESHOLDS
         prompts = self.size(pick, thresholds)
+        problems = stack_bench_problems(self.stack, self.bench_paths)
+        if problems:  # still exactly the bound bench inputs
+            raise RuntimeError(f"{pick}: {problems}")
         items = c84_items(self.stack, pick)
         record["reconstruction"] = self.check_reconstruction(
             pick, items[:2] if smoke else items
@@ -1597,11 +1672,12 @@ def main(argv=None):
         text=True,
         check=True,
     ).stdout.strip()
+    if args.reviewed_head:
+        args.reviewed_head = resolve_commit(args.fork_root, args.reviewed_head)
     problems = reviewed_head_problems(args.phase, args.reviewed_head, head)
+    problems += out_problems(out, os.environ)
     if problems:
         raise SystemExit(f"refused: {problems}")
-    if args.reviewed_head:
-        args.reviewed_head = head  # recorded as the full sha
     if args.phase == "full":
         if not args.smoke_summary:
             raise SystemExit("full: --smoke-summary of a passed smoke is required")
@@ -1614,7 +1690,8 @@ def main(argv=None):
         return
     if checks["problems"]:
         raise SystemExit(f"preflight refused: {checks['problems']}")
-    lock = out.parent / ".lock"
+    lock = lock_path(os.environ)
+    lock.parent.mkdir(parents=True, exist_ok=True)
     fd = acquire_lock(lock)
     import signal
 
