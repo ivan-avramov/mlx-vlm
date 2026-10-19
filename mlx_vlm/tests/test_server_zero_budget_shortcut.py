@@ -3,9 +3,14 @@
 Fork-only file. The batch loop ran the vision/text embedding (``_gpu_embed``) and built
 the generator before a zero-budget request was retired. It now answers immediately
 (context, one token-less ``length`` chunk, terminator) without embedding or prefill.
+Round 7 F29: it is answered before the ``Prefill started`` log line, too.
 """
 
+import logging
+from queue import Queue
+
 import mlx.core as mx
+import pytest
 from test_backend_label import TestBackendLabelReportsThePathThatRan as _Harness
 
 import mlx_vlm.server as server
@@ -52,3 +57,13 @@ def test_f26_zero_budget_request_skips_embedding_and_prefill(monkeypatch):
     assert token.finish_reason == "length" and token.token_count == 0
     assert rq.get_nowait() is None
     assert calls["embed"] == 0, "a zero-budget request ran the embedding"
+
+
+@pytest.mark.parametrize(("max_tokens", "logged"), [(0, False), (2, True)])
+def test_f29_only_a_request_that_prefills_logs_prefill_started(
+    monkeypatch, caplog, max_tokens, logged
+):
+    caplog.set_level(logging.INFO, logger="mlx_vlm.server")
+    _Harness()._drive_run_once(monkeypatch, _queued(Queue(), max_tokens))
+    lines = [r.getMessage() for r in caplog.records]
+    assert any("Prefill started" in line for line in lines) is logged
