@@ -741,7 +741,9 @@ def test_overall_status_and_exit_code():
         },
     )
     assert orchestrate.overall_status(passing) == ("PASS", 0)
-    for key in ("e7a", "e7b"):  # code round 2 H10: E7 must be observed for a full PASS
+    # code round 2 H10 / P394 (2) refined: E7a (the incidence measure) must be observed for a full PASS;
+    # E7b (scripted chat continuity, descriptive by design) is reported and never gates
+    for key, want in (("e7a", ("NOT_PASS", 2)), ("e7b", ("PASS", 0))):
         thin = dict(
             passing,
             picks=dict(
@@ -753,7 +755,7 @@ def test_overall_status_and_exit_code():
                 },
             ),
         )
-        assert orchestrate.overall_status(thin) == ("NOT_PASS", 2), key
+        assert orchestrate.overall_status(thin) == want, key
     failing = dict(
         passing,
         picks=dict(passing["picks"], **{UNIFORM: dict(outcome=dict(e1c="FAIL"))}),
@@ -1241,3 +1243,44 @@ def test_the_whole_lifecycle_is_one_persistence_boundary(tmp_path, monkeypatch):
     with pytest.raises(SystemExit):
         camp.execute()
     assert saved[-1]["status"] == "INTERRUPTED"
+
+
+# ------------------------------------------------------------------ P394 (2) refined: E7b in the smoke, never a gate
+def _smoke_camp(monkeypatch, calls):
+    camp = object.__new__(orchestrate.Campaign)
+    camp.stack, camp.bench_paths = None, []
+    monkeypatch.setattr(orchestrate, "c84_items", lambda stack, pick: ["i0", "i1"])
+    camp.check_bench = lambda pick: None
+    camp.size = lambda pick, thresholds: {}
+    camp.check_reconstruction = lambda pick, items: {}
+    camp.e1c = lambda pick, prompts, smoke: {"T1024": _v()}
+    camp.e2 = lambda pick, items, prompts, smoke: dict(verdict="PASS")
+    camp.e7a = lambda pick, items: calls.append(("e7a", items)) or dict(
+        status="OBSERVED"
+    )
+    camp.e7b = lambda pick, items, sessions=5: calls.append(("e7b", sessions)) or dict(
+        sessions=[dict(name="i0", censored=True)], status="INCOMPLETE"
+    )
+    camp.summary = dict(picks={})
+    camp.write_summary = lambda: None
+    return camp
+
+
+def test_the_smoke_runs_one_e7b_session_and_no_e7a(monkeypatch):
+    calls = []
+    record = _smoke_camp(monkeypatch, calls).run_pick(FABLE, smoke=True)
+    assert calls == [("e7b", 1)] and record["e7b"]["status"] == "INCOMPLETE"
+    calls.clear()
+    _smoke_camp(monkeypatch, calls).run_pick(FABLE, smoke=False)
+    assert [c[0] for c in calls] == ["e7a", "e7b"] and calls[1] == ("e7b", 5)
+
+
+def test_the_smoke_gate_needs_e7b_to_have_run_not_to_be_continuous():
+    camp = object.__new__(orchestrate.Campaign)
+    record = dict(outcome=dict(e1c="PASS"), e1c={}, e2=dict(verdict="PASS"), wall_s=60)
+    camp.summary = dict(picks={FABLE: record})
+    assert any("E7b" in p for p in camp.smoke_gate()["problems"])  # never ran
+    record["e7b"] = dict(sessions=[dict(censored=True)], status="INCOMPLETE")
+    gate = camp.smoke_gate()
+    assert gate["pass_"], gate  # ran and reported: a censored session does not block
+    assert gate["e7b"][FABLE] == "INCOMPLETE"
