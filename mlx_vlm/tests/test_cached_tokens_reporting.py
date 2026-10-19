@@ -426,6 +426,7 @@ class TestEveryStreamingTokenSiteIsAccountedFor:
         sites = self._streaming_token_sites()
         assert sorted(s.function for s in sites) == [
             "_process_cached_request",
+            "_run_impl",  # P369 round-6 F26: the zero-budget short-circuit
             "_step",
             "feed",
         ], [(s.lineno, s.function) for s in sites]

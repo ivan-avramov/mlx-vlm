@@ -2652,6 +2652,8 @@ class ResponseGenerator:
                                 token=0,
                                 logprobs=0.0,
                                 finish_reason="length",
+                                cached_tokens=0,  # no prefix reused (nothing ran)
+                                prompt_tps=None,  # no prefill ran
                                 token_count=0,
                                 emitted_at=time.perf_counter(),
                             )
