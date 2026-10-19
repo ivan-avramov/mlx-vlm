@@ -223,3 +223,36 @@ def test_smoke_positives_fire_on_live_data(pick):
     assert {"raw_ulp", "in_support", "old_prefix_k", "recurrent", "probe_logit"} <= set(
         got["fired"]
     )
+
+
+# ------------------------------------------------------------------ same-instance pairing (P391)
+def test_drafter_detached_restores_the_same_objects():
+    drafter = object()
+    rg = types.SimpleNamespace(draft_model=drafter, draft_kind="mtp")
+    with worker.drafter_detached(rg):
+        assert rg.draft_model is None and rg.draft_kind is None
+    assert rg.draft_model is drafter and rg.draft_kind == "mtp"
+    with pytest.raises(ZeroDivisionError):
+        with worker.drafter_detached(rg):
+            1 / 0
+    assert rg.draft_model is drafter and rg.draft_kind == "mtp"
+
+
+def test_snapshot_holder_splits_prompt_end_and_commits(tmp_path):
+    probe = compare.as_record(mx.arange(3).astype(mx.float32))
+    snaps = [
+        dict(offset=8, sha="a" * 64, neutral=True, kind="prompt_end", probe=probe),
+        dict(offset=11, sha="b" * 64, neutral=True, kind="block", probe=probe),
+    ]
+    worker.save_snapshots(tmp_path / "s.npz", snaps)
+    holder = worker.snapshot_holder(worker.load_snapshots(tmp_path / "s.npz"), rows=[])
+    assert holder.prompt_end["offset"] == 8 and [
+        c["offset"] for c in holder.commits
+    ] == [11]
+    plain = [dict(s, kind="plain") for s in snaps]
+    worker.save_snapshots(tmp_path / "p.npz", plain)
+    holder = worker.snapshot_holder(worker.load_snapshots(tmp_path / "p.npz"))
+    assert holder.prompt_end is None and [c["offset"] for c in holder.commits] == [
+        8,
+        11,
+    ]
