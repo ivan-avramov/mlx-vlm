@@ -89,6 +89,18 @@ def _validate_speculative_sampling(draft_model: nn.Module, greedy: bool) -> None
         )
 
 
+def _refuse_batched_mtp():
+    # Fork: fork-only helper (P369 round-4 F12).
+    """Batched MTP commits whole accepted blocks per row and cannot match plain
+    decoding's per-row stop / budget state; it decodes plainly, so the public batched
+    entry points refuse it (``_mtp_rounds_batch`` stays a private unit)."""
+    SPECULATION_FALLBACKS["mtp_batched_refused"] += 1
+    raise NotImplementedError(
+        "batched MTP decoding is disabled (it cannot match plain decoding's per-row "
+        "stop state); batched MTP requests decode plainly."
+    )
+
+
 def get_speculative_rounds_batch(draft_kind: str):
     # Fork: dispatches draft_kind == "suffix" to the fork's drafter-free
     # n-gram / prompt-lookup speculation (863441c9), which upstream does not
@@ -96,7 +108,7 @@ def get_speculative_rounds_batch(draft_kind: str):
     if draft_kind == "eagle3":
         return _eagle3_rounds_batch
     if draft_kind == "mtp":
-        return _mtp_rounds_batch
+        _refuse_batched_mtp()
     if draft_kind == "dflash":
         return _dflash_rounds_batch
     if draft_kind == "suffix":
@@ -276,25 +288,7 @@ def run_speculative_server_rounds(
         )
 
     if draft_kind == "mtp":
-        yield from _mtp_rounds_batch(
-            model,
-            draft_model,
-            prompt_cache,
-            hidden,
-            shared_kv_states,
-            prompt_tokens=prompt_tokens,
-            first_bonus=first_bonus,
-            max_tokens=max_tokens,
-            sampler=sampler,
-            draft_block_size=draft_block_size,
-            token_dtype=token_dtype,
-            stop_check=stop_check,
-            eos_token_ids=eos_token_ids,
-            greedy_sampling=greedy_sampling,
-            row_ids=row_ids,
-            thinking_budget_criteria=thinking_budget_criteria,
-        )
-        return
+        _refuse_batched_mtp()  # Fork (P369 round-4 F12)
 
     if draft_kind == "dflash":
         if batch_size == 1:
