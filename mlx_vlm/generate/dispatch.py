@@ -1604,24 +1604,26 @@ def _retire_session_on_abnormal_exit(fn):
             return state is not None and state._epoch != epoch
 
         completed = False
-        terminal = False
         try:
             for chunk in inner:
-                terminal = getattr(chunk, "finish_reason", None) is not None
+                if getattr(chunk, "finish_reason", None) is not None:
+                    # Round 6 F22 (supersedes round 3's drain-on-close): hold the
+                    # terminal chunk until the session has been PUBLISHED. Nothing
+                    # but publication runs after it, so the caller either gets a
+                    # finished stream with a valid session or the publication's
+                    # exception (and a cleared session) — never a silent success.
+                    # A close right after the terminal chunk then finds nothing left.
+                    if stale():
+                        return
+                    for _ in inner:
+                        pass
+                    completed = True
+                    yield chunk
+                    return
                 yield chunk
                 if stale():
                     return
             completed = True
-        except GeneratorExit:
-            # Round 3 F8: publication runs after the terminal yield; a consumer
-            # that closes on ``finish_reason`` has a complete, valid generation,
-            # so finish the stream (no decoding is left, only the publication)
-            # exactly as a drained consumer would, instead of dropping the session.
-            if terminal and not stale():
-                for _ in inner:
-                    pass
-                completed = True
-            raise
         finally:
             if state is not None and not stale():
                 if not completed:
