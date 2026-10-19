@@ -3014,7 +3014,9 @@ class BatchGenerator:
         self.draft_kind = draft_kind
         self.draft_block_size = draft_block_size
         self.greedy_sampling = greedy_sampling or sampler is None
-        if self.draft_model is not None:
+        # Fork (P369 round-5 F17): only a drafter that can actually speculate in
+        # batches restricts logprobs / APC; batched mtp always decodes plainly.
+        if _effective_prefill_draft(self.draft_model, self.draft_kind)[0] is not None:
             apc_manager = None
             compute_logprobs = False
             top_logprobs_k = 0
