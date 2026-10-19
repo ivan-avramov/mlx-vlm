@@ -897,13 +897,15 @@ def stream_generate(
     # _is_template_thinking_asymmetric on the (processor, template_kwargs)
     # pair). When True the chat template strips thinking content from prior
     # assistant messages → cache must anchor BEFORE the latest user message.
-    # Read from PromptCacheState (server sets it once per session) with an
-    # explicit kwarg override for tests / callers without a PromptCacheState.
-    is_asymmetric_rendering = bool(kwargs.pop("is_asymmetric_rendering", False))
-    if prompt_cache_state is not None and not is_asymmetric_rendering:
-        is_asymmetric_rendering = bool(
+    # The server forwards it per request (P369 round-6 F23). Fork (round-7 F23):
+    # an explicit kwarg (True OR False) is authoritative; the PromptCacheState's
+    # legacy attribute is read only when the request carries no flag.
+    is_asymmetric_rendering = kwargs.pop("is_asymmetric_rendering", None)
+    if is_asymmetric_rendering is None:
+        is_asymmetric_rendering = prompt_cache_state is not None and bool(
             getattr(prompt_cache_state, "is_asymmetric_rendering", False)
         )
+    is_asymmetric_rendering = bool(is_asymmetric_rendering)
 
     input_ids, pixel_values, mask, _ = _prepare_generation_inputs(
         model, processor, prompt, image, audio, video, kwargs
