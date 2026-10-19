@@ -791,37 +791,6 @@ def _prime_cached_prefix_rope_state(
 from .ar import generate_step
 
 
-def _retire_session_on_abnormal_exit(fn):
-    # Fork: fork-only helper (P369 round-2 F5).
-    """Clear the request's ``PromptCacheState`` unless the stream ran to completion.
-
-    The session cache is mutated in place while the label (``token_ids``) is only
-    published after the last chunk. A consumer that stops early (cancel, disconnect,
-    ``close()``), or an exception, would leave the old label over a cache holding the
-    prompt and decoded tokens; MTP additionally commits whole verified blocks before
-    yielding. Retiring the session on every such exit, for every draft kind, makes the
-    next turn re-prefill from scratch (identical for MTP-ON and OFF).
-    """
-
-    def wrapper(*args, **kwargs):
-        state = kwargs.get("prompt_cache_state")
-        completed = False
-        try:
-            yield from fn(*args, **kwargs)
-            completed = True
-        finally:
-            if state is not None and not completed:
-                state.clear()
-
-    wrapper.__name__ = fn.__name__
-    wrapper.__qualname__ = fn.__qualname__
-    wrapper.__doc__ = fn.__doc__
-    wrapper.__module__ = fn.__module__
-    wrapper.__annotations__ = dict(getattr(fn, "__annotations__", {}))
-    wrapper.__wrapped__ = fn
-    return wrapper
-
-
 def stream_generate(
     model: nn.Module,
     processor: ProcessorLike | PreTrainedTokenizer,
@@ -1596,6 +1565,38 @@ def stream_generate(
 
         # Cleanup after generation
         mx.clear_cache()
+
+
+# Fork: fork-only helper (P369 round-2 F5).
+def _retire_session_on_abnormal_exit(fn):
+    # Fork: fork-only helper (P369 round-2 F5).
+    """Clear the request's ``PromptCacheState`` unless the stream ran to completion.
+
+    The session cache is mutated in place while the label (``token_ids``) is only
+    published after the last chunk. A consumer that stops early (cancel, disconnect,
+    ``close()``), or an exception, would leave the old label over a cache holding the
+    prompt and decoded tokens; MTP additionally commits whole verified blocks before
+    yielding. Retiring the session on every such exit, for every draft kind, makes the
+    next turn re-prefill from scratch (identical for MTP-ON and OFF).
+    """
+
+    def wrapper(*args, **kwargs):
+        state = kwargs.get("prompt_cache_state")
+        completed = False
+        try:
+            yield from fn(*args, **kwargs)
+            completed = True
+        finally:
+            if state is not None and not completed:
+                state.clear()
+
+    wrapper.__name__ = fn.__name__
+    wrapper.__qualname__ = fn.__qualname__
+    wrapper.__doc__ = fn.__doc__
+    wrapper.__module__ = fn.__module__
+    wrapper.__annotations__ = dict(getattr(fn, "__annotations__", {}))
+    wrapper.__wrapped__ = fn
+    return wrapper
 
 
 # Fork (P369 round-2 F5): rebinding, not a decorator line, keeps the upstream def intact.

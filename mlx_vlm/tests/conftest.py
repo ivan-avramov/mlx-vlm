@@ -44,6 +44,29 @@ def pytest_sessionfinish(session, exitstatus):
 
 # Fork additions below this line
 
+import pytest  # noqa: E402  Fork: autouse determinism fixture below
+
+TEST_RANDOM_SEED = 0
+
+
+@pytest.fixture(autouse=True)
+def _deterministic_random_state():
+    """Every test starts from the same mx / numpy / python random state.
+
+    Unseeded draws made results depend on suite order and on which tests ran before
+    (a tolerance-edge test flaked in ~25% of runs); the operator requires zero
+    nondeterministic tests. A test that wants a different stream seeds itself.
+    """
+    import random
+
+    import mlx.core as mx
+    import numpy as np
+
+    mx.random.seed(TEST_RANDOM_SEED)
+    np.random.seed(TEST_RANDOM_SEED)
+    random.seed(TEST_RANDOM_SEED)
+    yield
+
 # path -> (missing symbol, what porting it actually requires)
 #
 # Empty as of the mlx-lm vendoring: adopting upstream's models/base.py brought
