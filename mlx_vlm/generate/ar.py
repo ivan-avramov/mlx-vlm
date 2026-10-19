@@ -3052,6 +3052,7 @@ class BatchGenerator:
         )
         self._prompt_batch: Optional[PromptProcessingBatch] = None
         self._unprocessed_sequences = []
+        self._zero_budget_uids = []  # Fork (P369 round-5 F16)
 
         self._prompt_tokens_counter = 0
         self._prompt_time_counter = 0
@@ -3420,8 +3421,13 @@ class BatchGenerator:
         """
         uids = []
 
+        # Fork (P369 round-5 F16): only ``None`` selects the default; 0 means zero.
         if max_tokens is None or isinstance(max_tokens, int):
-            max_tokens = [max_tokens or self.max_tokens] * len(prompts)
+            max_tokens = [self.max_tokens if max_tokens is None else max_tokens] * len(
+                prompts
+            )
+        else:
+            max_tokens = [self.max_tokens if m is None else m for m in max_tokens]
 
         if prompt_kwargs is None:
             prompt_kwargs = [{} for _ in range(len(prompts))]
@@ -3452,6 +3458,13 @@ class BatchGenerator:
             thinking_budget_criteria,
             seeds,
         ):
+            if m <= 0:
+                # Fork (P369 round-5 F16): a zero budget is retired before any
+                # prefill or sampling; it only reports its finish on the next step.
+                self._zero_budget_uids.append(self.uid_count)
+                uids.append(self.uid_count)
+                self.uid_count += 1
+                continue
             self._unprocessed_sequences.append((self.uid_count, p, m, kw, lp, tc, sd))
             uids.append(self.uid_count)
             self.uid_count += 1
@@ -3464,6 +3477,9 @@ class BatchGenerator:
     def remove(self, uid) -> bool:
         """Remove a sequence from the batch by uid."""
         with mx.stream(self._stream):
+            if uid in self._zero_budget_uids:  # Fork (P369 round-5 F16)
+                self._zero_budget_uids.remove(uid)
+                return True
             # Waiting in the queue.
             for i, (seq_uid, _, _, _, _, _, _) in enumerate(
                 self._unprocessed_sequences
@@ -3507,6 +3523,7 @@ class BatchGenerator:
             len(self._generation_batch) > 0
             or self._prompt_batch is not None
             or len(self._unprocessed_sequences) > 0
+            or len(self._zero_budget_uids) > 0  # Fork (P369 round-5 F16)
         )
 
     def stats(self):
@@ -3744,7 +3761,17 @@ class BatchGenerator:
 
     def next(self, **kwargs):
         with mx.stream(self._stream):
-            return self._next(**kwargs)
+            prompt_responses, generation_responses = self._next(**kwargs)
+        if self._zero_budget_uids:
+            # Fork (P369 round-5 F16): zero-budget rows finish with no token.
+            generation_responses = [
+                GenerationBatch.Response(
+                    uid=uid, token=None, token_logprob=0.0, finish_reason="length"
+                )
+                for uid in self._zero_budget_uids
+            ] + list(generation_responses)
+            self._zero_budget_uids = []
+        return prompt_responses, generation_responses
 
 
 def batch_generate(

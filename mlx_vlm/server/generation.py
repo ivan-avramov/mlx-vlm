@@ -526,7 +526,11 @@ def _apply_generation_budget(args: "GenerationArguments", prompt_tokens: int) ->
     and yielding no visible response). The criteria only actually fires for
     thinking prompts, so this is a no-op for non-thinking requests.
     """
-    requested = max(0, int(args.max_tokens or 0))
+    # Fork (P369 round-5 F16): only None selects the server default; 0 stays 0.
+    requested = max(
+        0,
+        int(get_server_max_tokens() if args.max_tokens is None else args.max_tokens),
+    )
     effective = _resolve_generation_budget(prompt_tokens, requested)
     args.max_tokens = effective
     headroom_cap = max(1, int(effective * THINKING_BUDGET_CLAMP_RATIO))
