@@ -697,13 +697,51 @@ def _read_json(path):
         return None
 
 
+def launch_worker(cmd, *, stdout, env):
+    """Code round 2 H17: every worker starts in its own session / process group, so a stop reaches every
+    descendant it spawned."""
+    return subprocess.Popen(
+        cmd, stdout=stdout, stderr=subprocess.STDOUT, env=env, start_new_session=True
+    )
+
+
+def _signal(proc, sig):
+    """Signal ``proc``'s whole process group when it leads one (``launch_worker``), else ``proc`` alone."""
+    try:
+        if os.getpgid(proc.pid) == proc.pid:
+            os.killpg(proc.pid, sig)
+            return
+    except ProcessLookupError:
+        pass
+    try:
+        os.kill(proc.pid, sig)
+    except ProcessLookupError:
+        pass
+
+
 def _stop(proc, grace_s):
-    proc.terminate()
+    """SIGTERM, ``grace_s`` to exit, then SIGKILL to the group (descendants that outlived the worker too)."""
+    import signal
+
+    _signal(proc, signal.SIGTERM)
     try:
         proc.wait(grace_s)
     except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
+        pass
+    _kill_group(proc)
+    proc.wait()
+
+
+def _kill_group(proc):
+    import signal
+
+    try:
+        os.killpg(
+            proc.pid, signal.SIGKILL
+        )  # a group survives its leader while a member lives
+    except (ProcessLookupError, PermissionError):
+        if proc.poll() is None:
+            proc.kill()
 
 
 def supervise(
@@ -745,9 +783,13 @@ def supervise(
                 deadline_s=progress["deadline_s"],
                 elapsed_s=round(time.time() - progress["started"], 1),
             )
-        if info is not None:
+        if (
+            info is not None
+        ):  # code round 2 H8: the decision is durable BEFORE the signal
+            tmp = job_dir / ".timeout.json.tmp"
+            tmp.write_text(json.dumps(info, indent=1))
+            os.replace(tmp, job_dir / "timeout.json")
             _stop(proc, grace_s)
-            (job_dir / "timeout.json").write_text(json.dumps(info, indent=1))
             return info
         time.sleep(poll_s)
 
@@ -787,7 +829,7 @@ def run_job(job, fork_root, env, monitor, *, deadline):
     monitor.current, monitor.current_dir = job["name"], job_dir
     python = str(Path(fork_root) / ".venv" / "bin" / "python")
     with (job_dir / "worker.log").open("w") as log:
-        proc = subprocess.Popen(
+        proc = launch_worker(
             [
                 python,
                 "-I",
@@ -795,7 +837,6 @@ def run_job(job, fork_root, env, monitor, *, deadline):
                 str(job_dir / "job.json"),
             ],
             stdout=log,
-            stderr=subprocess.STDOUT,
             env=env,
         )
         try:
@@ -809,6 +850,8 @@ def run_job(job, fork_root, env, monitor, *, deadline):
         except BaseException:
             _stop(proc, 5)
             raise
+        if outcome["outcome"] == "exited":
+            _kill_group(proc)  # H17: nothing the worker spawned outlives it
     if outcome["outcome"] != "exited":
         monitor.errors.append(f"{job['name']}: {outcome}")
         if outcome["outcome"] == "wall_limit":
@@ -1573,6 +1616,14 @@ def main(argv=None):
         raise SystemExit(f"preflight refused: {checks['problems']}")
     lock = out.parent / ".lock"
     fd = acquire_lock(lock)
+    import signal
+
+    def on_term(
+        signum, _frame
+    ):  # H17: a TERM stops the current worker group via run_job
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, on_term)  # HUP stays as nohup set it (ignored)
     try:
         summary = Campaign(args).execute()
     finally:

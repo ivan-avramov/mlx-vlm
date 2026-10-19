@@ -89,6 +89,18 @@ def atomic_write(path, payload):
 AFTER_REQUEST_S = 900.0  # release / idle wait / the next request's setup / shutdown
 
 
+def finish_request(out_dir, index, entry, name, cleanup):
+    """Code round 2 H8: the request's entry, then the ``after`` heartbeat, are durable BEFORE its cleanup
+    runs, so a cleanup hang is a ``hang_after`` (the observation kept), never a request timeout.
+    """
+    atomic_write(Path(out_dir) / f"req-{index}.json", entry)
+    write_progress(
+        out_dir, index=index, name=name, deadline_s=AFTER_REQUEST_S, phase="after"
+    )
+    for step in cleanup:
+        step()
+
+
 def write_progress(out_dir, *, index, name, deadline_s, phase="request"):
     """Code round 1 H8: the heartbeat the orchestrator's supervisor enforces — which request (or the
     ``after`` phase following it) is running, since when, and its deadline."""
@@ -888,6 +900,9 @@ def run_job(job, out_dir, result):
         for index, spec in enumerate(job["requests"]):
             entry = dict(name=spec["name"], index=index)
             timeout = float(spec["timeout_s"])
+            cleanup = (
+                []
+            )  # H8: session releases run after the entry and the after phase are durable
             write_progress(out_dir, index=index, name=spec["name"], deadline_s=timeout)
             if job["mode"] == "e1c_on":
                 part, rec = e1c_request(
@@ -1071,21 +1086,14 @@ def run_job(job, out_dir, result):
                     if (
                         job["mode"] != "e7b"
                     ):  # e7b keeps its one session across the turns
-                        release_session(got["chat_id"])
+                        cleanup.append(lambda cid=got["chat_id"]: release_session(cid))
                 if job["mode"] == "e7b":
-                    release_session(chat_id)
+                    cleanup.append(lambda cid=chat_id: release_session(cid))
                 entry["telemetry"] = tel.summary()
                 entry["verdict"] = telemetry.verdict(tel, manifest)
             else:
                 raise ValueError(f"unknown mode {job['mode']}")
-            atomic_write(out_dir / f"req-{index}.json", entry)
-            write_progress(
-                out_dir,
-                index=index,
-                name=spec["name"],
-                deadline_s=AFTER_REQUEST_S,
-                phase="after",
-            )
+            finish_request(out_dir, index, entry, spec["name"], cleanup)
             result["requests"].append(
                 {k: entry[k] for k in entry if k not in ("response", "turns")}
             )
