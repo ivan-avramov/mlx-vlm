@@ -468,6 +468,13 @@ def generate_step(
     # before chunked prefill can slice ``input_ids`` down to the last token, so
     # the proposer indexes the whole prompt (including any cached prefix).
     suffix_prompt_token_ids = None
+    # Fork (P369 round-4 F15): resolve the processor fallback BEFORE any speculative
+    # prefill setup, so a request that will decode plainly asks for no drafter
+    # captures and presents no drafter to the chunked-prefill / offload policies.
+    if draft_model is not None and _suffix_structured_fallback(
+        draft_kind, logits_processors, processors
+    ):
+        draft_model = None
     speculative_prefill = SpeculativePrefill(draft_kind, draft_model)
     speculative_prefill_capture_kwargs = {}
     if draft_model is not None:
