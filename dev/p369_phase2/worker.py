@@ -455,8 +455,87 @@ def main(job_path):
     atomic_write(out_dir / "result.json", result)
 
 
+@contextmanager
+def drafter_detached(rg):
+    """P391: the forced OFF replay on the SAME loaded target — the cached path reads ``draft_kind`` /
+    ``draft_model`` per request (``_inline_draft_kwargs``), so ``None`` there is plain decoding.
+    """
+    saved = (rg.draft_model, rg.draft_kind)
+    rg.draft_model, rg.draft_kind = None, None
+    try:
+        yield
+    finally:
+        rg.draft_model, rg.draft_kind = saved
+
+
+def snapshot_holder(snaps, rows=None):
+    """A comparison reference from saved snapshots: ``prompt_end`` (if recorded) and the rest as commits."""
+    from types import SimpleNamespace
+
+    first = snaps[0] if snaps and snaps[0]["kind"] == "prompt_end" else None
+    return SimpleNamespace(
+        prompt_end=first,
+        commits=[s for s in snaps if s is not first],
+        rows=rows,
+    )
+
+
+def e1c_request(
+    client, capture, lm, policy, manifest, spec, mode, timeout, **rec_kwargs
+):
+    """One E1c request: the recorder (ON or forced OFF), kernel telemetry, key-length spans."""
+    from p369_phase2 import observe, telemetry
+
+    tel = telemetry.KernelTelemetry(lm)
+    recorder = observe.Recorder(mode, lm=lm, **rec_kwargs)
+    real_probe = observe.probe
+
+    def frozen_probe(lm_, caches, token):
+        with probe_counters_frozen(policy), tel.probe():
+            return real_probe(lm_, caches, token)
+
+    observe.probe = frozen_probe
+    try:
+        with recorder, tel, observe.KeyLengths() as key_lengths:
+            got = post(
+                client, spec["payload"], f"p369-{uuid.uuid4().hex}", capture, timeout
+            )
+    finally:
+        observe.probe = real_probe
+    part = dict(got)
+    part["telemetry"] = tel.summary()
+    part["verify_scope_calls"] = sum(1 for c in tel.calls if c.get("scope") == "verify")
+    part["verdict"] = telemetry.verdict(tel, manifest)
+    part["offsets"] = (
+        [recorder.prompt_end["offset"]] if recorder.prompt_end else []
+    ) + [c["offset"] for c in recorder.commits]
+    part["prompt_end"] = recorder.prompt_end["offset"] if recorder.prompt_end else None
+    part["draft_rounds"] = recorder.draft_rounds
+    spans = sorted({(b["first_key"], b["last_key"]) for b in key_lengths.blocks})
+    part["key_spans"] = dict(
+        blocks=len(spans),
+        first=spans[0] if spans else None,
+        last=spans[-1] if spans else None,
+    )
+    threshold = spec.get("threshold")
+    part["straddle"] = (
+        observe.straddles(key_lengths.blocks, threshold) if threshold else None
+    )
+    return part, recorder
+
+
+def compare_pair(ref, recorder, n, params):
+    """Rows and states of a forced OFF ``recorder`` against a reference (ON recorder or holder)."""
+    from p369_phase2 import compare, observe
+
+    return dict(
+        rows=compare.compare_streams(ref.rows, recorder.rows, n, params),
+        states=observe.compare_states(ref, recorder),
+    )
+
+
 def run_job(job, out_dir, result):
-    from p369_phase2 import compare, observe, telemetry
+    from p369_phase2 import telemetry
 
     client = boot(job["argv"])
     with client, ExitStack() as stack:
@@ -469,14 +548,13 @@ def run_job(job, out_dir, result):
         rg = server.runtime.response_generator
         lm = rg.model.language_model
         policy = getattr(rg, "mtp_verify_policy", None)
-        result["manifest"] = telemetry.manifest_from_model(lm)
+        manifest = telemetry.manifest_from_model(lm)
+        result["manifest"] = manifest
         capture = stack.enter_context(Capture())
         if job["mode"] == "size":
             for spec in job["requests"]:
                 count = lambda text: prompt_tokens(  # noqa: E731
-                    client,
-                    [dict(role="user", content=text)],
-                    spec["payload"],
+                    client, [dict(role="user", content=text)], spec["payload"]
                 )
                 text, tokens = size_prompt(
                     count, spec["target"], prefix=spec["prefix"], suffix=spec["suffix"]
@@ -492,100 +570,103 @@ def run_job(job, out_dir, result):
                 )
                 result["requests"].append(dict(name=spec["name"], tokens=tokens))
             return
+        probe = dict(probe_token=int(job["probe_token"]))
+        params = job["params"]
         for index, spec in enumerate(job["requests"]):
             entry = dict(name=spec["name"], index=index)
             timeout = float(spec["timeout_s"])
-            tel = telemetry.KernelTelemetry(lm)
-            if job["mode"] in ("e1c_on", "e1c_off"):
-                rec_kwargs = dict(lm=lm, probe_token=int(job["probe_token"]))
-                if job["mode"] == "e1c_off":
-                    # The ON artifacts are per request (a straddle cell may come from a re-seeded ON job).
-                    on_meta = json.loads(Path(spec["on_req"]).read_text())
-                    rec_kwargs.update(
-                        force_tokens=on_meta["final"]["token_ids"],
-                        hash_offsets=on_meta["offsets"],
-                    )
-                recorder = observe.Recorder(
-                    "on" if job["mode"] == "e1c_on" else "off", **rec_kwargs
+            if job["mode"] == "e1c_on":
+                part, rec = e1c_request(
+                    client, capture, lm, policy, manifest, spec, "on", timeout, **probe
                 )
-                real_probe = observe.probe
-
-                def frozen_probe(lm_, caches, token):
-                    with probe_counters_frozen(policy), tel.probe():
-                        return real_probe(lm_, caches, token)
-
-                observe.probe = frozen_probe
-                try:
-                    with recorder, tel, observe.KeyLengths() as key_lengths:
-                        got = post(
+                entry.update(part)
+                save_rows(out_dir / f"rows-{index}.npz", rec.rows)
+                save_snapshots(
+                    out_dir / f"snaps-{index}.npz",
+                    ([rec.prompt_end] if rec.prompt_end else []) + rec.commits,
+                )
+            elif job["mode"] == "e1c_pair":
+                part, on = e1c_request(
+                    client, capture, lm, policy, manifest, spec, "on", timeout, **probe
+                )
+                entry.update(part)
+                save_rows(out_dir / f"rows-{index}.npz", on.rows)
+                save_snapshots(
+                    out_dir / f"snaps-{index}.npz",
+                    ([on.prompt_end] if on.prompt_end else []) + on.commits,
+                )
+                tokens, n = part["final"]["token_ids"], len(part["final"]["token_ids"])
+                same = dict(model=id(rg.model), policy=id(policy))
+                replays = []
+                with drafter_detached(rg):
+                    for k in range(2):  # the same-instance OFF replay, then control C1
+                        off_part, off = e1c_request(
                             client,
-                            spec["payload"],
-                            f"p369-{uuid.uuid4().hex}",
                             capture,
+                            lm,
+                            policy,
+                            manifest,
+                            spec,
+                            "off",
                             timeout,
+                            force_tokens=tokens,
+                            hash_offsets=part["offsets"],
+                            **probe,
                         )
-                finally:
-                    observe.probe = real_probe
-                entry.update(got)
-                entry["telemetry"] = tel.summary()
-                entry["verdict"] = telemetry.verdict(tel, result["manifest"])
-                offsets = []
-                if recorder.prompt_end is not None:
-                    offsets.append(recorder.prompt_end["offset"])
-                offsets += [c["offset"] for c in recorder.commits]
-                entry["offsets"] = offsets
-                entry["prompt_end"] = (
-                    recorder.prompt_end["offset"] if recorder.prompt_end else None
-                )
-                entry["draft_rounds"] = recorder.draft_rounds
-                spans = sorted(
-                    {(b["first_key"], b["last_key"]) for b in key_lengths.blocks}
-                )
-                entry["key_spans"] = dict(
-                    blocks=len(spans),
-                    first=spans[0] if spans else None,
-                    last=spans[-1] if spans else None,
-                )
-                threshold = spec.get("threshold")
-                entry["straddle"] = (
-                    observe.straddles(key_lengths.blocks, threshold)
-                    if threshold
-                    else None
-                )
-                save_rows(out_dir / f"rows-{index}.npz", recorder.rows)
-                snaps = (
-                    ([recorder.prompt_end] if recorder.prompt_end else [])
-                    + recorder.commits
-                    if job["mode"] == "e1c_on"
-                    else [recorder.states[o] for o in sorted(recorder.states)]
-                )
-                save_snapshots(out_dir / f"snaps-{index}.npz", snaps)
-                if job["mode"] == "e1c_off":
-                    n = len(on_meta["final"]["token_ids"])
-                    on_rows = load_rows(spec["on_rows"])
-                    entry["rows"] = compare.compare_streams(
-                        on_rows, recorder.rows, n, job["params"]
+                        if off_part["verify_scope_calls"] or off_part["draft_rounds"]:
+                            raise RuntimeError(
+                                "a detached replay ran speculative rounds"
+                            )
+                        replays.append((off_part, off))
+                if dict(model=id(rg.model), policy=id(policy)) != same:
+                    raise RuntimeError(
+                        "the target / verify policy changed during the pair"
                     )
-                    on_snaps = load_snapshots(spec["on_snaps"])
-                    holder = type("Snaps", (), {})()
-                    holder.prompt_end = (
-                        on_snaps[0]
-                        if on_snaps and on_snaps[0]["kind"] == "prompt_end"
-                        else None
+                (off1_part, off1), (_, off2) = replays
+                save_rows(out_dir / f"rows-off-{index}.npz", off1.rows)
+                save_snapshots(
+                    out_dir / f"snaps-off-{index}.npz",
+                    [off1.states[o] for o in sorted(off1.states)],
+                )
+                entry["off_final"] = off1_part["final"]
+                entry["pair"] = compare_pair(on, off1, n, params)
+                c1_ref = snapshot_holder(
+                    [off1.states[o] for o in sorted(off1.states)], rows=off1.rows
+                )
+                entry["c1"] = compare_pair(c1_ref, off2, n, params)
+                if spec.get("smoke_positives"):
+                    entry["smoke_positives"] = smoke_positives(on, off1, n, params)
+            elif (
+                job["mode"] == "e1c_off"
+            ):  # control C2 (or the v4 cross-load comparison)
+                ref_meta = json.loads(Path(spec["on_req"]).read_text())
+                tokens = ref_meta["final"]["token_ids"]
+                part, rec = e1c_request(
+                    client,
+                    capture,
+                    lm,
+                    policy,
+                    manifest,
+                    spec,
+                    "off",
+                    timeout,
+                    force_tokens=tokens,
+                    hash_offsets=ref_meta["offsets"],
+                    **probe,
+                )
+                entry.update(part)
+                ref = snapshot_holder(
+                    load_snapshots(spec["on_snaps"]), rows=load_rows(spec["on_rows"])
+                )
+                entry.update(compare_pair(ref, rec, len(tokens), params))
+                if spec.get("smoke_positives"):
+                    entry["smoke_positives"] = smoke_positives(
+                        ref, rec, len(tokens), params
                     )
-                    holder.commits = [s for s in on_snaps if s["kind"] != "prompt_end"]
-                    off_holder = type("Snaps", (), {})()
-                    off_holder.states = dict(recorder.states)
-                    entry["states"] = observe.compare_states(holder, off_holder)
-                    if spec.get("smoke_positives"):
-                        holder.rows = on_rows
-                        entry["smoke_positives"] = smoke_positives(
-                            holder, recorder, n, job["params"]
-                        )
-                atomic_write(out_dir / f"req-{index}.json", entry)
             elif job["mode"] in ("e2", "e7a", "e7b"):
                 from p369_phase2 import classes
 
+                tel = telemetry.KernelTelemetry(lm)
                 observer = classes.Observer()
                 turns = spec.get("turns") or [spec["payload"]]
                 chat_id = f"p369-{uuid.uuid4().hex}"
@@ -618,10 +699,10 @@ def run_job(job, out_dir, result):
                     ]
                     entry["turns"].append(dict(got, events=events))
                 entry["telemetry"] = tel.summary()
-                entry["verdict"] = telemetry.verdict(tel, result["manifest"])
-                atomic_write(out_dir / f"req-{index}.json", entry)
+                entry["verdict"] = telemetry.verdict(tel, manifest)
             else:
                 raise ValueError(f"unknown mode {job['mode']}")
+            atomic_write(out_dir / f"req-{index}.json", entry)
             result["requests"].append(
                 {k: entry[k] for k in entry if k not in ("response", "turns")}
             )

@@ -587,6 +587,7 @@ class Campaign:
                 dict(
                     name=f"T{t}" if t else "short",
                     threshold=t,
+                    smoke_positives=smoke and t == max(prompts),
                     payload=dict(
                         model=pick,
                         messages=[dict(role="user", content=text)],
@@ -598,8 +599,8 @@ class Campaign:
                 )
                 for t, text in pending
             ]
-            name = f"e1c-on-a{attempt}"
-            self.run(self.job(pick, name, "e1c_on", "on", requests))
+            name = f"e1c-pair-a{attempt}"
+            self.run(self.job(pick, name, "e1c_pair", "on", requests))
             still = []
             for i, ((t, text), req) in enumerate(zip(pending, requests)):
                 path = self.out / pick / name / f"req-{i}.json"
@@ -627,31 +628,39 @@ class Campaign:
             requests.append(
                 dict(
                     cell["req"],
+                    # control C2: the cross-load OFF arm against the same-instance OFF (P391)
                     on_req=str(cell["dir"] / f"req-{cell['index']}.json"),
-                    on_rows=str(cell["dir"] / f"rows-{cell['index']}.npz"),
-                    on_snaps=str(cell["dir"] / f"snaps-{cell['index']}.npz"),
-                    smoke_positives=smoke and k == len(names) - 1,
+                    on_rows=str(cell["dir"] / f"rows-off-{cell['index']}.npz"),
+                    on_snaps=str(cell["dir"] / f"snaps-off-{cell['index']}.npz"),
+                    smoke_positives=False,
                 )
             )
-        self.run(self.job(pick, "e1c-off", "e1c_off", "off", requests))
+        self.run(self.job(pick, "e1c-c2", "e1c_off", "off", requests))
         verdicts = {}
         for i, name in enumerate(names):
             cell = accepted[name]
             on = json.loads((cell["dir"] / f"req-{cell['index']}.json").read_text())
-            off = json.loads(
-                (self.out / pick / "e1c-off" / f"req-{i}.json").read_text()
-            )
+            c2 = json.loads((self.out / pick / "e1c-c2" / f"req-{i}.json").read_text())
             v = e1c_verdict(
                 on,
-                off,
+                on["pair"],  # the verdict is the SAME-INSTANCE pair (P391)
                 threshold=cell["threshold"],
                 verify_policy=PICKS[pick]["verify_policy"],
             )
+            c1_ok = on["c1"]["rows"]["pass"] and on["c1"]["states"]["pass"]
+            if not c1_ok:
+                v["pass_"] = False
+                v["problems"].append("C1: two same-instance OFF replays differ (stop)")
             v.update(
-                rows=off["rows"],
-                states=off["states"],
+                pair=on["pair"],
+                c1=dict(identical=c1_ok, **on["c1"]),
+                c2=dict(
+                    identical=bool(c2["rows"]["pass"] and c2["states"]["pass"]),
+                    rows=c2["rows"],
+                    states=c2["states"],
+                ),
                 kernels=on["verdict"],
-                smoke_positives=off.get("smoke_positives"),
+                smoke_positives=on.get("smoke_positives"),
                 attempts=attempts[name],
             )
             verdicts[name] = v
