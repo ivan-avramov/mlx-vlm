@@ -76,11 +76,15 @@ def _scope_overridden_draw(request):
 
 @pytest.mark.parametrize("_scope_overridden_draw", [0], indirect=True, scope="module")
 def test_a_parametrize_scope_override_is_seeded_from_the_effective_scope(
-    _scope_overridden_draw,
+    request, _scope_overridden_draw
 ):
     """Round 7 F30: parametrization can override a fixture's declared scope; the
     setup is seeded from the scope it really runs under (``request.scope``)."""
     draw, node_id, scope = _scope_overridden_draw
     assert scope == "module"
     want = _draws(fixture_seed("module", node_id, "_scope_overridden_draw"))[0]
+    # Round 8 F31: unseeded, this setup runs right after the per-test autouse seed
+    # (pytest orders it by its DECLARED function scope), so it would draw exactly
+    # this — deterministically, and different from ``want``.
+    assert _draws(seed_for(request.node.nodeid))[0] != want
     assert draw == want
