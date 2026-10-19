@@ -195,3 +195,57 @@ def test_e6_control_default_seed_decodes_plain_for_the_batched_mtp_reason(lm):
     on, rounds = _run(lm, mtp_drafter(lm), request)
     assert on == plain and rounds == 0
     assert ar.SPECULATION_FALLBACKS["mtp_batched"] == 1
+
+
+# ------------------------------------------------------------ round 4 / F15
+def test_f15_inline_penalty_fallback_presents_plain_to_prefill_policies(lm, monkeypatch):
+    """A cached MTP request that falls back for a penalty must not request the
+    drafter's prefill captures nor present MTP to the chunked-prefill / offload
+    policies (an explicit unchunked MoE-offload prefill would bypass its default)."""
+    from test_mtp_exactness import fake_model
+
+    seen = {"capture": [], "offload": [], "chunked": []}
+    real_capture = ar.speculative_prefill_kwargs
+    real_offload = ar._default_prefill_step_size_for_offload
+    real_chunked = ar._chunked_prefill_enabled
+
+    monkeypatch.setattr(
+        ar,
+        "speculative_prefill_kwargs",
+        lambda k, d: (seen["capture"].append(k), real_capture(k, d))[1],
+    )
+    monkeypatch.setattr(
+        ar,
+        "_default_prefill_step_size_for_offload",
+        lambda m, step, draft, default: (
+            seen["offload"].append(draft),
+            real_offload(m, step, draft, default),
+        )[1],
+    )
+    monkeypatch.setattr(
+        ar,
+        "_chunked_prefill_enabled",
+        lambda m, **kw: (
+            seen["chunked"].append(kw.get("draft_model")),
+            real_chunked(m, **kw),
+        )[1],
+    )
+    model = fake_model(lm)
+    plain, _ = turn(
+        model, PROMPT, PromptCacheState(), n=N, prefill_step_size=4, repetition_penalty=1.3
+    )
+    seen.update(capture=[], offload=[], chunked=[])
+    drafter = mtp_drafter(lm)
+    on, _ = turn(
+        model,
+        PROMPT,
+        PromptCacheState(),
+        drafter=drafter,
+        n=N,
+        prefill_step_size=4,
+        repetition_penalty=1.3,
+    )
+    assert on == plain
+    assert seen["capture"] == []
+    assert seen["offload"] and all(d is None for d in seen["offload"])
+    assert all(d is None for d in seen["chunked"])

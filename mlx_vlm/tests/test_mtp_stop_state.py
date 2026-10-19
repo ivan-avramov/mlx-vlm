@@ -96,8 +96,8 @@ def turn(
         prefill_step_size=None,
         seed=seed,
         **(params or deployed_sampling(PICKS[0])),
-        **extra,
     )
+    kwargs.update(extra)  # an extra may override a default (e.g. prefill_step_size)
     if drafter is not None:
         kwargs.update(draft_model=drafter, draft_kind="mtp", draft_block_size=BLOCK)
     tokenizer = tokenizer or Tokenizer(stop_ids)
