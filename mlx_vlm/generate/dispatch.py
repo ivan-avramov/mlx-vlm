@@ -1331,6 +1331,11 @@ def stream_generate(
             finish_reason = "length"
 
         if not generated_tokens:
+            # Fork (P369 round-4 F10): the warm session's cache was extended by
+            # this request's prefill but nothing is published for it; retire it so
+            # the next turn re-prefills (identical for every draft kind).
+            if prompt_cache_state is not None:
+                prompt_cache_state.clear()
             prompt_time = time.perf_counter() - tic
             prompt_tps = total_prompt_tokens / prompt_time if prompt_time > 0 else 0.0
             yield GenerationResult(

@@ -361,6 +361,11 @@ def run_speculative_rounds(
     B = input_ids.shape[0]
     _validate_speculative_sampling(draft_model, sampler_is_greedy)
 
+    # Fork (P369 round-4 F10): a zero budget emits (and commits) nothing, as plain
+    # decoding does; the first sampled token is never yielded.
+    if max_tokens <= 0:
+        return
+
     if draft_kind == "suffix":
         if B != 1:
             raise NotImplementedError(
