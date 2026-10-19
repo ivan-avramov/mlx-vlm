@@ -13,11 +13,28 @@ succeeded inside it:
 - the entry raised → ``error`` (re-raised).
 
 The lm's ``speculative_argmax_from_hidden`` / ``speculative_logits_from_hidden`` calls are counted too.
-Calls made inside ``probe()`` are kept apart (``probe_calls``).
+Calls made inside ``probe()`` are kept apart (``probe_calls``). Each call carries its ``scope``: ``verify``
+inside ``speculative.mtp._mtp_verify_target`` / ``_mtp_acceptance_walk`` (the target's verify forward and
+its readout), else ``other`` (the drafter's proposals). ``verdict(telemetry, manifest)`` judges the verify
+scope against a static module manifest (``manifest_from_model``).
 """
 
 import collections
 from contextlib import contextmanager
+
+QUANTIZED_FAMILIES = {
+    "quantized_affine_optimized",
+    "quantized_singleton",
+    "quantized_linears_optimized",
+    "quantized_fused_decode",
+    "argmax_affine_optimized",
+    "argmax_nvfp4",
+    "argmax_singleton",
+}
+DENSE_FAMILIES = {"dense_exact"}
+FALLBACK_FAMILIES = {"fallback_singletons", "fallback_timewise"}
+FORBIDDEN_WIDE = {"plain_wide", "declined", "error"}
+SCOPES = ("_mtp_verify_target", "_mtp_acceptance_walk")
 
 ENTRIES = (
     "_target_verify_linear",
@@ -61,6 +78,7 @@ class KernelTelemetry:
         self._names = {id(m): name for name, m in lm.named_modules()}
         self._frames = []
         self._probe_depth = 0
+        self._scope_depth = 0
         self._patched = []
 
     # -- recording
@@ -71,7 +89,14 @@ class KernelTelemetry:
     def _record(self, entry, family, width, dtype, modules):
         target = self.probe_calls if self._probe_depth else self.calls
         target.append(
-            dict(entry=entry, family=family, width=width, dtype=dtype, modules=modules)
+            dict(
+                entry=entry,
+                family=family,
+                width=width,
+                dtype=dtype,
+                modules=modules,
+                scope="verify" if self._scope_depth else "other",
+            )
         )
 
     @contextmanager
@@ -146,13 +171,29 @@ class KernelTelemetry:
 
         return wrapped
 
+    def _scope(self, real):
+        telemetry = self
+
+        def wrapped(*args, **kwargs):
+            telemetry._scope_depth += 1
+            try:
+                return real(*args, **kwargs)
+            finally:
+                telemetry._scope_depth -= 1
+
+        return wrapped
+
     def _patch(self, owner, name, value):
         self._patched.append((owner, name, getattr(owner, name)))
         setattr(owner, name, value)
 
     def __enter__(self):
         from mlx_vlm.models.qwen3_5 import speculative_verifier as sv
+        from mlx_vlm.speculative import mtp
         from mlx_vlm.speculative.ops import linear as ops_linear
+
+        for name in SCOPES:
+            self._patch(mtp, name, self._scope(getattr(mtp, name)))
 
         for name in ENTRIES:
             self._patch(sv, name, self._entry(name, getattr(sv, name)))
@@ -169,3 +210,70 @@ class KernelTelemetry:
             owner, name, value = self._patched.pop()
             setattr(owner, name, value)
         return False
+
+
+def manifest_from_model(lm):
+    """``{module name: {kind, bits, group_size, mode}}`` for every linear / embedding of a loaded lm."""
+    import mlx.nn as nn
+
+    out = {}
+    for name, module in lm.named_modules():
+        if isinstance(module, nn.QuantizedLinear):
+            out[name] = dict(
+                kind="quantized",
+                bits=int(module.bits),
+                group_size=int(module.group_size),
+                mode=str(getattr(module, "mode", "affine")),
+            )
+        elif isinstance(module, nn.Linear):
+            out[name] = dict(kind="dense", bias="bias" in module)
+        elif isinstance(module, getattr(nn, "QuantizedEmbedding", ())):
+            out[name] = dict(kind="quantized", bits=int(module.bits))
+        elif isinstance(module, nn.Embedding):
+            out[name] = dict(kind="dense")
+    return out
+
+
+def _consistent(family, kinds):
+    parts = family.split("+")
+    for part in parts:
+        if part in FALLBACK_FAMILIES:
+            continue
+        if part in QUANTIZED_FAMILIES and "quantized" in kinds:
+            continue
+        if part in DENSE_FAMILIES and "dense" in kinds:
+            continue
+        return False
+    return True
+
+
+def verdict(telemetry, manifest):
+    """Judge the verify-scope calls: there are some; at width > 1 no forbidden family; every module is
+    known to the manifest; every family is consistent with its modules' kinds."""
+    problems = []
+    verify = [c for c in telemetry.calls if c.get("scope") == "verify"]
+    wide = [c for c in verify if c["width"] > 1]
+    if not verify:
+        problems.append("no verify-scope projection call")
+    for call in verify:
+        kinds = {manifest.get(m, {}).get("kind") for m in call["modules"]}
+        if any(m not in manifest for m in call["modules"]):
+            problems.append(f"unknown module in {call}")
+            continue
+        if call["family"] == "error":
+            problems.append(f"error in {call}")
+        elif call["width"] > 1 and call["family"] in FORBIDDEN_WIDE:
+            problems.append(f"forbidden wide family in {call}")
+        elif call["family"] not in ("plain", "declined") and not _consistent(
+            call["family"], kinds
+        ):
+            problems.append(f"family inconsistent with the manifest in {call}")
+    families = collections.Counter(c["family"] for c in wide)
+    return dict(
+        verify_calls=len(verify),
+        wide_calls=len(wide),
+        wide_families=dict(families),
+        problems=problems[:50],
+        problem_count=len(problems),
+        **{"pass": not problems},
+    )
