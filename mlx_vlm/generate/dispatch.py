@@ -1582,13 +1582,28 @@ def _retire_session_on_abnormal_exit(fn):
 
     def wrapper(*args, **kwargs):
         state = kwargs.get("prompt_cache_state")
+        inner = fn(*args, **kwargs)
         completed = False
+        terminal = False
         try:
-            yield from fn(*args, **kwargs)
+            for chunk in inner:
+                terminal = getattr(chunk, "finish_reason", None) is not None
+                yield chunk
             completed = True
+        except GeneratorExit:
+            # Round 3 F8: publication runs after the terminal yield; a consumer
+            # that closes on ``finish_reason`` has a complete, valid generation,
+            # so finish the stream (no decoding is left, only the publication)
+            # exactly as a drained consumer would, instead of dropping the session.
+            if terminal:
+                for _ in inner:
+                    pass
+                completed = True
+            raise
         finally:
             if state is not None and not completed:
                 state.clear()
+            inner.close()
 
     wrapper.__name__ = fn.__name__
     wrapper.__qualname__ = fn.__qualname__
