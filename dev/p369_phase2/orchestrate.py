@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 PRODUCTION = "4e6d0e03"
@@ -131,6 +132,9 @@ def worker_env(base):
         if k in ENV_ALLOW or k.startswith(ENV_ALLOW_PREFIXES)
     }
     env["MLX_VLM_CACHE_SESSION_MAX"] = "1"
+    # code round 4 H9: the worker loads only the cached (attested) snapshots — no mid-campaign download can
+    # change the weights; network access does not change generation
+    env["HF_HUB_OFFLINE"] = "1"
     return env
 
 
@@ -312,6 +316,31 @@ def hf_hub_cache(env, home):
     if env.get("XDG_CACHE_HOME"):
         return Path(env["XDG_CACHE_HOME"]) / "huggingface" / "hub"
     return Path(home) / ".cache" / "huggingface" / "hub"
+
+
+def stack_bench_state(stack, bundles):
+    """The stack bench inputs as bound: the committed ``benchmark/bench`` tree and each bundle file's sha256."""
+    tree = subprocess.run(
+        ["git", "-C", str(stack), "rev-parse", "HEAD:benchmark/bench"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    return dict(
+        tree=tree,
+        bundles={rel: sha256_file(Path(stack) / rel) for rel in sorted(bundles)},
+    )
+
+
+def stack_bench_drift(stack, want):
+    """Code round 4 H9: the stack bench inputs still equal the manifest (a clean checkout that MOVED is
+    drift too)."""
+    have = stack_bench_state(stack, want["bundles"])
+    return [
+        f"stack bench {key} drifted from the manifest"
+        for key in ("tree", "bundles")
+        if have[key] != want[key]
+    ]
 
 
 def stack_bench_problems(stack, paths):
@@ -774,26 +803,172 @@ def launch_worker(cmd, *, stdout, env):
     )
 
 
-def _signal(proc, sig):
-    """Signal ``proc``'s whole process group when it leads one (``launch_worker``), else ``proc`` alone."""
-    if _is_leader(proc):
+@contextmanager
+def deferred_signals(signals=None):
+    """Code round 4 H27: TERM / INT arriving while a worker is spawned and its cleanup ownership is published
+    are RECORDED (``pending``), not raised — Python runs handlers in the main thread only, so no other
+    thread can raise here either. No signal mask is touched, so the worker inherits none; the caller
+    replays ``pending`` once the worker is owned."""
+    import signal
+
+    signals = signals or (signal.SIGTERM, signal.SIGINT)
+    pending = []
+    old = {
+        s: signal.signal(s, lambda signum, frame: pending.append(signum))
+        for s in signals
+    }
+    try:
+        yield pending
+    finally:
+        for s, handler in old.items():
+            signal.signal(s, handler)
+
+
+PS_ENV = {"LC_ALL": "C", "LANG": "C"}
+
+
+def ps_table(*, retries=3, backoff_s=0.2, timeout_s=10.0):
+    """Code round 4 H28: ``{pid: {ppid, pgid, stat, start}}`` of every process (``ps``, ``LC_ALL=C`` so
+    ``lstart`` is "Mon Oct 19 14:03:12 2026"). A failure, a timeout, an unparseable line or a table without
+    this process RAISES after ``retries`` — process state is never assumed empty."""
+    last = None
+    for _ in range(retries):
         try:
-            os.killpg(proc.pid, sig)
-            return
+            out = subprocess.run(
+                ["ps", "-A", "-o", "pid=,ppid=,pgid=,stat=,lstart="],
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+                check=True,
+                env=dict(os.environ, **PS_ENV),
+            ).stdout
+        except (
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            OSError,
+        ) as exc:
+            last = exc
+            time.sleep(backoff_s)
+            continue
+        table = {}
+        for line in out.splitlines():
+            if not line.strip():
+                continue
+            parts = line.split(None, 4)
+            if len(parts) != 5 or not all(p.isdigit() for p in parts[:3]):
+                raise RuntimeError(f"unparseable ps line: {line!r}")
+            table[int(parts[0])] = dict(
+                ppid=int(parts[1]),
+                pgid=int(parts[2]),
+                stat=parts[3],
+                start=" ".join(parts[4].split()),
+            )
+        if os.getpid() not in table:
+            raise RuntimeError("the ps table lacks this process (partial output)")
+        return table
+    raise RuntimeError(f"ps failed {retries} times: {last}")
+
+
+class Descendants:
+    """Code rounds 3 H22, 4 H30: the identities (pid + start time) of a worker and of every process
+    descended from it, scanned at each supervisor poll, so a stop or a normal exit also reaches one that
+    left the worker's group (``setsid``). An identity counts only while its recorded start time still
+    matches: a stale (reused) pid is never a traversal frontier and never signalled. The worker's process
+    group (pgid = its pid) is used only while that pid is still the worker or absent. Residual (disclosed):
+    a helper that both spawns and escapes between two polls; pid reuse within one ``lstart`` second.
+    """
+
+    def __init__(self, root, *, table=None):
+        table = ps_table() if table is None else table
+        row = table.get(root)
+        if row is None:
+            raise RuntimeError(f"worker {root} is not in the process table")
+        self.root, self.root_start, self.seen = root, row["start"], {}
+
+    def _ours(self, pid, table):
+        row = table.get(pid)
+        if row is None:
+            return False
+        want = self.root_start if pid == self.root else self.seen.get(pid)
+        return row["start"] == want
+
+    def scan(self, table=None):
+        table = ps_table() if table is None else table
+        frontier = {pid for pid in [self.root, *self.seen] if self._ours(pid, table)}
+        grew = True
+        while grew:
+            grew = False
+            for pid, row in table.items():
+                if row["ppid"] in frontier and pid not in frontier:
+                    frontier.add(pid)
+                    self.seen[pid] = row["start"]
+                    grew = True
+        return table
+
+    def alive(self, table):
+        """Tracked identities still alive (non-zombie)."""
+        return sorted(
+            pid
+            for pid in self.seen
+            if self._ours(pid, table) and not table[pid]["stat"].startswith("Z")
+        )
+
+    def group_members(self, table):
+        """Live members of the worker's process group — refused once the worker's pid belongs to another
+        process (the cached group id is no longer ours)."""
+        row = table.get(self.root)
+        if row is not None and row["start"] != self.root_start:
+            raise RuntimeError(
+                f"process group {self.root} is no longer ours (pid reused)"
+            )
+        return sorted(
+            pid
+            for pid, r in table.items()
+            if r["pgid"] == self.root and not r["stat"].startswith("Z")
+        )
+
+
+def _owned_live(proc, tracker, table):
+    live = set(tracker.alive(table)) | set(tracker.group_members(table))
+    if proc.poll() is None:
+        live.add(proc.pid)
+    return live
+
+
+def _signal_each(pids, sig):
+    for pid in sorted(pids):
+        try:
+            os.kill(pid, sig)
         except ProcessLookupError:
             pass
-    try:
-        os.kill(proc.pid, sig)
-    except ProcessLookupError:
-        pass
 
 
 def _stop(proc, grace_s, tracker=None):
-    """SIGTERM, ``grace_s`` to exit, then SIGKILL to the group (descendants that outlived the worker too)
-    and to every tracked descendant that left it."""
+    """SIGTERM to the worker and every live owned identity, ``grace_s`` to exit, then ``reap``. Without a
+    usable tracker (the worker died before one existed, or ps keeps failing) the group just created is
+    SIGKILLed directly and the failure re-raised by ``reap``'s caller."""
     import signal
 
-    _signal(proc, signal.SIGTERM)
+    try:
+        if tracker is None:
+            tracker = Descendants(proc.pid)
+        targets = _owned_live(proc, tracker, tracker.scan())
+    except RuntimeError:
+        # no verifiable process state: SIGKILL the group launch_worker created — safe while the worker is
+        # unreaped (its pid, hence the group id, cannot be reused yet) — then fail closed if anything was
+        # tracked
+        if proc.returncode is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+        if tracker is None:
+            return
+        raise
+    _signal_each(targets, signal.SIGTERM)
     try:
         proc.wait(grace_s)
     except subprocess.TimeoutExpired:
@@ -801,115 +976,22 @@ def _stop(proc, grace_s, tracker=None):
     reap(proc, tracker)
 
 
-def _is_leader(proc):
-    """``proc`` leads its own group (``launch_worker``). Cached on the first observation while it lives,
-    because a reaped leader's pid can no longer be asked — and its group may outlive it.
-    """
-    if not hasattr(proc, "_p369_leader"):
-        try:
-            proc._p369_leader = os.getpgid(proc.pid) == proc.pid
-        except ProcessLookupError:
-            return False
-    return proc._p369_leader
-
-
-def _kill_group(proc):
+def reap(proc, tracker, *, wait_s=10.0):
+    """Code rounds 2 H17, 3 H22, 4 H29: SIGKILL the worker, every live member of its (still ours) group and
+    every tracked identity, re-scanning and re-signalling until NONE is alive; anything surviving
+    ``wait_s`` RAISES — the next launch never shares the GPU with it."""
     import signal
 
-    if _is_leader(proc):
-        try:
-            os.killpg(
-                proc.pid, signal.SIGKILL
-            )  # a group survives its leader while a member lives
-        except (ProcessLookupError, PermissionError):
-            pass
-    if proc.poll() is None:
-        proc.kill()
-
-
-def _ps_table():
-    """``{pid: (ppid, start)}`` of every process (``ps``; no psutil in the fork venv)."""
-    out = subprocess.run(
-        ["ps", "-A", "-o", "pid=,ppid=,lstart="], capture_output=True, text=True
-    ).stdout
-    table = {}
-    for line in out.splitlines():
-        parts = line.split(None, 2)
-        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
-            table[int(parts[0])] = (int(parts[1]), parts[2].strip())
-    return table
-
-
-class Descendants:
-    """Code round 3 H22: every process descended from a worker, seen at each supervisor poll (pid + start
-    time), so a stop or a normal exit also reaches one that left the worker's group (``setsid``). A pid is
-    killed only while its start time is unchanged (never a reused pid)."""
-
-    def __init__(self, root):
-        self.root, self.seen = root, {}
-
-    def scan(self):
-        table = _ps_table()
-        frontier = {self.root} | set(self.seen)
-        grew = True
-        while grew:
-            grew = False
-            for pid, (ppid, start) in table.items():
-                if ppid in frontier and pid not in frontier:
-                    frontier.add(pid)
-                    self.seen.setdefault(pid, start)
-                    grew = True
-
-    def kill(self):
-        import signal
-
-        table = _ps_table()
-        for pid, start in self.seen.items():
-            if table.get(pid, (None, None))[1] == start:
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-
-
-def _group_alive(pgid):
-    """Some non-zombie process is still in group ``pgid`` (macOS ``killpg(pgid, 0)`` answers EPERM for a
-    group of zombies awaiting their reaper, so ``ps`` decides)."""
-    out = subprocess.run(
-        ["ps", "-A", "-o", "pgid=,stat="], capture_output=True, text=True
-    ).stdout
-    for line in out.splitlines():
-        parts = line.split()
-        if len(parts) == 2 and parts[0] == str(pgid) and not parts[1].startswith("Z"):
-            return True
-    return False
-
-
-def reap(proc, tracker=None, *, wait_s=10.0):
-    """After a stop or an exit: SIGKILL the worker's group and every tracked descendant, then wait until the
-    group is gone (bounded) — nothing the worker spawned outlives it into the next launch.
-    """
-    import signal
-
-    if tracker is not None:
-        tracker.scan()
-    leader = _is_leader(proc)
-    _kill_group(proc)
-    if tracker is not None:
-        tracker.kill()
-    proc.wait()
-    if not leader:
-        return
     deadline = time.monotonic() + wait_s
-    while time.monotonic() < deadline:
-        if not _group_alive(proc.pid):
+    while True:
+        live = _owned_live(proc, tracker, tracker.scan())
+        if not live:
+            proc.wait()
             return
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"worker processes survived {wait_s} s: {sorted(live)}")
+        _signal_each(live, signal.SIGKILL)
         time.sleep(0.05)
-    raise RuntimeError(f"the worker group {proc.pid} did not die within {wait_s} s")
 
 
 def supervise(
@@ -931,10 +1013,16 @@ def supervise(
     """
     job_dir = Path(job_dir)
     started = time.monotonic()
-    _is_leader(proc)  # observed while it lives
+    if tracker is None:
+        try:
+            tracker = Descendants(proc.pid)
+        except RuntimeError:
+            if proc.poll() is not None:  # finished before it could be tracked
+                return dict(outcome="exited", returncode=proc.returncode)
+            raise
+    proc.p369_tracker = tracker  # the caller reaps with the same identities
     while True:
-        if tracker is not None:
-            tracker.scan()
+        tracker.scan()
         returncode = proc.poll()
         if returncode is not None:
             return dict(outcome="exited", returncode=returncode)
@@ -1006,31 +1094,30 @@ def run_job(job, fork_root, env, monitor, *, deadline):
     (job_dir / "job.json").write_text(json.dumps(job, indent=1))
     monitor.current, monitor.current_dir = job["name"], job_dir
     python = str(Path(fork_root) / ".venv" / "bin" / "python")
-    import signal
-
     with (job_dir / "worker.log").open("w") as log:
-        # H22: no TERM / INT between the spawn and the cleanup ownership below
-        blocked = signal.pthread_sigmask(
-            signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGINT}
-        )
+        proc = tracker = None
         try:
-            proc = launch_worker(
-                [
-                    python,
-                    "-I",
-                    str(Path(job["dev_dir"]) / "p369_phase2" / "worker.py"),
-                    str(job_dir / "job.json"),
-                ],
-                stdout=log,
-                env=env,
-            )
-            proc._p369_leader = True
-            tracker = Descendants(proc.pid)
-        except BaseException:
-            signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
-            raise
-        try:
-            signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
+            # H27: TERM / INT during the spawn and the tracker's creation are deferred, then replayed
+            # below with the worker owned; a signal after the deferral is inside this try as well
+            with deferred_signals() as pending:
+                proc = launch_worker(
+                    [
+                        python,
+                        "-I",
+                        str(Path(job["dev_dir"]) / "p369_phase2" / "worker.py"),
+                        str(job_dir / "job.json"),
+                    ],
+                    stdout=log,
+                    env=env,
+                )
+                try:
+                    tracker = Descendants(proc.pid)
+                except RuntimeError:
+                    tracker = (
+                        None  # supervise / _stop decide (exited, or kill the new group)
+                    )
+            if pending:
+                raise SystemExit(128 + pending[0])
             outcome = supervise(
                 proc,
                 job_dir,
@@ -1040,10 +1127,14 @@ def run_job(job, fork_root, env, monitor, *, deadline):
                 tracker=tracker,
             )
         except BaseException:
-            _stop(proc, 5, tracker)
+            if proc is not None:
+                _stop(proc, 5, tracker)
             raise
-        if outcome["outcome"] == "exited":
-            reap(proc, tracker)  # H17 / H22: nothing the worker spawned outlives it
+        tracker = getattr(proc, "p369_tracker", tracker)
+        if outcome["outcome"] == "exited" and tracker is not None:
+            reap(
+                proc, tracker
+            )  # H17 / H22 / H29: nothing the worker spawned outlives it
     if outcome["outcome"] != "exited":
         monitor.errors.append(f"{job['name']}: {outcome}")
         if outcome["outcome"] == "wall_limit":
@@ -1222,6 +1313,7 @@ class Campaign:
     # -- setup
     def prepare(self):
         self.out.mkdir(parents=True, exist_ok=False)
+        self._out_created = True  # from here a stop can record its status (H23)
         self.arms = {}
 
         def rev(spec):
@@ -1245,7 +1337,7 @@ class Campaign:
         self.bench_paths = ["benchmark/bench", *sorted(bundles)]
         problems = stack_bench_problems(self.stack, self.bench_paths)
         if problems:  # code round 3 H9: the reconstruction imports these files
-            raise SystemExit(f"refused: {problems}")
+            raise Refused(f"refused: {problems}")
         manifest = dict(
             production=PRODUCTION,
             fork_head=self.head,
@@ -1256,17 +1348,10 @@ class Campaign:
             env_dropped=dropped_env(dict(os.environ)),
             env_values={k: self.env[k] for k in ENV_RECORDED_VALUES if k in self.env},
             env_digest=env_digest(self.env),
-            stack_bench=dict(
-                tree=subprocess.run(
-                    ["git", "-C", str(self.stack), "rev-parse", "HEAD:benchmark/bench"],
-                    capture_output=True,
-                    text=True,
-                    check=True,
-                ).stdout.strip(),
-                bundles=bundles,
-            ),
+            stack_bench=stack_bench_state(self.stack, bundles),
             picks={},
         )
+        self.stack_bench = manifest["stack_bench"]
         for pick in self.picks:
             text, restored = overlay_registry(self.registry, pick)
             overlay = self.out / f"overlay-{pick}.yaml"
@@ -1617,6 +1702,13 @@ class Campaign:
         )
 
     # -- the whole run
+    def check_bench(self, pick):
+        """Code rounds 3–4 H9: the stack bench inputs are clean AND still the bound ones."""
+        problems = stack_bench_problems(self.stack, self.bench_paths)
+        problems += stack_bench_drift(self.stack, self.stack_bench)
+        if problems:
+            raise RuntimeError(f"{pick}: {problems}")
+
     def run_pick(self, pick, *, smoke):
         """One pick under the Q37 precedence. A supervisor stop (``JobTimeout``) can never pass: in E1c the
         pick ABORTs (no verdict, no bound), in E2 the identity is INCOMPLETE; E7 censors per request.
@@ -1630,10 +1722,9 @@ class Campaign:
 
         thresholds = (1024, 65536) if smoke else THRESHOLDS
         prompts = self.size(pick, thresholds)
-        problems = stack_bench_problems(self.stack, self.bench_paths)
-        if problems:  # still exactly the bound bench inputs
-            raise RuntimeError(f"{pick}: {problems}")
+        self.check_bench(pick)  # still exactly the bound bench inputs, before...
         items = c84_items(self.stack, pick)
+        self.check_bench(pick)  # ...and after the reconstruction imported them (H9)
         record["reconstruction"] = self.check_reconstruction(
             pick, items[:2] if smoke else items
         )
@@ -1668,15 +1759,18 @@ class Campaign:
         job), any stop — the binding refusal, a wall limit, a harness error, the final tree guard, an
         interruption (SIGTERM → SystemExit) — writes its status to ``summary.json`` before propagating.
         """
-        manifest = self.prepare()
-        self.summary["binding"] = binding(manifest)
 
         def stop(status, exc):
             self.summary["status"], self.summary["exit_code"] = status, 1
             self.summary["error"] = f"{type(exc).__name__}: {exc}"
-            self.write_summary()
+            if getattr(
+                self, "_out_created", False
+            ):  # never into a run dir prepare did not create
+                self.write_summary()
 
-        try:
+        try:  # code round 4 H23: preparation inside the boundary too
+            manifest = self.prepare()
+            self.summary["binding"] = binding(manifest)
             return self._execute(manifest)
         except Refused as exc:
             stop("REFUSED", exc)

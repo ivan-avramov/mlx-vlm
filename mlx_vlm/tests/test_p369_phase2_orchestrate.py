@@ -788,7 +788,7 @@ def test_run_pick_saves_each_step_as_it_finishes(monkeypatch):
     camp = object.__new__(orchestrate.Campaign)
     camp.stack, camp.bench_paths = None, []
     monkeypatch.setattr(orchestrate, "c84_items", lambda stack, pick: [])
-    monkeypatch.setattr(orchestrate, "stack_bench_problems", lambda stack, paths: [])
+    camp.check_bench = lambda pick: None
     camp.size = lambda pick, thresholds: {}
     camp.check_reconstruction = lambda pick, items: {}
     camp.e1c = lambda pick, prompts, smoke: {"T1024": _v()}
@@ -815,6 +815,9 @@ def test_a_harness_error_is_recorded_before_it_propagates(tmp_path):
     camp = object.__new__(orchestrate.Campaign)
     camp.args = type("A", (), dict(smoke_summary=None, phase="smoke"))()
     camp.out, camp.picks = tmp_path, [FABLE]
+    camp._out_created = (
+        True  # what the real prepare() marks once it created the run dir
+    )
     camp.prepare = lambda: _binding()
     camp.summary = dict(picks={})
     camp.write_summary = lambda: saved.append(json.loads(json.dumps(camp.summary)))
@@ -1106,7 +1109,9 @@ def owned(tmp_path):
         if proc.poll() is None:
             proc.kill()
         proc.wait()
-    recorded = tmp_path / "child.pid"  # a child that escaped the group before the test read its pid
+    recorded = (
+        tmp_path / "child.pid"
+    )  # a child that escaped the group before the test read its pid
     if recorded.exists() and recorded.read_text().strip().isdigit():
         pids.append(int(recorded.read_text()))
     for pid in pids:
@@ -1192,6 +1197,9 @@ def _lifecycle_camp(tmp_path, run_pick):
     camp = object.__new__(orchestrate.Campaign)
     camp.args = type("A", (), dict(smoke_summary=None, phase="smoke"))()
     camp.out, camp.picks, camp.fork, camp.head = tmp_path, [FABLE], tmp_path, "h"
+    camp._out_created = (
+        True  # what the real prepare() marks once it created the run dir
+    )
     camp.prepare = lambda: _binding()
     camp.summary = dict(picks={})
     camp.write_summary = lambda: saved.append(json.loads(json.dumps(camp.summary)))
