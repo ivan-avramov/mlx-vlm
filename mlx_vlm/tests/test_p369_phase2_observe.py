@@ -117,6 +117,79 @@ def test_state_hash_refuses_an_unknown_state_type():
         observe.state_hash([Odd()])
 
 
+# ------------------------------------------------------------------ code round 1 H1: type-specific metadata
+def test_state_hash_sees_the_arrays_cache_mask_metadata():
+    from mlx_vlm.models.cache import ArraysCache
+
+    leaf = ArraysCache(2)
+    leaf[0], leaf[1] = mx.zeros((1, 3, 4)), mx.ones((1, 2, 2))
+    before = observe.state_hash([leaf])
+    leaf.left_padding = mx.array([0])
+    assert observe.state_hash([leaf]) != before
+    leaf.left_padding = None
+    assert observe.state_hash([leaf]) == before
+    leaf.lengths = mx.array([3])
+    assert observe.state_hash([leaf]) != before
+    leaf.lengths = None
+    leaf.advance(0)
+    assert observe.state_hash([leaf]) == before
+
+
+def test_state_hash_ignores_the_derived_metadata_revision_counter():
+    # A cache-invalidation counter, bumped by every speculative commit / abort (so by every ON block and
+    # every probe): not logical state, and hashing it would make ON and OFF differ by construction.
+    from mlx_vlm.models.cache import ArraysCache
+
+    leaf = ArraysCache(1)
+    leaf[0] = mx.zeros((1, 2, 2))
+    before = observe.state_hash([leaf])
+    leaf.metadata_revision += 3
+    assert observe.state_hash([leaf]) == before
+
+
+def test_state_hash_refuses_an_active_speculative_transaction():
+    from mlx_vlm.models.cache import ArraysCache
+
+    leaf = ArraysCache(1)
+    leaf[0] = mx.zeros((1, 2, 2))
+    leaf.start_speculation(2)
+    with pytest.raises(RuntimeError, match="active speculative transaction"):
+        observe.state_hash([leaf])
+
+
+def _turboquant(**bits):
+    from mlx_vlm import turboquant as tq
+
+    mx.random.seed(0)
+    cache = tq.TurboQuantKVCache(**bits)
+    keys = mx.random.normal((1, 2, 8, 64)).astype(mx.bfloat16)
+    cache.update_and_fetch(keys, keys)
+    return cache
+
+
+def test_state_hash_sees_the_turboquant_split_codec_coordinates():
+    cache = _turboquant(bits=3.5, key_bits=3.5, value_bits=3.5)
+    codec = cache.key_codec
+    assert type(codec).__name__ == "_SplitCodec"
+    before = observe.state_hash([cache])
+    low, high = codec.low_idx, codec.high_idx
+    codec.low_idx = mx.concatenate([low[:-1], high[:1]])
+    codec.high_idx = mx.concatenate([low[-1:], high[1:]])
+    assert observe.state_hash([cache]) != before
+    codec.low_idx, codec.high_idx = low, high
+    assert observe.state_hash([cache]) == before
+
+
+def test_state_hash_sees_the_turboquant_codec_kind_and_mode():
+    a, b = _turboquant(bits=4), _turboquant(bits=4)
+    assert observe.state_hash([a]) == observe.state_hash([b])
+    b._kv_quant_mode = "prod"
+    assert observe.state_hash([a]) != observe.state_hash([b])
+    b._kv_quant_mode = a._kv_quant_mode
+    b.key_codec = _turboquant(bits=3.5, key_bits=3.5, value_bits=3.5).key_codec
+    assert observe.state_hash([a]) != observe.state_hash([b])
+
+
 # ------------------------------------------------------------------ probe
 def test_probe_is_neutral_and_repeatable():
     state, _ = _warm()

@@ -300,25 +300,43 @@ def _part(tokens, finish="length", cached=0):
     )
 
 
+EXPECTED = [8, 11, 13]
+
+
 def test_c1_acceptance():
     ok = dict(rows={"pass": True}, states={"pass": True})
     on, offs = _part([1, 2, 3]), [_part([1, 2, 3]), _part([1, 2, 3])]
-    assert worker.c1_acceptance(on, offs, ok, retired=True)["pass"]
+    full = [EXPECTED, EXPECTED]
+    assert worker.c1_acceptance(
+        on, offs, ok, retired=True, expected_offsets=EXPECTED, replay_offsets=full
+    )["pass"]
     cases = [
-        (on, [_part([1, 2]), _part([1, 2, 3])], ok, True, "forced tokens"),
+        (on, [_part([1, 2]), _part([1, 2, 3])], ok, True, full, "forced tokens"),
         (
             on,
             [_part([1, 2, 3], finish="stop"), _part([1, 2, 3])],
             ok,
             True,
+            full,
             "finish",
         ),
-        (on, [_part([1, 2, 3], cached=4), _part([1, 2, 3])], ok, True, "reused"),
-        (on, offs, dict(ok, states={"pass": False}), True, "states"),
-        (on, offs, ok, False, "not retired"),
+        (on, [_part([1, 2, 3], cached=4), _part([1, 2, 3])], ok, True, full, "reused"),
+        (on, offs, dict(ok, states={"pass": False}), True, full, "states"),
+        (on, offs, ok, False, full, "not retired"),
+        # code round 1 H4: both replays missing the same ON offset is a C1 failure (ABORT), not an E1c FAIL
+        (on, offs, ok, True, [[8, 13], [8, 13]], "OFF1 offsets"),
+        (on, offs, ok, True, [EXPECTED, [8, 11]], "OFF2 offsets"),
+        (on, offs, ok, True, [EXPECTED + [15], EXPECTED], "OFF1 offsets"),
     ]
-    for on_, offs_, cmp_, ids, why in cases:
-        got = worker.c1_acceptance(on_, offs_, cmp_, retired=ids)
+    for on_, offs_, cmp_, ids, replay, why in cases:
+        got = worker.c1_acceptance(
+            on_,
+            offs_,
+            cmp_,
+            retired=ids,
+            expected_offsets=EXPECTED,
+            replay_offsets=replay,
+        )
         assert not got["pass"] and any(why in p for p in got["problems"]), (why, got)
 
 
@@ -354,26 +372,57 @@ def test_wait_ack_waits_for_the_next_exit():
         worker.wait_ack(capture, 4, timeout_s=0.05)
 
 
-def test_release_trajectory_retires_the_cache_tree(monkeypatch):
+def _production_session(chat_id):
+    """A session entry exactly as the server makes it (``{"state", "last_used", "turn_hashes"}``)."""
     from mlx_vlm.models.cache import KVCache
     from mlx_vlm.server import session_manager
 
-    def make():
-        state = PromptCacheState()
-        state.cache = [KVCache(), KVCache()]
-        state.token_ids = [1, 2]
-        return state
+    state = session_manager.get_or_create_prompt_cache_state(chat_id)
+    state.cache = [KVCache(), KVCache()]
+    state.token_ids = [1, 2]
+    return state
 
-    state = make()
-    monkeypatch.setitem(session_manager._session_caches, "p369-x", state)
+
+def test_release_trajectory_retires_the_cache_tree(monkeypatch):
+    from mlx_vlm.server import session_manager
+
+    monkeypatch.setattr(session_manager, "_session_cache_max", 4)
+    monkeypatch.setattr(session_manager, "_session_caches", type(session_manager._session_caches)())
+    cleared = []
+    real_clear = PromptCacheState.clear
+    monkeypatch.setattr(
+        PromptCacheState, "clear", lambda self: (cleared.append(self), real_clear(self))
+    )
+    state = _production_session("p369-x")
+    assert isinstance(session_manager._session_caches["p369-x"], dict)
     rec = types.SimpleNamespace(_cache=state.cache)
     worker.release_trajectory(rec, "p369-x")
     assert "p369-x" not in session_manager._session_caches
-    assert rec._cache is None and state.cache is None
-    held = make()
-    monkeypatch.setitem(session_manager._session_caches, "p369-y", held)
+    assert cleared == [state]  # code round 1 H13: the PromptCacheState itself is cleared
+    assert rec._cache is None and state.cache is None and state.token_ids is None
+    held = _production_session("p369-y")
     lingering = held.cache  # someone else still holds the tree
     rec = types.SimpleNamespace(_cache=held.cache)
     with pytest.raises(RuntimeError, match="not retired"):
         worker.release_trajectory(rec, "p369-y")
     del lingering
+
+
+def test_release_session_clears_the_production_entry(monkeypatch):
+    from mlx_vlm.server import session_manager
+
+    monkeypatch.setattr(session_manager, "_session_cache_max", 4)
+    monkeypatch.setattr(session_manager, "_session_caches", type(session_manager._session_caches)())
+    state = _production_session("p369-z")
+    worker.release_session("p369-z")
+    assert "p369-z" not in session_manager._session_caches
+    assert state.cache is None and state.token_ids is None
+
+
+def test_release_refuses_an_unexpected_session_entry_shape(monkeypatch):
+    from mlx_vlm.server import session_manager
+
+    monkeypatch.setattr(session_manager, "_session_caches", type(session_manager._session_caches)())
+    session_manager._session_caches["p369-odd"] = PromptCacheState()  # not the production shape
+    with pytest.raises(RuntimeError, match="unexpected session entry"):
+        worker.release_session("p369-odd")
