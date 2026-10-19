@@ -46,25 +46,32 @@ def pytest_sessionfinish(session, exitstatus):
 
 import pytest  # noqa: E402  Fork: autouse determinism fixture below
 
-TEST_RANDOM_SEED = 0
+def seed_for(nodeid: str) -> int:
+    """A fixed 32-bit seed per test node id (identical across runs and orders)."""
+    import hashlib
+
+    return int.from_bytes(hashlib.sha256(nodeid.encode()).digest()[:4], "big")
 
 
 @pytest.fixture(autouse=True)
-def _deterministic_random_state():
-    """Every test starts from the same mx / numpy / python random state.
+def _deterministic_random_state(request):
+    """Every test (and parametrization) starts from its own fixed random stream.
 
     Unseeded draws made results depend on suite order and on which tests ran before
     (a tolerance-edge test flaked in ~25% of runs); the operator requires zero
-    nondeterministic tests. A test that wants a different stream seeds itself.
+    nondeterministic tests. The seed derives from the node id, so each test/param
+    sees a different but run-independent stream. A test that wants another stream
+    seeds itself.
     """
     import random
 
     import mlx.core as mx
     import numpy as np
 
-    mx.random.seed(TEST_RANDOM_SEED)
-    np.random.seed(TEST_RANDOM_SEED)
-    random.seed(TEST_RANDOM_SEED)
+    seed = seed_for(request.node.nodeid)
+    mx.random.seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
     yield
 
 # path -> (missing symbol, what porting it actually requires)

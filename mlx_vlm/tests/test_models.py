@@ -64,7 +64,7 @@ def capture_positions(
 
 # Fork (P369 round 3, F9): seed corpus of the deepseek_v41 MoE precision test.
 _MOE_SEEDS = 64
-_MOE_SORTED_QUANT_SKIP = (
+_MOE_SORTED_QUANT_NOTE = (
     "P385: the quantized (bits 4/8) sorted-dispatch prefill (length 17) is "
     "nondeterministic across fresh processes even with fixed seeds and separately "
     "evaluated graphs (MLX 0.32.3, M5 Max, seeds 0-63 x 10 processes: bits=4 miss "
@@ -2225,12 +2225,10 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
             range(_MOE_SEEDS), (None, 4, 8), (1, 17)
         ):
             with self.subTest(bits=bits, length=length, seed=seed):
-                if bits is not None and length == 17:
-                    self.skipTest(_MOE_SORTED_QUANT_SKIP)
                 # Fork: a deterministic seed corpus (0.._MOE_SEEDS-1), each case
                 # seeded so no draw depends on suite order. Reference and actual
                 # are evaluated as SEPARATE graphs. Quantized length-17 sorted
-                # dispatch is skipped: nondeterministic in the kernel (P385).
+                # dispatch gets a structural smoke only: nondeterministic in the kernel (P385).
                 mx.random.seed(seed)
                 model = DeepseekV41MoE(config)
                 model.gate.weight = mx.random.normal(model.gate.weight.shape) * 0.1
@@ -2264,6 +2262,18 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
                 actual = model(x)
                 mx.eval(actual)
                 self.assertEqual(actual.dtype, x.dtype)
+                if bits is not None and length == 17:
+                    # Structural smoke only (P385, see _MOE_SORTED_QUANT_NOTE): the
+                    # kernel is nondeterministic here, so exactness is NOT asserted;
+                    # shape, dtype and a finite reference still are, and the NaN
+                    # incidence of the actual output is recorded.
+                    self.assertEqual(actual.shape, expected.shape)
+                    self.assertTrue(mx.all(mx.isfinite(expected)).item())
+                    if not mx.all(mx.isfinite(actual)).item():
+                        logging.getLogger(__name__).warning(
+                            "P385: non-finite output (bits=%s seed=%s)", bits, seed
+                        )
+                    continue
                 close = mx.allclose(actual, expected, rtol=1e-5, atol=1e-5).item()
                 self.assertTrue(close)
 
