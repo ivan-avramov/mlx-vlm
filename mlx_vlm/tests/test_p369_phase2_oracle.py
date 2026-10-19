@@ -117,3 +117,18 @@ def test_the_classifier_unit_cases():
     assert m3["cls"] == "M3" and m3["overshoot"] == 2 and m3["trip_index"] == 0
     (m4b,) = c(1, [5, 6], 2, True, None, 2)
     assert m4b["cause"] == "budget"
+
+
+# ------------------------------------------------------------------ code round 1 H12: the gate's scope
+def test_the_unit_cases_do_not_depend_on_git_history():
+    # only the tests that need both trees may skip in a shallow clone; the classifier cases always run
+    assert not getattr(sys.modules[__name__], "pytestmark", None)
+
+
+def test_the_oracle_gate_skips_or_fails_closed():
+    _oracle_gate(True, required=True)
+    _oracle_gate(True, required=False)
+    with pytest.raises(pytest.skip.Exception):
+        _oracle_gate(False, required=False)
+    with pytest.raises(pytest.fail.Exception, match="MLX_REQUIRE_P369_ORACLE"):
+        _oracle_gate(False, required=True)
