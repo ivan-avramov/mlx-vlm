@@ -31,27 +31,44 @@ PICKS = {
 }
 THRESHOLDS = (1024, 8192, 32768, 65536)
 C84_AXES = ("math500", "humanevalplus", "mbppplus", "cjudge")
-DROP_ENV = (
-    "APC_ENABLED",
-    "MLX_VLM_DRAFT_MODEL",
-    "MLX_VLM_DRAFT_KIND",
-    "MLX_VLM_DRAFT_BLOCK_SIZE",
-    "MLX_VLM_DRAFT_COOLDOWN",
-    "MLX_VLM_SUFFIX_MIN_MATCH",
-    "MLX_VLM_MTP_VERIFY_SCAN",
-    "MLX_VLM_MTP_VERIFY_AB",
+# Code round 1 H3: the worker env is an ALLOWLIST (process / locale / Hugging Face cache plumbing); every
+# generation knob (MLX_*, KV_*, TQ_*, APC_*, MIN_OUTPUT_TOKENS, future ones) is dropped, then exactly
+# MLX_VLM_CACHE_SESSION_MAX=1 is set. mlx-serve spawns the worker with the router's inherited env, and the
+# deployed tuple lives in the registry argv, not in env knobs.
+ENV_ALLOW = (
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TMPDIR",
+    "LANG",
+    "TERM",
+    "TZ",
+    "HF_HOME",
+    "HF_HUB_CACHE",
+    "HF_HUB_OFFLINE",
+    "HF_TOKEN",
+    "HUGGINGFACE_HUB_CACHE",
+    "XDG_CACHE_HOME",
+    "SSL_CERT_FILE",
+    "REQUESTS_CA_BUNDLE",
+    "__CF_USER_TEXT_ENCODING",
 )
-DROP_PREFIXES = ("MLX_VLM_PRELOAD_",)
-REFUSED_PROCESSES = (
-    "mlx_vlm.server",
-    "mlx-serve",
-    "mlx_serve",
-    "pytest",
-    "opencode",
-    "run_tg1",
-    "run_m64",
+ENV_ALLOW_PREFIXES = ("LC_",)
+ENV_RECORDED_VALUES = ("MLX_VLM_CACHE_SESSION_MAX", "HF_HUB_OFFLINE")
+# Code round 1 H11: refused by argv STRUCTURE (an element, a ``-m`` module root, a script path), never by a
+# substring of a shell command string.
+REFUSED_EXECUTABLES = ("mlx-serve", "mlx_serve", "pytest", "py.test", "opencode")
+REFUSED_MODULES = ("mlx_vlm", "mlx_lm", "mlx_serve", "pytest", "bench")
+REFUSED_SCRIPTS = (
     "worker.py",
+    "run_tg1_probe.py",
+    "run_opencode_probe.py",
+    "run_opencode_probe_v2.py",
+    "session_cache_probe.py",
 )
+REFUSED_SCRIPT_DIRS = ("benchmark", "mlx_vlm")
 PORTS = (8000, 8091)
 MIN_FREE_GB = 20
 MONITOR_S = 300
@@ -111,10 +128,128 @@ def worker_env(base):
     env = {
         k: v
         for k, v in base.items()
-        if k not in DROP_ENV and not k.startswith(DROP_PREFIXES)
+        if k in ENV_ALLOW or k.startswith(ENV_ALLOW_PREFIXES)
     }
     env["MLX_VLM_CACHE_SESSION_MAX"] = "1"
     return env
+
+
+def dropped_env(base):
+    """The NAMES of the launch-env variables the worker does not get (recorded; values never)."""
+    kept = worker_env(base)
+    return sorted(k for k in base if k not in kept)
+
+
+def refused_process(argv):
+    """Why a process with ``argv`` must not run beside the campaign (None = allowed)."""
+    if not argv:
+        return None
+    names = [os.path.basename(a) for a in argv]
+    for name in names:
+        if name in REFUSED_EXECUTABLES:
+            return f"executable {name}"
+    if not names[0].lower().startswith("python"):
+        return None
+    args = argv[1:]
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "-m" and i + 1 < len(args):
+            root = args[i + 1].split(".")[0]
+            return f"module {args[i + 1]}" if root in REFUSED_MODULES else None
+        if arg == "-c":
+            return None
+        if arg in ("-X", "-W"):  # options that take a value
+            i += 2
+            continue
+        if arg.startswith("-"):
+            i += 1
+            continue
+        script = Path(arg)
+        if script.name in REFUSED_SCRIPTS:
+            return f"script {script.name}"
+        if any(part in REFUSED_SCRIPT_DIRS for part in script.parts[:-1]):
+            return f"script under {script.parent}"
+        return None
+    return None
+
+
+def tree_status_problems(porcelain):
+    """Code round 1 H9: the reviewed fork tree must be clean — no tracked change, no untracked file."""
+    lines = [line for line in porcelain.splitlines() if line.strip()]
+    return [f"fork worktree not clean: {lines[:10]}"] if lines else []
+
+
+def parse_power(ac, batt):
+    """``pmset -g ac`` / ``-g batt`` → watts, volts, battery % and the AGENTS.md rule (140 W / 28 V, > 20 %)."""
+    watts = re.search(r"Wattage\s*=\s*(\d+)W", ac)
+    millivolts = re.search(r"Voltage\s*=\s*(\d+)mV", ac)
+    pct = re.search(r"(\d+)%", batt)
+    watts = int(watts.group(1)) if watts else None
+    volts = int(millivolts.group(1)) / 1000 if millivolts else None
+    battery = int(pct.group(1)) if pct else None
+    return dict(
+        watts=watts,
+        volts=volts,
+        battery=battery,
+        ac_ok=watts == 140 and volts == 28.0,
+        battery_ok=battery is not None and battery > 20,
+    )
+
+
+BINDING_PICK_KEYS = (
+    "overlay_sha256",
+    "argv_on",
+    "argv_off",
+    "params",
+    "target",
+    "drafter",
+)
+
+
+def binding(manifest):
+    """Code round 1 H9: what a full run must share with the smoke that authorizes it."""
+    return dict(
+        production=manifest["production"],
+        fork_head=manifest["fork_head"],
+        harness_tree=manifest["harness_tree"],
+        picks={
+            pick: {k: entry[k] for k in BINDING_PICK_KEYS}
+            for pick, entry in sorted(manifest["picks"].items())
+        },
+    )
+
+
+def binding_problems(smoke_summary, manifest):
+    want = smoke_summary.get("binding")
+    if not want:
+        return ["the smoke summary carries no binding"]
+    have = binding(manifest)
+    problems = [
+        f"{key}: smoke {want.get(key)!r} != now {have[key]!r}"
+        for key in ("production", "fork_head", "harness_tree")
+        if want.get(key) != have[key]
+    ]
+    if sorted(want.get("picks", {})) != sorted(have["picks"]):
+        problems.append(
+            f"picks: smoke {sorted(want.get('picks', {}))} != now {sorted(have['picks'])}"
+        )
+    for pick, entry in have["picks"].items():
+        for key in BINDING_PICK_KEYS:
+            if want.get("picks", {}).get(pick, {}).get(key) != entry[key]:
+                problems.append(f"{pick} {key} differs from the smoke")
+    return problems
+
+
+def lock_is_stale(record, create_time_of):
+    """Code round 1 H14: reclaim the run lock only when its recorded owner is provably gone — the pid is not
+    alive (``create_time_of(pid)`` None) or was reused (a different create time). Unreadable: keep.
+    """
+    pid, created = record.get("pid"), record.get("create_time")
+    if type(pid) is not int or type(created) is not float:
+        return False
+    now = create_time_of(pid)
+    return now is None or now != created
 
 
 def clopper_pearson(k, n, alpha=0.05):
@@ -208,9 +343,10 @@ def preflight(args, out):
     for p in psutil.process_iter(["pid", "cmdline"]):
         if p.info["pid"] == me:
             continue
-        cmd = " ".join(p.info["cmdline"] or [])
-        if any(token in cmd for token in REFUSED_PROCESSES):
-            problems.append(f"process {p.info['pid']}: {cmd[:120]}")
+        why = refused_process(p.info["cmdline"] or [])
+        if why:
+            cmd = " ".join(p.info["cmdline"] or [])
+            problems.append(f"process {p.info['pid']} ({why}): {cmd[:120]}")
     for (
         port
     ) in (
@@ -249,6 +385,13 @@ def preflight(args, out):
     ).stdout.strip()
     if diff:
         problems.append(f"production code differs from {PRODUCTION}:\n{diff}")
+    porcelain = subprocess.run(
+        ["git", "-C", args.fork_root, "status", "--porcelain", "--untracked-files=all"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    problems += tree_status_problems(porcelain)
     return dict(problems=problems, power=power, free_gb=free_gb)
 
 
@@ -260,19 +403,7 @@ def power_state():
     therm = subprocess.run(
         ["pmset", "-g", "therm"], capture_output=True, text=True
     ).stdout
-    watts = re.search(r"Wattage\s*=\s*(\d+)W", ac)
-    volts = re.search(r"(\d+(?:\.\d+)?)\s*V", ac) or re.search(
-        r"Voltage\s*=\s*(\d+)", ac
-    )
-    pct = re.search(r"(\d+)%", batt)
-    return dict(
-        watts=int(watts.group(1)) if watts else None,
-        volts=float(volts.group(1)) if volts else None,
-        battery=int(pct.group(1)) if pct else None,
-        ac_ok=bool(watts and int(watts.group(1)) == 140),
-        battery_ok=bool(pct and int(pct.group(1)) > 20),
-        thermal=" ".join(therm.split())[:200],
-    )
+    return dict(parse_power(ac, batt), thermal=" ".join(therm.split())[:200])
 
 
 def worker_argv(stack_root, overlay, pick):
@@ -511,16 +642,23 @@ class Campaign:
     def prepare(self):
         self.out.mkdir(parents=True, exist_ok=False)
         self.arms = {}
-        manifest = dict(
-            production=PRODUCTION,
-            fork_head=subprocess.run(
-                ["git", "-C", str(self.fork), "rev-parse", "HEAD"],
+
+        def rev(spec):
+            return subprocess.run(
+                ["git", "-C", str(self.fork), "rev-parse", spec],
                 capture_output=True,
                 text=True,
                 check=True,
-            ).stdout.strip(),
+            ).stdout.strip()
+
+        manifest = dict(
+            production=PRODUCTION,
+            fork_head=rev("HEAD"),
+            harness_tree=rev("HEAD:dev/p369_phase2"),
             versions=fork_versions(self.fork),
             env_keys=sorted(self.env),
+            env_dropped=dropped_env(dict(os.environ)),
+            env_values={k: self.env[k] for k in ENV_RECORDED_VALUES if k in self.env},
             picks={},
         )
         for pick in self.picks:
@@ -837,6 +975,12 @@ class Campaign:
     # -- the whole run
     def execute(self):
         manifest = self.prepare()
+        self.summary["binding"] = binding(manifest)
+        if self.args.smoke_summary:  # code round 1 H9: before any GPU job
+            smoke_summary = json.loads(Path(self.args.smoke_summary).read_text())
+            problems = binding_problems(smoke_summary, manifest)
+            if problems:
+                raise SystemExit(f"full: the smoke does not bind this run: {problems}")
         estimate = 20 * 60 if self.args.phase == "smoke" else int(ESTIMATE_LIMIT_S)
         smoke = self.args.phase == "smoke"
         with Monitor(self.out / "monitor.log", estimate) as self.monitor:
@@ -902,6 +1046,37 @@ class Campaign:
         os.replace(tmp, self.out / "summary.json")
 
 
+def _create_time(pid):
+    import psutil
+
+    try:
+        return psutil.Process(pid).create_time()
+    except psutil.NoSuchProcess:
+        return None
+
+
+def acquire_lock(lock):
+    """The exclusive run lock, recording ``{pid, create_time}``; a stale lock (owner provably gone, H14) is
+    reclaimed once with a message, a live or unreadable one refuses."""
+    for attempt in (1, 2):
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                record = json.loads(lock.read_text())
+            except (OSError, ValueError):
+                record = {}
+            if attempt == 1 and lock_is_stale(record, _create_time):
+                print(f"reclaiming a stale run lock {lock}: {record}")
+                lock.unlink()
+                continue
+            raise SystemExit(f"run lock {lock} is held: {record or 'unreadable'}")
+        me = os.getpid()
+        os.write(fd, json.dumps(dict(pid=me, create_time=_create_time(me))).encode())
+        return fd
+    raise SystemExit(f"run lock {lock}: could not acquire")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--stack-root", required=True)
@@ -929,9 +1104,8 @@ def main(argv=None):
     if checks["problems"]:
         raise SystemExit(f"preflight refused: {checks['problems']}")
     lock = out.parent / ".lock"
-    fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    fd = acquire_lock(lock)
     try:
-        os.write(fd, str(os.getpid()).encode())
         summary = Campaign(args).execute()
     finally:
         os.close(fd)
