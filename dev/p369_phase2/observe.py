@@ -290,3 +290,52 @@ class Recorder:
             owner, name, value = self._patched.pop()
             setattr(owner, name, value)
         return False
+
+
+class KeyLengths:
+    """Every verifier attention block's key-length span (Q19): per call of
+    ``Qwen3_5BatchInvariantForward._attention`` with width > 1, the first query sees ``offset + 1`` keys and
+    the last ``offset + width`` (``offset`` = the layer cache's offset before the block is appended).
+    """
+
+    def __init__(self):
+        self.blocks = []
+        self._patched = None
+
+    def __enter__(self):
+        from mlx_vlm.models.qwen3_5 import speculative_verifier as sv
+
+        cls = sv.Qwen3_5BatchInvariantForward
+        real = cls._attention
+        blocks = self.blocks
+
+        def recording_attention(verifier, attention, x, mask, cache, *args, **kwargs):
+            width = int(x.shape[1])
+            if width > 1 and cache is not None:
+                offset = getattr(cache, "offset", None)
+                offset = (
+                    int(offset.max().item()) if hasattr(offset, "max") else int(offset)
+                )
+                blocks.append(
+                    dict(
+                        width=width,
+                        first_key=offset + 1,
+                        last_key=offset + width,
+                        cache=type(cache).__name__,
+                    )
+                )
+            return real(verifier, attention, x, mask, cache, *args, **kwargs)
+
+        self._patched = (cls, real)
+        cls._attention = recording_attention
+        return self
+
+    def __exit__(self, *exc):
+        cls, real = self._patched
+        cls._attention = real
+        return False
+
+
+def straddles(blocks, threshold):
+    """True when some verifier block has queries on both sides of the key-length ``threshold``."""
+    return any(b["first_key"] <= threshold < b["last_key"] for b in blocks)

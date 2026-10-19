@@ -71,7 +71,7 @@ def test_rows_refuse_mixed_dtypes(tmp_path):
         (0, compare.as_record(mx.zeros((3,), dtype=mx.bfloat16))),
         (1, compare.as_record(mx.zeros((3,), dtype=mx.float32))),
     ]
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match="mixed row dtypes"):
         worker.save_rows(tmp_path / "r.npz", rows)
 
 
@@ -134,7 +134,7 @@ def test_assert_served_accepts_the_expected_state():
     ],
 )
 def test_assert_served_refuses_any_mismatch(change):
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match="served state mismatch"):
         worker.assert_served(dict(GOOD, **change), EXPECT)
 
 
@@ -146,7 +146,7 @@ def test_check_sources_refuses_a_module_outside_the_reviewed_tree(
     stray = types.ModuleType("mlx_vlm._p369_stray")
     stray.__file__ = str(tmp_path / "elsewhere.py")
     monkeypatch.setitem(sys.modules, "mlx_vlm._p369_stray", stray)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match="outside the reviewed sources"):
         worker.check_sources(root, DEV)
 
 
