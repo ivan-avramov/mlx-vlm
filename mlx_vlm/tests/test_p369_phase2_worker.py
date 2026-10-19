@@ -320,3 +320,60 @@ def test_c1_acceptance():
     for on_, offs_, cmp_, ids, why in cases:
         got = worker.c1_acceptance(on_, offs_, cmp_, cache_ids=ids)
         assert not got["pass"] and any(why in p for p in got["problems"]), (why, got)
+
+
+# ------------------------------------------------------------------ round 6 (Q35 / Q38)
+def test_capture_acknowledges_every_cached_request_exit(monkeypatch):
+    from mlx_vlm.server import generation
+
+    calls = []
+
+    def fake_process(rg, *args, **kwargs):
+        calls.append(1)
+        if kwargs.get("boom"):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(
+        generation.ResponseGenerator, "_process_cached_request", fake_process
+    )
+    with worker.Capture() as capture:
+        generation.ResponseGenerator._process_cached_request(object())
+        with pytest.raises(RuntimeError):
+            generation.ResponseGenerator._process_cached_request(object(), boom=True)
+        assert capture.completed == 2
+    assert generation.ResponseGenerator._process_cached_request is fake_process
+
+
+def test_wait_ack_waits_for_the_next_exit():
+    import threading
+
+    capture = types.SimpleNamespace(completed=3)
+    threading.Timer(0.05, lambda: setattr(capture, "completed", 4)).start()
+    worker.wait_ack(capture, 3, timeout_s=2)
+    with pytest.raises(RuntimeError, match="did not acknowledge"):
+        worker.wait_ack(capture, 4, timeout_s=0.05)
+
+
+def test_release_trajectory_retires_the_cache_tree(monkeypatch):
+    from mlx_vlm.models.cache import KVCache
+    from mlx_vlm.server import session_manager
+
+    def make():
+        state = PromptCacheState()
+        state.cache = [KVCache(), KVCache()]
+        state.token_ids = [1, 2]
+        return state
+
+    state = make()
+    monkeypatch.setitem(session_manager._session_caches, "p369-x", state)
+    rec = types.SimpleNamespace(_cache=state.cache)
+    worker.release_trajectory(rec, "p369-x")
+    assert "p369-x" not in session_manager._session_caches
+    assert rec._cache is None and state.cache is None
+    held = make()
+    monkeypatch.setitem(session_manager._session_caches, "p369-y", held)
+    lingering = held.cache  # someone else still holds the tree
+    rec = types.SimpleNamespace(_cache=held.cache)
+    with pytest.raises(RuntimeError, match="not retired"):
+        worker.release_trajectory(rec, "p369-y")
+    del lingering
