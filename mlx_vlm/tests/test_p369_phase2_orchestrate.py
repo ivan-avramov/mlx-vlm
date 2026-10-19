@@ -4,6 +4,7 @@ Fork-only file. The orchestrator runs under the STACK venv (mlx-serve, psutil); 
 tested here without either.
 """
 
+import json
 import sys
 from pathlib import Path
 
@@ -329,3 +330,138 @@ def test_pick_outcome_precedence():
     assert orchestrate.pick_outcome(
         {"a": _v(pass_=False, c1=False), "b": _v()}
     ) == dict(e1c="ABORT", run_e2_e7=False, cross_load="identical")
+
+
+# ------------------------------------------------------------------ code round 1 H8: watchdogs
+SLEEPER = """
+import json, os, signal, sys, time
+from pathlib import Path
+out = Path(sys.argv[1])
+if sys.argv[2] == "ignore-term":
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+if sys.argv[3] != "no-progress":
+    tmp = out / ".progress.json.tmp"
+    tmp.write_text(json.dumps(dict(index=1, name="req-1", started=time.time(), deadline_s=0.3)))
+    os.replace(tmp, out / "progress.json")
+time.sleep(60)
+"""
+
+
+@pytest.fixture
+def sleeper(tmp_path):
+    """Start fake workers; every one still alive at teardown is killed (a failing test leaves no orphan)."""
+    import subprocess
+
+    procs = []
+
+    def start(*flags):
+        proc = subprocess.Popen(
+            [sys.executable, "-c", SLEEPER, str(tmp_path), *flags],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        procs.append(proc)
+        return proc
+
+    yield start
+    for proc in procs:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+
+
+@pytest.mark.parametrize("term", ["obey-term", "ignore-term"])
+def test_supervise_kills_a_request_past_its_deadline_and_records_it(
+    tmp_path, sleeper, term
+):
+    import time
+
+    proc = sleeper(term, "progress")
+    started = time.monotonic()
+    got = orchestrate.supervise(
+        proc,
+        tmp_path,
+        boot_timeout_s=30,
+        deadline=time.monotonic() + 30,
+        poll_s=0.05,
+        grace_s=0.5,
+    )
+    assert got["outcome"] == "request_timeout" and got["index"] == 1, got
+    assert (
+        proc.poll() is not None
+    )  # the worker is gone (SIGKILL when SIGTERM is ignored)
+    assert time.monotonic() - started < 20
+    record = json.loads((tmp_path / "timeout.json").read_text())
+    assert record["index"] == 1 and record["name"] == "req-1"
+
+
+def test_supervise_times_out_a_silent_boot(tmp_path, sleeper):
+    import time
+
+    proc = sleeper("obey-term", "no-progress")
+    got = orchestrate.supervise(
+        proc,
+        tmp_path,
+        boot_timeout_s=0.3,
+        deadline=time.monotonic() + 30,
+        poll_s=0.05,
+        grace_s=0.5,
+    )
+    assert got["outcome"] == "boot_timeout" and proc.poll() is not None
+
+
+def test_supervise_enforces_the_campaign_deadline(tmp_path, sleeper):
+    import time
+
+    proc = sleeper("obey-term", "no-progress")
+    got = orchestrate.supervise(
+        proc,
+        tmp_path,
+        boot_timeout_s=30,
+        deadline=time.monotonic() + 0.3,
+        poll_s=0.05,
+        grace_s=0.5,
+    )
+    assert got["outcome"] == "wall_limit" and proc.poll() is not None
+
+
+def test_supervise_returns_the_exit_of_a_finished_worker(tmp_path):
+    import subprocess
+    import time
+
+    proc = subprocess.Popen([sys.executable, "-c", "raise SystemExit(3)"])
+    got = orchestrate.supervise(
+        proc,
+        tmp_path,
+        boot_timeout_s=30,
+        deadline=time.monotonic() + 30,
+        poll_s=0.05,
+        grace_s=0.5,
+    )
+    assert got == dict(outcome="exited", returncode=3)
+
+
+def test_run_with_censoring_relaunches_the_rest_after_a_request_timeout():
+    requests = [dict(name=f"r{i}") for i in range(5)]
+    launches = []
+
+    def run(batch):
+        launches.append([r["name"] for r in batch])
+        if len(launches) == 1:  # the third request of the first worker hangs
+            raise orchestrate.JobTimeout(
+                dict(outcome="request_timeout", index=2), {0: "e0", 1: "e1"}
+            )
+        return {i: f"late{i}" for i in range(len(batch))}
+
+    done, censored = orchestrate.run_with_censoring(run, requests)
+    assert launches == [["r0", "r1", "r2", "r3", "r4"], ["r3", "r4"]]
+    assert censored == ["r2"]
+    assert done == {"r0": "e0", "r1": "e1", "r3": "late0", "r4": "late1"}
+
+
+def test_run_with_censoring_never_absorbs_other_failures():
+    def run(batch):
+        raise orchestrate.JobTimeout(dict(outcome="boot_timeout"), {})
+
+    with pytest.raises(orchestrate.JobTimeout):
+        orchestrate.run_with_censoring(run, [dict(name="r0")])

@@ -436,3 +436,15 @@ def test_release_refuses_an_unexpected_session_entry_shape(monkeypatch):
     )  # not the production shape
     with pytest.raises(RuntimeError, match="unexpected session entry"):
         worker.release_session("p369-odd")
+
+
+# ------------------------------------------------------------------ code round 1 H8: the request heartbeat
+def test_progress_records_the_request_and_its_deadline_atomically(tmp_path):
+    import time
+
+    before = time.time()
+    worker.write_progress(tmp_path, index=3, name="e7a/x", deadline_s=120.0)
+    got = json.loads((tmp_path / "progress.json").read_text())
+    assert (got["index"], got["name"], got["deadline_s"]) == (3, "e7a/x", 120.0)
+    assert before <= got["started"] <= time.time()
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["progress.json"]
