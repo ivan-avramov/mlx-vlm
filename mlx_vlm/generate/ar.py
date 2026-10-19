@@ -1455,6 +1455,18 @@ def _resolve_seeds(
     return [default_seed if s is None else s for s in seeds]
 
 
+def _effective_prefill_draft(draft_model, draft_kind):
+    # Fork: fork-only helper (P369 round-3 F7).
+    """The drafter configuration the chunked-prefill policy must see.
+
+    Batched mtp always decodes plainly, so its prefill is a plain prefill: telling the
+    policy it is MTP made qwen3_5 disable chunking (a dense N x N mask at long context).
+    """
+    if draft_kind == "mtp":
+        return None, None
+    return draft_model, draft_kind
+
+
 def _speculation_fallback_reason(
     draft_kind, logits_processors, seeds, sampler
 ) -> Optional[str]:
@@ -2362,27 +2374,29 @@ class PromptProcessingBatch:
                     )
                 prepare(right_padding=right_pad_per_row, lengths=self._suffix_lens)
 
+        # Fork (P369 round-3 F7): the policy sees the effective (plain, for mtp) setup.
+        policy_draft_model, policy_draft_kind = _effective_prefill_draft(
+            draft_model, draft_kind
+        )
         self.prefill_step_size = _default_prefill_step_size_for_offload(
-            self.model, self.prefill_step_size, draft_model, DEFAULT_PREFILL_STEP_SIZE
+            self.model,
+            self.prefill_step_size,
+            policy_draft_model,
+            DEFAULT_PREFILL_STEP_SIZE,
         )
         if self.prefill_step_size is not None:
             policy_kwargs = dict(self._prompt_kwargs)
-            # Fork (P369 round-2 F6): batched mtp never speculates; no capture kwargs.
-            if (
-                draft_model is not None
-                and draft_kind is not None
-                and draft_kind != "mtp"
-            ):
+            if policy_draft_model is not None and policy_draft_kind is not None:
                 policy_kwargs.update(
-                    speculative_prefill_kwargs(draft_kind, draft_model)
+                    speculative_prefill_kwargs(policy_draft_kind, policy_draft_model)
                 )
             if not _chunked_prefill_enabled(
                 self.model,
                 input_ids=self._input_ids,
                 inputs_embeds=self._inputs_embeds,
                 prompt_cache=self.prompt_cache,
-                draft_model=draft_model,
-                draft_kind=draft_kind,
+                draft_model=policy_draft_model,
+                draft_kind=policy_draft_kind,
                 prefill_kwargs=policy_kwargs,
             ):
                 self.prefill_step_size = None
@@ -4055,16 +4069,18 @@ def _generate_batch(
         **{k: v for k, v in embedding_output.to_dict().items() if v is not None},
     }
 
+    # Fork (P369 round-3 F7): the policy sees the effective (plain, for mtp) setup.
+    draft_model, draft_kind = _effective_prefill_draft(
+        kwargs.get("draft_model"), kwargs.get("draft_kind")
+    )
     kwargs["prefill_step_size"] = _default_prefill_step_size_for_offload(
         model,
         kwargs.get("prefill_step_size", DEFAULT_PREFILL_STEP_SIZE),
-        kwargs.get("draft_model"),
+        draft_model,
         DEFAULT_PREFILL_STEP_SIZE,
     )
     if kwargs.get("prefill_step_size", DEFAULT_PREFILL_STEP_SIZE) is not None:
         policy_kwargs = dict(gen_kwargs)
-        draft_model = kwargs.get("draft_model")
-        draft_kind = kwargs.get("draft_kind")
         if draft_model is not None and draft_kind is not None:
             policy_kwargs.update(speculative_prefill_kwargs(draft_kind, draft_model))
         if not _chunked_prefill_enabled(
