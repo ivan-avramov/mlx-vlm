@@ -35,6 +35,8 @@ from contextlib import contextmanager
 WIDTH1_OK = {"plain", "quantized_fused_decode", "declined"}
 SCOPES = ("_mtp_verify_target", "_mtp_acceptance_walk")
 NESTED = "_target_verify_linear"  # dispatched per module by the tuple fallback
+TUPLE_ENTRY = "_target_verify_linears"
+TUPLE_FAMILY = "quantized_linears_optimized"
 VERIFY_BLOCK = (
     3  # the expected-family probe width (any 1 < T <= 8 is the same eligibility)
 )
@@ -90,7 +92,7 @@ class KernelTelemetry:
         items = arg if isinstance(arg, (list, tuple)) else [arg]
         return [self._names.get(id(m), "?") for m in items]
 
-    def _record(self, entry, family, width, dtype, modules, *, attribute=True):
+    def _record(self, entry, family, width, dtype, modules, *, attribute=True, **extra):
         scope = "verify" if self._scope_depth else "other"
         target = self.probe_calls if self._probe_depth else self.calls
         target.append(
@@ -101,6 +103,7 @@ class KernelTelemetry:
                 dtype=dtype,
                 modules=modules,
                 scope=scope,
+                **extra,
             )
         )
         if attribute and not self._probe_depth:
@@ -142,7 +145,12 @@ class KernelTelemetry:
 
     # -- wrappers
     def _classified_call(self, name, real, target, x, args, kwargs):
-        """Run ``real`` in its own frame and record it exactly once (see the module docstring)."""
+        """Run ``real`` in its own frame and record it exactly once (see the module docstring). A tuple
+        entry also records whether the production tuple kernel was eligible for this exact group
+        (``tuple_expected``, code round 2 H2)."""
+        extra = {}
+        if name == TUPLE_ENTRY and _width(x) > 1:
+            extra["tuple_expected"] = tuple_kernel_eligible(target, x)
         frame = dict(families=[], subs=0)
         self._frames.append(frame)
         modules = self._modules(target)
@@ -150,7 +158,7 @@ class KernelTelemetry:
             out = real(target, x, *args, **kwargs)
         except BaseException:
             self._frames.pop()
-            self._record(name, "error", _width(x), _dtype(x), modules)
+            self._record(name, "error", _width(x), _dtype(x), modules, **extra)
             raise
         self._frames.pop()
         if frame["families"]:
@@ -158,14 +166,20 @@ class KernelTelemetry:
         elif frame["subs"]:
             # the tuple fallback: its nested per-module calls carry the attributions
             self._record(
-                name, "per_module", _width(x), _dtype(x), modules, attribute=False
+                name,
+                "per_module",
+                _width(x),
+                _dtype(x),
+                modules,
+                attribute=False,
+                **extra,
             )
             return out
         elif out is None:
             family = "declined"
         else:
             family = "plain" if _width(x) <= 1 else "plain_wide"
-        self._record(name, family, _width(x), _dtype(x), modules)
+        self._record(name, family, _width(x), _dtype(x), modules, **extra)
         return out
 
     def _entry(self, name, real):
@@ -253,6 +267,32 @@ class KernelTelemetry:
             owner, name, value = self._patched.pop()
             setattr(owner, name, value)
         return False
+
+
+def tuple_kernel_eligible(linears, x):
+    """``quantized_verifier.optimized_affine_linears``' guard (production, replicated with its source named)
+    for the exact group and verify block: 2–4 bias-free affine QuantizedLinears of one bits / group size /
+    mode, each eligible for the optimized kernel, 1 < T <= 8."""
+    import mlx.nn as nn
+    from mlx_vlm.models import quantized_verifier as qv
+
+    linears = list(linears) if isinstance(linears, (list, tuple)) else [linears]
+    bits = getattr(linears[0], "bits", None) if linears else None
+    return bool(
+        2 <= len(linears) <= 4
+        and x.ndim == 3
+        and 1 < x.shape[1] <= 8
+        and bits in (4, 5, 8)
+        and all(
+            isinstance(linear, nn.QuantizedLinear)
+            and linear.bits == bits
+            and linear.group_size == linears[0].group_size
+            and linear.mode == linears[0].mode
+            and "bias" not in linear
+            and qv._can_optimized_affine_linear(linear, x)
+            for linear in linears
+        )
+    )
 
 
 def _dense_exact_eligible(weight, dtype):
@@ -371,6 +411,19 @@ def verdict(telemetry, manifest):
     wide = [a for a in verify if a["width"] > 1]
     if not verify:
         problems.append("no verify-scope projection call")
+    for (
+        call
+    ) in (
+        telemetry.calls
+    ):  # code round 2 H2: an eligible group must use the tuple kernel
+        if (
+            call.get("scope") == "verify"
+            and call.get("tuple_expected")
+            and call["family"] != TUPLE_FAMILY
+        ):
+            problems.append(
+                f"tuple kernel expected ({TUPLE_FAMILY}) for {call['modules']}, got {call['family']}"
+            )
     observed = collections.defaultdict(set)
     for a in verify:
         info = manifest.get(a["module"])

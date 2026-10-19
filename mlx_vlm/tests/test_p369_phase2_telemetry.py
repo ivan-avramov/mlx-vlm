@@ -280,6 +280,11 @@ def test_tuple_fallbacks_are_attributed_per_module_and_reconcile_with_the_manife
     verdict = telemetry.verdict(tel, manifest)
     assert verdict["pass"], verdict
     assert not verdict["missing_coverage"]
+    # code round 2 H2: the tuple check is not vacuous — eligible groups occur and used the tuple kernel,
+    # ineligible ones (e.g. the GDN projections with small heads) fell back per module
+    tuples = [c for c in tel.calls if "tuple_expected" in c and c["scope"] == "verify"]
+    assert any(c["tuple_expected"] for c in tuples), tuples
+    assert any(not c["tuple_expected"] for c in tuples), tuples
 
 
 @metal
