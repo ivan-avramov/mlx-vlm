@@ -2605,6 +2605,36 @@ class ResponseGenerator:
                     args = request.args
                     images = request.images
                     prompt_cache_state = request.prompt_cache_state
+                    if (
+                        prompt_cache_state is None
+                        and args.max_tokens is not None
+                        and int(args.max_tokens) <= 0
+                    ):
+                        # Fork (P369 round-6 F26): a zero budget is answered
+                        # before any embedding / generator construction / prefill,
+                        # and (round-7 F29) before the "Prefill started" line.
+                        rqueue.put(
+                            GenerationContext(
+                                uid=id(rqueue),
+                                prompt_tokens=prompt_tokens,
+                                backend=BACKEND_CONTINUOUS_BATCHING,
+                            )
+                        )
+                        rqueue.put(
+                            StreamingToken(
+                                text="",
+                                token=0,
+                                logprobs=0.0,
+                                finish_reason="length",
+                                cached_tokens=0,  # no prefix reused (nothing ran)
+                                prompt_tps=None,  # no prefill ran
+                                token_count=0,
+                                emitted_at=time.perf_counter(),
+                            )
+                        )
+                        rqueue.put(None)
+                        continue
+
                     # Fork: decide the path label BEFORE logging it. Upstream
                     # passes the "continuous_batching" literal here because
                     # upstream has only one path out of this loop; the fork's
@@ -2634,31 +2664,6 @@ class ResponseGenerator:
                             session_retention=request.session_retention,
                             is_asymmetric_rendering=request.is_asymmetric_rendering,
                         )
-                        continue
-
-                    if args.max_tokens is not None and int(args.max_tokens) <= 0:
-                        # Fork (P369 round-6 F26): a zero budget is answered
-                        # before any embedding / generator construction / prefill.
-                        rqueue.put(
-                            GenerationContext(
-                                uid=id(rqueue),
-                                prompt_tokens=prompt_tokens,
-                                backend=BACKEND_CONTINUOUS_BATCHING,
-                            )
-                        )
-                        rqueue.put(
-                            StreamingToken(
-                                text="",
-                                token=0,
-                                logprobs=0.0,
-                                finish_reason="length",
-                                cached_tokens=0,  # no prefix reused (nothing ran)
-                                prompt_tps=None,  # no prefill ran
-                                token_count=0,
-                                emitted_at=time.perf_counter(),
-                            )
-                        )
-                        rqueue.put(None)
                         continue
 
                     if batch_gen is None:
