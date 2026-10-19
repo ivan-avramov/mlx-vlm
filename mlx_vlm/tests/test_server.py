@@ -494,11 +494,11 @@ def test_chat_completions_rejects_invalid_tool_choice(
     mock_get_cached_model.assert_not_called()
 
 
-def test_speculative_server_dispatches_mtp_batch_loop():
-    assert (
+def test_speculative_server_refuses_the_mtp_batch_loop():
+    # Fork (P369 round-4 F12): the public batched entry points never hand out
+    # ``_mtp_rounds_batch``; batched MTP decodes plainly.
+    with pytest.raises(NotImplementedError, match="batched"):
         speculative_utils.get_speculative_rounds_batch("mtp")
-        is speculative_utils._mtp_rounds_batch
-    )
 
 
 def test_positioned_target_sampler_is_batch_grouping_invariant():

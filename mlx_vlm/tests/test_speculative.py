@@ -1881,42 +1881,31 @@ def test_speculative_walk_batch_deferred_uniform_stops_at_batch_rejection():
     assert fake_head.calls == 1
 
 
-def test_mtp_server_singleton_dispatches_batch_rounds(monkeypatch):
-    calls = []
-
+def test_mtp_server_rounds_refuse_even_a_singleton(monkeypatch):
+    # Fork (P369 round-4 F12): batched MTP is refused centrally (it decodes plainly).
     def fake_batch(*args, **kwargs):
-        calls.append(("batch", args, kwargs))
-        yield [3], None
-
-    def fake_single(*args, **kwargs):
-        raise AssertionError("server MTP singleton should use batch round path")
+        raise AssertionError("_mtp_rounds_batch must not be reached")
 
     monkeypatch.setattr(speculative_utils, "_mtp_rounds_batch", fake_batch)
-    monkeypatch.setattr(speculative_utils, "_mtp_rounds", fake_single)
 
-    result = list(
-        speculative_utils.run_speculative_server_rounds(
-            SimpleNamespace(language_model=SimpleNamespace()),
-            SimpleNamespace(),
-            prompt_cache=[],
-            hidden=mx.zeros((1, 1, 1), dtype=mx.float32),
-            shared_kv_states={},
-            draft_kind="mtp",
-            first_bonus=mx.array([2], dtype=mx.int32),
-            max_tokens=4,
-            sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
-            token_dtype=mx.int32,
-            greedy_sampling=False,
-            prompt_tokens=mx.array([[7, 8]], dtype=mx.int32),
-            row_ids=[0],
+    with pytest.raises(NotImplementedError, match="batched"):
+        list(
+            speculative_utils.run_speculative_server_rounds(
+                SimpleNamespace(language_model=SimpleNamespace()),
+                SimpleNamespace(),
+                prompt_cache=[],
+                hidden=mx.zeros((1, 1, 1), dtype=mx.float32),
+                shared_kv_states={},
+                draft_kind="mtp",
+                first_bonus=mx.array([2], dtype=mx.int32),
+                max_tokens=4,
+                sampler=lambda logprobs: mx.argmax(logprobs, axis=-1),
+                token_dtype=mx.int32,
+                greedy_sampling=False,
+                prompt_tokens=mx.array([[7, 8]], dtype=mx.int32),
+                row_ids=[0],
+            )
         )
-    )
-
-    assert result == [([3], None)]
-    assert calls
-    assert calls[0][2]["first_bonus"].tolist() == [2]
-    assert calls[0][2]["prompt_tokens"].tolist() == [[7, 8]]
-    assert calls[0][2]["row_ids"] == [0]
 
 
 def test_dflash_server_singleton_dispatches_single_rounds(monkeypatch):

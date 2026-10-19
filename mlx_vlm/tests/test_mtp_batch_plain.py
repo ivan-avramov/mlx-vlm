@@ -257,3 +257,25 @@ def test_f7_effective_policy_draft_helper():
     assert ar._effective_prefill_draft(drafter, "mtp") == (None, None)
     assert ar._effective_prefill_draft(drafter, "dflash") == (drafter, "dflash")
     assert ar._effective_prefill_draft(None, None) == (None, None)
+
+
+def test_f12_public_batched_entry_points_refuse_mtp_and_count():
+    from mlx_vlm.speculative import utils as su
+
+    before = ar.SPECULATION_FALLBACKS["mtp_batched_refused"]
+    with pytest.raises(NotImplementedError, match="batched"):
+        su.get_speculative_rounds_batch("mtp")
+    with pytest.raises(NotImplementedError, match="batched"):
+        list(
+            su.run_speculative_server_rounds(
+                SimpleNamespace(),
+                SimpleNamespace(),
+                [],
+                mx.zeros((1, 1, 1)),
+                draft_kind="mtp",
+                first_bonus=mx.array([1], dtype=mx.int32),
+                max_tokens=2,
+                sampler=lambda x: x,
+            )
+        )
+    assert ar.SPECULATION_FALLBACKS["mtp_batched_refused"] == before + 2

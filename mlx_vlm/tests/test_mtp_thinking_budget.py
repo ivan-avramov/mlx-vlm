@@ -289,15 +289,10 @@ def test_batch_criteria_with_b_gt_1_refuses():
         )
 
 
-def test_server_rounds_forwards_criteria_to_the_batch_loop():
-    seen = {}
-
-    def fake_batch(*args, **kwargs):
-        seen["criteria"] = kwargs.get("thinking_budget_criteria")
-        return iter(())
-
-    crit = [_ForcedCriteria(armed=False)]
-    with patch.object(speculative_utils, "_mtp_rounds_batch", side_effect=fake_batch):
+def test_server_rounds_refuse_mtp_before_the_batch_loop():
+    # Fork (P369 round-4 F12): the batch loop (and its criteria forwarding) is
+    # private; the public entry point refuses MTP.
+    with pytest.raises(NotImplementedError, match="batched"):
         list(
             speculative_utils.run_speculative_server_rounds(
                 SimpleNamespace(language_model=_LM()),
@@ -308,10 +303,9 @@ def test_server_rounds_forwards_criteria_to_the_batch_loop():
                 first_bonus=mx.array([1], dtype=mx.int32),
                 max_tokens=4,
                 sampler=lambda logits: mx.argmax(logits, axis=-1),
-                thinking_budget_criteria=crit,
+                thinking_budget_criteria=[_ForcedCriteria(armed=False)],
             )
         )
-    assert seen.get("criteria") is crit
 
 
 def test_speculative_generation_batch_drives_and_forwards_criteria():
