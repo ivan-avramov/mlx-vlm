@@ -244,3 +244,57 @@ def test_f8_closed_after_terminal_session_is_published_before_next_turn(setup, a
     stream.close()
     assert state.token_ids is not None and state.cache is not None
     assert list(state.token_ids)[: len(TURN2)] == TURN2
+
+
+# ------------------------------------------------------------------ round 5 / F18
+def _start(setup, state, drafter, ids=None, n=N, seed=7):
+    kwargs = dict(
+        input_ids=mx.array([ids or TURN2]),
+        prompt_cache_state=state,
+        max_tokens=n,
+        prefill_step_size=None,
+        seed=seed,
+        **deployed_sampling(PICKS[0]),
+    )
+    if drafter is not None:
+        kwargs.update(draft_model=drafter, draft_kind="mtp", draft_block_size=BLOCK)
+    return stream_generate(setup.model, Tokenizer(()), "", **kwargs)
+
+
+@pytest.mark.parametrize("arm", ["off", "on"])
+def test_f18_abandoned_unclosed_stream_cannot_corrupt_or_clear_a_newer_one(
+    setup, arm
+):
+    """Round 5 F18: stream A is abandoned WITHOUT closing; stream B starts on the same
+    session (it must retire the stale in-flight state and decode from scratch), and
+    closing / resuming A afterwards must neither clear nor publish over B."""
+    drafter = _drafter(setup, arm)
+    state = PromptCacheState()
+    turn(setup.model, PROMPT, state, drafter=drafter, n=N, seed=5)  # warm
+    stream_a = _start(setup, state, drafter)
+    next(stream_a)
+    next(stream_a)  # A in flight; its prefill extended the shared cache
+    chunks_b = list(_start(setup, state, drafter))  # B on the same session
+    tokens_b = [c.token for c in chunks_b if c.token is not None]
+    assert tokens_b == setup.ref2[: len(tokens_b)] and len(tokens_b) == N
+    published = (list(state.token_ids), cache_snapshot(state))
+    # A comes back to life: it must be a no-op for the session.
+    with pytest.raises(StopIteration):
+        for _ in range(N + 2):
+            next(stream_a)
+    stream_a.close()
+    assert list(state.token_ids) == published[0]
+    assert_same_cache(cache_snapshot(state), published[1])
+
+
+@pytest.mark.parametrize("arm", ["off", "on"])
+def test_f18_closing_the_stale_stream_alone_keeps_the_newer_publication(setup, arm):
+    drafter = _drafter(setup, arm)
+    state = PromptCacheState()
+    turn(setup.model, PROMPT, state, drafter=drafter, n=N, seed=5)
+    stream_a = _start(setup, state, drafter)
+    next(stream_a)
+    list(_start(setup, state, drafter))
+    ids = list(state.token_ids)
+    stream_a.close()
+    assert state.token_ids is not None and list(state.token_ids) == ids
