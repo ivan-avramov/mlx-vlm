@@ -341,6 +341,100 @@ def load_snapshots(path):
     return out
 
 
+# ------------------------------------------------------------------ smoke positives (Q32)
+def _replace_last(records, position, new):
+    out = list(records)
+    index = max(i for i, (p, _) in enumerate(out) if p == position)
+    out[index] = (position, new)
+    return out
+
+
+def _mutate_and_restore(caches, array, index, sha):
+    """Change one element of a live cache array, hash, restore it exactly; True when the change was seen."""
+    from p369_phase2 import observe
+
+    saved = array[index]
+    array[index] = saved + 1
+    seen = observe.state_hash(caches) != sha
+    array[index] = saved
+    if observe.state_hash(caches) != sha:
+        raise RuntimeError("smoke positive: the restored cache does not hash back")
+    return seen
+
+
+def smoke_positives(on, off, n, params):
+    """Q32 on live data: the unmodified ON / OFF data pass, and each injected change is detected."""
+    import copy
+
+    import numpy as np
+    from p369_phase2 import compare, observe
+
+    rows_on, rows_off = on.rows, off.rows
+    base_rows = compare.compare_streams(rows_on, rows_off, n, params)
+    base_states = observe.compare_states(on, off)
+    fired = {}
+    latest, _ = compare.latest_rows(rows_off, n)
+    position = max(latest)
+    record = latest[position]
+    canon = compare.canonical(record, params)
+    # raw ulp, outside the support: the raw recorder sees it, the filtered distribution cannot.
+    j = int(np.flatnonzero(canon == 0)[0])
+    bits = np.array(record["bits"]).copy()
+    bits[j] = bits[j] + 1
+    raw = compare.compare_streams(
+        rows_on, _replace_last(rows_off, position, dict(record, bits=bits)), n, params
+    )
+    fired["raw_ulp"] = raw["raw_only_differences"] == [position] and raw["pass"]
+    # in support: the comparator must fail exactly there.
+    row = compare.from_record(record)
+    top = int(np.argmax(canon))
+    import mlx.core as mx
+
+    bumped = mx.where(mx.arange(row.size) == top, row + 0.5, row).astype(row.dtype)
+    bad = compare.compare_streams(
+        rows_on, _replace_last(rows_off, position, compare.as_record(bumped)), n, params
+    )
+    fired["in_support"] = (not bad["pass"]) and [
+        m["position"] for m in bad["mismatches"]
+    ] == [position]
+    # live cache components (the final OFF cache): each change must move the full-state hash.
+    from mlx_vlm.speculative.cache_state import iter_leaf_caches
+
+    caches = off._cache
+    sha = observe.state_hash(caches)
+    leaves = list(iter_leaf_caches(caches))
+    tq = sys.modules.get("mlx_vlm.turboquant")
+    for leaf in leaves:
+        kind = type(leaf).__name__
+        if tq is not None and isinstance(leaf, tq.TurboQuantKVCache):
+            if "tq_norm" not in fired and leaf.keys is not None:
+                norms = leaf.keys[0]
+                fired["tq_norm"] = _mutate_and_restore(caches, norms, (..., 0), sha)
+        elif hasattr(leaf, "keys") and getattr(leaf, "keys", None) is not None:
+            if "old_prefix_k" not in fired and not isinstance(leaf.keys, (list, tuple)):
+                fired["old_prefix_k"] = _mutate_and_restore(
+                    caches, leaf.keys, (..., 0, 0), sha
+                )
+        elif kind == "ArraysCache" and "recurrent" not in fired:
+            arrays = [a for a in leaf.state if a is not None]
+            fired["recurrent"] = _mutate_and_restore(caches, arrays[-1], (..., 0), sha)
+    # probe logit: one ON snapshot's probe changed must fail the state comparison there.
+    if on.commits and on.commits[0]["probe"] is not None:
+        changed = copy.copy(on)
+        changed.commits = [dict(c) for c in on.commits]
+        probe = dict(changed.commits[0]["probe"])
+        probe_bits = np.array(probe["bits"]).copy()
+        probe_bits[0] = probe_bits[0] + 1
+        changed.commits[0]["probe"] = dict(probe, bits=probe_bits)
+        states = observe.compare_states(changed, off)
+        fired["probe_logit"] = (not states["pass"]) and states["probe_mismatches"] == [
+            changed.commits[0]["offset"]
+        ]
+    return dict(
+        baseline_pass=bool(base_rows["pass"] and base_states["pass"]), fired=fired
+    )
+
+
 # ------------------------------------------------------------------ main
 def main(job_path):
     job = json.loads(Path(job_path).read_text())
