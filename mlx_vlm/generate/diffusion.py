@@ -604,7 +604,9 @@ def stream_diffusion_generate(
         input_ids.dtype,
     )
     max_new_tokens = int(
-        generation_config.get("max_new_tokens", 256) if max_tokens is None else max_tokens
+        generation_config.get("max_new_tokens", 256)
+        if max_tokens is None
+        else max_tokens
     )  # Fork (P369 round-5 F16): 0 stays 0
     if max_denoising_steps is None:
         max_denoising_steps = int(

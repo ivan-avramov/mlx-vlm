@@ -198,7 +198,9 @@ def test_e6_control_default_seed_decodes_plain_for_the_batched_mtp_reason(lm):
 
 
 # ------------------------------------------------------------ round 4 / F15
-def test_f15_inline_penalty_fallback_presents_plain_to_prefill_policies(lm, monkeypatch):
+def test_f15_inline_penalty_fallback_presents_plain_to_prefill_policies(
+    lm, monkeypatch
+):
     """A cached MTP request that falls back for a penalty must not request the
     drafter's prefill captures nor present MTP to the chunked-prefill / offload
     policies (an explicit unchunked MoE-offload prefill would bypass its default)."""
@@ -232,7 +234,12 @@ def test_f15_inline_penalty_fallback_presents_plain_to_prefill_policies(lm, monk
     )
     model = fake_model(lm)
     plain, _ = turn(
-        model, PROMPT, PromptCacheState(), n=N, prefill_step_size=4, repetition_penalty=1.3
+        model,
+        PROMPT,
+        PromptCacheState(),
+        n=N,
+        prefill_step_size=4,
+        repetition_penalty=1.3,
     )
     seen.update(capture=[], offload=[], chunked=[])
     drafter = mtp_drafter(lm)

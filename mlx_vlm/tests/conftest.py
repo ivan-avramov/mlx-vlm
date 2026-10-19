@@ -46,6 +46,7 @@ def pytest_sessionfinish(session, exitstatus):
 
 import pytest  # noqa: E402  Fork: autouse determinism fixture below
 
+
 def seed_for(nodeid: str) -> int:
     """A fixed 32-bit seed per test node id (identical across runs and orders)."""
     import hashlib
@@ -73,6 +74,7 @@ def _deterministic_random_state(request):
     np.random.seed(seed)
     random.seed(seed)
     yield
+
 
 # path -> (missing symbol, what porting it actually requires)
 #

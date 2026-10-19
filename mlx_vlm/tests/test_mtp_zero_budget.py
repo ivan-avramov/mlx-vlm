@@ -9,10 +9,17 @@ re-prefills identically for MTP-ON and OFF.
 
 import mlx.core as mx
 import pytest
-from test_mtp_exactness import PICKS, PROMPT, deployed_sampling, fake_model, hybrid_lm
+from test_mtp_exactness import PICKS, PROMPT, deployed_sampling, fake_model
 from test_mtp_exactness import generate as ar_generate
-from test_mtp_exactness import mtp_drafter
-from test_mtp_stop_state import BLOCK, N, Tokenizer, assert_same_cache, cache_snapshot, turn
+from test_mtp_exactness import hybrid_lm, mtp_drafter
+from test_mtp_stop_state import (
+    BLOCK,
+    N,
+    Tokenizer,
+    assert_same_cache,
+    cache_snapshot,
+    turn,
+)
 
 from mlx_vlm.generate.common import PromptCacheState
 from mlx_vlm.generate.dispatch import stream_generate

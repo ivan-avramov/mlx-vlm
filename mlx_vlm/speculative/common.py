@@ -9,6 +9,7 @@ from .cache_state import start_speculative_cache
 
 generation_stream = mx.new_thread_local_stream(mx.default_device())
 
+
 # Fork (P369): how often a configured drafter was NOT used, by reason, so a
 # performance cliff (e.g. every batched MTP request decoding plainly) is visible.
 class _FallbackCounter(dict):

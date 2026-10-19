@@ -32,8 +32,8 @@ from ..sample_utils import (  # Fork: isort regrouping around the fork's sampler
 from ..sample_utils import (
     top_p_sampling as top_p_sampling,  # Fork: explicit compatibility re-export
 )
-from ..speculative.common import (  # Fork (P369): fallback counter
-    SPECULATION_FALLBACKS as SPECULATION_FALLBACKS,
+from ..speculative.common import (
+    SPECULATION_FALLBACKS as SPECULATION_FALLBACKS,  # Fork (P369): fallback counter
 )
 from ..speculative.utils import (
     SpeculativePrefill,

@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import mlx.core as mx
 import pytest
-from test_mtp_batch_plain import N, OTHER, _drive
+from test_mtp_batch_plain import OTHER, N, _drive
 from test_mtp_exactness import PICKS, PROMPT, deployed_sampling, hybrid_lm, mtp_drafter
 
 from mlx_vlm.generate import ar

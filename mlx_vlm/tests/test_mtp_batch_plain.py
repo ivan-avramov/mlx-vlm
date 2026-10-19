@@ -293,7 +293,9 @@ def test_f14_positioned_sampler_without_a_seed_attribute_does_not_raise():
         == "request_seed"
     )
     # No explicit seeds at all: nothing to honour, speculation may proceed.
-    assert ar._speculation_fallback_reason("dflash", None, [None, None], sampler) is None
+    assert (
+        ar._speculation_fallback_reason("dflash", None, [None, None], sampler) is None
+    )
     assert ar._speculation_fallback_reason("dflash", None, None, sampler) is None
 
 
@@ -353,5 +355,7 @@ def test_f17_batched_mtp_keeps_apc_like_plain(lm):
     from mlx_vlm.apc import APCManager
 
     off_flags, _ = _logprob_run(lm, None, apc_manager=APCManager(num_blocks=8))
-    on_flags, _ = _logprob_run(lm, mtp_drafter(lm), apc_manager=APCManager(num_blocks=8))
+    on_flags, _ = _logprob_run(
+        lm, mtp_drafter(lm), apc_manager=APCManager(num_blocks=8)
+    )
     assert on_flags == off_flags

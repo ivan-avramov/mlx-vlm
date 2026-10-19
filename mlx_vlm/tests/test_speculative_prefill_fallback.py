@@ -12,8 +12,8 @@ from types import SimpleNamespace
 
 import mlx.core as mx
 import pytest
-from test_mtp_exactness import BLOCK, PICKS, PROMPT, deployed_sampling, hybrid_lm
 from test_mtp_batch_fallbacks import _processors
+from test_mtp_exactness import BLOCK, PICKS, deployed_sampling, hybrid_lm
 
 from mlx_vlm.generate import ar
 from mlx_vlm.utils import StoppingCriteria
@@ -34,7 +34,9 @@ def _drafter(kind):
 
 
 def _prefill_to_decode_batch(lm, kind, insert_kwargs, monkeypatch):
-    monkeypatch.setattr(ar, "validate_drafter_compatibility", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(
+        ar, "validate_drafter_compatibility", lambda *a, **k: None, raising=False
+    )
     monkeypatch.setattr(
         ar, "speculative_prefill_kwargs", lambda k, d: {"capture_layer_ids": [0, 1]}
     )
@@ -85,7 +87,9 @@ REASONS = {
 
 @pytest.mark.parametrize("kind", ["dflash", "eagle3"])
 @pytest.mark.parametrize("reason", sorted(REASONS))
-def test_f11_chunked_capture_then_fallback_does_not_crash(lm, kind, reason, monkeypatch):
+def test_f11_chunked_capture_then_fallback_does_not_crash(
+    lm, kind, reason, monkeypatch
+):
     batch = _prefill_to_decode_batch(lm, kind, REASONS[reason](), monkeypatch)
     assert batch is not None and len(batch) > 0
     assert not getattr(batch, "is_speculative", False)

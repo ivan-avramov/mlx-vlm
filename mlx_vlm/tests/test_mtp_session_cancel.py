@@ -18,7 +18,6 @@ closing the ``stream_generate`` generator directly, plus a raised exception.
 from types import SimpleNamespace
 
 import mlx.core as mx
-
 import pytest
 from test_mtp_exactness import PICKS, PROMPT, deployed_sampling, mtp_drafter, scripted
 from test_mtp_stop_state import (
@@ -74,9 +73,8 @@ def _drafter(setup, arm):
 
 def _serve_cancelled(rg, ids, chat_id, n, seed, cancel_after, monkeypatch):
     """Run one cached request, cancelling it once ``cancel_after`` chunks went out."""
-    from queue import Queue
-
     import importlib
+    from queue import Queue
 
     generate_pkg = importlib.import_module("mlx_vlm.generate")
     from mlx_vlm.server import generation as server
@@ -199,9 +197,7 @@ def test_f8_closing_right_after_the_terminal_chunk_keeps_the_session(setup, arm)
             **deployed_sampling(PICKS[0]),
         )
         if drafter is not None:
-            kwargs.update(
-                draft_model=drafter, draft_kind="mtp", draft_block_size=BLOCK
-            )
+            kwargs.update(draft_model=drafter, draft_kind="mtp", draft_block_size=BLOCK)
         stream = stream_generate(setup.model, Tokenizer(()), "", **kwargs)
         if close_after_terminal:
             for chunk in stream:
@@ -211,9 +207,7 @@ def test_f8_closing_right_after_the_terminal_chunk_keeps_the_session(setup, arm)
         else:
             list(stream)
         follow = list(state.token_ids or []) + [41, 42]
-        second, _ = turn(
-            setup.model, follow, state, drafter=drafter, n=6, seed=9
-        )
+        second, _ = turn(setup.model, follow, state, drafter=drafter, n=6, seed=9)
         return state, second
 
     drained_state, drained_next = run(False)
@@ -262,9 +256,7 @@ def _start(setup, state, drafter, ids=None, n=N, seed=7):
 
 
 @pytest.mark.parametrize("arm", ["off", "on"])
-def test_f18_abandoned_unclosed_stream_cannot_corrupt_or_clear_a_newer_one(
-    setup, arm
-):
+def test_f18_abandoned_unclosed_stream_cannot_corrupt_or_clear_a_newer_one(setup, arm):
     """Round 5 F18: stream A is abandoned WITHOUT closing; stream B starts on the same
     session (it must retire the stale in-flight state and decode from scratch), and
     closing / resuming A afterwards must neither clear nor publish over B."""
