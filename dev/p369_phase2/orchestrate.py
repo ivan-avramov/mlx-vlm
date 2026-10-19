@@ -241,17 +241,6 @@ def binding_problems(smoke_summary, manifest):
     return problems
 
 
-def lock_is_stale(record, create_time_of):
-    """Code round 1 H14: reclaim the run lock only when its recorded owner is provably gone — the pid is not
-    alive (``create_time_of(pid)`` None) or was reused (a different create time). Unreadable: keep.
-    """
-    pid, created = record.get("pid"), record.get("create_time")
-    if type(pid) is not int or type(created) is not float:
-        return False
-    now = create_time_of(pid)
-    return now is None or now != created
-
-
 def clopper_pearson(k, n, alpha=0.05):
     """Two-sided exact interval for k events in n independent trials (bisection on the binomial tail)."""
     if n == 0:
@@ -1401,35 +1390,34 @@ class Campaign:
         os.replace(tmp, self.out / "summary.json")
 
 
-def _create_time(pid):
-    import psutil
-
-    try:
-        return psutil.Process(pid).create_time()
-    except psutil.NoSuchProcess:
-        return None
-
-
 def acquire_lock(lock):
-    """The exclusive run lock, recording ``{pid, create_time}``; a stale lock (owner provably gone, H14) is
-    reclaimed once with a message, a live or unreadable one refuses."""
-    for attempt in (1, 2):
+    """Code round 2 H14: the exclusive run lock is ``fcntl.flock`` on a stable descriptor — the kernel
+    releases it when the holder exits or dies, so there is no stale-lock reclaim and the file is never
+    unlinked (no pathname race). The holder's ``{pid, started}`` is written for diagnostics only.
+    """
+    import fcntl
+
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
         try:
-            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
-            try:
-                record = json.loads(lock.read_text())
-            except (OSError, ValueError):
-                record = {}
-            if attempt == 1 and lock_is_stale(record, _create_time):
-                print(f"reclaiming a stale run lock {lock}: {record}")
-                lock.unlink()
-                continue
-            raise SystemExit(f"run lock {lock} is held: {record or 'unreadable'}")
-        me = os.getpid()
-        os.write(fd, json.dumps(dict(pid=me, create_time=_create_time(me))).encode())
-        return fd
-    raise SystemExit(f"run lock {lock}: could not acquire")
+            holder = lock.read_text().strip() or "unreadable"
+        except OSError:
+            holder = "unreadable"
+        raise SystemExit(f"run lock {lock} is held: {holder}")
+    os.ftruncate(fd, 0)
+    os.write(fd, json.dumps(dict(pid=os.getpid(), started=time.time())).encode())
+    os.fsync(fd)
+    return fd
+
+
+def release_lock(fd):
+    import fcntl
+
+    fcntl.flock(fd, fcntl.LOCK_UN)
+    os.close(fd)
 
 
 def main(argv=None):
@@ -1468,8 +1456,7 @@ def main(argv=None):
     try:
         summary = Campaign(args).execute()
     finally:
-        os.close(fd)
-        lock.unlink()
+        release_lock(fd)
     print(
         json.dumps(
             dict(status=summary["status"], smoke_gate=summary.get("smoke_gate")),

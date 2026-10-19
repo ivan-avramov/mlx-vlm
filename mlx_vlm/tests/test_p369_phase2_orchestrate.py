@@ -243,16 +243,6 @@ def test_binding_mismatch_refuses_the_full_run():
     )  # a smoke summary without a binding
 
 
-def test_lock_staleness_needs_a_dead_or_reused_owner():
-    record = dict(pid=4242, create_time=100.0)
-    assert orchestrate.lock_is_stale(record, lambda pid: None)  # owner gone
-    assert orchestrate.lock_is_stale(record, lambda pid: 200.0)  # pid reused
-    assert not orchestrate.lock_is_stale(record, lambda pid: 100.0)  # owner alive
-    assert not orchestrate.lock_is_stale(
-        dict(pid="x"), lambda pid: None
-    )  # unreadable: keep
-
-
 @pytest.mark.parametrize(
     ("k", "n", "lo", "hi"),
     [(0, 20, 0.0, 0.1684), (20, 20, 0.8316, 1.0), (5, 20, 0.0866, 0.4910)],
