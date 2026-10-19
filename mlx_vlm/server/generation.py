@@ -1091,6 +1091,8 @@ class QueuedGenerationRequest:
     prompt: Optional[str] = None
     # Fork (M48): per-request retention plan (boundary + echo predictor); never on the session.
     session_retention: Optional[Any] = None
+    # Fork (P369 round-6 F23): per-request asymmetric-rendering flag.
+    is_asymmetric_rendering: Optional[bool] = None
 
 
 @dataclass
@@ -1577,6 +1579,7 @@ class ResponseGenerator:
         videos: Optional[List] = None,
         prompt_cache_state: Optional["PromptCacheState"] = None,
         session_retention: Optional[Any] = None,
+        is_asymmetric_rendering: Optional[bool] = None,  # Fork (P369 round-6 F23)
     ) -> Tuple[GenerationContext, "_TokenIterator"]:
         """Submit a generation request to the GPU thread.
 
@@ -1657,6 +1660,7 @@ class ResponseGenerator:
             prompt_cache_state=prompt_cache_state,
             prompt=prompt,
             session_retention=session_retention,
+            is_asymmetric_rendering=is_asymmetric_rendering,
         )
         logger.info(
             "Generation queued: request=%s prompt_tokens=%d max_tokens=%d "
@@ -1751,6 +1755,7 @@ class ResponseGenerator:
         prompt_tokens: int,
         prompt_cache_state: "PromptCacheState",
         session_retention=None,
+        is_asymmetric_rendering: Optional[bool] = None,  # Fork (P369 round-6 F23)
     ) -> None:
         """Run a chat_id'd request inline on the daemon thread.
 
@@ -1791,6 +1796,8 @@ class ResponseGenerator:
         gen_kwargs["prompt_cache_state"] = prompt_cache_state
         if session_retention is not None:
             gen_kwargs["session_retention"] = session_retention  # Fork (M48)
+        if is_asymmetric_rendering is not None:
+            gen_kwargs["is_asymmetric_rendering"] = is_asymmetric_rendering
         # L1: thread the server-configured prefill step (--prefill-step-size, e.g.
         # 512) into the cached path. Without it, generate_step falls back to
         # DEFAULT_PREFILL_STEP_SIZE (2048), 4x-ing the QK^2 prefill scratch and
@@ -2625,6 +2632,7 @@ class ResponseGenerator:
                             prompt_tokens=prompt_tokens,
                             prompt_cache_state=prompt_cache_state,
                             session_retention=request.session_retention,
+                            is_asymmetric_rendering=request.is_asymmetric_rendering,
                         )
                         continue
 

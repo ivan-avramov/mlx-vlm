@@ -2528,8 +2528,11 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
         # Mark the session's cache as asymmetric so stream_generate can anchor
         # the cache at end-of-user on multi-turn thinking conversations.
         if prompt_cache_state is not None:
-            prompt_cache_state.is_asymmetric_rendering = (
-                _is_template_thinking_asymmetric(formatted_prompt)
+            # Fork (P369 round-6 F23): the flag rides on THIS request (forwarded
+            # through generate()), never on the shared session another queued
+            # request on the same chat could be reading.
+            kwargs["is_asymmetric_rendering"] = _is_template_thinking_asymmetric(
+                formatted_prompt
             )
             # Fork (M48): retention plan for this request — the token boundary the
             # next request will reproduce, plus a predictor of the client's echo of
@@ -2657,6 +2660,13 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             _gen_extra["session_retention"] = kwargs[
                                 "session_retention"
                             ]  # Fork (M48)
+                        if (
+                            prompt_cache_state is not None
+                            and kwargs.get("is_asymmetric_rendering") is not None
+                        ):
+                            _gen_extra["is_asymmetric_rendering"] = kwargs[
+                                "is_asymmetric_rendering"
+                            ]  # Fork (P369 round-6 F23)
                         if videos:
                             _gen_extra["videos"] = videos
                         ctx, token_iter = await asyncio.to_thread(
@@ -3161,6 +3171,13 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             _gen_extra["session_retention"] = kwargs[
                                 "session_retention"
                             ]  # Fork (M48)
+                        if (
+                            prompt_cache_state is not None
+                            and kwargs.get("is_asymmetric_rendering") is not None
+                        ):
+                            _gen_extra["is_asymmetric_rendering"] = kwargs[
+                                "is_asymmetric_rendering"
+                            ]  # Fork (P369 round-6 F23)
                         if videos:
                             _gen_extra["videos"] = videos
                         ctx, token_iter = runtime.response_generator.generate(
