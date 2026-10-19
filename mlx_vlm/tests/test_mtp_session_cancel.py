@@ -15,6 +15,7 @@ server's own ``_process_cached_request`` cooperative-cancel path, plus a consume
 closing the ``stream_generate`` generator directly, plus a raised exception.
 """
 
+import importlib
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -35,6 +36,8 @@ from test_mtp_stop_state import (
 
 from mlx_vlm.generate.common import PromptCacheState
 from mlx_vlm.generate.dispatch import stream_generate
+
+_dispatch = importlib.import_module("mlx_vlm.generate.dispatch")
 
 # Warm follow-up: the session holds PROMPT + the plain turn-1 emission, and TURN2
 # extends that whole history (what a real next chat turn does), so it is a cache HIT.
@@ -371,3 +374,67 @@ def test_f22_server_reports_the_publication_error_not_a_finished_stream(
     )
     assert state.token_ids is None and state.cache is None
     session_manager.clear_session_caches()
+
+
+# ------------------------------------------------------------------ round 7 / F27
+def _next_turn(setup, state, drafter):
+    """The next turn on ``state``: (cached prefix length, emitted ids)."""
+    follow = list(state.token_ids) + [41, 42]
+    final = list(_start(setup, state, drafter, ids=follow, n=6, seed=9))[-1]
+    return final.cached_tokens, list(final.token_ids)
+
+
+@pytest.mark.parametrize("arm", ["off", "on"])
+def test_f27_breaking_on_the_terminal_chunk_without_close_keeps_the_session(setup, arm):
+    """Round 7 F27: a consumer that breaks on ``finish_reason`` and keeps the generator
+    alive (never closes it) left the stream marked in flight, so the next request on
+    the session cleared a valid published cache. The next turn must reuse the session
+    exactly as after a fully drained stream."""
+
+    def run(break_without_close):
+        drafter = _drafter(setup, arm)
+        state = PromptCacheState()
+        turn(setup.model, PROMPT, state, drafter=drafter, n=N, seed=5)
+        stream = _start(setup, state, drafter)
+        if break_without_close:
+            for chunk in stream:
+                if chunk.finish_reason is not None:
+                    break
+        else:
+            list(stream)
+        return stream, _next_turn(setup, state, drafter)
+
+    _, drained = run(False)
+    kept_alive, broken = run(True)  # ``kept_alive`` is still referenced here
+    assert drained[0] > 0, "the drained stream's session must be reused"
+    assert broken == drained
+    kept_alive.close()  # stale by now: a no-op
+
+
+# ------------------------------------------------------------------ round 7 / F28
+def _body(events):
+    def body(*args, **kwargs):
+        yield SimpleNamespace(finish_reason=None)
+        yield SimpleNamespace(finish_reason="stop")
+        events.append("after-terminal")  # APC commit / publication / cache release
+
+    return body
+
+
+def test_f28_a_stateless_stream_delivers_the_terminal_chunk_before_its_cleanup():
+    """Round 7 F28: the terminal chunk is held back only to publish a session; a
+    stateless stream delivers it first, as upstream (cleanup on the next pull)."""
+    events = []
+    wrapped = _dispatch._retire_session_on_abnormal_exit(_body(events))
+    for chunk in wrapped(prompt_cache_state=None):
+        events.append(chunk.finish_reason or "token")
+    assert events == ["token", "stop", "after-terminal"]
+
+
+def test_f28_a_session_backed_stream_still_publishes_before_the_terminal_chunk():
+    events = []
+    state = SimpleNamespace(clear=lambda: events.append("clear"))
+    wrapped = _dispatch._retire_session_on_abnormal_exit(_body(events))
+    for chunk in wrapped(prompt_cache_state=state):
+        events.append(chunk.finish_reason or "token")
+    assert events == ["token", "after-terminal", "stop"]
