@@ -9,7 +9,7 @@ import random
 import mlx.core as mx
 import numpy as np
 import pytest
-from conftest import seed_for
+from conftest import fixture_seed, seed_for
 
 
 def _draws(seed):
@@ -43,3 +43,26 @@ def test_parametrizations_get_distinct_streams(request, case):
 def test_seed_for_is_stable():
     assert seed_for("a::b") == seed_for("a::b") != seed_for("a::c")
     assert 0 <= seed_for("a::b") < 2**32
+
+
+@pytest.fixture(scope="module")
+def _module_scoped_draw(request):
+    # Drawn at MODULE-scoped setup (before any test body's per-test reseed).
+    return mx.random.normal((3,)).tolist(), request.node.nodeid
+
+
+def test_module_scoped_setup_is_seeded_from_scope_nodeid_and_name(_module_scoped_draw):
+    draw, module_id = _module_scoped_draw
+    want = _draws(fixture_seed("module", module_id, "_module_scoped_draw"))[0]
+    assert draw == want
+
+
+@pytest.fixture(scope="session")
+def _session_scoped_draw(request):
+    return mx.random.normal((3,)).tolist(), request.node.nodeid
+
+
+def test_session_scoped_setup_is_seeded_even_when_requested_late(_session_scoped_draw):
+    draw, session_id = _session_scoped_draw
+    want = _draws(fixture_seed("session", session_id, "_session_scoped_draw"))[0]
+    assert draw == want
