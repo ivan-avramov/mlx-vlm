@@ -7,7 +7,8 @@ worker runs the fork's real CLI (``mlx_vlm.server.cli.main``) with ``uvicorn.run
 runs the job's mode and writes ``result.json`` atomically (plus per-request ``.npz`` row / commit files).
 Claims are WORKER conformance; the mlx-serve router layer is not exercised.
 
-Modes: ``size`` (dry-run prompt sizing through the endpoint, no generation), ``e1c_on``, ``e1c_off`` (the
+Modes: ``size`` (dry-run prompt sizing through the endpoint, no generation), ``count`` (the endpoint's
+prompt token count of given messages, no generation), ``e1c_on``, ``e1c_off`` (the
 forced clean replay, then the comparison against the ON artifacts), ``e2`` (greedy identity material),
 ``e7a`` / ``e7b`` (event observation; ``e7b`` continues one chat id across scripted turns).
 """
@@ -24,8 +25,9 @@ FILLER = "alpha beta gamma delta epsilon zeta eta theta iota kappa".split()
 NUDGES = list("abcdefghijklmnopqrstuvwxyz0123456789")
 
 
-class DryRun(Exception):
-    """Raised inside the endpoint's tokenization to measure a prompt without generating."""
+class DryRun(BaseException):
+    """Raised inside the endpoint's tokenization to measure a prompt without generating (a BaseException,
+    so no generic ``except Exception`` handler on the way out can swallow it)."""
 
     def __init__(self, tokens):
         super().__init__(tokens)
@@ -389,6 +391,13 @@ def run_job(job, out_dir, result):
                     dict(name=spec["name"], text=text, tokens=tokens)
                 )
             return
+        if job["mode"] == "count":
+            for spec in job["requests"]:
+                tokens = prompt_tokens(
+                    client, spec["payload"]["messages"], spec["payload"]
+                )
+                result["requests"].append(dict(name=spec["name"], tokens=tokens))
+            return
         for index, spec in enumerate(job["requests"]):
             entry = dict(name=spec["name"], index=index)
             timeout = float(spec["timeout_s"])
@@ -413,7 +422,7 @@ def run_job(job, out_dir, result):
 
                 observe.probe = frozen_probe
                 try:
-                    with recorder, tel:
+                    with recorder, tel, observe.KeyLengths() as key_lengths:
                         got = post(
                             client,
                             spec["payload"],
@@ -435,6 +444,20 @@ def run_job(job, out_dir, result):
                     recorder.prompt_end["offset"] if recorder.prompt_end else None
                 )
                 entry["draft_rounds"] = recorder.draft_rounds
+                spans = sorted(
+                    {(b["first_key"], b["last_key"]) for b in key_lengths.blocks}
+                )
+                entry["key_spans"] = dict(
+                    blocks=len(spans),
+                    first=spans[0] if spans else None,
+                    last=spans[-1] if spans else None,
+                )
+                threshold = spec.get("threshold")
+                entry["straddle"] = (
+                    observe.straddles(key_lengths.blocks, threshold)
+                    if threshold
+                    else None
+                )
                 save_rows(out_dir / f"rows-{index}.npz", recorder.rows)
                 snaps = (
                     ([recorder.prompt_end] if recorder.prompt_end else [])
