@@ -290,3 +290,84 @@ def test_f18_closing_the_stale_stream_alone_keeps_the_newer_publication(setup, a
     ids = list(state.token_ids)
     stream_a.close()
     assert state.token_ids is not None and list(state.token_ids) == ids
+
+
+# ------------------------------------------------------------------ round 6 / F22
+class _PublicationFailure(RuntimeError):
+    pass
+
+
+@pytest.mark.parametrize("arm", ["off", "on"])
+def test_f22_publication_failure_surfaces_before_the_terminal_chunk(
+    setup, arm, monkeypatch
+):
+    """The terminal chunk is held until publication succeeded: a failing publication
+    raises to the caller (no silent success) and the session is cleared."""
+    drafter = _drafter(setup, arm)
+    state = PromptCacheState()
+    turn(setup.model, PROMPT, state, drafter=drafter, n=N, seed=5)
+
+    def boom(self, *args, **kwargs):
+        raise _PublicationFailure("publication failed")
+
+    monkeypatch.setattr(PromptCacheState, "update", boom)
+    delivered = []
+    with pytest.raises(_PublicationFailure):
+        for chunk in _start(setup, state, drafter):
+            delivered.append(chunk.finish_reason)
+    assert all(r is None for r in delivered)  # no terminal chunk was delivered
+    assert state.token_ids is None and state.cache is None
+
+
+@pytest.mark.parametrize("arm", ["off", "on"])
+def test_f22_server_reports_the_publication_error_not_a_finished_stream(
+    setup, arm, monkeypatch
+):
+    from mlx_vlm.server import generation as server
+    from mlx_vlm.server import session_manager
+
+    monkeypatch.setattr(session_manager, "_session_cache_max", 8)
+    monkeypatch.setattr(server, "_get_draft_block_size_from_env", lambda: BLOCK)
+    session_manager.clear_session_caches()
+    drafter = _drafter(setup, arm)
+    rg = _bare_response_generator(setup.model, drafter)
+    chat_id = f"p369-f22-{arm}"
+    _serve_turn(rg, PROMPT, chat_id, [], N, 5)
+
+    def boom(self, *args, **kwargs):
+        raise _PublicationFailure("publication failed")
+
+    monkeypatch.setattr(PromptCacheState, "update", boom)
+    from queue import Queue
+
+    rg.processor = Tokenizer(())
+    state = session_manager.get_or_create_prompt_cache_state(chat_id)
+    params = deployed_sampling(PICKS[0])
+    args = server.GenerationArguments(
+        max_tokens=N,
+        temperature=params["temperature"],
+        top_p=params["top_p"],
+        top_k=params["top_k"],
+        min_p=params["min_p"],
+        seed=7,
+    )
+    rqueue = Queue()
+    rg._process_cached_request(
+        rqueue=rqueue,
+        prompt=" ".join(map(str, TURN2)),
+        images=None,
+        args=args,
+        prompt_tokens=len(TURN2),
+        prompt_cache_state=state,
+    )
+    items = []
+    while not rqueue.empty():
+        items.append(rqueue.get_nowait())
+    assert any(isinstance(i, _PublicationFailure) for i in items)
+    assert not any(
+        getattr(i, "finish_reason", None) is not None
+        for i in items
+        if not isinstance(i, BaseException)
+    )
+    assert state.token_ids is None and state.cache is None
+    session_manager.clear_session_caches()
