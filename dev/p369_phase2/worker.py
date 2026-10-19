@@ -53,6 +53,32 @@ def check_sources(root, dev_dir):
         raise RuntimeError(f"modules outside the reviewed sources: {bad[:5]}")
 
 
+def _hf_snapshot(repo):
+    """The local snapshot ``huggingface_hub`` resolves for ``repo`` (no network)."""
+    from huggingface_hub import snapshot_download
+
+    if Path(repo).exists():
+        return Path(repo).resolve()
+    return Path(snapshot_download(repo_id=repo, local_files_only=True))
+
+
+def check_snapshots(argv, expected, resolve=_hf_snapshot):
+    """Code round 2 H9: the snapshot revision each model flag of ``argv`` resolves to (what the worker
+    loaded) must equal the orchestrator's attested revision; returns ``{flag: revision}``.
+    """
+    got = {}
+    for flag, want in expected.items():
+        if flag not in argv:
+            raise RuntimeError(f"snapshot check: {flag} absent from the worker argv")
+        revision = Path(resolve(argv[argv.index(flag) + 1])).name
+        if revision != want:
+            raise RuntimeError(
+                f"snapshot {flag}: loaded revision {revision} != attested {want}"
+            )
+        got[flag] = revision
+    return got
+
+
 def atomic_write(path, payload):
     path = Path(path)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
@@ -815,6 +841,9 @@ def run_job(job, out_dir, result):
         result["served"] = state
         assert_served(state, job["expect"])
         check_sources(job["source_root"], job["dev_dir"])
+        result["snapshots"] = check_snapshots(
+            job["argv"], job["expect"].get("revisions", {})
+        )
         import mlx_vlm.server as server
 
         rg = server.runtime.response_generator

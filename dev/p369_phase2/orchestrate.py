@@ -207,12 +207,24 @@ BINDING_PICK_KEYS = (
 )
 
 
+BINDING_KEYS = (
+    "production",
+    "fork_head",
+    "harness_tree",
+    "reviewed_head",
+    "versions",
+    "env_digest",
+    "stack_bench",
+)
+
+
 def binding(manifest):
-    """Code round 1 H9: what a full run must share with the smoke that authorizes it."""
+    """Code rounds 1 H9, 2 H9: what a full run must share with the smoke that authorizes it — the
+    production pin, the fork head and harness tree, the reviewed head, the dependency versions, the worker
+    env digest, the stack bench tree + C84 bundle shas, and per pick the overlay / argv / params / weights.
+    """
     return dict(
-        production=manifest["production"],
-        fork_head=manifest["fork_head"],
-        harness_tree=manifest["harness_tree"],
+        {key: manifest[key] for key in BINDING_KEYS},
         picks={
             pick: {k: entry[k] for k in BINDING_PICK_KEYS}
             for pick, entry in sorted(manifest["picks"].items())
@@ -225,9 +237,14 @@ def binding_problems(smoke_summary, manifest):
     if not want:
         return ["the smoke summary carries no binding"]
     have = binding(manifest)
-    problems = [
+    problems = []
+    if not want.get("reviewed_head"):
+        problems.append(
+            "the smoke ran on an unreviewed head: only a smoke on the reviewed head authorizes a full run"
+        )
+    problems += [
         f"{key}: smoke {want.get(key)!r} != now {have[key]!r}"
-        for key in ("production", "fork_head", "harness_tree")
+        for key in BINDING_KEYS
         if want.get(key) != have[key]
     ]
     if sorted(want.get("picks", {})) != sorted(have["picks"]):
@@ -239,6 +256,60 @@ def binding_problems(smoke_summary, manifest):
             if want.get("picks", {}).get(pick, {}).get(key) != entry[key]:
                 problems.append(f"{pick} {key} differs from the smoke")
     return problems
+
+
+def reviewed_head_problems(phase, reviewed, head):
+    """P394 (refined): smoke iterations may run on any committed clean head; ``--reviewed-head`` (a commit a
+    Cursor round cleared), when given, must equal HEAD; the full run requires it."""
+    if reviewed is None:
+        return (
+            ["the full run needs --reviewed-head (a Cursor-cleared commit)"]
+            if phase == "full"
+            else []
+        )
+    if reviewed != head and not head.startswith(reviewed):
+        return [f"--reviewed-head {reviewed} is not HEAD {head}"]
+    return []
+
+
+def env_digest(env):
+    """The worker env's variable names and ONE sha256 over its sorted items — values are never recorded."""
+    items = json.dumps(sorted(env.items()), separators=(",", ":"))
+    return dict(names=sorted(env), sha256=hashlib.sha256(items.encode()).hexdigest())
+
+
+def hf_hub_cache(env, home):
+    """The Hugging Face hub cache as ``huggingface_hub`` resolves it: HF_HUB_CACHE, else
+    HUGGINGFACE_HUB_CACHE, else ``$HF_HOME/hub``, else ``~/.cache/huggingface/hub``."""
+    for key in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
+        if env.get(key):
+            return Path(env[key])
+    if env.get("HF_HOME"):
+        return Path(env["HF_HOME"]) / "hub"
+    return Path(home) / ".cache" / "huggingface" / "hub"
+
+
+def tree_guard(fork_root, head):
+    """Code round 2 H9: before every worker launch (and at exit) the fork is still at ``head`` with no
+    tracked change and no untracked file — a mid-campaign edit or commit aborts the run.
+    """
+
+    def git(*args):
+        return subprocess.run(
+            ["git", "-C", str(fork_root), *args],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+
+    now = git("rev-parse", "HEAD").strip()
+    if now != head:
+        raise RuntimeError(f"fork HEAD moved during the campaign: {head} -> {now}")
+    problems = tree_status_problems(
+        git("status", "--porcelain", "--untracked-files=all")
+    )
+    if problems:
+        raise RuntimeError(problems[0])
 
 
 def clopper_pearson(k, n, alpha=0.05):
@@ -802,9 +873,9 @@ def e7_timeout():
 
 
 def weights_record(hf_path):
-    root = (
-        Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")) / "hub"
-    )
+    root = hf_hub_cache(
+        os.environ, Path.home()
+    )  # code round 2 H9: the worker's own resolution
     repo = root / ("models--" + hf_path.replace("/", "--"))
     ref = (repo / "refs" / "main").read_text().strip()
     snap = repo / "snapshots" / ref
@@ -901,6 +972,9 @@ class Campaign:
         }
         self.env = worker_env(dict(os.environ))
         self.digests = {}  # pick -> {C84 item: templated prompt digest} (H6)
+        self.attested = (
+            {}
+        )  # pick -> {target, drafter}: the snapshot revisions hashed (H9)
         self.wall_limit_s = args.wall_limit_s
         self.deadline = campaign_deadline(self.wall_limit_s, now=time.monotonic())
         self.summary = dict(
@@ -923,14 +997,35 @@ class Campaign:
                 check=True,
             ).stdout.strip()
 
+        self.head = rev("HEAD")
+        bundles = {
+            str(p.relative_to(self.stack)): sha256_file(p)
+            for pick in self.picks
+            for p in sorted(
+                (self.stack / "benchmark" / "results" / pick).glob(
+                    f"*.c84bundle-after-{PICKS[pick]['kv']}-20260914.jsonl"
+                )
+            )
+        }
         manifest = dict(
             production=PRODUCTION,
-            fork_head=rev("HEAD"),
+            fork_head=self.head,
             harness_tree=rev("HEAD:dev/p369_phase2"),
+            reviewed_head=self.args.reviewed_head,
             versions=fork_versions(self.fork),
             env_keys=sorted(self.env),
             env_dropped=dropped_env(dict(os.environ)),
             env_values={k: self.env[k] for k in ENV_RECORDED_VALUES if k in self.env},
+            env_digest=env_digest(self.env),
+            stack_bench=dict(
+                tree=subprocess.run(
+                    ["git", "-C", str(self.stack), "rev-parse", "HEAD:benchmark/bench"],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout.strip(),
+                bundles=bundles,
+            ),
             picks={},
         )
         for pick in self.picks:
@@ -942,7 +1037,7 @@ class Campaign:
             self.arms[pick] = dict(on=on, off=off)
             model = on[on.index("--model") + 1]
             drafter = on[on.index("--draft-model") + 1]
-            manifest["picks"][pick] = dict(
+            entry = manifest["picks"][pick] = dict(
                 overlay_sha256=sha256_file(overlay),
                 restored=restored,
                 argv_on=on,
@@ -951,13 +1046,21 @@ class Campaign:
                 target=weights_record(model),
                 drafter=weights_record(drafter),
             )
+            self.attested[pick] = dict(
+                target=entry["target"]["revision"], drafter=entry["drafter"]["revision"]
+            )
         (self.out / "manifest.json").write_text(json.dumps(manifest, indent=1))
         return manifest
 
     def job(self, pick, name, mode, arm, requests, **extra):
+        attested = self.attested[pick]
+        revisions = {"--model": attested["target"]}
+        if arm == "on":
+            revisions["--draft-model"] = attested["drafter"]
         expect = dict(
             drafter=arm == "on",
             verify_policy=PICKS[pick]["verify_policy"] if arm == "on" else None,
+            revisions=revisions,  # code round 2 H9: what the worker must actually load
         )
         timeout = sum(int(r["timeout_s"]) for r in requests) + 900
         return dict(
@@ -976,6 +1079,7 @@ class Campaign:
         )
 
     def run(self, job):
+        tree_guard(self.fork, self.head)  # code round 2 H9: before every worker launch
         return run_job(job, self.fork, self.env, self.monitor, deadline=self.deadline)
 
     # -- steps
@@ -1340,6 +1444,7 @@ class Campaign:
                 self.summary["error"] = f"{type(exc).__name__}: {exc}"
                 self.write_summary()
                 raise
+        tree_guard(self.fork, self.head)  # code round 2 H9: unchanged through the end
         self.summary["manifest"] = dict(
             fork_head=manifest["fork_head"], production=PRODUCTION
         )
@@ -1436,9 +1541,24 @@ def main(argv=None):
         type=float,
         help="an operator-set hard total-wall stop (default: none, C184)",
     )
+    ap.add_argument(
+        "--reviewed-head",
+        help="the Cursor-cleared fork commit; must equal HEAD; required for --phase full (P394)",
+    )
     args = ap.parse_args(argv)
     out = Path(args.out).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
+    head = subprocess.run(
+        ["git", "-C", args.fork_root, "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    problems = reviewed_head_problems(args.phase, args.reviewed_head, head)
+    if problems:
+        raise SystemExit(f"refused: {problems}")
+    if args.reviewed_head:
+        args.reviewed_head = head  # recorded as the full sha
     if args.phase == "full":
         if not args.smoke_summary:
             raise SystemExit("full: --smoke-summary of a passed smoke is required")
