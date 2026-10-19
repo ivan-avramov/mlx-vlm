@@ -1724,9 +1724,9 @@ FIXTURE_REGISTRY = (
 FIXTURE_MARKER = "# ---- BEGIN VERBATIM main_models.yaml ----\n"
 FIXTURE_SHA256 = "1d07c9dd0ebf5058b526e1d78fee2a88f8e92976323ddf0e8d5503dcaa18253d"
 UNIFORM_PICK = "Qwen3.8-27B-mlx-uniform-4bit"
-FIXTURE_SOURCE = (
-    "7021bdbb"  # the last MTP-ON stack registry (= the parent of the C177 commit)
-)
+# The last stack commit that changed main_models.yaml before C177 (78a730fe); its registry is byte-identical
+# to 78a730fe^ (98a14f2e) — the last MTP-ON registry.
+FIXTURE_SOURCE = "7021bdbb"
 _C177 = "  # P369 INTERIM (C177 2026-10-17): MTP OFF on the daily driver until the MTP EOS/budget fixes ship and are re-certified"
 # Per pick, (fixture line, its C177 interim line), verbatim — the ONLY lines the interim may change (K2).
 INTERIM_LINES = {
@@ -1758,7 +1758,8 @@ OPT_IN_SKIP = (
 
 
 def _fixture_verbatim() -> str:
-    return FIXTURE_REGISTRY.read_text().split(FIXTURE_MARKER, 1)[1]
+    # bytes decoded, never universal-newline read: the comparison is byte level (code round 3 H19)
+    return FIXTURE_REGISTRY.read_bytes().decode("utf-8").split(FIXTURE_MARKER, 1)[1]
 
 
 def certified_registry():
@@ -1798,12 +1799,15 @@ def live_registry_state(text):
 
 def live_registry():
     """Opt-in (``MLX_REQUIRE_STACK_REGISTRY=1``, else skip with ``OPT_IN_SKIP``): the live registry —
-    ``MLX_STACK_REGISTRY`` (set-but-absent FAILS), else the sibling checkout, else FAIL — and its state;
-    any state other than the fixture or the C177 interim FAILS."""
+    ``MLX_STACK_REGISTRY`` (set-but-empty or set-but-absent FAILS), else the sibling checkout, else FAIL —
+    and its state, classified on the raw bytes; any state other than the fixture or the C177 interim
+    FAILS."""
     if os.environ.get("MLX_REQUIRE_STACK_REGISTRY") != "1":
         pytest.skip(OPT_IN_SKIP)
     env = os.environ.get("MLX_STACK_REGISTRY")
-    if env:
+    if env is not None:
+        if not env:
+            pytest.fail("MLX_STACK_REGISTRY is set but empty")
         if not Path(env).exists():
             pytest.fail(f"MLX_STACK_REGISTRY={env!r} does not exist")
         path = Path(env)
@@ -1814,7 +1818,7 @@ def live_registry():
             "MLX_REQUIRE_STACK_REGISTRY=1 but no live stack registry (MLX_STACK_REGISTRY "
             f"or {SIBLING_REGISTRY}) exists"
         )
-    state = live_registry_state(path.read_text())
+    state = live_registry_state(path.read_bytes().decode("utf-8", errors="replace"))
     if state is None:
         pytest.fail(
             f"the live registry {path} is neither the pinned fixture nor the C177 interim; "

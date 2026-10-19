@@ -1,5 +1,5 @@
-# PINNED COPY of the stack's main_models.yaml at stack 7021bdbb — the LAST MTP-ON registry (the parent of
-# the C177 commit that turned MTP off on the daily driver), i.e. the shipped-when-ON tuple the P369 tests
+# PINNED COPY of the stack's main_models.yaml at stack 7021bdbb — the LAST MTP-ON registry (the last commit
+# changing it before C177 78a730fe; byte-identical to 78a730fe^ = 98a14f2e), i.e. the shipped-when-ON tuple the P369 tests
 # certify (P387). Everything after the BEGIN marker is a VERBATIM copy; its sha256 is recorded in the golden
 # test. The ordinary suite reads ONLY this file; the opt-in live check (MLX_REQUIRE_STACK_REGISTRY=1) accepts
 # a live registry that equals it or equals its C177 interim (test_mtp_verify_scan.INTERIM_LINES). REFRESH
