@@ -137,3 +137,58 @@ def test_uninstall_restores_every_attribute():
         n: getattr(sv, n) for n in telemetry.ENTRIES
     }
     assert before == after
+
+
+# ------------------------------------------------------------------ scope + verdict
+@metal
+@pytest.mark.parametrize("pick", PICKS)
+def test_verifier_scope_is_tagged_and_the_verdict_passes(pick):
+    lm, _, tel, _, _ = _on_run(pick)
+    scopes = {c["scope"] for c in tel.calls}
+    assert "verify" in scopes
+    assert all(c["width"] == 1 for c in tel.calls if c["scope"] != "verify")
+    verdict = telemetry.verdict(tel, telemetry.manifest_from_model(lm))
+    assert verdict["pass"], verdict
+    assert verdict["verify_calls"] > 0
+
+
+def _fake(calls, manifest):
+    class Lm:
+        def named_modules(self):
+            return []
+
+    tel = telemetry.KernelTelemetry(Lm())
+    tel.calls = calls
+    return telemetry.verdict(tel, manifest)
+
+
+def _call(family, module="layers.0.mlp", width=3, scope="verify"):
+    return dict(
+        entry="_target_verify_linear",
+        family=family,
+        width=width,
+        dtype="bfloat16",
+        modules=[module],
+        scope=scope,
+    )
+
+
+QUANT = {"layers.0.mlp": {"kind": "quantized", "bits": 4, "group_size": 64}}
+DENSE = {"layers.0.mlp": {"kind": "dense"}}
+
+
+@pytest.mark.parametrize("family", ["plain_wide", "declined", "error"])
+def test_the_verdict_refuses_a_forbidden_verify_family(family):
+    assert not _fake([_call(family)], QUANT)["pass"]
+
+
+def test_the_verdict_refuses_a_family_inconsistent_with_the_manifest():
+    assert not _fake([_call("dense_exact")], QUANT)["pass"]
+    assert not _fake([_call("quantized_affine_optimized")], DENSE)["pass"]
+    assert _fake([_call("dense_exact")], DENSE)["pass"]
+    assert _fake([_call("quantized_affine_optimized")], QUANT)["pass"]
+
+
+def test_the_verdict_refuses_an_unknown_module_and_no_verify_calls():
+    assert not _fake([_call("quantized_affine_optimized", module="?")], QUANT)["pass"]
+    assert not _fake([_call("plain", width=1, scope="other")], QUANT)["pass"]
