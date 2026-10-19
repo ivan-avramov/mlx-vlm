@@ -132,6 +132,9 @@ class Capture:
     def __init__(self):
         self.final = None
         self.backend = None
+        self.completed = (
+            0  # Q38: exits of _process_cached_request seen on the GPU thread
+        )
         self._patched = []
 
     def __enter__(self):
@@ -163,12 +166,22 @@ class Capture:
             capture.backend = getattr(ctx, "backend", None)
             return ctx, tokens
 
+        process = generation.ResponseGenerator._process_cached_request
+
+        def acknowledged_process(rg, *args, **kwargs):
+            try:
+                return process(rg, *args, **kwargs)
+            finally:
+                capture.completed += 1
+
         self._patched += [
             (sys.modules["mlx_vlm.generate"], "stream_generate", stream),
             (generation.ResponseGenerator, "generate", generate_fn),
+            (generation.ResponseGenerator, "_process_cached_request", process),
         ]
         sys.modules["mlx_vlm.generate"].stream_generate = capturing_stream
         generation.ResponseGenerator.generate = capturing_generate
+        generation.ResponseGenerator._process_cached_request = acknowledged_process
         return self
 
     def reset(self):
@@ -181,8 +194,54 @@ class Capture:
         return False
 
 
+def wait_ack(capture, before, *, timeout_s=60.0, poll_s=0.01):
+    """Q38: the GPU thread's ``_process_cached_request`` for this request has returned."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if capture.completed > before:
+            return
+        time.sleep(poll_s)
+    raise RuntimeError("the cached request did not acknowledge its exit")
+
+
+def release_trajectory(recorder, chat_id):
+    """Q35: retire one trajectory's session and cache tree BEFORE the next trajectory starts — clear the
+    chat's ``PromptCacheState``, drop the session entry and the recorder's reference, and prove with weak
+    references that every leaf cache was collected."""
+    import gc
+    import weakref
+
+    from mlx_vlm.server import session_manager
+    from mlx_vlm.speculative.cache_state import iter_leaf_caches
+
+    caches = recorder._cache
+    refs = [weakref.ref(leaf) for leaf in iter_leaf_caches(caches or [])]
+    with session_manager._session_caches_lock:
+        state = session_manager._session_caches.pop(chat_id, None)
+    if state is not None:
+        state.clear()
+    recorder._cache = None
+    del caches, state
+    gc.collect()
+    alive = sum(1 for r in refs if r() is not None)
+    if alive:
+        raise RuntimeError(
+            f"trajectory {chat_id}: cache tree not retired ({alive} leaves alive)"
+        )
+
+
+def release_session(chat_id):
+    from mlx_vlm.server import session_manager
+
+    with session_manager._session_caches_lock:
+        state = session_manager._session_caches.pop(chat_id, None)
+    if state is not None:
+        state.clear()
+
+
 def post(client, payload, chat_id, capture, timeout_s):
     capture.reset()
+    before = capture.completed
     started = time.monotonic()
     r = client.post(
         "/v1/chat/completions",
@@ -193,11 +252,14 @@ def post(client, payload, chat_id, capture, timeout_s):
     elapsed = time.monotonic() - started
     if r.status_code != 200:
         raise RuntimeError(f"request failed {r.status_code}: {r.text[:500]}")
+    wait_ack(capture, before)
     if capture.backend != "cached_session":
         raise RuntimeError(f"backend {capture.backend!r}, expected cached_session")
     if capture.final is None:
         raise RuntimeError("no final chunk captured")
-    return dict(response=r.json(), final=dict(capture.final), wall_s=elapsed)
+    return dict(
+        response=r.json(), final=dict(capture.final), wall_s=elapsed, chat_id=chat_id
+    )
 
 
 @contextmanager
@@ -518,10 +580,11 @@ class DetachedGuard:
         return False
 
 
-def c1_acceptance(on_part, off_parts, c1, *, cache_ids):
+def c1_acceptance(on_part, off_parts, c1, *, retired):
     """Q37: the within-instance control is complete and identical — every replay emitted exactly the forced
-    tokens with ON's finish reason and no reused prefix, ON / OFF1 / OFF2 ran on identity-disjoint cache
-    trees (Q35), and OFF1 vs OFF2 rows (raw + transformed) and states (hashes + probes) are equal.
+    tokens with ON's finish reason and no reused prefix, each trajectory's cache tree was retired before the
+    next one started (Q35; ``retired``, from ``release_trajectory``), and OFF1 vs OFF2 rows (raw +
+    transformed) and states (hashes + probes) are equal.
     """
     problems = []
     want = on_part["final"]["token_ids"]
@@ -535,8 +598,8 @@ def c1_acceptance(on_part, off_parts, c1, *, cache_ids):
             problems.append(f"OFF{k} reused {final['cached_tokens']} cached tokens")
     if on_part["final"].get("cached_tokens"):
         problems.append(f"ON reused {on_part['final']['cached_tokens']} cached tokens")
-    if len(set(cache_ids)) != len(cache_ids):
-        problems.append("trajectories shared cache trees")
+    if not retired:
+        problems.append("trajectory cache trees were not retired in turn")
     if not c1["rows"]["pass"]:
         problems.append("C1 rows differ")
     if not c1["states"]["pass"]:
@@ -661,6 +724,8 @@ def run_job(job, out_dir, result):
                     out_dir / f"snaps-{index}.npz",
                     ([rec.prompt_end] if rec.prompt_end else []) + rec.commits,
                 )
+                wait_idle(rg, server.runtime.metrics)
+                release_trajectory(rec, part["chat_id"])
             elif job["mode"] == "e1c_pair":
                 part, on = e1c_request(
                     client, capture, lm, policy, manifest, spec, "on", timeout, **probe
@@ -676,10 +741,13 @@ def run_job(job, out_dir, result):
                 metrics = server.runtime.metrics
                 replays = []
                 wait_idle(rg, metrics)
+                release_trajectory(
+                    on, part["chat_id"]
+                )  # Q35: before the next trajectory
                 # Detached from before submission through worker idle (Q38); the same-instance OFF replay,
-                # then control C1.
+                # then control C1. Each trajectory is retired before the next starts (Q35).
                 with drafter_detached(rg):
-                    for _ in range(2):
+                    for k in range(2):
                         guard = DetachedGuard()
                         with guard:
                             off_part, off = e1c_request(
@@ -702,6 +770,12 @@ def run_job(job, out_dir, result):
                             raise RuntimeError(
                                 "a detached replay ran speculative rounds"
                             )
+                        if k == 0 and spec.get("smoke_positives"):
+                            # on OFF1's live cache, before it is retired
+                            entry["smoke_positives"] = smoke_positives(
+                                on, off, n, params
+                            )
+                        release_trajectory(off, off_part["chat_id"])
                         replays.append((off_part, off))
                 if dict(model=id(rg.model), policy=id(policy)) != same:
                     raise RuntimeError(
@@ -722,14 +796,9 @@ def run_job(job, out_dir, result):
                 entry["c1"] = dict(
                     c1,
                     acceptance=c1_acceptance(
-                        part,
-                        [off1_part, off2_part],
-                        c1,
-                        cache_ids=[id(on._cache), id(off1._cache), id(off2._cache)],
+                        part, [off1_part, off2_part], c1, retired=True
                     ),
                 )
-                if spec.get("smoke_positives"):
-                    entry["smoke_positives"] = smoke_positives(on, off1, n, params)
             elif (
                 job["mode"] == "e1c_off"
             ):  # control C2 (or the v4 cross-load comparison)
@@ -757,6 +826,8 @@ def run_job(job, out_dir, result):
                     entry["smoke_positives"] = smoke_positives(
                         ref, rec, len(tokens), params
                     )
+                wait_idle(rg, server.runtime.metrics)
+                release_trajectory(rec, part["chat_id"])
             elif job["mode"] in ("e2", "e7a", "e7b"):
                 from p369_phase2 import classes
 
@@ -792,6 +863,12 @@ def run_job(job, out_dir, result):
                         dict(role="assistant", content=message.get("content") or "")
                     ]
                     entry["turns"].append(dict(got, events=events))
+                    if (
+                        job["mode"] != "e7b"
+                    ):  # e7b keeps its one session across the turns
+                        release_session(got["chat_id"])
+                if job["mode"] == "e7b":
+                    release_session(chat_id)
                 entry["telemetry"] = tel.summary()
                 entry["verdict"] = telemetry.verdict(tel, manifest)
             else:

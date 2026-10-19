@@ -303,22 +303,22 @@ def _part(tokens, finish="length", cached=0):
 def test_c1_acceptance():
     ok = dict(rows={"pass": True}, states={"pass": True})
     on, offs = _part([1, 2, 3]), [_part([1, 2, 3]), _part([1, 2, 3])]
-    assert worker.c1_acceptance(on, offs, ok, cache_ids=[1, 2, 3])["pass"]
+    assert worker.c1_acceptance(on, offs, ok, retired=True)["pass"]
     cases = [
-        (on, [_part([1, 2]), _part([1, 2, 3])], ok, [1, 2, 3], "forced tokens"),
+        (on, [_part([1, 2]), _part([1, 2, 3])], ok, True, "forced tokens"),
         (
             on,
             [_part([1, 2, 3], finish="stop"), _part([1, 2, 3])],
             ok,
-            [1, 2, 3],
+            True,
             "finish",
         ),
-        (on, [_part([1, 2, 3], cached=4), _part([1, 2, 3])], ok, [1, 2, 3], "reused"),
-        (on, offs, dict(ok, states={"pass": False}), [1, 2, 3], "states"),
-        (on, offs, ok, [1, 1, 3], "cache trees"),
+        (on, [_part([1, 2, 3], cached=4), _part([1, 2, 3])], ok, True, "reused"),
+        (on, offs, dict(ok, states={"pass": False}), True, "states"),
+        (on, offs, ok, False, "not retired"),
     ]
     for on_, offs_, cmp_, ids, why in cases:
-        got = worker.c1_acceptance(on_, offs_, cmp_, cache_ids=ids)
+        got = worker.c1_acceptance(on_, offs_, cmp_, retired=ids)
         assert not got["pass"] and any(why in p for p in got["problems"]), (why, got)
 
 
