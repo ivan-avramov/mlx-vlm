@@ -112,6 +112,135 @@ def test_worker_env_drops_conditional_knobs_and_sets_the_session_max():
     }
 
 
+# ------------------------------------------------------------------ code round 1 H3 H9 H11 H14 + power
+def test_worker_env_is_an_allowlist():
+    base = {
+        "PATH": "/bin",
+        "HOME": "/home/u",
+        "HF_TOKEN": "t",
+        "HF_HUB_OFFLINE": "1",
+        "LC_ALL": "C",
+        "MLX_EPICACHE_BUDGET": "4096",
+        "MIN_OUTPUT_TOKENS": "64",
+        "MLX_VLM_SPEC_BATCH_COALESCE_MS": "5",
+        "KV_BITS": "4",
+        "TQ_FUSED_PREFILL": "1",
+        "MLX_SDPA_BLOCKS": "1",
+        "SOME_FUTURE_KNOB": "x",
+        "PYTHONPATH": "/elsewhere",
+    }
+    env = orchestrate.worker_env(base)
+    assert env == {
+        "PATH": "/bin",
+        "HOME": "/home/u",
+        "HF_TOKEN": "t",
+        "HF_HUB_OFFLINE": "1",
+        "LC_ALL": "C",
+        "MLX_VLM_CACHE_SESSION_MAX": "1",
+    }
+    assert orchestrate.dropped_env(base) == sorted(k for k in base if k not in env)
+
+
+@pytest.mark.parametrize(
+    ("argv", "refused"),
+    [
+        (["/v/bin/python", "-m", "mlx_vlm.generate", "--model", "m"], True),
+        (["python3", "-I", "-m", "mlx_vlm.server"], True),
+        (["/v/bin/python", "-m", "pytest", "-q"], True),
+        (["/v/bin/python", "-m", "mlx_lm.server"], True),
+        (["uv", "run", "mlx-serve", "start"], True),
+        (["/v/bin/mlx-serve", "start"], True),
+        (["opencode", "run", "x"], True),
+        (["/v/bin/python", "/s/benchmark/bench/run_tg1_probe.py"], True),
+        (["/v/bin/python", "-m", "bench.runner"], True),
+        (["/v/bin/python", "-I", "/f/dev/p369_phase2/worker.py", "job.json"], True),
+        (["zsh", "-c", "cd x && pytest -q && mlx-serve start"], False),
+        (["/usr/bin/vim", "notes_mlx_vlm.txt"], False),
+        (["/v/bin/python", "-c", "import mlx_vlm"], False),
+        (["cursor-agent", "-p", "review mlx_vlm"], False),
+        ([], False),
+    ],
+)
+def test_refused_process_inspects_argv_structurally(argv, refused):
+    assert bool(orchestrate.refused_process(argv)) is refused, argv
+
+
+def test_tree_status_refuses_any_tracked_or_untracked_change():
+    assert orchestrate.tree_status_problems("") == []
+    assert orchestrate.tree_status_problems(" M dev/p369_phase2/worker.py\n")
+    assert orchestrate.tree_status_problems("?? dev/p369_phase2/new.py\n")
+
+
+PMSET_AC = """ Wattage = 140W
+ Current = 4990mA
+ Voltage = 28000mV
+ AdapterID = 28697
+ Adapter Name = 140W USB-C Power Adapter
+ Hardware Version = 1.0
+"""
+
+
+def test_parse_power_reads_watts_volts_and_battery():
+    batt = " -InternalBattery-0 (id=1)\t64%; charging; (no estimate) present: true\n"
+    got = orchestrate.parse_power(PMSET_AC, batt)
+    assert (got["watts"], got["volts"], got["battery"]) == (140, 28.0, 64)
+    assert got["ac_ok"] and got["battery_ok"]
+    low_volts = orchestrate.parse_power(PMSET_AC.replace("28000mV", "20000mV"), batt)
+    assert not low_volts["ac_ok"]
+    assert not orchestrate.parse_power("No adapter attached.\n", batt)["ac_ok"]
+    assert not orchestrate.parse_power(PMSET_AC, batt.replace("64%", "19%"))[
+        "battery_ok"
+    ]
+
+
+def _binding(**changes):
+    pick = dict(
+        overlay_sha256="o",
+        argv_on=["--model", "m", "--draft-model", "d"],
+        argv_off=["--model", "m"],
+        params=dict(temperature=0.5),
+        target=dict(revision="r", files={"a.safetensors": "1"}),
+        drafter=dict(revision="r2", files={"b.safetensors": "2"}),
+    )
+    pick.update(changes)
+    return dict(
+        production=orchestrate.PRODUCTION,
+        fork_head="h",
+        harness_tree="t",
+        picks={FABLE: pick},
+    )
+
+
+def test_binding_mismatch_refuses_the_full_run():
+    manifest = _binding()
+    smoke = dict(binding=orchestrate.binding(manifest))
+    assert orchestrate.binding_problems(smoke, manifest) == []
+    for key, value in [
+        ("argv_on", ["--model", "other"]),
+        ("target", dict(revision="r", files={"a.safetensors": "9"})),
+        ("overlay_sha256", "x"),
+        ("params", dict(temperature=0.6)),
+    ]:
+        assert orchestrate.binding_problems(smoke, _binding(**{key: value})), key
+    head = dict(_binding(), fork_head="other")
+    assert orchestrate.binding_problems(smoke, head)
+    picks = dict(_binding(), picks={})
+    assert orchestrate.binding_problems(smoke, picks)
+    assert orchestrate.binding_problems(
+        {}, manifest
+    )  # a smoke summary without a binding
+
+
+def test_lock_staleness_needs_a_dead_or_reused_owner():
+    record = dict(pid=4242, create_time=100.0)
+    assert orchestrate.lock_is_stale(record, lambda pid: None)  # owner gone
+    assert orchestrate.lock_is_stale(record, lambda pid: 200.0)  # pid reused
+    assert not orchestrate.lock_is_stale(record, lambda pid: 100.0)  # owner alive
+    assert not orchestrate.lock_is_stale(
+        dict(pid="x"), lambda pid: None
+    )  # unreadable: keep
+
+
 @pytest.mark.parametrize(
     ("k", "n", "lo", "hi"),
     [(0, 20, 0.0, 0.1684), (20, 20, 0.8316, 1.0), (5, 20, 0.0866, 0.4910)],
