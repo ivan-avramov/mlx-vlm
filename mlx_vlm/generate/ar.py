@@ -1486,7 +1486,8 @@ def _speculation_fallback_reason(
     if not callable(getattr(sampler, "sample_target", None)):
         return None  # unpositioned sampler: plain batching ignores seeds too
     resolved = _resolve_seeds(seeds, sampler)
-    if resolved is None or all(seed == sampler.seed for seed in resolved):
+    sampler_seed = getattr(sampler, "seed", None)  # Fork (P369 round-4 F14)
+    if resolved is None or all(seed == sampler_seed for seed in resolved):
         return None
     return "request_seed"
 
