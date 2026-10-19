@@ -279,3 +279,19 @@ def test_f12_public_batched_entry_points_refuse_mtp_and_count():
             )
         )
     assert ar.SPECULATION_FALLBACKS["mtp_batched_refused"] == before + 2
+
+
+def test_f14_positioned_sampler_without_a_seed_attribute_does_not_raise():
+    class NoSeedSampler:
+        def sample_target(self, logprobs, *, row_ids, positions, seeds=None):
+            raise AssertionError("not called")
+
+    sampler = NoSeedSampler()
+    # An explicit per-request seed cannot be proven equal to an unknown sampler seed.
+    assert (
+        ar._speculation_fallback_reason("dflash", None, [123, None], sampler)
+        == "request_seed"
+    )
+    # No explicit seeds at all: nothing to honour, speculation may proceed.
+    assert ar._speculation_fallback_reason("dflash", None, [None, None], sampler) is None
+    assert ar._speculation_fallback_reason("dflash", None, None, sampler) is None
