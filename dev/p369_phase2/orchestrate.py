@@ -896,10 +896,12 @@ def smoke_gate(picks):
     )
 
 
-def smoke_authorization_problems(summary):
+def smoke_authorization_problems(summary, projection_ruling=None):
     """Code round 6 H36: a full run is authorized only by a smoke summary (as loaded from its JSON) whose
     phase is smoke, status ``SMOKE_PASS`` with exit code 0, whose stored gate holds exact ``True`` for
     ``pass_`` and ``fits``, and which equals the gate recomputed from the summary's own evidence.
+    C193: with a ``projection_ruling`` from ``PROJECTION_RULINGS`` whose pick is the summary's only pick, a
+    ``SMOKE_NOT_PASS`` / exit 2 smoke whose gate PASSED but does not fit authorizes too — nothing else is lifted.
     """
     if not isinstance(summary, dict):
         return ["the smoke summary is not an object"]
@@ -907,7 +909,17 @@ def smoke_authorization_problems(summary):
     if summary.get("phase") != "smoke":
         problems.append(f"phase {summary.get('phase')!r} is not smoke")
     code = summary.get("exit_code")
-    if summary.get("status") != "SMOKE_PASS" or type(code) is not int or code != 0:
+    ruled = None
+    if projection_ruling is not None:
+        ruled = PROJECTION_RULINGS.get(projection_ruling)
+        if ruled is None:
+            return problems + [f"unknown projection ruling {projection_ruling!r}"]
+        if list(summary.get("picks") or {}) != [ruled]:
+            return problems + [
+                f"ruling {projection_ruling} covers {ruled} only, not {list(summary.get('picks') or {})}"
+            ]
+    want = ("SMOKE_NOT_PASS", 2) if ruled else ("SMOKE_PASS", 0)
+    if (summary.get("status"), code) != want or type(code) is not int:
         problems.append(f"status {summary.get('status')!r} / exit code {code!r}")
     gate = summary.get("smoke_gate")
     if not isinstance(gate, dict):
@@ -915,7 +927,7 @@ def smoke_authorization_problems(summary):
     try:
         passed = exact_bool(gate.get("pass_"), "smoke_gate.pass_")
         fits = exact_bool(gate.get("fits"), "smoke_gate.fits")
-        if not (passed and fits):
+        if not (passed and (fits or ruled)):
             problems.append(f"the smoke gate did not pass / fit: {gate}")
         again = smoke_gate(summary.get("picks") or {})
         if again != gate:
@@ -1620,6 +1632,9 @@ SIZE_PREFIX = (
 SIZE_SUFFIX = "Now write the story."
 SHORT_PROMPT = "Explain, step by step, why the sum of two odd integers is even."
 ESTIMATE_LIMIT_S = 3.5 * 3600
+# C193 (operator 2026-10-20): recorded rulings that lift ONLY the smoke gate's `fits` for one pick's full run (its
+# total-wall watchdog stays the cap); the P369 v13 phase-based projection replaces this in the v13 build.
+PROJECTION_RULINGS = {"C193": "Qwen3.8-27B-mlx-uniform-4bit"}
 
 
 def campaign_deadline(wall_limit_s, *, now):
@@ -1788,6 +1803,7 @@ class Campaign:
             fork_head=self.head,
             harness_tree=rev("HEAD:dev/p369_phase2"),
             reviewed_head=self.args.reviewed_head,
+            projection_ruling=getattr(self.args, "projection_ruling", None),  # C193
             versions=fork_versions(self.fork),
             env_keys=sorted(self.env),
             env_dropped=dropped_env(dict(os.environ)),
@@ -2341,6 +2357,10 @@ def main(argv=None):
         help="an operator-set hard total-wall stop (default: none, C184)",
     )
     ap.add_argument(
+        "--projection-ruling",
+        help="C193: a recorded operator ruling (PROJECTION_RULINGS) that lifts only the smoke gate's fits",
+    )
+    ap.add_argument(
         "--reviewed-head",
         help="the Cursor-cleared fork commit; must equal HEAD; required for --phase full (P394)",
     )
@@ -2363,7 +2383,9 @@ def main(argv=None):
         if not args.smoke_summary:
             raise SystemExit("full: --smoke-summary of a passed smoke is required")
         smoke = json.loads(Path(args.smoke_summary).read_text())
-        problems = smoke_authorization_problems(smoke)  # code round 6 H36
+        problems = smoke_authorization_problems(  # code round 6 H36; C193
+            smoke, projection_ruling=args.projection_ruling
+        )
         if problems:
             raise SystemExit(f"full: the smoke summary does not authorize: {problems}")
     checks = preflight(args, out.parent)
