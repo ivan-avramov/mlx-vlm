@@ -912,3 +912,44 @@ def f(mode):
     assert sorted(bad) == [("compare", 6, 7), ("late", 3, 4), ("other", 10, 9)], bad
     ok = "def g():\n    from p import a\n    a.go()\n"
     assert import_violations(ast.parse(ok).body[0]) == ([], 1)
+
+
+# ------------------------------------------------------------------ smoke 4: KV positives on every TurboQuant / native leaf
+def _tq_leaf(batch=False):
+    from mlx_vlm import turboquant as tq
+
+    mx.random.seed(0)
+    leaf = (
+        tq.BatchTurboQuantKVCache([0], bits=4)
+        if batch
+        else tq.TurboQuantKVCache(bits=4)
+    )
+    keys = mx.random.normal((1, 2, 8, 64)).astype(mx.bfloat16)
+    leaf.update_and_fetch(keys, keys)
+    return leaf
+
+
+def test_kv_positive_targets_cover_both_turboquant_classes_and_native_kv():
+    """Smoke 4: neither `tq_norm` nor `old_prefix_k` fired on the live `Qwen3.8-27B-mlx-uniform-4bit` cache — the
+    TurboQuant branch tested one class only and the native branch skipped tuple-shaped keys (a TurboQuantMSEState
+    is a NamedTuple). Every KV leaf must yield exactly one positive target."""
+    from mlx_vlm.models.cache import KVCache
+
+    native = KVCache()
+    native.update_and_fetch(mx.ones((1, 2, 4, 16)), mx.ones((1, 2, 4, 16)))
+    got = worker.kv_positive_targets([_tq_leaf(), _tq_leaf(batch=True), native])
+    assert [kind for kind, _ in got] == ["tq_norm", "tq_norm", "old_prefix_k"], got
+    assert all(isinstance(array, mx.array) for _, array in got)
+
+
+def test_cache_census_names_every_leaf_class():
+    from mlx_vlm.models.cache import ArraysCache
+
+    census = worker.cache_census(
+        [ArraysCache(size=2), _tq_leaf(), _tq_leaf(batch=True)]
+    )
+    assert census == {
+        "ArraysCache": 1,
+        "TurboQuantKVCache": 1,
+        "BatchTurboQuantKVCache": 1,
+    }

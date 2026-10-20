@@ -566,3 +566,24 @@ def test_quantized_e1c_detects_a_turboquant_packed_state_change():
         )
     states = observe.compare_states(on, off)
     assert not states["pass"] and target in states["mismatched_offsets"]
+
+
+# ------------------------------------------------------------------ smoke 4: either TurboQuant class (the live leaf census)
+def _batch_turboquant(**bits):
+    from mlx_vlm import turboquant as tq
+
+    mx.random.seed(0)
+    cache = tq.BatchTurboQuantKVCache([0], **bits)
+    keys = mx.random.normal((1, 2, 8, 64)).astype(mx.bfloat16)
+    cache.update_and_fetch(keys, keys)
+    return cache
+
+
+def test_state_hash_sees_the_codec_of_a_batch_turboquant_cache_too():
+    """Smoke 4: the live `Qwen3.8-27B-mlx-uniform-4bit` leaf matched neither positive's branch — the hash's codec
+    metadata must not depend on which TurboQuant class (single or batch) the server built.
+    """
+    a, b = _batch_turboquant(bits=4), _batch_turboquant(bits=4)
+    assert observe.state_hash([a]) == observe.state_hash([b])
+    b._kv_quant_mode = "prod"
+    assert observe.state_hash([a]) != observe.state_hash([b])
