@@ -29,6 +29,8 @@ from test_mtp_exactness import (
 
 from mlx_vlm import turboquant as tq
 from mlx_vlm.generate import ar
+from mlx_vlm.models import base
+from mlx_vlm.models import cache as kv_cache
 from mlx_vlm.models.qwen3_5 import speculative_verifier as sv
 from mlx_vlm.speculative.cache_state import iter_leaf_caches
 
@@ -38,7 +40,14 @@ pytestmark = pytest.mark.skipif(
 
 TQ4 = dict(kv_bits=4, kv_quant_scheme="turboquant", quantized_kv_start=0)
 PRODUCTION_NUMERICS = os.environ.get("MLX_VLM_TEST_TF32") == "1"  # conftest (P403)
-DEPLOYED_KV = {PICKS[0]: {}, PICKS[1]: TQ4}  # native16 / TurboQuant 4-bit
+AFFINE4 = dict(kv_bits=4, kv_quant_scheme="uniform", quantized_kv_start=0)
+# Each pick's KV codecs: `Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed` native16; `Qwen3.8-27B-mlx-uniform-4bit` the
+# registry's TurboQuant 4-bit AND the affine 4-bit KV the server actually builds today (P405: --kv-quant-scheme ignored).
+CASES = [
+    (PICKS[0], "native16", {}),
+    (PICKS[1], "turboquant4", TQ4),
+    (PICKS[1], "affine4", AFFINE4),
+]
 
 
 @pytest.fixture
@@ -46,9 +55,10 @@ def observed(monkeypatch):
     """Verifier block widths, and the query length of every TurboQuant attention call made INSIDE the verifier —
     through any of its entry points (``decode_attention`` for L == 1; ``prefill_attention`` / ``quantized_attention``
     for L > 1)."""
-    rec = SimpleNamespace(widths=[], tq_lengths=[])
+    rec = SimpleNamespace(widths=[], tq_lengths=[], affine_lengths=[])
     depth = [0]
     real_attention = sv.Qwen3_5BatchInvariantForward._attention
+    real_affine = base.quantized_scaled_dot_product_attention
 
     def attention(self, attn, x, *args, **kwargs):
         rec.widths.append(int(x.shape[1]))
@@ -66,7 +76,13 @@ def observed(monkeypatch):
 
         return wrapped
 
+    def affine(queries, *args, **kwargs):  # affine-quantized KV (QuantizedKVCache) SDPA
+        if depth[0]:
+            rec.affine_lengths.append(int(queries.shape[-2]))
+        return real_affine(queries, *args, **kwargs)
+
     monkeypatch.setattr(sv.Qwen3_5BatchInvariantForward, "_attention", attention)
+    monkeypatch.setattr(base, "quantized_scaled_dot_product_attention", affine)
     for name in ("decode_attention", "prefill_attention", "quantized_attention"):
         real = getattr(tq._TurboQuantAttentionMixin, name)
         monkeypatch.setattr(tq._TurboQuantAttentionMixin, name, recording(real))
@@ -93,23 +109,40 @@ def _run(lm, drafter, *, n, kv, block, **kwargs):
     return [int(t) for t, _ in stream], cache
 
 
-def _assert_codec(cache, kv):
+def _assert_codec(cache, codec):
     leaves = list(iter_leaf_caches(cache))
+    names = [type(c).__name__ for c in leaves]
     turbo = [c for c in leaves if isinstance(c, tq.TurboQuantKVCache)]
-    if kv:
-        assert turbo, [type(c).__name__ for c in leaves]
+    affine = [c for c in leaves if isinstance(c, kv_cache.QuantizedKVCache)]
+    if codec == "turboquant4":
+        assert turbo and not affine, names
         assert all(float(c.bits) == 4.0 for c in turbo), [c.bits for c in turbo]
+    elif codec == "affine4":
+        assert affine and not turbo, names
+        assert all(int(c.bits) == 4 for c in affine), [c.bits for c in affine]
     else:
-        assert not turbo, [type(c).__name__ for c in leaves]
+        assert not turbo and not affine, names
+
+
+def _assert_singleton_quantized_attention(observed, codec):
+    """Every quantized-KV attention call INSIDE the verifier is a singleton (plain decoding's call)."""
+    lengths = {
+        "turboquant4": observed.tq_lengths,
+        "affine4": observed.affine_lengths,
+    }.get(codec)
+    if lengths is not None:
+        assert lengths and set(lengths) == {1}, sorted(set(lengths))
 
 
 @pytest.mark.parametrize("block", [2, 3, 4])
-@pytest.mark.parametrize("pick", PICKS)
-def test_e1b_token_identity_on_the_deployed_kv_codec(pick, block, observed):
+@pytest.mark.parametrize(
+    ("pick", "codec", "kv"), CASES, ids=[f"{p}-{c}" for p, c, _ in CASES]
+)
+def test_e1b_token_identity_on_the_deployed_kv_codec(pick, codec, kv, block, observed):
     """ON emits plain decoding's tokens at every block size, incl. the terminal round with one token of budget (n with
     (n - 1) % block == 1) — the round that served a width-2 block through the batched call.
     """
-    params, kv = deployed_sampling(pick), DEPLOYED_KV[pick]
+    params = deployed_sampling(pick)
     lm, drafter = _quantized_pair(pick)
     mismatches = []
     for n in (13, 14, 17):
@@ -122,18 +155,13 @@ def test_e1b_token_identity_on_the_deployed_kv_codec(pick, block, observed):
                 vocab=64,
             )
             on, cache = _run(lm, drafter, n=n, kv=kv, block=block, seed=seed, **params)
-            _assert_codec(cache, kv)
+            _assert_codec(cache, codec)
             if on != off:
                 mismatches.append((n, seed, off, on))
     assert 2 in observed.widths, sorted(
         set(observed.widths)
     )  # a width-2 verify block ran
-    if (
-        kv
-    ):  # every TurboQuant attention call inside the verifier is a singleton (plain decoding's call)
-        assert observed.tq_lengths and set(observed.tq_lengths) == {1}, sorted(
-            set(observed.tq_lengths)
-        )
+    _assert_singleton_quantized_attention(observed, codec)
     assert mismatches == []
 
 
@@ -162,17 +190,20 @@ def _law(lm, drafter, k, params, kv, block, path=None, script=None):
     return law, rounds
 
 
-@pytest.mark.parametrize("pick", PICKS)
-def test_e1a_exact_joint_law_on_the_deployed_kv_codec(pick, observed):
+@pytest.mark.parametrize(
+    ("pick", "codec", "kv"), CASES, ids=[f"{p}-{c}" for p, c, _ in CASES]
+)
+def test_e1a_exact_joint_law_on_the_deployed_kv_codec(pick, codec, kv, observed):
     """The exact joint law of the first 3 tokens with a full-accept drafter: every conditional of length >= 1 ends with
     one token of budget, so width-2 verify blocks are asserted to have run."""
-    params, kv = deployed_sampling(pick), DEPLOYED_KV[pick]
+    params = deployed_sampling(pick)
     lm, drafter = _quantized_pair(pick)
     law_off, _ = _law(lm, None, 3, params, kv, 3)
     path = {}
     script = scripted(drafter, lambda pos: path.get(pos), high=True, vocab=64)
     law_on, rounds = _law(lm, drafter, 3, params, kv, 3, path=path, script=script)
     assert rounds and 2 in observed.widths, sorted(set(observed.widths))
+    _assert_singleton_quantized_attention(observed, codec)
     assert_equal_laws(law_on, law_off, tol=1e-5)
 
 
@@ -182,14 +213,15 @@ def _prefilled(lm, kv):
     return cache
 
 
-@pytest.mark.parametrize("pick", PICKS)
-def test_a_width_2_verify_block_equals_two_singleton_calls(pick, observed):
+@pytest.mark.parametrize(
+    ("pick", "codec", "kv"), CASES, ids=[f"{p}-{c}" for p, c, _ in CASES]
+)
+def test_a_width_2_verify_block_equals_two_singleton_calls(pick, codec, kv, observed):
     """Route level: one width-2 ``speculative_verify`` call vs two plain singleton calls on an INDEPENDENT, identically
     prefilled cache — the logits rows and every full-attention layer's KV bitwise."""
-    kv = DEPLOYED_KV[pick]
     lm, _ = _quantized_pair(pick)
     block_cache, plain_cache = _prefilled(lm, kv), _prefilled(lm, kv)
-    _assert_codec(block_cache, kv)
+    _assert_codec(block_cache, codec)
     tokens = mx.array([[5, 9]], dtype=mx.int32)
     verify = lm(tokens, cache=block_cache, speculative_verify=True)
     rows = [
@@ -199,11 +231,12 @@ def test_a_width_2_verify_block_equals_two_singleton_calls(pick, observed):
     assert 2 in observed.widths, observed.widths
     for i in range(2):
         assert mx.array_equal(verify.logits[:, i, :], rows[i]).item(), f"row {i}"
-    if kv:
-        assert set(observed.tq_lengths) == {1}, sorted(set(observed.tq_lengths))
+    _assert_singleton_quantized_attention(observed, codec)
     compared = 0
     for a, b in zip(iter_leaf_caches(block_cache), iter_leaf_caches(plain_cache)):
-        if isinstance(a, tq.TurboQuantKVCache) or type(a).__name__ == "KVCache":
+        if isinstance(a, (tq.TurboQuantKVCache, kv_cache.QuantizedKVCache)) or (
+            type(a).__name__ == "KVCache"
+        ):
             assert a.offset == b.offset
             fa, fb = tree_flatten(a.state), tree_flatten(b.state)
             assert [k for k, _ in fa] == [k for k, _ in fb]

@@ -496,16 +496,25 @@ def test_forced_schedule_compares_only_emitted_positions():
 
 # ------------------------------------------------------------------ P400: the deployed KV codec (TurboQuant)
 TQ4 = dict(kv_bits=4, kv_quant_scheme="turboquant", quantized_kv_start=0)
+AFFINE4 = dict(
+    kv_bits=4, kv_quant_scheme="uniform", quantized_kv_start=0
+)  # what the server builds today (P405)
 DEPLOYED_KV = {PICKS[0]: {}, PICKS[1]: TQ4}
+KV_CASES = [
+    (PICKS[0], {}, "KVCache"),
+    (PICKS[1], TQ4, "TurboQuantKVCache"),
+    (PICKS[1], AFFINE4, "QuantizedKVCache"),
+]
 
 
 @metal
 @pytest.mark.parametrize(
     "n", [14, 17]
 )  # (n - 1) % 3 == 1: the terminal round has one token of budget (width 2)
-@pytest.mark.parametrize("pick", PICKS)
-def test_quantized_e1c_on_the_deployed_kv_codec(pick, n):
-    kv = DEPLOYED_KV[pick]
+@pytest.mark.parametrize(
+    ("pick", "kv", "want"), KV_CASES, ids=[f"{p}-{w}" for p, _, w in KV_CASES]
+)
+def test_quantized_e1c_on_the_deployed_kv_codec(pick, kv, want, n):
     lm, model, params, on, emitted, offsets = _e1c(pick, n=n, kv=kv)
     leaf_kinds = {type(c).__name__ for c in iter_leaf_caches(on._cache or [])}
     with observe.Recorder(
@@ -521,8 +530,8 @@ def test_quantized_e1c_on_the_deployed_kv_codec(pick, n):
             **kv,
         )
         off_kinds = {type(c).__name__ for c in iter_leaf_caches(off._cache or [])}
-    want = "TurboQuantKVCache" if kv else "KVCache"
-    assert want in leaf_kinds | off_kinds, (leaf_kinds, off_kinds)
+    kinds = leaf_kinds | off_kinds  # a Prealloc* subclass name counts as its codec
+    assert any(k.endswith(want) for k in kinds), (want, leaf_kinds, off_kinds)
     forced = compare.forced_positions(on, emitted, finish_reason="length")
     rows = compare.compare_streams(
         on.rows, off.rows, len(emitted), params, exclude=forced
