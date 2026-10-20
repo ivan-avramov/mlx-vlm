@@ -99,6 +99,38 @@ MONITOR_S = 300
 
 
 # ------------------------------------------------------------------ pure parts (tested)
+def read_registry(path):
+    """The registry as BYTES decoded (code round 1 M1): never universal-newline normalized, so a CRLF or mixed-newline
+    file is not mistaken for an accepted LF state."""
+    return Path(path).read_bytes().decode("utf-8")
+
+
+def draft_inventory_problems(pick, name, dk):
+    """Code round 1 M2: the drafter MoE-path inventory itself — MoE, at least one invocation, each running every
+    part exactly once, with selected experts — never only its pass flag."""
+    from p369_phase2 import telemetry
+
+    where = f"{pick} {name}.draft_kernels"
+    if not isinstance(dk, dict) or not isinstance(dk.get("invocations"), list):
+        raise MalformedEvidence(f"malformed evidence: {where} = {dk!r}")
+    problems = []
+    if not exact_bool(dk.get("pass"), f"{where}.pass"):
+        problems.append(f"{pick} {name}: drafter MoE path {dk.get('problems')}")
+    if dk.get("moe") is not True:
+        problems.append(f"{pick} {name}: the drafter inventory is not a MoE one")
+    if not dk["invocations"]:
+        problems.append(f"{pick} {name}: no drafter MoE-block invocation")
+    want = sorted(telemetry.DRAFT_MOE_PARTS)
+    for inv in dk["invocations"]:
+        if not isinstance(inv, dict) or inv.get("parts") != want:
+            problems.append(f"{pick} {name}: drafter MoE invocation parts {inv!r}")
+        elif not inv.get("selected_experts"):
+            problems.append(
+                f"{pick} {name}: drafter MoE invocation without selected experts"
+            )
+    return problems
+
+
 def needs_draft_inventory(pick):
     """v13 V15: an entry whose certified drafter is MoE must show its drafter's routed path in the smoke."""
     return bool(PICKS[pick]["drafter"].get("experts"))
@@ -152,6 +184,9 @@ def build_panel(source, bundles, items, entries):
                 name=i["name"],
                 seed=i["seed"],
                 item_sha256=i["item_sha256"],
+                corpus_sha256=i[
+                    "corpus_sha256"
+                ],  # code round 1 M9: the dataset content, per axis
                 messages_sha256=messages_sha(i["messages"]),
             )
             for i in items
@@ -167,6 +202,12 @@ def panel_problems(panel, pick, bundles, items, counts=None):
     problems = []
     if pick not in panel.get("entries", {}):
         return [f"{pick}: not in the borrowed panel"]
+    if (
+        panel.get("source_pick") != items_source(pick)[0]
+    ):  # code round 1 M9: derived independently
+        return [
+            f"{pick}: panel source {panel.get('source_pick')!r} != {items_source(pick)[0]!r}"
+        ]
     if dict(sorted(bundles.items())) != panel["bundles"]:
         problems.append("source bundles differ from the panel")
     live = build_panel(panel["source_pick"], bundles, items, {})["items"]
@@ -935,18 +976,10 @@ def smoke_gate(picks):
                 if not baseline or not need <= seen:
                     problems.append(f"{pick}: smoke positives {sp}")
                 problems += leaf_manifest_problems(pick, name, v, record.get("kv"))
-                if needs_draft_inventory(pick):  # v13 V15
-                    dk = v.get("draft_kernels")
-                    if not isinstance(dk, dict):
-                        raise MalformedEvidence(
-                            f"malformed evidence: {pick} {name}.draft_kernels = {dk!r}"
-                        )
-                    if not exact_bool(
-                        dk.get("pass"), f"{pick} {name}.draft_kernels.pass"
-                    ):
-                        problems.append(
-                            f"{pick} {name}: drafter MoE path {dk.get('problems')}"
-                        )
+                if needs_draft_inventory(pick):  # v13 V15 / code round 1 M2
+                    problems += draft_inventory_problems(
+                        pick, name, v.get("draft_kernels")
+                    )
         # code round 2 C2: exactly the scheduled cells, the positive block on the last one only
         cells = record.get("e1c") or {}
         scheduled = [f"T{t}" for t in SMOKE_THRESHOLDS]
@@ -977,8 +1010,11 @@ def smoke_gate(picks):
         if not (
             isinstance(steps, dict)
             and set(steps) >= {"prep", "e1c", "e2", "e7b"}
-            and all(
-                type(steps[k]) in (int, float) for k in ("prep", "e1c", "e2", "e7b")
+            and all(  # code round 1 M10: finite and non-negative
+                type(steps[k]) in (int, float)
+                and math.isfinite(steps[k])
+                and steps[k] >= 0
+                for k in ("prep", "e1c", "e2", "e7b")
             )
         ):
             raise MalformedEvidence(f"malformed evidence: {pick}.step_s = {steps!r}")
@@ -1882,6 +1918,8 @@ for axis in axes:
     path = Path(stack) / "benchmark" / "results" / pick / f"{axis}.c84bundle-after-{kv}-20260914.jsonl"
     rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
     corpus = {str(item["id"]): item for item in benchmarks.load(axis)}
+    import hashlib
+    corpus_sha = hashlib.sha256(json.dumps(sorted(corpus.items()), sort_keys=True, default=str).encode()).hexdigest()
     for row in rows:
         item = corpus.get(str(row["id"]))
         if item is None:
@@ -1890,7 +1928,7 @@ for axis in axes:
         content = hashlib.sha256(json.dumps(item, sort_keys=True, default=str).encode()).hexdigest()
         items.append(dict(name=f"{axis}/{row['id']}", messages=benchmarks.build_messages(axis, item),
                           seed=row.get("sampler_seed"), prompt_tokens=row.get("prompt_tokens"),
-                          item_sha256=content))
+                          item_sha256=content, corpus_sha256=corpus_sha))
 print(json.dumps(items))
 """
 
@@ -1958,7 +1996,9 @@ class Campaign:
         self._out_created = True  # from here a stop can record its status (H23)
         import yaml
 
-        self.registry = (self.stack / "main_models.yaml").read_text()
+        self.registry = read_registry(
+            self.stack / "main_models.yaml"
+        )  # code round 1 M1
         entries = {e["name"]: e for e in yaml.safe_load(self.registry)["models"]}
         self.params = {
             p: {
