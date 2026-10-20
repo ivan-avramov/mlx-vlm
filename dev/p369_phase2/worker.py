@@ -1082,12 +1082,22 @@ def snapshot_holder(snaps, rows=None):
 
 
 def e1c_request(
-    client, capture, lm, policy, manifest, spec, mode, timeout, **rec_kwargs
+    client,
+    capture,
+    lm,
+    policy,
+    manifest,
+    spec,
+    mode,
+    timeout,
+    drafter=None,
+    **rec_kwargs,
 ):
-    """One E1c request: the recorder (ON or forced OFF), kernel telemetry, key-length spans."""
+    """One E1c request: the recorder (ON or forced OFF), kernel telemetry (with the drafter's MoE path when
+    ``drafter`` is given, v13 V15), key-length spans."""
     from p369_phase2 import observe, telemetry
 
-    tel = telemetry.KernelTelemetry(lm)
+    tel = telemetry.KernelTelemetry(lm, drafter=drafter)
     recorder = observe.Recorder(mode, lm=lm, **rec_kwargs)
     real_probe = observe.probe
 
@@ -1107,6 +1117,8 @@ def e1c_request(
     part["telemetry"] = tel.summary()
     part["verify_scope_calls"] = sum(1 for c in tel.calls if c.get("scope") == "verify")
     part["verdict"] = telemetry.verdict(tel, manifest)
+    if drafter is not None:
+        part["draft_verdict"] = telemetry.draft_verdict(tel, drafter)
     part["offsets"] = (
         [recorder.prompt_end["offset"]] if recorder.prompt_end else []
     ) + [c["offset"] for c in recorder.commits]
@@ -1226,7 +1238,16 @@ def run_job(job, out_dir, result):
                 release_trajectory(rec, part["chat_id"])
             elif job["mode"] == "e1c_pair":
                 part, on = e1c_request(
-                    client, capture, lm, policy, manifest, spec, "on", timeout, **probe
+                    client,
+                    capture,
+                    lm,
+                    policy,
+                    manifest,
+                    spec,
+                    "on",
+                    timeout,
+                    drafter=rg.draft_model,  # v13 V15
+                    **probe,
                 )
                 entry.update(part)
                 save_rows(out_dir / f"rows-{index}.npz", on.rows)

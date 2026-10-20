@@ -99,6 +99,11 @@ MONITOR_S = 300
 
 
 # ------------------------------------------------------------------ pure parts (tested)
+def needs_draft_inventory(pick):
+    """v13 V15: an entry whose certified drafter is MoE must show its drafter's routed path in the smoke."""
+    return bool(PICKS[pick]["drafter"].get("experts"))
+
+
 def campaign_pick_problems(picks):
     """P369 v13 V9: exactly one known entry per campaign (smoke and full bind one entry each)."""
     if not picks or len(picks) != 1:
@@ -930,6 +935,18 @@ def smoke_gate(picks):
                 if not baseline or not need <= seen:
                     problems.append(f"{pick}: smoke positives {sp}")
                 problems += leaf_manifest_problems(pick, name, v, record.get("kv"))
+                if needs_draft_inventory(pick):  # v13 V15
+                    dk = v.get("draft_kernels")
+                    if not isinstance(dk, dict):
+                        raise MalformedEvidence(
+                            f"malformed evidence: {pick} {name}.draft_kernels = {dk!r}"
+                        )
+                    if not exact_bool(
+                        dk.get("pass"), f"{pick} {name}.draft_kernels.pass"
+                    ):
+                        problems.append(
+                            f"{pick} {name}: drafter MoE path {dk.get('problems')}"
+                        )
         # code round 2 C2: exactly the scheduled cells, the positive block on the last one only
         cells = record.get("e1c") or {}
         scheduled = [f"T{t}" for t in SMOKE_THRESHOLDS]
@@ -2208,6 +2225,7 @@ class Campaign:
                 ),  # smoke 9: what the hash / positives saw
                 leaf_manifest=on.get("leaf_manifest"),  # P405 F3
                 drafter_manifest=on.get("drafter_manifest"),  # P405 code round 1 K3
+                draft_kernels=on.get("draft_verdict"),  # v13 V15
                 attempts=attempts[name],
                 rejected=[a for a in attempts[name] if not a["valid"]],
             )

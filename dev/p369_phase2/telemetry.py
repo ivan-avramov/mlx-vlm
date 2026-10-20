@@ -61,6 +61,28 @@ LEAVES = {
     "_target_verify_singleton_quantized_argmax": "argmax_singleton",
 }
 READOUTS = ("speculative_argmax_from_hidden", "speculative_logits_from_hidden")
+# P369 v13 V3 / V15: routed MoE projections run OUTSIDE the linear dispatcher — the verifier's ``_switch_glu`` calls the
+# SwitchLinear / QuantizedSwitchLinear banks directly, ``SwitchGLU`` may take exact fused helpers that read the bank
+# weights. Each is recorded per routed-bank invocation, by module identity.
+ROUTED_PROJ = ("gate_proj", "up_proj", "down_proj")
+# helper name -> (module, the bank(s) its first argument stands for)
+ROUTED_HELPERS = {
+    "exact_affine_switch_gate_up": ("fast_ops", ("gate_proj", "up_proj")),
+    "exact_affine_moe_down": ("fast_ops", None),
+    "exact_quantized_switch_linear": ("quantized_verifier", None),
+    "exact_quantized_selected_linear": ("quantized_verifier", None),
+    "exact_quantized_moe_hc_expand": ("quantized_verifier", None),
+}
+DRAFT_MOE_PARTS = (
+    "gate",
+    "shared_expert.gate_proj",
+    "shared_expert.up_proj",
+    "shared_expert.down_proj",
+    "shared_expert_gate",
+    "switch_mlp.gate_proj",
+    "switch_mlp.up_proj",
+    "switch_mlp.down_proj",
+)
 
 
 def _width(x):
@@ -75,13 +97,27 @@ def _dtype(x):
 
 
 class KernelTelemetry:
-    def __init__(self, lm):
+    def __init__(self, lm, drafter=None):
         self.lm = lm
+        self.drafter = drafter
+        self.routed_frames = (
+            []
+        )  # v13 V3: one per routed-bank invocation (verifier ``_switch_glu`` / ``SwitchGLU``)
+        self.draft_moe = (
+            []
+        )  # v13 V15: one per drafter MoE-block invocation in draft scope
+        self._routed_stack = []
+        self._draft_stack = []
+        self._draft_depth = 0
         self.calls = []
         self.probe_calls = []
         self.attributions = []
         self.readouts = collections.Counter()
         self._names = {id(m): name for name, m in lm.named_modules()}
+        if drafter is not None:
+            self._names.update(
+                {id(m): f"drafter.{name}" for name, m in drafter.named_modules()}
+            )
         self._frames = []
         self._probe_depth = 0
         self._scope_depth = 0
@@ -237,6 +273,137 @@ class KernelTelemetry:
 
         return wrapped
 
+    # -- v13 V3 / V15: routed MoE banks and the drafter's MoE path
+    def _scope_name(self):
+        if self._draft_depth:
+            return "draft"
+        return "verify" if self._scope_depth else "other"
+
+    def _routed_note(self, module, indices, projections=None):
+        """One routed-bank projection call (or a fused helper standing for ``projections``) on ``module``."""
+        import numpy as np
+
+        name = self._names.get(id(module), "?")
+        projs = projections or (name.rsplit(".", 1)[-1],)
+        tokens = int(indices.size // indices.shape[-1]) if indices is not None else 0
+        experts = (
+            sorted({int(e) for e in np.array(indices).reshape(-1)})
+            if indices is not None
+            else []
+        )
+        bank = name.rsplit(".", 1)[0] if projections is None else name
+        if self._routed_stack:
+            frame = self._routed_stack[-1]
+            frame["projections"].extend(projs)
+            frame["experts"].update(experts)
+        family = (
+            "routed_gather_quantized"
+            if type(module).__name__.startswith("Quantized")
+            else "routed_gather"
+        )
+        if not self._probe_depth:
+            for proj in projs:
+                self.attributions.append(
+                    dict(
+                        entry="routed",
+                        family=family,
+                        width=tokens,
+                        module=f"{bank}.{proj}" if projections else name,
+                        kind="routed",
+                        scope=self._scope_name(),
+                    )
+                )
+        if self._draft_stack:
+            self._draft_stack[-1]["parts"].extend(f"switch_mlp.{p}" for p in projs)
+            self._draft_stack[-1]["experts"].update(experts)
+
+    def _routed_bank(self, real):
+        telemetry = self
+
+        def wrapped(module, x, indices, *args, **kwargs):
+            telemetry._routed_note(module, indices)
+            return real(module, x, indices, *args, **kwargs)
+
+        return wrapped
+
+    def _routed_helper(self, real, projections):
+        telemetry = self
+
+        def wrapped(module, x, indices, *args, **kwargs):
+            out = real(module, x, indices, *args, **kwargs)
+            if out is not None:
+                telemetry._routed_note(module, indices, projections)
+            return out
+
+        return wrapped
+
+    def _routed_invocation(self, real, *, positional_indices=2):
+        """Opens a routed-bank invocation frame around ``_switch_glu`` / ``SwitchGLU.__call__``."""
+        telemetry = self
+
+        def wrapped(*args, **kwargs):
+            x = args[positional_indices - 1]
+            frame = dict(
+                scope=telemetry._scope_name(),
+                width=int(x.shape[0] * x.shape[1]) if x.ndim == 3 else int(x.shape[0]),
+                projections=[],
+                experts=set(),
+            )
+            telemetry._routed_stack.append(frame)
+            try:
+                return real(*args, **kwargs)
+            finally:
+                telemetry._routed_stack.pop()
+                if not telemetry._probe_depth:
+                    frame["experts"] = sorted(frame["experts"])
+                    telemetry.routed_frames.append(frame)
+
+        return wrapped
+
+    def _draft_scope(self, real):
+        telemetry = self
+
+        def wrapped(*args, **kwargs):
+            telemetry._draft_depth += 1
+            try:
+                return real(*args, **kwargs)
+            finally:
+                telemetry._draft_depth -= 1
+
+        return wrapped
+
+    def _draft_moe_block(self, real):
+        telemetry = self
+
+        def wrapped(block, x, *args, **kwargs):
+            name = telemetry._names.get(id(block), "?")
+            if not (telemetry._draft_depth and name.startswith("drafter.")):
+                return real(block, x, *args, **kwargs)
+            frame = dict(block=name, parts=[], experts=set())
+            telemetry._draft_stack.append(frame)
+            try:
+                return real(block, x, *args, **kwargs)
+            finally:
+                telemetry._draft_stack.pop()
+                frame["experts"] = sorted(frame["experts"])
+                telemetry.draft_moe.append(frame)
+
+        return wrapped
+
+    def _draft_linear(self, real):
+        telemetry = self
+
+        def wrapped(module, x, *args, **kwargs):
+            if telemetry._draft_stack:
+                frame = telemetry._draft_stack[-1]
+                name = telemetry._names.get(id(module), "?")
+                prefix = frame["block"] + "."
+                if name.startswith(prefix):
+                    frame["parts"].append(name[len(prefix) :])
+            return real(module, x, *args, **kwargs)
+
+        return wrapped
+
     def _patch(self, owner, name, value):
         self._patched.append((owner, name, getattr(owner, name)))
         setattr(owner, name, value)
@@ -260,6 +427,45 @@ class KernelTelemetry:
         for name in READOUTS:
             if hasattr(cls, name):
                 self._patch(cls, name, self._readout(name, getattr(cls, name)))
+        # v13 V3 / V15: routed banks, their fused helpers, and the drafter's own MoE path
+        import mlx.nn as nn
+        from mlx_vlm.models import fast_ops, quantized_verifier, switch_layers
+
+        helpers = dict(fast_ops=fast_ops, quantized_verifier=quantized_verifier)
+        for bank in (switch_layers.SwitchLinear, switch_layers.QuantizedSwitchLinear):
+            self._patch(bank, "__call__", self._routed_bank(bank.__call__))
+        for helper, (module, projections) in ROUTED_HELPERS.items():
+            owner = helpers[module]
+            if hasattr(owner, helper):
+                self._patch(
+                    owner,
+                    helper,
+                    self._routed_helper(getattr(owner, helper), projections),
+                )
+        self._patch(
+            sv.Qwen3_5BatchInvariantForward,
+            "_switch_glu",
+            self._routed_invocation(
+                sv.Qwen3_5BatchInvariantForward._switch_glu, positional_indices=3
+            ),
+        )
+        self._patch(
+            switch_layers.SwitchGLU,
+            "__call__",
+            self._routed_invocation(switch_layers.SwitchGLU.__call__),
+        )
+        if self.drafter is not None:
+            from mlx_vlm.models.qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
+
+            dcls = type(self.drafter)
+            self._patch(dcls, "draft_block", self._draft_scope(dcls.draft_block))
+            self._patch(
+                Qwen3_5MoeSparseMoeBlock,
+                "__call__",
+                self._draft_moe_block(Qwen3_5MoeSparseMoeBlock.__call__),
+            )
+            for lin in (nn.Linear, nn.QuantizedLinear):
+                self._patch(lin, "__call__", self._draft_linear(lin.__call__))
         return self
 
     def __exit__(self, *exc):
@@ -387,6 +593,19 @@ def manifest_from_model(lm, dtype=None):
             entry = dict(kind="quantized", bits=int(module.bits))
         elif isinstance(module, nn.Embedding):
             entry = dict(kind="dense")
+        elif type(module).__name__ in ("SwitchLinear", "QuantizedSwitchLinear"):
+            quantized = type(module).__name__ == "QuantizedSwitchLinear"
+            entry = dict(
+                kind="routed",
+                expected=dict(
+                    routed=["routed_gather_quantized" if quantized else "routed_gather"]
+                ),
+                on_path=name.startswith("model.layers."),
+            )
+            out[name] = (
+                entry  # v13 V3: the routed banks, invisible to the linear dispatcher
+            )
+            continue
         else:
             continue
         entry["expected"] = expected_families(module, dtype)
@@ -442,6 +661,15 @@ def verdict(telemetry, manifest):
                 )
         elif a["family"] not in allowed | WIDTH1_OK:
             problems.append(f"unexpected width-1 family in {a}")
+    for (
+        frame
+    ) in (
+        telemetry.routed_frames
+    ):  # v13 V3: each verify-scope invocation runs every bank exactly once
+        if frame["scope"] == "verify" and sorted(frame["projections"]) != sorted(
+            ROUTED_PROJ
+        ):
+            problems.append(f"routed invocation ran {frame['projections']}: {frame}")
     on_path = sorted(m for m, info in manifest.items() if _on_path(m, info))
     missing = [m for m in on_path if m not in observed]
     if missing:
@@ -456,5 +684,47 @@ def verdict(telemetry, manifest):
         not_on_path=sorted(m for m, info in manifest.items() if not _on_path(m, info)),
         problems=problems[:50],
         problem_count=len(problems),
+        **{"pass": not problems},
+    )
+
+
+def routed_invocations(telemetry, *, scope):
+    """The routed-bank invocations recorded in ``scope`` (``verify`` / ``draft`` / ``other``)."""
+    return [f for f in telemetry.routed_frames if f["scope"] == scope]
+
+
+def draft_verdict(telemetry, drafter):
+    """P369 v13 V15: the drafter's MoE path in its draft scope — at least one MoE-block invocation, each running the
+    router, the shared expert, its gate and every routed bank exactly once, with its selected experts recorded. A
+    dense drafter (no MoE block) has nothing to verify here."""
+    names = [
+        n
+        for n, m in drafter.named_modules()
+        if type(m).__name__ == "Qwen3_5MoeSparseMoeBlock"
+    ]
+    problems = []
+    if not names:
+        return dict(
+            pass_=True, problems=[], invocations=[], moe=False, **{"pass": True}
+        )
+    if not telemetry.draft_moe:
+        problems.append("no drafter MoE-block invocation in draft scope")
+    for frame in telemetry.draft_moe:
+        if sorted(frame["parts"]) != sorted(DRAFT_MOE_PARTS):
+            problems.append(
+                f"drafter MoE block ran {sorted(frame['parts'])}: {frame['block']}"
+            )
+        if not frame["experts"]:
+            problems.append(
+                f"drafter MoE block {frame['block']}: no selected experts recorded"
+            )
+    invocations = [
+        dict(block=f["block"], parts=sorted(f["parts"]), selected_experts=f["experts"])
+        for f in telemetry.draft_moe
+    ]
+    return dict(
+        problems=problems[:50],
+        invocations=invocations,
+        moe=True,
         **{"pass": not problems},
     )
