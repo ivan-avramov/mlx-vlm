@@ -837,3 +837,42 @@ def test_a_dry_run_that_misses_tokenization_or_reaches_generation_refuses(
     with TestClient(_middleware_app(behaviour)) as client:
         with pytest.raises(RuntimeError, match=why):
             worker.prompt_ids(client, [dict(role="user", content="x")], dict(model="m"))
+
+
+# ------------------------------------------------------------------ smoke 7 (live): no branch-local imports in run_job
+def test_run_job_uses_each_branch_local_import_only_inside_its_block():
+    """A ``from … import`` inside one mode's branch makes the name local to the WHOLE function, so a use
+    outside that block raises UnboundLocalError (smoke 7: ``compare`` imported in the e1c_pair branch, used
+    by e1c_off for the forced schedule). run_job's branches have no unit test, so the shape is checked:
+    every use of a name bound by a nested import lies inside the statement block holding the import.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    fn = ast.parse(textwrap.dedent(inspect.getsource(worker.run_job))).body[0]
+    blocks = []  # (statement list, its line span)
+    for node in ast.walk(fn):
+        for field in ("body", "orelse", "finalbody", "handlers"):
+            stmts = getattr(node, field, None)
+            if isinstance(stmts, list) and stmts and isinstance(stmts[0], ast.AST):
+                blocks.append((stmts, (stmts[0].lineno, stmts[-1].end_lineno)))
+    loads = [
+        (n.id, n.lineno)
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
+    ]
+    escaped = []
+    for stmts, (lo, hi) in blocks:
+        if stmts is fn.body:
+            continue
+        for stmt in stmts:
+            if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+                for alias in stmt.names:
+                    name = (alias.asname or alias.name).split(".")[0]
+                    escaped += [
+                        (name, line)
+                        for n, line in loads
+                        if n == name and not lo <= line <= hi
+                    ]
+    assert escaped == [], escaped
