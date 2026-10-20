@@ -1451,18 +1451,21 @@ TQ_KV = dict(NATIVE_KV, kv_bits=4.0, kv_quant_scheme="turboquant")
 
 
 def _layers(kinds):
-    return [dict(path=str(i), kind=k, cls=k) for i, k in enumerate(kinds)]
+    return [dict(path=str(i), kind=k, cls=k, batch=False) for i, k in enumerate(kinds)]
 
 
 TEMPLATE = _layers(["ArraysCache", "ArraysCache", "ArraysCache", "native"] * 4)
 TQ_LEAF = dict(kind="tq", bits=4.0, key_bits=4.0, value_bits=4.0, mode="mse")
+DRAFTER = [dict(path="0", kind="native", cls="KVCache", batch=False)]
 
 
 def _tq_observed():
     out = []
     for t in TEMPLATE:
         if t["kind"] == "native" and t["path"] != "15":
-            out.append(dict(TQ_LEAF, path=t["path"], cls="TurboQuantKVCache"))
+            out.append(
+                dict(TQ_LEAF, path=t["path"], cls="TurboQuantKVCache", batch=False)
+            )
         else:
             out.append(dict(t))
     return out
@@ -1477,6 +1480,7 @@ def _smoke_e1c():
             pass_=True,
             leaf_census=dict(NATIVE_CENSUS),
             leaf_manifest=dict(observed=list(TEMPLATE), template=list(TEMPLATE)),
+            drafter_manifest=dict(observed=list(DRAFTER), template=list(DRAFTER)),
             smoke_positives=dict(baseline_pass=True, fired=dict(SMOKE_FIRED)),
         ),
     }
@@ -2143,3 +2147,15 @@ def test_every_job_expects_the_kv_codec_its_argv_names():
     for arm in ("on", "off"):
         job = camp.job(UNIFORM, "x", "e1c_pair", arm, [dict(timeout_s=1)])
         assert job["expect"]["kv"] == TQ_KV, arm
+
+
+def test_the_smoke_gate_refuses_a_missing_or_wrong_drafter_manifest():
+    """P405 code round 1 K3: the drafter's cache is part of the served MTP state."""
+    record = _tq_record(_tq_observed())
+    wrong = json.loads(json.dumps(record))
+    wrong["e1c"]["T65536"]["drafter_manifest"]["observed"] = []
+    assert not orchestrate.smoke_gate({UNIFORM: wrong})["pass_"]
+    missing = json.loads(json.dumps(record))
+    del missing["e1c"]["T65536"]["drafter_manifest"]
+    with pytest.raises(orchestrate.MalformedEvidence, match="drafter_manifest"):
+        orchestrate.smoke_gate({UNIFORM: missing})

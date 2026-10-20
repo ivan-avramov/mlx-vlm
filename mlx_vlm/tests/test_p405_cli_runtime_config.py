@@ -159,7 +159,9 @@ def test_t5_the_load_log_states_the_resolved_codec(loaded, caplog):
         "quantized_kv_start",
     ):
         assert f"{name}={kwargs[name]!r}" in resolved[0], (name, resolved[0])
-    assert "TQ_KV_QUANT_MODE=" in resolved[0]
+    assert (
+        "TQ_KV_QUANT_MODE='mse'" in resolved[0]
+    )  # K6: the RESOLVED default, as TurboQuantKVCache applies it
 
 
 def test_t5_the_env_derived_preload_log_line_is_gone():
@@ -168,3 +170,22 @@ def test_t5_the_env_derived_preload_log_line_is_gone():
     assert 'os.environ.get("KV_QUANT_SCHEME"' not in inspect.getsource(
         server_app.lifespan
     )
+
+
+def test_k6_the_logged_mode_is_the_resolved_default_without_the_env(
+    launch, monkeypatch, caplog
+):
+    """P405 code round 1 K6: a non-CLI load (no TQ_KV_QUANT_MODE) logs the mode TurboQuantKVCache applies, 'mse'."""
+    _Generator.seen = []
+    monkeypatch.setattr(server_app, "ResponseGenerator", _Generator)
+    monkeypatch.setattr(server_app._apc, "from_env", lambda **k: None)
+    launch("--kv-bits", "4", "--kv-quant-scheme", "turboquant")
+    monkeypatch.delenv("TQ_KV_QUANT_MODE", raising=False)
+    with caplog.at_level(logging.INFO, logger="mlx_vlm"):
+        server_app.get_cached_model("/models/tiny", None, model_kind="text_generation")
+    (line,) = [
+        r.getMessage()
+        for r in caplog.records
+        if r.getMessage().startswith("KV cache resolved:")
+    ]
+    assert "TQ_KV_QUANT_MODE='mse'" in line, line

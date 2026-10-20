@@ -228,3 +228,39 @@ def test_a_native_argv_wants_every_kv_layer_native():
     served = [PreallocKVCache() if isinstance(c, KVCache) else c for c in template]
     assert _problems(served, template, native) == []
     assert _problems(_served_tq(template), template, native)
+
+
+# ------------------------------------------------------------------ P405 code round 1 K1 / K3
+def test_batch_cache_variants_are_classified_and_refused_not_crashed():
+    """K1: the continuous-batching classes (``_make_cache``) are not the cached-session path F3 models (smoke 11 saw
+    the session path's classes): a batch TurboQuant leaf has no ``_kv_quant_mode`` — recorded, never an AttributeError —
+    and any batch leaf fails the manifest check by name."""
+    from mlx_vlm.models.cache import BatchKVCache
+    from mlx_vlm.turboquant import BatchTurboQuantKVCache
+
+    got = kvmanifest.manifest(
+        [
+            BatchKVCache(left_padding=[0]),
+            BatchTurboQuantKVCache(left_padding=[0], bits=4),
+        ]
+    )
+    assert [(m["kind"], m["batch"]) for m in got] == [("native", True), ("tq", True)]
+    template = kvmanifest.manifest([KVCache(), KVCache(), KVCache()])
+    served = [BatchTurboQuantKVCache(left_padding=[0], bits=4)] * 2 + [
+        PreallocKVCache()
+    ]
+    problems = kvmanifest.manifest_problems(
+        kvmanifest.manifest(served), template, kvmanifest.kv_from_argv(TQ_ARGV)
+    )
+    assert any("batch" in p for p in problems), problems
+
+
+def test_the_drafter_cache_must_match_its_own_template():
+    """K3: the MTP drafter's cache is checked too — its leaves stay its template's (never quantized, never missing)."""
+    template = kvmanifest.manifest([KVCache()])
+    assert (
+        kvmanifest.drafter_problems(kvmanifest.manifest([PreallocKVCache()]), template)
+        == []
+    )
+    for bad in ([], [KVCache(), KVCache()], [TurboQuantKVCache(bits=4)]):
+        assert kvmanifest.drafter_problems(kvmanifest.manifest(bad), template), bad
