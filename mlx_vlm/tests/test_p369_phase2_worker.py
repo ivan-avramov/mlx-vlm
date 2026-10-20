@@ -113,8 +113,19 @@ GOOD = dict(
     apc_env=None,
     session_max=1,
     session_max_env="1",
+    kv=dict(
+        kv_bits=None,
+        kv_key_bits=None,
+        kv_value_bits=None,
+        kv_key_scheme=None,
+        kv_value_scheme=None,
+        kv_quant_scheme="uniform",
+        kv_group_size=64,
+        quantized_kv_start=0,
+        tq_kv_quant_mode="mse",
+    ),
 )
-EXPECT = dict(drafter=True, verify_policy="joint_v1")
+EXPECT = dict(drafter=True, verify_policy="joint_v1", kv=dict(GOOD["kv"]))
 
 
 def test_assert_served_accepts_the_expected_state():
@@ -136,6 +147,54 @@ def test_assert_served_accepts_the_expected_state():
 def test_assert_served_refuses_any_mismatch(change):
     with pytest.raises(RuntimeError, match="served state mismatch"):
         worker.assert_served(dict(GOOD, **change), EXPECT)
+
+
+def test_assert_served_refuses_a_kv_codec_the_argv_did_not_ask_for():
+    """P405 F3: argv TurboQuant, served uniform (the live shape) — and each other resolved KV field singly."""
+    want = dict(GOOD["kv"], kv_bits=4.0, kv_quant_scheme="turboquant")
+    worker.assert_served(dict(GOOD, kv=dict(want)), dict(EXPECT, kv=want))
+    for name, wrong in [
+        ("kv_quant_scheme", "uniform"),
+        ("kv_bits", None),
+        ("kv_key_bits", 3.0),
+        ("kv_group_size", 32),
+        ("quantized_kv_start", 5000),
+        ("tq_kv_quant_mode", "prod"),
+    ]:
+        served = dict(GOOD, kv=dict(want, **{name: wrong}))
+        with pytest.raises(RuntimeError, match=name):
+            worker.assert_served(served, dict(EXPECT, kv=want))
+
+
+def test_assert_served_needs_a_kv_expectation():
+    with pytest.raises(RuntimeError, match="no KV expectation"):
+        worker.assert_served(GOOD, dict(drafter=True, verify_policy="joint_v1"))
+
+
+def test_served_state_reads_the_generators_resolved_kv(monkeypatch):
+    import mlx_vlm.server as server
+
+    rg = types.SimpleNamespace(
+        draft_model=object(),
+        draft_kind="mtp",
+        mtp_verify_policy=types.SimpleNamespace(name="joint_v1"),
+        kv_bits=4.0,
+        kv_key_bits=None,
+        kv_value_bits=None,
+        kv_key_scheme=None,
+        kv_value_scheme=None,
+        kv_quant_scheme="turboquant",
+        kv_group_size=64,
+        quantized_kv_start=0,
+    )
+    monkeypatch.setattr(server.runtime, "response_generator", rg)
+    monkeypatch.setenv("TQ_KV_QUANT_MODE", "mse")
+    kv = worker.served_state()["kv"]
+    assert (kv["kv_bits"], kv["kv_quant_scheme"], kv["tq_kv_quant_mode"]) == (
+        4.0,
+        "turboquant",
+        "mse",
+    )
 
 
 def test_check_sources_refuses_a_module_outside_the_reviewed_tree(

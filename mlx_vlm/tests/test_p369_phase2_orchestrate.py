@@ -1286,6 +1286,7 @@ def test_the_smoke_gate_needs_e7b_to_have_run_not_to_be_continuous():
         reconstruction={"math500/1": {}},
         outcome=dict(e1c="PASS"),
         e1c=_smoke_e1c(),
+        kv=dict(NATIVE_KV),
         e2=dict(verdict="PASS"),
         wall_s=60,
     )
@@ -1433,13 +1434,47 @@ SMOKE_FIRED = {
 }
 
 
+NATIVE_KV = dict(
+    kv_bits=None,
+    kv_key_bits=None,
+    kv_value_bits=None,
+    kv_key_scheme=None,
+    kv_value_scheme=None,
+    kv_quant_scheme="uniform",
+    kv_group_size=64,
+    quantized_kv_start=0,
+    tq_kv_quant_mode="mse",
+)
+TQ_KV = dict(NATIVE_KV, kv_bits=4.0, kv_quant_scheme="turboquant")
+
+
+def _layers(kinds):
+    return [dict(path=str(i), kind=k, cls=k) for i, k in enumerate(kinds)]
+
+
+TEMPLATE = _layers(["ArraysCache", "ArraysCache", "ArraysCache", "native"] * 4)
+TQ_LEAF = dict(kind="tq", bits=4.0, key_bits=4.0, value_bits=4.0, mode="mse")
+
+
+def _tq_observed():
+    out = []
+    for t in TEMPLATE:
+        if t["kind"] == "native" and t["path"] != "15":
+            out.append(dict(TQ_LEAF, path=t["path"], cls="TurboQuantKVCache"))
+        else:
+            out.append(dict(t))
+    return out
+
+
 def _smoke_e1c():
-    """The scheduled smoke E1c cells: the positive block rides exactly the T65536 cell (code round 2 C2)."""
+    """The scheduled smoke E1c cells: the positive block rides exactly the T65536 cell (code round 2 C2), which also
+    carries the exact leaf manifest (P405 F3)."""
     return {
         "T1024": dict(pass_=True),
         "T65536": dict(
             pass_=True,
             leaf_census=dict(NATIVE_CENSUS),
+            leaf_manifest=dict(observed=list(TEMPLATE), template=list(TEMPLATE)),
             smoke_positives=dict(baseline_pass=True, fired=dict(SMOKE_FIRED)),
         ),
     }
@@ -1453,6 +1488,7 @@ def _smoke_record(**changes):
         e2=dict(verdict="PASS"),
         e7b=_e7b_report(),
         wall_s=60,
+        kv=dict(NATIVE_KV),
     )
     record.update(changes)
     return record
@@ -2033,3 +2069,73 @@ def test_the_smoke_gate_requires_the_scheduled_positive_block(e1c):
 
 def test_the_smoke_schedule_is_the_gate_s_schedule():
     assert orchestrate.SMOKE_THRESHOLDS == (1024, 65536)
+
+
+# ------------------------------------------------------------------ P405 F3: the exact leaf manifest gates the smoke
+def _tq_record(observed):
+    cells = _smoke_e1c()
+    cells["T65536"] = dict(
+        cells["T65536"],
+        leaf_census={"ArraysCache": 12, "TurboQuantKVCache": 15, "PreallocKVCache": 1},
+        leaf_manifest=dict(observed=observed, template=list(TEMPLATE)),
+        smoke_positives=dict(baseline_pass=True, fired=dict(SMOKE_FIRED, tq_norm=True)),
+    )
+    return _smoke_record(e1c=cells, kv=dict(TQ_KV))
+
+
+def test_the_smoke_gate_passes_the_exact_turboquant_manifest():
+    gate = orchestrate.smoke_gate({UNIFORM: _tq_record(_tq_observed())})
+    assert gate["pass_"], gate
+
+
+def test_the_smoke_gate_refuses_affine_leaves_under_a_turboquant_argv():
+    """The P405 shape: the census holds KV leaves (so the old gate found a positive), but they are affine."""
+    affine = [
+        (
+            dict(
+                path=t["path"],
+                kind="affine",
+                cls="PreallocQuantizedKVCache",
+                bits=4,
+                group_size=64,
+            )
+            if t["kind"] == "native"
+            else dict(t)
+        )
+        for t in TEMPLATE
+    ]
+    gate = orchestrate.smoke_gate({UNIFORM: _tq_record(affine)})
+    assert not gate["pass_"]
+    assert any("leaf manifest" in p for p in gate["problems"]), gate["problems"]
+
+
+def test_the_smoke_gate_refuses_a_partly_engaged_cache():
+    mixed = _tq_observed()
+    mixed[3] = dict(
+        path="3", kind="affine", cls="PreallocQuantizedKVCache", bits=4, group_size=64
+    )
+    assert not orchestrate.smoke_gate({UNIFORM: _tq_record(mixed)})["pass_"]
+
+
+@pytest.mark.parametrize("drop", ["manifest", "kv"])
+def test_the_smoke_gate_refuses_a_missing_manifest_or_kv_expectation(drop):
+    record = _tq_record(_tq_observed())
+    if drop == "manifest":
+        del record["e1c"]["T65536"]["leaf_manifest"]
+    else:
+        del record["kv"]
+    with pytest.raises(orchestrate.MalformedEvidence, match="malformed evidence"):
+        orchestrate.smoke_gate({UNIFORM: record})
+
+
+def test_every_job_expects_the_kv_codec_its_argv_names():
+    camp = object.__new__(orchestrate.Campaign)
+    argv = ["--model", "m", "--kv-bits", "4", "--kv-quant-scheme", "turboquant"]
+    argv += ["--quantized-kv-start", "0"]
+    camp.attested = {UNIFORM: dict(target={}, drafter={})}
+    camp.arms = {UNIFORM: dict(on=argv, off=argv)}
+    camp.fork, camp.dev, camp.out = Path("/f"), Path("/d"), Path("/o")
+    camp.params = {UNIFORM: {}}
+    for arm in ("on", "off"):
+        job = camp.job(UNIFORM, "x", "e1c_pair", arm, [dict(timeout_s=1)])
+        assert job["expect"]["kv"] == TQ_KV, arm

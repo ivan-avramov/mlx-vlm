@@ -97,12 +97,17 @@ def test_the_idle_time_cannot_be_shortened_below_ten_minutes(capsys):
 
 
 class _RG:
-    def __init__(self, bits, scheme):
+    def __init__(self, bits, scheme, **changes):
         self.kv_bits, self.kv_quant_scheme = bits, scheme
+        self.kv_key_bits = self.kv_value_bits = None
+        self.kv_key_scheme = self.kv_value_scheme = None
+        self.kv_group_size, self.quantized_kv_start = 64, 0
+        self.__dict__.update(changes)
 
 
-def test_the_leg_asserts_the_served_tuple_and_kv_codec_its_argv_asks_for():
-    """C6 (+ P405): the leg proves the deployed MTP tuple (drafter, verify policy) and the KV codec its argv names."""
+def test_the_leg_asserts_the_served_tuple_and_kv_codec_its_argv_asks_for(monkeypatch):
+    """C6 + P405 F3: the leg proves the deployed MTP tuple (drafter, verify policy) and EVERY resolved KV field its argv
+    names (the shared kvmanifest resolution)."""
     calls = []
 
     class Worker:
@@ -114,23 +119,26 @@ def test_the_leg_asserts_the_served_tuple_and_kv_codec_its_argv_asks_for():
         def assert_served(state, expect):
             calls.append((state, expect))
 
+    monkeypatch.setenv("TQ_KV_QUANT_MODE", "mse")
     pick = "Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed"
     argv = ["--model", "m", "--kv-bits", "4", "--kv-quant-scheme", "turboquant"]
+    argv += ["--quantized-kv-start", "0"]
     got = probe.served_check(Worker, _RG(4.0, "turboquant"), argv, pick)
     assert calls == [(dict(state=1), dict(drafter=True, verify_policy="joint_v1"))]
-    assert got == dict(state=1, kv=dict(bits=4.0, scheme="turboquant"))
+    assert got["kv"]["kv_quant_scheme"] == "turboquant" and got["state"] == 1
     import pytest
 
-    with pytest.raises(
-        RuntimeError, match="KV"
-    ):  # the P405 shape: the CLI asked TurboQuant, affine served
-        probe.served_check(Worker, _RG(4.0, "uniform"), argv, pick)
+    for rg in (
+        _RG(4.0, "uniform"),  # the P405 shape: the CLI asked TurboQuant, affine served
+        _RG(None, "uniform"),
+        _RG(4.0, "turboquant", kv_group_size=32),
+        _RG(4.0, "turboquant", quantized_kv_start=5000),
+    ):
+        with pytest.raises(RuntimeError, match="KV"):
+            probe.served_check(Worker, rg, argv, pick)
+    monkeypatch.setenv("TQ_KV_QUANT_MODE", "prod")
     with pytest.raises(RuntimeError, match="KV"):
-        probe.served_check(Worker, _RG(None, "uniform"), argv, pick)
-    native = ["--model", "m", "--kv-bits", "0", "--kv-quant-scheme", "turboquant"]
-    assert probe.served_check(Worker, _RG(None, "turboquant"), native, pick)[
-        "kv"
-    ] == dict(bits=None, scheme=None)
+        probe.served_check(Worker, _RG(4.0, "turboquant"), argv, pick)
 
 
 # ------------------------------------------------------------------ code round 3 C8 C9
