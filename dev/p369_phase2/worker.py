@@ -1038,7 +1038,7 @@ def run_job(job, out_dir, result):
                     ([on.prompt_end] if on.prompt_end else []) + on.commits,
                 )
                 tokens, n = part["final"]["token_ids"], len(part["final"]["token_ids"])
-                same = dict(model=id(rg.model), policy=id(policy))
+                ident = instance_identity(rg)  # P397: held by reference, re-read live
                 metrics = server.runtime.metrics
                 replays = []
                 wait_idle(rg, metrics)
@@ -1078,7 +1078,7 @@ def run_job(job, out_dir, result):
                             )
                         release_trajectory(off, off_part["chat_id"])
                         replays.append((off_part, off))
-                if dict(model=id(rg.model), policy=id(policy)) != same:
+                if not same_instance(rg, ident):
                     raise RuntimeError(
                         "the target / verify policy changed during the pair"
                     )
