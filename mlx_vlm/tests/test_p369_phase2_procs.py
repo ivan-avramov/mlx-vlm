@@ -391,22 +391,32 @@ def test_malformed_comparator_evidence_is_a_harness_error(rows):
         )  # never FAIL (H34)
 
 
-def test_constructing_a_campaign_reads_nothing(tmp_path):
-    args = type(
+def _campaign_args(tmp_path, pick):
+    return type(
         "A",
         (),
         dict(
             stack_root=str(tmp_path / "missing-stack"),
             fork_root=str(tmp_path / "missing-fork"),
             out=str(tmp_path / "run"),
-            pick=None,
+            pick=pick,
             phase="smoke",
             wall_limit_s=None,
             reviewed_head=None,
             smoke_summary=None,
         ),
     )()
+
+
+def test_constructing_a_campaign_reads_nothing(tmp_path):
     camp = orchestrate.Campaign(
-        args
-    )  # side-effect free: registry and params load in prepare() (H23)
+        _campaign_args(tmp_path, ["Qwen3.8-27B-mlx-uniform-4bit"])
+    )  # side-effect free: registry and params load in prepare() (H23); one pick per campaign (v13 V9)
     assert camp.summary["picks"] == {}
+    assert not (tmp_path / "run").exists()
+
+
+def test_constructing_a_campaign_without_one_pick_refuses_before_any_read(tmp_path):
+    with pytest.raises(SystemExit, match="exactly one --pick"):
+        orchestrate.Campaign(_campaign_args(tmp_path, None))
+    assert not (tmp_path / "run").exists()
