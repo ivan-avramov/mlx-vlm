@@ -187,7 +187,34 @@ def _quantized_shapes(module):
     )
 
 
-def drafter_identity(drafter, *, quantized=_quantized_shapes):
+def _callable_identity(fn):
+    """A head callable by what it IS: a module (``["module", id]``) or a bound method (``["method", id(owner), name]``)."""
+    owner = getattr(fn, "__self__", None)
+    if owner is None or callable(getattr(fn, "parameters", None)):
+        return ["module", id(fn)]
+    return ["method", id(owner), fn.__name__]
+
+
+def _bank_shapes(drafter):
+    """Code round 1 M3: each routed bank's ``[type, bits, group_size]`` across the drafter's MoE layers."""
+    out = set()
+    for layer in drafter.layers:
+        switch = getattr(getattr(layer, "mlp", None), "switch_mlp", None)
+        if switch is None:
+            continue
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            bank = getattr(switch, proj)
+            out.add(
+                (
+                    type(bank).__name__,
+                    getattr(bank, "bits", None),
+                    getattr(bank, "group_size", None),
+                )
+            )
+    return sorted(list(b) for b in out)
+
+
+def drafter_identity(drafter, *, requested_block=None, quantized=_quantized_shapes):
     """P369 v13 V11: what the LOADED drafter is (not its config file): type, layer classes and depth, dims, MoE
     shape, quantization, and what it is bound to."""
     tc = drafter.config.text_config
@@ -202,16 +229,32 @@ def drafter_identity(drafter, *, quantized=_quantized_shapes):
         experts=(int(experts), int(tc.num_experts_per_tok)) if experts else None,
         quant=[list(q) for q in quantized(drafter)],
         embed=id(drafter._input_embed),
-        head_bound=drafter._lm_head_fn is not None,
+        head=_callable_identity(
+            drafter._lm_head_fn
+        ),  # code round 1 M3: exactly THIS target's head
+        block_size=int(drafter.config.block_size),
+        effective_block=int(requested_block or drafter.config.block_size),
+        banks=_bank_shapes(drafter) if experts else None,
     )
 
 
-def target_identity(lm):
+def target_identity(model):
+    """What a drafter bound to ``model`` must hold — ``Qwen3_5MTPDraftModel.bind``'s own choice of head: the outer
+    model's ``lm_head``, else the language model's, else the tied embedding's ``as_linear``.
+    """
+    lm = getattr(model, "language_model", model)
     args = getattr(lm, "args", None) or getattr(lm, "config")
+    embed = lm.model.embed_tokens
+    head = getattr(model, "lm_head", None) or getattr(lm, "lm_head", None)
     return dict(
         hidden=int(args.hidden_size),
         vocab=int(args.vocab_size),
-        embed=id(lm.model.embed_tokens),
+        embed=id(embed),
+        head=(
+            ["module", id(head)]
+            if head is not None
+            else ["method", id(embed), "as_linear"]
+        ),
     )
 
 
@@ -219,14 +262,18 @@ def drafter_problems(identity, target, expect):
     """The loaded drafter matches the certified shape (``expect``) and is bound to THIS target."""
     want = dict(
         model_type="qwen3_5_mtp",
+        text_type=expect["text_type"],
         layer=[expect["layer"]],
         depth=expect["depth"],
         experts=expect["experts"],
         quant=[list(q) for q in expect["quant"]],
+        block_size=expect["block_size"],
+        effective_block=expect["block_size"],
+        banks=[list(expect["banks"])] if expect.get("banks") else None,
         hidden=target["hidden"],
         vocab=target["vocab"],
         embed=target["embed"],
-        head_bound=True,
+        head=target["head"],
     )
     return [
         f"drafter {k} {identity.get(k)!r} != {v!r}"
@@ -1175,9 +1222,12 @@ def run_job(job, out_dir, result):
         lm = rg.model.language_model
         shape = job["expect"].get("drafter_shape")
         if shape:  # P369 v13 V11: the LOADED drafter, not its config file
-            ident = drafter_identity(rg.draft_model)
-            result["drafter_identity"] = dict(ident, embed=None)
-            problems = drafter_problems(ident, target_identity(lm), shape)
+            ident = drafter_identity(
+                rg.draft_model,
+                requested_block=os.environ.get("MLX_VLM_DRAFT_BLOCK_SIZE") or None,
+            )
+            result["drafter_identity"] = dict(ident, embed=None, head=None)
+            problems = drafter_problems(ident, target_identity(rg.model), shape)
             if problems:
                 raise RuntimeError("served drafter mismatch: " + "; ".join(problems))
         policy = getattr(rg, "mtp_verify_policy", None)

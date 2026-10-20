@@ -30,7 +30,14 @@ except ImportError:  # run as a script: this directory is sys.path[0]
     import registry_states
 
 PRODUCTION = "7207179b"  # P400 + P401 (C188) + P405 F1 / F2 + K6 (C189 / C192); was 3395cef3, da27f0ef, 4e6d0e03
-_DENSE = dict(layer="Qwen3_5DecoderLayer", depth=1, experts=None, quant=[(4, 64)])
+_DENSE = dict(
+    layer="Qwen3_5DecoderLayer",
+    depth=1,
+    experts=None,
+    quant=[(4, 64)],
+    text_type="qwen3_5_text",
+    block_size=3,  # every certified drafter's configured block (two drafts + the bonus); no override deployed
+)
 PICKS = {  # P369 v13 §3.1: every MTP-certified registry entry; one entry per campaign (V9)
     "Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed": dict(
         kv="native16", verify_policy="joint_v1", drafter=_DENSE
@@ -48,7 +55,13 @@ PICKS = {  # P369 v13 §3.1: every MTP-certified registry entry; one entry per c
         verify_policy=None,
         items_from="Qwen3.8-27B-mlx-uniform-4bit",
         drafter=dict(  # the transplanted MoE head (M27): routed experts, never dense layers (V12 / V14)
-            layer="Qwen3_5MoeDecoderLayer", depth=1, experts=(256, 8), quant=[(4, 64)]
+            layer="Qwen3_5MoeDecoderLayer",
+            depth=1,
+            experts=(256, 8),
+            quant=[(4, 64)],
+            text_type="qwen3_5_moe_text",
+            block_size=3,
+            banks=("QuantizedSwitchLinear", 4, 64),
         ),
     ),
 }
