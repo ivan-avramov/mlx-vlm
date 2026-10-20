@@ -956,10 +956,20 @@ def smoke_gate(picks):
         wall = record.get("wall_s")
         if type(wall) not in (int, float):
             raise MalformedEvidence(f"malformed evidence: {pick}.wall_s = {wall!r}")
-        projected += wall * 6  # the full run is ≈ 6× the smoke per pick (plan §4)
+        steps = record.get("step_s")
+        if not (
+            isinstance(steps, dict)
+            and set(steps) >= {"prep", "e1c", "e2", "e7b"}
+            and all(
+                type(steps[k]) in (int, float) for k in ("prep", "e1c", "e2", "e7b")
+            )
+        ):
+            raise MalformedEvidence(f"malformed evidence: {pick}.step_s = {steps!r}")
+        projected += phase_projection(steps)["nominal_s"]  # v13 V13 (was wall × 6)
     return dict(
         problems=problems,
         projected_full_s=projected,
+        projected_with_tail_s=projected + TAIL_RESERVE_S * len(picks),
         fits=projected <= ESTIMATE_LIMIT_S,
         pass_=not problems,
         e7b=e7b_status_of,
@@ -1708,6 +1718,29 @@ SIZE_PREFIX = (
 SIZE_SUFFIX = "Now write the story."
 SHORT_PROMPT = "Explain, step by step, why the sum of two odd integers is even."
 ESTIMATE_LIMIT_S = 3.5 * 3600
+TAIL_RESERVE_S = 7200  # v13 V13: one full-budget E7 runaway, REPORTED (C194: never enforced as a cap)
+
+
+def phase_projection(step_s):
+    """P369 v13 V13: the full run per phase from the smoke's measured steps × the full cardinalities — prep (sizing
+    four thresholds, reconstructing 20 items) × 1.5; E1c × the threshold-token ratio (+ the short cell, negligible);
+    E2 × 10 items + its four straddles at the E1c rate; E7a = 20 requests at E7b's per-turn time (3 turns); E7b × 5.
+    """
+    e1c = step_s["e1c"] * sum(THRESHOLDS) / sum(SMOKE_THRESHOLDS)
+    nominal = (
+        step_s["prep"] * 1.5
+        + e1c
+        + step_s["e2"] * 10
+        + e1c
+        + step_s["e7b"] * (20 / 3 + 5)
+    )
+    return dict(
+        nominal_s=nominal,
+        tail_reserve_s=TAIL_RESERVE_S,
+        with_tail_s=nominal + TAIL_RESERVE_S,
+    )
+
+
 # C193 (operator 2026-10-20): recorded rulings that lift ONLY the smoke gate's `fits` for one pick's full run; the
 # P369 v13 phase-based projection replaces this in the v13 build. C194 ("no hard stop"): a ruling brings NO campaign
 # wall cap — C184 stands; the per-request watchdogs remain the only automatic stops.
@@ -2415,8 +2448,14 @@ class Campaign:
         record = self.summary["picks"].setdefault(pick, {})
         record["kv"] = kvmanifest.kv_from_argv(self.arms[pick]["on"])  # P405 F3
 
-        def save():  # C184: every finished step reaches summary.json at once
-            record["wall_s"] = round(time.monotonic() - started)
+        mark_at = [started]
+
+        def save(step=None):  # C184: every finished step reaches summary.json at once
+            now = time.monotonic()
+            record["wall_s"] = round(now - started)
+            if step:  # v13 V13: per-phase timings for the projection
+                record.setdefault("step_s", {})[step] = round(now - mark_at[0], 1)
+            mark_at[0] = now
             self.write_summary()
 
         thresholds = SMOKE_THRESHOLDS if smoke else THRESHOLDS
@@ -2434,7 +2473,7 @@ class Campaign:
         record["reconstruction"] = self.check_reconstruction(
             pick, items[:2] if smoke else items, panel=panel
         )
-        save()
+        save("prep")
         try:
             record["e1c"] = self.e1c(pick, prompts, smoke=smoke)
             record["outcome"] = pick_outcome(record["e1c"])
@@ -2442,7 +2481,7 @@ class Campaign:
             record["outcome"] = dict(
                 e1c="ABORT", run_e2_e7=False, reason=f"E1c worker stopped: {exc.info}"
             )
-        save()
+        save("e1c")
         if record["outcome"]["run_e2_e7"]:  # Q37 precedence
             try:
                 record["e2"] = self.e2(pick, items, prompts, smoke=smoke)
@@ -2450,17 +2489,17 @@ class Campaign:
                 record["e2"] = dict(
                     verdict="INCOMPLETE", reason=f"E2 worker stopped: {exc.info}"
                 )
-            save()
+            save("e2")
             if (
                 not smoke
             ):  # code round 2 H16: E7a reaches summary.json before E7b starts
                 record["e7a"] = self.e7a(pick, items)
-                save()
+                save("e7a")
                 record["e7b"] = self.e7b(pick, items)
-                save()
+                save("e7b")
             else:  # P394 (2) refined: one E7b session exercises the continuity mechanics in the smoke
                 record["e7b"] = self.e7b(pick, items, sessions=1)
-                save()
+                save("e7b")
         return record
 
     def execute(self):

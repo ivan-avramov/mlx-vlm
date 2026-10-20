@@ -1254,6 +1254,7 @@ def test_the_smoke_gate_needs_e7b_to_have_run_not_to_be_continuous():
         kv=dict(NATIVE_KV),
         e2=dict(verdict="PASS"),
         wall_s=60,
+        step_s=dict(prep=5, e1c=20, e2=5, e7b=10),
     )
     camp.summary = dict(picks={FABLE: record})
     assert any("E7b" in p for p in camp.smoke_gate()["problems"])  # never ran
@@ -2133,7 +2134,9 @@ def test_the_smoke_gate_refuses_a_missing_or_wrong_drafter_manifest():
 def _over_budget_summary(pick=UNIFORM, **record_changes):
     """A smoke whose evidence all passed but whose × 6 projection exceeds ESTIMATE_LIMIT_S (smoke 12b's shape)."""
     record = _tq_record(_tq_observed())
-    record.update(wall_s=2190, **record_changes)
+    record.update(
+        wall_s=2190, step_s=dict(prep=200, e1c=2000, e2=200, e7b=400), **record_changes
+    )
     picks = {pick: record}
     gate = orchestrate.smoke_gate(picks)
     assert gate["pass_"] and not gate["fits"], gate
@@ -2182,6 +2185,7 @@ def test_the_c193_ruling_never_covers_a_smoke_that_fits():
     fitting = _over_budget_summary()
     for record in fitting["picks"].values():
         record["wall_s"] = 60
+        record["step_s"] = dict(prep=5, e1c=20, e2=5, e7b=10)
     fitting["smoke_gate"] = orchestrate.smoke_gate(fitting["picks"])
     assert fitting["smoke_gate"]["fits"]
     assert orchestrate.smoke_authorization_problems(fitting, projection_ruling="C193")
