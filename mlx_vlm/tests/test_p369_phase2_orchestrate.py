@@ -764,7 +764,7 @@ def test_run_pick_saves_each_step_as_it_finishes(monkeypatch):
     monkeypatch.setattr(orchestrate, "c84_items", lambda stack, pick: [])
     camp.check_bench = lambda pick: None
     camp.size = lambda pick, thresholds: {}
-    camp.check_reconstruction = lambda pick, items: {}
+    camp.check_reconstruction = lambda pick, items, panel=None: {}
     camp.e1c = lambda pick, prompts, smoke: {"T1024": _v()}
     camp.e2 = lambda pick, items, prompts, smoke: dict(verdict="PASS")
     camp.e7a = lambda pick, items: dict(status="OBSERVED")
@@ -1222,7 +1222,7 @@ def _smoke_camp(monkeypatch, calls):
     monkeypatch.setattr(orchestrate, "c84_items", lambda stack, pick: ["i0", "i1"])
     camp.check_bench = lambda pick: None
     camp.size = lambda pick, thresholds: {}
-    camp.check_reconstruction = lambda pick, items: {}
+    camp.check_reconstruction = lambda pick, items, panel=None: {}
     camp.e1c = lambda pick, prompts, smoke: {"T1024": _v()}
     camp.e2 = lambda pick, items, prompts, smoke: dict(verdict="PASS")
     camp.e7a = lambda pick, items: calls.append(("e7a", items)) or dict(
@@ -2389,3 +2389,31 @@ def test_a_borrowed_entry_reconstructs_from_its_source_picks_bundles():
     assert orchestrate.items_source(QWEN36) == (UNIFORM, "tq4")
     assert orchestrate.items_source(ORNITH) == (UNIFORM, "tq4")
     assert orchestrate.items_source(FABLE) == (FABLE, "native16")
+
+
+def test_the_panel_phase_counts_without_generating_and_writes_the_entrys_panel(
+    monkeypatch, tmp_path
+):
+    """v13 V4: `--phase panel` reconstructs the source pick's items, counts them in the entry's OFF worker (no
+    generation) and writes a panel for review — never used by a campaign until committed to dev/.
+    """
+    camp = object.__new__(orchestrate.Campaign)
+    camp.stack, camp.out = tmp_path, tmp_path
+    camp.bundles = dict(BUNDLES)
+    jobs = []
+    monkeypatch.setattr(orchestrate, "c84_items", lambda stack, pick: _items())
+    camp.check_bench = lambda pick: None
+    camp.job = lambda pick, name, mode, arm, requests: dict(
+        pick=pick, name=name, mode=mode, arm=arm, n=len(requests)
+    )
+    camp.run = lambda job: jobs.append(job) or dict(
+        requests=[dict(name=n, **c) for n, c in COUNTS.items()]
+    )
+    panel = camp.make_panel(QWEN36)
+    assert jobs == [dict(pick=QWEN36, name="panel-count", mode="count", arm="off", n=3)]
+    assert panel == orchestrate.build_panel(
+        UNIFORM, BUNDLES, _items(), {QWEN36: COUNTS}
+    )
+    assert json.loads((tmp_path / "borrowed_panel.json").read_text()) == panel
+    with pytest.raises(orchestrate.Refused, match="own C84"):
+        camp.make_panel(UNIFORM)

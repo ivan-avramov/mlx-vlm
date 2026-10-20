@@ -118,6 +118,70 @@ def argv_scan_problems(pick, argv):
     )
 
 
+PANEL = Path(__file__).resolve().parent / "borrowed_panel.json"
+
+
+def items_source(pick):
+    """``(the pick whose C84 bundles the items come from, its kv label)`` — the borrowed entries use the uniform
+    pick's items (v13 V4)."""
+    source = PICKS[pick].get("items_from", pick)
+    return source, PICKS[source]["kv"]
+
+
+def messages_sha(messages):
+    blob = json.dumps(
+        messages, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    )
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def build_panel(source, bundles, items, entries):
+    """The borrowed-panel fixture (v13 V4): the source bundles' sha256, per item its seed, dataset-content hash and
+    built-message sha256, and per borrowed entry its templated ``{name: {tokens, sha256}}`` (from ``--phase panel``).
+    """
+    return dict(
+        source_pick=source,
+        bundles=dict(sorted(bundles.items())),
+        items=[
+            dict(
+                name=i["name"],
+                seed=i["seed"],
+                item_sha256=i["item_sha256"],
+                messages_sha256=messages_sha(i["messages"]),
+            )
+            for i in items
+        ],
+        entries=entries,
+    )
+
+
+def panel_problems(panel, pick, bundles, items, counts=None):
+    """Live reconstruction vs the reviewed panel: bundles, items (names, seeds, content, messages) and — when
+    given — the entry's live templated counts / digests must be exactly the pinned ones.
+    """
+    problems = []
+    if pick not in panel.get("entries", {}):
+        return [f"{pick}: not in the borrowed panel"]
+    if dict(sorted(bundles.items())) != panel["bundles"]:
+        problems.append("source bundles differ from the panel")
+    live = build_panel(panel["source_pick"], bundles, items, {})["items"]
+    if live != panel["items"]:
+        diff = [
+            a["name"] for a, b in zip(live, panel["items"]) if a != b
+        ] or "the item set"
+        problems.append(f"reconstructed items differ from the panel: {diff}")
+    if counts is not None and counts != panel["entries"][pick]:
+        diff = sorted(
+            n
+            for n in set(counts) | set(panel["entries"][pick])
+            if counts.get(n) != panel["entries"][pick].get(n)
+        )
+        problems.append(
+            f"{pick}: templated counts / digests differ from the panel: {diff}"
+        )
+    return problems
+
+
 def borrowed_panel(pick, path):
     """P369 v13 V4: the reviewed borrowed-panel fixture for an entry without C84 bundles (None for an entry with its
     own); absent → Refused, never a silent reconstruction."""
@@ -1772,8 +1836,11 @@ for axis in axes:
         item = corpus.get(str(row["id"]))
         if item is None:
             raise SystemExit(f"{axis}/{row['id']}: not in the corpus")
+        import hashlib
+        content = hashlib.sha256(json.dumps(item, sort_keys=True, default=str).encode()).hexdigest()
         items.append(dict(name=f"{axis}/{row['id']}", messages=benchmarks.build_messages(axis, item),
-                          seed=row.get("sampler_seed"), prompt_tokens=row.get("prompt_tokens")))
+                          seed=row.get("sampler_seed"), prompt_tokens=row.get("prompt_tokens"),
+                          item_sha256=content))
 print(json.dumps(items))
 """
 
@@ -1789,8 +1856,9 @@ def c84_items(stack_root, pick):
             "-c",
             C84_SCRIPT,
             str(stack_root),
-            pick,
-            PICKS[pick]["kv"],
+            *items_source(
+                pick
+            ),  # v13 V4: a borrowed entry reads the source pick's bundles
             ",".join(C84_AXES),
         ],
         capture_output=True,
@@ -1864,11 +1932,12 @@ class Campaign:
             str(p.relative_to(self.stack)): sha256_file(p)
             for pick in self.picks
             for p in sorted(
-                (self.stack / "benchmark" / "results" / pick).glob(
-                    f"*.c84bundle-after-{PICKS[pick]['kv']}-20260914.jsonl"
+                (self.stack / "benchmark" / "results" / items_source(pick)[0]).glob(
+                    f"*.c84bundle-after-{items_source(pick)[1]}-20260914.jsonl"
                 )
             )
         }
+        self.bundles = bundles  # v13 V4: bound into the borrowed-panel check
         self.bench_paths = ["benchmark/bench", *sorted(bundles)]
         problems = stack_bench_problems(self.stack, self.bench_paths)
         if problems:  # code round 3 H9: the reconstruction imports these files
@@ -2147,7 +2216,45 @@ class Campaign:
             )
         return out
 
-    def check_reconstruction(self, pick, items):
+    def bundles_of(self, pick):
+        source, kv = items_source(pick)
+        return {
+            p: sha
+            for p, sha in self.bundles.items()
+            if p.startswith(f"benchmark/results/{source}/")
+            and p.endswith(f".c84bundle-after-{kv}-20260914.jsonl")
+        }
+
+    def make_panel(self, pick):
+        """v13 V4 (``--phase panel``): the borrowed entry's panel — the source pick's reconstructed items counted in
+        the entry's OFF worker (no generation); written for review, used only once committed to ``dev/``.
+        """
+        if "items_from" not in PICKS[pick]:
+            raise Refused(f"refused: {pick} has its own C84 bundles; no panel")
+        items = c84_items(self.stack, pick)
+        self.check_bench(pick)
+        requests = [
+            dict(
+                name=i["name"],
+                payload=dict(model=pick, messages=i["messages"], max_tokens=1),
+                timeout_s=120,
+            )
+            for i in items
+        ]
+        result = self.run(self.job(pick, "panel-count", "count", "off", requests))
+        counts = {
+            r["name"]: dict(tokens=r["tokens"], sha256=r["sha256"])
+            for r in result["requests"]
+        }
+        panel = build_panel(
+            items_source(pick)[0], self.bundles_of(pick), items, {pick: counts}
+        )
+        (self.out / "borrowed_panel.json").write_text(
+            json.dumps(panel, indent=1) + "\n"
+        )
+        return panel
+
+    def check_reconstruction(self, pick, items, panel=None):
         requests = [
             dict(
                 name=i["name"],
@@ -2157,15 +2264,26 @@ class Campaign:
             for i in items
         ]
         result = self.run(self.job(pick, "c84-count", "count", "off", requests))
-        bad = [
-            (i["name"], r["tokens"], i["prompt_tokens"])
-            for i, r in zip(items, result["requests"])
-            if r["tokens"] != i["prompt_tokens"]
-        ]
-        if bad:
-            raise RuntimeError(
-                f"{pick}: C84-item reconstruction differs from the recorded counts: {bad}"
-            )
+        if (
+            panel is not None
+        ):  # v13 V4: the borrowed entry's counts / digests are the reviewed panel's
+            live = {
+                r["name"]: dict(tokens=r["tokens"], sha256=r["sha256"])
+                for r in result["requests"]
+            }
+            pinned = {n: panel["entries"][pick][n] for n in live}
+            if live != pinned:
+                raise RuntimeError(f"{pick}: templated prompts differ from the panel")
+        else:
+            bad = [
+                (i["name"], r["tokens"], i["prompt_tokens"])
+                for i, r in zip(items, result["requests"])
+                if r["tokens"] != i["prompt_tokens"]
+            ]
+            if bad:
+                raise RuntimeError(
+                    f"{pick}: C84-item reconstruction differs from the recorded counts: {bad}"
+                )
         # H6: the C84 bundles store counts only, so the link to the original runs is the count; every later
         # E2 / E7 request is bound to THIS reconstruction by its templated token digest.
         self.digests[pick] = {r["name"]: r["sha256"] for r in result["requests"]}
@@ -2306,8 +2424,15 @@ class Campaign:
         self.check_bench(pick)  # still exactly the bound bench inputs, before...
         items = c84_items(self.stack, pick)
         self.check_bench(pick)  # ...and after the reconstruction imported them (H9)
+        panel = borrowed_panel(
+            pick, PANEL
+        )  # v13 V4: None for an entry with its own bundles
+        if panel is not None:
+            problems = panel_problems(panel, pick, self.bundles_of(pick), items)
+            if problems:
+                raise Refused(f"refused: {problems}")
         record["reconstruction"] = self.check_reconstruction(
-            pick, items[:2] if smoke else items
+            pick, items[:2] if smoke else items, panel=panel
         )
         save()
         try:
@@ -2382,6 +2507,13 @@ class Campaign:
                 raise Refused(f"full: the smoke does not bind this run: {problems}")
         estimate = 20 * 60 if self.args.phase == "smoke" else int(ESTIMATE_LIMIT_S)
         smoke = self.args.phase == "smoke"
+        if self.args.phase == "panel":  # v13 V4: count-only, no generation
+            with Monitor(self.out / "monitor.log", 20 * 60) as self.monitor:
+                for pick in self.picks:
+                    self.summary.setdefault("panels", {})[pick] = self.make_panel(pick)
+            self.summary["status"], self.summary["exit_code"] = "PANEL_WRITTEN", 0
+            self.write_summary()
+            return self.summary
         with Monitor(self.out / "monitor.log", estimate) as self.monitor:
             for pick in self.picks:
                 self.run_pick(pick, smoke=smoke)
@@ -2439,7 +2571,7 @@ def main(argv=None):
     ap.add_argument("--stack-root", required=True)
     ap.add_argument("--fork-root", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--phase", choices=("smoke", "full"), required=True)
+    ap.add_argument("--phase", choices=("smoke", "full", "panel"), required=True)
     ap.add_argument("--pick", action="append")
     ap.add_argument("--plan-only", action="store_true")
     ap.add_argument(
