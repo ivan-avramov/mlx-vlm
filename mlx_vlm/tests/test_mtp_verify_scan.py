@@ -135,18 +135,22 @@ class TestAC1DefaultPreservation:
         run_verifier_attention(q, k, v, "causal")
         assert [kw["mask"] for _, _, kw in calls] == [None] * length
 
-    def test_ac1_length2_branch_is_the_shipped_joint_call(self, monkeypatch):
+    def test_ac1_length2_block_takes_the_per_query_loop(self, monkeypatch):
+        """P400 (operator-approved, C188) changed this default: upstream served a length-2 block with ONE joint masked
+        SDPA call, which on a TurboQuant cache is not bit-identical to plain decoding under TF32; every length > 1
+        block now makes plain decoding's singleton call per query over its own key prefix.
+        """
         calls = []
 
         def spy(queries, keys, values, **kwargs):
-            calls.append(kwargs)
+            calls.append((queries.shape[-2], keys.shape[-2], kwargs.get("mask")))
             return mx.zeros(queries.shape, queries.dtype)
 
         monkeypatch.setattr(qwen_verifier, "scaled_dot_product_attention", spy)
         q, k, v = make_qkv(2, 40)
         run_verifier_attention(q, k, v, "causal")
-        assert len(calls) == 1 and calls[0]["mask"].shape == (1, 1, 2, 40)
-        assert calls[0]["mask"].dtype == mx.bool_
+        assert [(lq, lk) for lq, lk, _ in calls] == [(1, 39), (1, 40)], calls
+        assert all(mask is None for _, _, mask in calls)
 
     def test_ac1_default_policy_attribute_is_absent_on_attention(self):
         assert getattr(Qwen3_5Attention_cls(), "mtp_verify_policy", None) is None
@@ -610,9 +614,10 @@ _M58_MARKERS = {
 
 
 class TestAC5Scope:
-    def test_ac5_verifier_keeps_its_three_sdpa_calls(self):
+    def test_ac5_verifier_keeps_its_sdpa_calls(self):
+        # P400 (C188) removed the length-2 joint call: the per-query loop and the singleton call remain
         now = (REPO / _VERIFIER).read_text()
-        assert now.count("scaled_dot_product_attention(") == 3
+        assert now.count("scaled_dot_product_attention(") == 2
 
     def test_ac5_verifier_never_passes_policy_keywords(self):
         now = (REPO / _VERIFIER).read_text()

@@ -215,26 +215,31 @@ def test_a_width_2_verify_block_equals_two_singleton_calls(pick, observed):
 
 
 # --------------------------------------------------------------------------- P403: production numerics (TF32 on)
-def test_these_checks_hold_under_production_numerics():
-    """The suite runs with TF32 OFF (conftest); this box serves with it ON (MLX's default), and P400 shows only then
+QUANTIZED_EXACTNESS = (  # the deployed kernel path (bf16 affine-quantized); dense float32 fixtures stay TF32-off (P390)
+    "test_mtp_exactness.py::test_e1a_exact_joint_law_quantized_hybrid",
+    "test_mtp_exactness.py::test_e1b_paired_rng_bitwise_identity_quantized",
+    "test_p369_phase2_observe.py::test_quantized_e1c_on_equals_off_rows_states_and_probes",
+    "test_p369_phase2_observe.py::test_quantized_e1c_detects_an_old_prefix_byte_flip_at_one_offset",
+    "test_p369_phase2_observe.py::test_quantized_e1c_detects_an_in_support_change_of_one_verifier_row",
+    "test_p369_phase2_observe.py::test_quantized_e1c_on_the_deployed_kv_codec",
+    "test_p369_phase2_observe.py::test_quantized_e1c_detects_a_turboquant_packed_state_change",
+)
+
+
+def test_the_exactness_checks_hold_under_production_numerics():
+    """The suite runs with TF32 OFF (conftest); this box serves with it ON (MLX's default), and P400 showed only then
     (TurboQuant's multi-query attention path runs TF32 matmuls the singleton decode path does not). Rerun this module and
-    the TurboQuant E1c cases in a fresh interpreter under production numerics."""
+    every quantized exactness test in a fresh interpreter under production numerics (P403).
+    """
     if PRODUCTION_NUMERICS:
         assert os.environ["MLX_ENABLE_TF32"] == "1"
         pytest.skip("this IS the production-numerics run")
     here = Path(__file__).resolve()
-    observe = here.with_name("test_p369_phase2_observe.py")
     out = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            "-q",
-            "-p",
-            "no:cacheprovider",
-            str(here),
-            f"{observe}::test_quantized_e1c_on_the_deployed_kv_codec",
-            f"{observe}::test_quantized_e1c_detects_a_turboquant_packed_state_change",
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", str(here)]
+        + [
+            str(here.with_name(node.split("::")[0])) + "::" + node.split("::")[1]
+            for node in QUANTIZED_EXACTNESS
         ],
         cwd=str(here.parent),
         env=dict(os.environ, MLX_VLM_TEST_TF32="1"),
