@@ -840,11 +840,13 @@ def test_a_dry_run_that_misses_tokenization_or_reaches_generation_refuses(
 
 
 # ------------------------------------------------------------------ smoke 7 (live): no branch-local imports in run_job
-def test_run_job_uses_each_branch_local_import_only_inside_its_block():
+def test_run_job_uses_each_import_only_after_it_inside_its_block():
     """A ``from … import`` inside one mode's branch makes the name local to the WHOLE function, so a use
-    outside that block raises UnboundLocalError (smoke 7: ``compare`` imported in the e1c_pair branch, used
-    by e1c_off for the forced schedule). run_job's branches have no unit test, so the shape is checked:
-    every use of a name bound by a nested import lies inside the statement block holding the import.
+    outside that block — or before the import — raises UnboundLocalError (smoke 7: ``compare`` imported in
+    the e1c_pair branch, used by e1c_off for the forced schedule; review micro-round E11: order too).
+    run_job's branches have no unit test, so the shape is checked for EVERY import in run_job, function-level
+    ones included: each use lies inside the statement block holding the import and after the import line
+    (straight-line source order; run_job has no loops that re-enter a block above its import).
     """
     import ast
     import inspect
@@ -862,17 +864,47 @@ def test_run_job_uses_each_branch_local_import_only_inside_its_block():
         for n in ast.walk(fn)
         if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
     ]
-    escaped = []
-    for stmts, (lo, hi) in blocks:
-        if stmts is fn.body:
-            continue
+    bad, seen = [], 0
+    for stmts, (_, hi) in blocks:
         for stmt in stmts:
             if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+                seen += 1
                 for alias in stmt.names:
                     name = (alias.asname or alias.name).split(".")[0]
-                    escaped += [
-                        (name, line)
+                    bad += [
+                        (name, line, stmt.lineno)
                         for n, line in loads
-                        if n == name and not lo <= line <= hi
+                        if n == name and not stmt.end_lineno < line <= hi
                     ]
-    assert escaped == [], escaped
+    assert (
+        seen >= 4
+    ), seen  # the guard sees run_job's imports (function-level and branch-local)
+    assert bad == [], bad
+
+
+def test_the_import_guard_catches_a_use_before_the_import():
+    """The guard's own negative cases (E11): a use before a same-block import and a use after a branch."""
+    import ast
+
+    src = """
+def f(mode):
+    if mode:
+        x = compare.go()
+        from p import compare
+    elif mode is None:
+        from p import other
+    other.go()
+"""
+    fn = ast.parse(src).body[0]
+    loads = [(n.id, n.lineno) for n in ast.walk(fn) if isinstance(n, ast.Name)]
+    stmts = fn.body[0].body
+    imp = stmts[1]
+    hi = stmts[-1].end_lineno
+    assert [
+        (n, ln) for n, ln in loads if n == "compare" and not imp.end_lineno < ln <= hi
+    ]
+    other = fn.body[0].orelse[0].body[0]
+    hi2 = other.end_lineno
+    assert [
+        (n, ln) for n, ln in loads if n == "other" and not other.end_lineno < ln <= hi2
+    ]
