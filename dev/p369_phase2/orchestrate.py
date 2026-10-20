@@ -512,10 +512,12 @@ def e2_turn_checked(where, turn, *, readout=False):
         and all(_exact_int(t) for t in ids)
         and type(final.get("finish_reason")) is str
         and _exact_int(turn.get("mtp_rounds"))
+        and isinstance(turn.get("prompt", {}), dict)  # round 2 E1: containers too
     )
     if ok and readout:
-        ok = _exact_int(
-            (turn.get("telemetry") or {}).get("speculative_argmax_from_hidden")
+        telemetry = turn.get("telemetry")
+        ok = isinstance(telemetry, dict) and _exact_int(
+            telemetry.get("speculative_argmax_from_hidden")
         )
     if not ok:
         raise MalformedEvidence(f"malformed evidence: E2 {where} turn = {turn!r}")
@@ -534,27 +536,38 @@ def e2_summary(pair, cross, *, digests):
 
     if not isinstance(pair, dict) or not pair:
         bad("requests", pair)
-    tokens = lambda turn: turn["final"]["token_ids"]  # noqa: E731
+
+    def first_turn(where, entry):  # round 2 E1: an entry with a non-empty turn list
+        turns = entry.get("turns") if isinstance(entry, dict) else None
+        if not isinstance(turns, list) or not turns:
+            bad(f"{where} entry", entry)
+        return turns[0]
+
+    # round 2 E5: the generation OUTCOME — token ids AND finish reason
+    outcome = lambda t: (
+        t["final"]["token_ids"],
+        t["final"]["finish_reason"],
+    )  # noqa: E731
     identity, c1, cross_per, engaged, problems = {}, {}, {}, {}, []
     for n, entry in pair.items():
+        on = first_turn(n, entry)
         offs = entry.get("off")
         if not isinstance(offs, list) or len(offs) != 2:
             bad(f"{n}.off", offs)
         if n not in cross:
             bad(f"{n} cross-load entry", None)
-        on, (off1, off2), far = entry["turns"][0], offs, cross[n]["turns"][0]
+        (off1, off2), far = offs, first_turn(f"{n} cross-load", cross[n])
         e2_turn_checked(f"{n} ON", on, readout=True)
         for label, turn in (("OFF1", off1), ("OFF2", off2), ("cross-load", far)):
             e2_turn_checked(f"{n} {label}", turn)
+        verdict = entry.get("verdict")
         kernel = exact_bool(
-            (entry.get("verdict") or {}).get("pass"), f"E2 {n}.verdict.pass"
+            verdict.get("pass") if isinstance(verdict, dict) else verdict,
+            f"E2 {n}.verdict.pass",
         )
-        c1[n] = (
-            tokens(off1) == tokens(off2)
-            and off1["final"]["finish_reason"] == off2["final"]["finish_reason"]
-        )
-        identity[n] = tokens(on) == tokens(off1)
-        cross_per[n] = tokens(far) == tokens(off1)
+        c1[n] = outcome(off1) == outcome(off2)
+        identity[n] = outcome(on) == outcome(off1)
+        cross_per[n] = outcome(far) == outcome(off1)
         engaged[n] = (
             on["telemetry"]["speculative_argmax_from_hidden"] > 0
             and kernel

@@ -1786,6 +1786,7 @@ def test_e2_output_identity_includes_the_finish_reason():
         lambda pair, cross: pair["off"].__setitem__(0, "bad"),
         lambda pair, cross: cross.update(turns=[]),
         lambda pair, cross: cross.update(turns="x"),
+        lambda pair, cross: pair.update(verdict=["bad"]),
     ],
 )
 def test_e2_summary_refuses_malformed_containers(mutate):
