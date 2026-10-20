@@ -224,6 +224,10 @@ class Recorder:
         self.states = {}
         self.prompt_end = None
         self.draft_rounds = 0
+        self.forced = []  # P398: thinking-budget forced tokens popped (ON)
+        self._block = (
+            None  # (rows index, base position) of the verifier block being walked
+        )
         self._cache = None
         self._in_pending = False
         self._patched = []
@@ -239,6 +243,21 @@ class Recorder:
             probe_rec = probe(self.lm, caches, self.probe_token)
             neutral = state_hash(caches) == sha
         return dict(offset=offset, sha=sha, probe=probe_rec, neutral=neutral, kind=kind)
+
+    def _cut_block(self, n_emit):
+        """P398: keep only the rows production sampled the block's ``n_emit`` emitted tokens from; rows past
+        the cut (a rejection, a stop, a budget or a forced token) are unreachable history.
+        """
+        if self._block is None or self._block[1] is None:
+            raise RuntimeError(
+                "an emission decision without a positioned verifier block"
+            )
+        start, base = self._block
+        block = self.rows[start:]
+        if any(position < base for position, _ in block):
+            raise RuntimeError(f"a block row precedes its base position {base}")
+        self.rows[start:] = [r for r in block if r[0] < base + n_emit]
+        self._block = None
 
     # -- patches
     def _patch(self, owner, name, value):
@@ -291,6 +310,27 @@ class Recorder:
 
         commit = mtp._MTPVerifyResult.commit
         pending = mtp._mtp_commit_pending_token
+        walk, emission, pop_forced = (
+            mtp._mtp_acceptance_walk,
+            mtp._mtp_plain_emission,
+            mtp._mtp_pop_forced,
+        )
+
+        def recording_walk(*args, **kwargs):
+            base = kwargs.get("base_position", args[6] if len(args) > 6 else None)
+            recorder._block = (len(recorder.rows), base)
+            return walk(*args, **kwargs)
+
+        def recording_emission(tokens, **kwargs):
+            out = emission(tokens, **kwargs)
+            recorder._cut_block(out[0])
+            return out
+
+        def recording_pop_forced(criteria):
+            token = pop_forced(criteria)
+            if token is not None:
+                recorder.forced.append(int(token))
+            return token
 
         def recording_commit(verify, model, caches, accepted, block_size):
             result = commit(verify, model, caches, accepted, block_size)
@@ -315,6 +355,9 @@ class Recorder:
         if self.mode == "on":
             self._patch(mtp._MTPVerifyResult, "commit", recording_commit)
             self._patch(mtp, "_mtp_commit_pending_token", recording_pending)
+            self._patch(mtp, "_mtp_acceptance_walk", recording_walk)
+            self._patch(mtp, "_mtp_plain_emission", recording_emission)
+            self._patch(mtp, "_mtp_pop_forced", recording_pop_forced)
         return self
 
     def __exit__(self, *exc):

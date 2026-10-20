@@ -83,12 +83,39 @@ def _margin(p):
     return float(top[0] - top[1]) if top.size > 1 else float(top[0])
 
 
-def compare_streams(on_records, off_records, n, params):
-    """Compare the emitted-position rows ``0..n-1`` of the ON and OFF streams."""
+def forced_positions(recorder, tokens, *, finish_reason):
+    """P398: the ON positions without a sampled row are EXACTLY the forced emissions — ON's tokens there are
+    the forced tokens in order; one forced pop may stay unemitted only when the request ended at its length
+    budget. Anything else is an instrument error (RAISES)."""
+    _, missing = latest_rows(recorder.rows, len(tokens))
+    forced = list(recorder.forced)
+    extra = len(forced) - len(missing)
+    if (
+        [int(tokens[p]) for p in missing] != forced[: len(missing)]
+        or extra not in (0, 1)
+        or (extra == 1 and finish_reason != "length")
+    ):
+        raise RuntimeError(
+            f"forced emissions {forced} do not account for the ON positions without a row "
+            f"{missing} (finish {finish_reason})"
+        )
+    return missing
+
+
+def compare_streams(on_records, off_records, n, params, *, exclude=()):
+    """Compare the emitted-position rows ``0..n-1`` of the ON and OFF streams, except the ``exclude``d
+    positions (P398: the forced emissions, which production samples from no row)."""
+    exclude = sorted({int(p) for p in exclude})
     on, missing_on = latest_rows(on_records, n)
     off, missing_off = latest_rows(off_records, n)
+    for position in exclude:
+        on.pop(position, None)
+        off.pop(position, None)
+    missing_on = [p for p in missing_on if p not in exclude]
+    missing_off = [p for p in missing_off if p not in exclude]
     report = dict(
         positions=n,
+        excluded=exclude,
         compared=0,
         missing_on=missing_on,
         missing_off=missing_off,

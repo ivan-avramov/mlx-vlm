@@ -637,19 +637,20 @@ def _mutate_and_restore(caches, array, index, sha):
     return seen
 
 
-def smoke_positives(on, off, n, params):
-    """Q32 on live data: the unmodified ON / OFF data pass, and each injected change is detected."""
+def smoke_positives(on, off, n, params, exclude=()):
+    """Q32 on live data: the unmodified ON / OFF data pass, and each injected change is detected (rows at the
+    ``exclude``d forced positions are not compared, P398)."""
     import copy
 
     import numpy as np
     from p369_phase2 import compare, observe
 
     rows_on, rows_off = on.rows, off.rows
-    base_rows = compare.compare_streams(rows_on, rows_off, n, params)
+    base_rows = compare.compare_streams(rows_on, rows_off, n, params, exclude=exclude)
     base_states = observe.compare_states(on, off)
     fired = {}
     latest, _ = compare.latest_rows(rows_off, n)
-    position = max(latest)
+    position = max(p for p in latest if p not in set(exclude))
     record = latest[position]
     canon = compare.canonical(record, params)
     # raw ulp, outside the support: the raw recorder sees it, the filtered distribution cannot.
@@ -657,7 +658,11 @@ def smoke_positives(on, off, n, params):
     bits = np.array(record["bits"]).copy()
     bits[j] = bits[j] + 1
     raw = compare.compare_streams(
-        rows_on, _replace_last(rows_off, position, dict(record, bits=bits)), n, params
+        rows_on,
+        _replace_last(rows_off, position, dict(record, bits=bits)),
+        n,
+        params,
+        exclude=exclude,
     )
     fired["raw_ulp"] = raw["raw_only_differences"] == [position] and raw["pass"]
     # in support: the comparator must fail exactly there.
@@ -667,7 +672,11 @@ def smoke_positives(on, off, n, params):
 
     bumped = mx.where(mx.arange(row.size) == top, row + 0.5, row).astype(row.dtype)
     bad = compare.compare_streams(
-        rows_on, _replace_last(rows_off, position, compare.as_record(bumped)), n, params
+        rows_on,
+        _replace_last(rows_off, position, compare.as_record(bumped)),
+        n,
+        params,
+        exclude=exclude,
     )
     fired["in_support"] = (not bad["pass"]) and [
         m["position"] for m in bad["mismatches"]
@@ -981,12 +990,15 @@ def e1c_request(
     return part, recorder
 
 
-def compare_pair(ref, recorder, n, params):
-    """Rows and states of a forced OFF ``recorder`` against a reference (ON recorder or holder)."""
+def compare_pair(ref, recorder, n, params, exclude=()):
+    """Rows and states of a forced OFF ``recorder`` against a reference (ON recorder or holder); rows at the
+    ``exclude``d (forced, P398) positions are not compared."""
     from p369_phase2 import compare, observe
 
     return dict(
-        rows=compare.compare_streams(ref.rows, recorder.rows, n, params),
+        rows=compare.compare_streams(
+            ref.rows, recorder.rows, n, params, exclude=exclude
+        ),
         states=observe.compare_states(ref, recorder),
     )
 
@@ -1077,6 +1089,13 @@ def run_job(job, out_dir, result):
                     ([on.prompt_end] if on.prompt_end else []) + on.commits,
                 )
                 tokens, n = part["final"]["token_ids"], len(part["final"]["token_ids"])
+                from p369_phase2 import compare
+
+                # P398: the forced emissions have no sampled ON row; proven, then excluded from the rows
+                forced = compare.forced_positions(
+                    on, tokens, finish_reason=part["final"]["finish_reason"]
+                )
+                entry["forced_positions"] = forced
                 ident = instance_identity(rg)  # P397: held by reference, re-read live
                 metrics = server.runtime.metrics
                 replays = []
@@ -1113,7 +1132,7 @@ def run_job(job, out_dir, result):
                         if k == 0 and spec.get("smoke_positives"):
                             # on OFF1's live cache, before it is retired
                             entry["smoke_positives"] = smoke_positives(
-                                on, off, n, params
+                                on, off, n, params, exclude=forced
                             )
                         release_trajectory(off, off_part["chat_id"])
                         replays.append((off_part, off))
@@ -1128,7 +1147,7 @@ def run_job(job, out_dir, result):
                     [off1.states[o] for o in sorted(off1.states)],
                 )
                 entry["off_final"] = off1_part["final"]
-                entry["pair"] = compare_pair(on, off1, n, params)
+                entry["pair"] = compare_pair(on, off1, n, params, exclude=forced)
                 c1_ref = snapshot_holder(
                     [off1.states[o] for o in sorted(off1.states)], rows=off1.rows
                 )

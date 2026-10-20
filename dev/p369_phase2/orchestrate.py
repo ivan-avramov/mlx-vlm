@@ -1877,6 +1877,7 @@ class Campaign:
                 ),
                 kernels=on["verdict"],
                 smoke_positives=on.get("smoke_positives"),
+                forced_positions=on.get("forced_positions"),  # P398: not compared
                 attempts=attempts[name],
             )
             verdicts[name] = v
