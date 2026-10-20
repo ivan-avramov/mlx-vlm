@@ -958,7 +958,8 @@ def get_cached_model(
         kv_quant_scheme,
         kv_group_size,
         quantized_kv_start,
-        os.environ.get("TQ_KV_QUANT_MODE"),
+        # as TurboQuantKVCache resolves it (P405 code round 1 K6): absent -> "mse"
+        (os.environ.get("TQ_KV_QUANT_MODE") or "mse").lower(),
     )
 
     # APC: build a shared block pool if opted in via env var. The namespace
