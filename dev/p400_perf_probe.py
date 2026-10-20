@@ -17,6 +17,7 @@ tokens to the length cap, and each leg asserts the served MTP tuple and the KV c
 
 import argparse
 import json
+import math
 import os
 import statistics
 import subprocess
@@ -57,6 +58,11 @@ def verdict(stats, bounds=BOUNDS):
     a, b = stats["A"], stats["B"]
     if a["n"] != 2 * MEASURED or b["n"] != 2 * MEASURED:
         return dict(status="INCOMPLETE", reason=f"n A {a['n']} B {b['n']}")
+    inputs = [a["median_tps"], b["median_tps"], a["median_peak"], b["median_peak"]]
+    if not all(_positive(x) for x in inputs):  # code round 3 C9
+        return dict(
+            status="INVALID", reason=f"non-finite / non-positive medians {inputs}"
+        )
     tps_reg = 1.0 - b["median_tps"] / a["median_tps"]
     peak_inc = b["median_peak"] / a["median_peak"] - 1.0
     ok = tps_reg <= bounds["tps_regression"] and peak_inc <= bounds["peak_increase"]
@@ -68,11 +74,23 @@ def verdict(stats, bounds=BOUNDS):
     )
 
 
+def _positive(x):
+    """A finite number > 0 (code round 3 C9: inf / nan / 0 must never reach the statistic)."""
+    return (
+        isinstance(x, (int, float))
+        and not isinstance(x, bool)
+        and math.isfinite(x)
+        and x > 0
+    )
+
+
 def request_problems(probe, finish_reason, widths):
     """Code round 2 C3: a measured request decodes exactly DECODE_TOKENS to the length cap and saw a width-2 block."""
     problems = []
-    if not probe or not probe.get("tps", 0) > 0:
+    if not probe or not _positive(probe.get("tps")):
         problems.append(f"no decode measurement {probe}")
+    elif not _positive(probe.get("decode_peak")):  # code round 3 C9
+        problems.append(f"no decode-phase peak {probe}")
     elif probe.get("tokens") != DECODE_TOKENS:
         problems.append(f"decoded {probe.get('tokens')} tokens, not {DECODE_TOKENS}")
     if finish_reason != "length":
@@ -94,16 +112,43 @@ def attest_tree(path):
     return dict(head=head, clean=not dirty)
 
 
+def resolve_ref(path, ref):
+    """Code round 3 C8: a ref (any spelling) → its full commit id in ``path``'s repository; never a prefix."""
+    out = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(path),
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            f"{ref}^{{commit}}",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if not ref or out.returncode != 0:
+        raise SystemExit(f"cannot resolve {ref!r} to a commit in {path}")
+    return out.stdout.strip()
+
+
 def tree_problems(trees, refs, attest):
-    """Code round 2 C4: two distinct clean trees, each at its expected commit. ``attest``: path → attest_tree()."""
+    """Code round 2 C4 / round 3 C8: two distinct clean trees, each EXACTLY at its expected commit, the two commits
+    different. ``refs``: full resolved ids (``resolve_ref``); ``attest``: path → attest_tree().
+    """
     problems = []
     if trees["A"] == trees["B"]:
         problems.append(f"both arms load {trees['A']}")
+    for arm in ("A", "B"):
+        if not (
+            len(refs[arm]) == 40 and all(c in "0123456789abcdef" for c in refs[arm])
+        ):
+            problems.append(f"arm {arm}: ref {refs[arm]!r} is not a full commit id")
     if refs["A"] == refs["B"]:
-        problems.append(f"both arms expect commit {refs['A']}")
+        problems.append(f"both arms expect the same commit {refs['A']}")
     for arm in ("A", "B"):
         got = attest[trees[arm]]
-        if not got["head"].startswith(refs[arm]):
+        if got["head"] != refs[arm]:
             problems.append(
                 f"arm {arm}: {trees[arm]} at {got['head']}, not {refs[arm]}"
             )
@@ -264,7 +309,9 @@ def drive(args):
     trees = dict(
         A=str(Path(args.old_tree).resolve()), B=str(Path(args.new_tree).resolve())
     )
-    refs = dict(A=args.old_ref, B=args.new_ref)
+    refs = dict(  # code round 3 C8: full ids, resolved in each arm's own tree
+        A=resolve_ref(trees["A"], args.old_ref), B=resolve_ref(trees["B"], args.new_ref)
+    )
     attest = {path: attest_tree(path) for path in set(trees.values())}
     problems = tree_problems(trees, refs, attest)
     if problems:
