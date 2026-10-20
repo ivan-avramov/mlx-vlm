@@ -406,7 +406,7 @@ def test_e1c_verdict_needs_the_policy_specific_straddle_evidence():
 
 
 # ------------------------------------------------------------------ round 5 precedence (Q37)
-def _v(pass_=True, c1=True, c2=True, evidence=True):
+def _v(pass_=True, c1=True, c2=True, evidence=True, rejected=()):
     return dict(
         pass_=pass_ and evidence,
         neutral=pass_,
@@ -414,6 +414,7 @@ def _v(pass_=True, c1=True, c2=True, evidence=True):
         c1=dict(identical=c1),
         c2=dict(identical=c2),
         problems=[],
+        rejected=list(rejected),
     )
 
 
@@ -1797,3 +1798,40 @@ def test_e2_summary_refuses_malformed_containers(mutate):
         orchestrate.e2_summary({"a": pair}, {"a": cross}, digests={"a": D64})
     with pytest.raises(orchestrate.MalformedEvidence, match="malformed evidence"):
         orchestrate.e2_summary({"a": "entry"}, {"a": _cross()}, digests={"a": D64})
+
+
+# ------------------------------------------------------------------ smoke 4 / P399: a rejected attempt's evidence still counts
+def test_pick_outcome_counts_the_neutrality_and_c1_of_rejected_attempts():
+    """A cell retried for VALIDITY (no straddle, too short) is still a same-instance ON / OFF1 observation:
+    smoke 4 saw uniform's seed-a0 cells differ at the terminal position (C1 identical) and both were
+    retried; a passing retry must not turn that into an E1c PASS."""
+    po = orchestrate.pick_outcome
+    differs = dict(seed=1, neutral=False, c1=True, problems=["rows"])
+    unstable = dict(seed=1, neutral=True, c1=False, problems=["C1"])
+    clean = dict(seed=1, neutral=True, c1=True, problems=["no straddle"])
+    assert po({"a": _v(rejected=[clean]), "b": _v()})["e1c"] == "PASS"
+    assert po({"a": _v(rejected=[differs]), "b": _v()})["e1c"] == "FAIL"
+    assert po({"a": _v(rejected=[unstable]), "b": _v()})["e1c"] == "ABORT"
+    assert po({"a": _v(rejected=[differs, unstable]), "b": _v()})["e1c"] == "ABORT"
+    for bad in ("false", None, 0):
+        with pytest.raises(orchestrate.MalformedEvidence, match="rejected"):
+            po({"a": _v(rejected=[dict(differs, neutral=bad)])})
+    with pytest.raises(orchestrate.MalformedEvidence, match="rejected"):
+        po({"a": dict(_v(), rejected=None)})
+
+
+def test_e1c_keeps_the_neutrality_of_an_attempt_rejected_for_validity(tmp_path):
+    camp = _e1c_camp(tmp_path)
+    first = tmp_path / FABLE / "e1c-pair-a0" / "req-0.json"
+    entry = json.loads(first.read_text())
+    retry = tmp_path / FABLE / "e1c-pair-a1"
+    retry.mkdir()
+    (retry / "req-0.json").write_text(json.dumps(entry))  # the valid, passing retry
+    rejected = dict(entry, straddle=False)
+    rejected["pair"] = dict(rows={"pass": False}, states={"pass": False})
+    first.write_text(json.dumps(rejected))
+    got = camp.e1c(FABLE, {1024: "x"}, smoke=True)
+    cell = got["T1024"]
+    assert cell["pass_"], cell  # the accepted retry itself conforms...
+    assert [a["neutral"] for a in cell["rejected"]] == [False], cell["rejected"]
+    assert orchestrate.pick_outcome(got)["e1c"] == "FAIL"  # ...but the pick does not
