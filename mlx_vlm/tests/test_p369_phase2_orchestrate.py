@@ -2308,3 +2308,84 @@ def test_the_reviewed_pins_cover_all_four_entries_and_match_the_registry():
         for role in ("target", "drafter"):
             assert len(pin[role]["revision"]) == 40 and pin[role]["files"], (pick, role)
             assert all(len(sha) == 64 for sha in pin[role]["files"].values())
+
+
+# ------------------------------------------------------------------ P369 v13 V4: the reviewed borrowed panel
+def _items():
+    return [
+        dict(
+            name=f"math500/{i}",
+            seed=i,
+            item_sha256=str(i) * 64,
+            messages=[dict(role="user", content=f"q{i}")],
+        )
+        for i in range(3)
+    ]
+
+
+BUNDLES = {
+    "benchmark/results/Qwen3.8-27B-mlx-uniform-4bit/math500.c84bundle-after-tq4-20260914.jsonl": "b"
+    * 64
+}
+COUNTS = {f"math500/{i}": dict(tokens=100 + i, sha256=str(i) * 64) for i in range(3)}
+
+
+def _panel():
+    return orchestrate.build_panel(UNIFORM, BUNDLES, _items(), {QWEN36: COUNTS})
+
+
+def test_the_panel_binds_bundles_items_messages_and_per_entry_digests():
+    panel = _panel()
+    assert panel["source_pick"] == UNIFORM and panel["bundles"] == BUNDLES
+    assert [i["name"] for i in panel["items"]] == [i["name"] for i in _items()]
+    assert all(len(i["messages_sha256"]) == 64 for i in panel["items"])
+    assert panel["entries"][QWEN36] == COUNTS
+    assert orchestrate.panel_problems(panel, QWEN36, BUNDLES, _items(), COUNTS) == []
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "bundle",
+        "item_content",
+        "messages",
+        "seed",
+        "item_set",
+        "count",
+        "digest",
+        "entry",
+    ],
+)
+def test_the_panel_refuses_any_drift(change):
+    """V4: a changed dataset row, builder output, bundle or templated digest refuses — never a new digest silently."""
+    import copy
+
+    bundles, items, counts, pick = (
+        dict(BUNDLES),
+        copy.deepcopy(_items()),
+        copy.deepcopy(COUNTS),
+        QWEN36,
+    )
+    if change == "bundle":
+        bundles = {k: "c" * 64 for k in bundles}
+    elif change == "item_content":
+        items[0]["item_sha256"] = "9" * 64
+    elif change == "messages":
+        items[1]["messages"][0]["content"] = "changed"
+    elif change == "seed":
+        items[2]["seed"] = 99
+    elif change == "item_set":
+        items = items[:2]
+    elif change == "count":
+        counts["math500/0"]["tokens"] += 1
+    elif change == "digest":
+        counts["math500/1"]["sha256"] = "f" * 64
+    elif change == "entry":
+        pick = ORNITH  # not in this panel
+    assert orchestrate.panel_problems(_panel(), pick, bundles, items, counts), change
+
+
+def test_a_borrowed_entry_reconstructs_from_its_source_picks_bundles():
+    assert orchestrate.items_source(QWEN36) == (UNIFORM, "tq4")
+    assert orchestrate.items_source(ORNITH) == (UNIFORM, "tq4")
+    assert orchestrate.items_source(FABLE) == (FABLE, "native16")
