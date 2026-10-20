@@ -131,3 +131,71 @@ def test_the_leg_asserts_the_served_tuple_and_kv_codec_its_argv_asks_for():
     assert probe.served_check(Worker, _RG(None, "turboquant"), native, pick)[
         "kv"
     ] == dict(bits=None, scheme=None)
+
+
+# ------------------------------------------------------------------ code round 3 C8 C9
+def test_arm_refs_must_be_full_resolved_commit_ids():
+    """C8: a prefix or an empty ref could match any HEAD; refs are resolved to full ids before comparison."""
+    trees = dict(A="/w/old", B="/w/new")
+    att = {
+        "/w/old": dict(head="a" * 40, clean=True),
+        "/w/new": dict(head="a" * 40, clean=True),
+    }
+    for refs in (dict(A="", B="a" * 40), dict(A="aaaa", B="a" * 40)):
+        assert any(
+            "full commit id" in p for p in probe.tree_problems(trees, refs, att)
+        ), refs
+
+
+def test_two_spellings_of_one_commit_resolve_to_the_same_id(tmp_path):
+    """C8 regression: a short and a full spelling of one commit are the same arm."""
+    import subprocess
+
+    git = ["git", "-C", str(tmp_path)]
+    subprocess.run(git + ["init", "-q"], check=True)
+    subprocess.run(
+        git
+        + [
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "x",
+        ],
+        check=True,
+    )
+    full = probe.resolve_ref(tmp_path, "HEAD")
+    assert len(full) == 40 and probe.resolve_ref(tmp_path, full[:8]) == full
+    trees = dict(A=str(tmp_path), B="/w/other")
+    att = {
+        str(tmp_path): dict(head=full, clean=True),
+        "/w/other": dict(head=full, clean=True),
+    }
+    refs = dict(A=probe.resolve_ref(tmp_path, full[:8]), B=full)
+    assert any("same commit" in p for p in probe.tree_problems(trees, refs, att))
+    import pytest
+
+    with pytest.raises(SystemExit, match="resolve"):
+        probe.resolve_ref(tmp_path, "")
+
+
+def test_non_finite_or_non_positive_measurements_are_refused():
+    """C9: inf / nan / zero / negative telemetry must never satisfy the bounds."""
+    good = dict(tps=10.0, tokens=probe.DECODE_TOKENS, decode_peak=1000)
+    for bad in (
+        dict(tps=float("inf")),
+        dict(tps=float("nan")),
+        dict(tps=-1.0),
+        dict(decode_peak=0),
+        dict(decode_peak=-5),
+        dict(decode_peak=float("nan")),
+    ):
+        assert probe.request_problems(dict(good, **bad), "length", [2]), bad
+    stats = probe.arm_stats(_legs([10.0] * 10, [float("inf")] * 10, 1000, 1000))
+    assert probe.verdict(stats)["status"] == "INVALID"
+    stats = probe.arm_stats(_legs([10.0] * 10, [10.0] * 10, 1000, 0))
+    assert probe.verdict(stats)["status"] == "INVALID"
