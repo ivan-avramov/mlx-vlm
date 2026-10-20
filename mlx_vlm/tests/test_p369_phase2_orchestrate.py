@@ -1302,10 +1302,328 @@ def test_the_smoke_runs_one_e7b_session_and_no_e7a(monkeypatch):
 
 def test_the_smoke_gate_needs_e7b_to_have_run_not_to_be_continuous():
     camp = object.__new__(orchestrate.Campaign)
-    record = dict(outcome=dict(e1c="PASS"), e1c={}, e2=dict(verdict="PASS"), wall_s=60)
+    record = dict(
+        reconstruction={"math500/1": {}},
+        outcome=dict(e1c="PASS"),
+        e1c={},
+        e2=dict(verdict="PASS"),
+        wall_s=60,
+    )
     camp.summary = dict(picks={FABLE: record})
     assert any("E7b" in p for p in camp.smoke_gate()["problems"])  # never ran
-    record["e7b"] = dict(sessions=[dict(censored=True)], status="INCOMPLETE")
+    record["e7b"] = dict(
+        sessions=[dict(name="math500/1", censored=True, reason="timeout")],
+        status="INCOMPLETE",
+    )  # code round 6 H38: the expected session, a valid report
     gate = camp.smoke_gate()
     assert gate["pass_"], gate  # ran and reported: a censored session does not block
     assert gate["e7b"][FABLE] == "INCOMPLETE"
+
+
+# ------------------------------------------------------------------ code round 6 H34 H36 H38 (C186): exact-boolean evidence
+BAD = ("false", "true", 1, 0, None)
+
+
+def _bad_paths(record, *paths):
+    import copy
+
+    for path in paths:
+        for value in BAD:
+            changed = copy.deepcopy(record)
+            node = changed
+            for key in path[:-1]:
+                node = node[key]
+            node[path[-1]] = value
+            yield path, value, changed
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        ("pass_",),
+        ("neutral",),
+        ("evidence_ok",),
+        ("c1", "identical"),
+        ("c2", "identical"),
+    ],
+)
+def test_pick_outcome_refuses_non_boolean_evidence(path):
+    for _, value, bad in _bad_paths(_v(), path):
+        with pytest.raises(orchestrate.MalformedEvidence, match="malformed evidence"):
+            orchestrate.pick_outcome({"a": bad, "b": _v()})
+
+
+def test_e1c_verdict_refuses_a_non_boolean_per_query_straddle():
+    for value in BAD:
+        on, off = _entries(straddle=value)
+        with pytest.raises(orchestrate.MalformedEvidence, match="straddle"):
+            orchestrate.e1c_verdict(on, off, threshold=8192, verify_policy=None)
+
+
+def test_e7a_stats_refuses_a_non_boolean_kernel_verdict():
+    for value in BAD:
+        for entry in (
+            _e7_entry(3, verdict=value),
+            _e7_entry(0, ["M4b_first"], n=1, verdict=value),  # first-terminal too
+        ):
+            with pytest.raises(orchestrate.MalformedEvidence, match="verdict"):
+                orchestrate.e7a_stats({"r": entry}, censored=[])
+    with pytest.raises(orchestrate.MalformedEvidence, match="verdict"):
+        orchestrate.e7a_stats({"r": dict(_e7_entry(3), verdict=None)}, censored=[])
+
+
+def test_e7b_session_refuses_non_boolean_verdict_or_continuity():
+    first = _e7b_turn(first=True)
+    for value in BAD:
+        with pytest.raises(orchestrate.MalformedEvidence, match="verdict"):
+            orchestrate.e7b_session(
+                "s", _e7b_entry(first, _e7b_turn(), verdict=value), digest="d"
+            )
+        turn = dict(_e7b_turn(), continuity=dict(continuity=value, reason=None))
+        with pytest.raises(orchestrate.MalformedEvidence, match="continuity"):
+            orchestrate.e7b_session("s", _e7b_entry(first, turn), digest="d")
+    # a follow-up turn always carries a continuity record (the worker writes one for every e7b turn > 0)
+    missing = dict(_e7b_turn(), continuity=None)
+    with pytest.raises(orchestrate.MalformedEvidence, match="continuity"):
+        orchestrate.e7b_session("s", _e7b_entry(first, missing), digest="d")
+
+
+def test_overall_status_refuses_a_non_boolean_smoke_gate():
+    for key in ("pass_", "fits"):
+        for value in BAD:
+            gate = dict(pass_=True, fits=True, **{key: value})
+            with pytest.raises(orchestrate.MalformedEvidence, match=key):
+                orchestrate.overall_status(dict(phase="smoke", smoke_gate=gate))
+
+
+def _e1c_camp(tmp_path, *, acceptance=True, c2_rows=True, c2_states=True):
+    camp = object.__new__(orchestrate.Campaign)
+    camp.out = tmp_path
+    camp.job = lambda pick, name, mode, arm, requests: name
+    camp.run = lambda name: None
+    on = dict(
+        final=dict(token_ids=[1] * 70),
+        straddle=True,
+        verdict={"pass": True},
+        draft_rounds=5,
+        prompt_end=orchestrate.straddle_target(1024),
+        response=dict(
+            timings=dict(verify_blocks_straddle=1, verify_fallback_reasons={})
+        ),
+        pair=dict(rows={"pass": True}, states={"pass": True}),
+        c1=dict(acceptance={"pass": acceptance, "problems": []}),
+    )
+    c2 = dict(rows={"pass": c2_rows}, states={"pass": c2_states})
+    for name, entry in (("e1c-pair-a0", on), ("e1c-c2", c2)):
+        d = tmp_path / FABLE / name
+        d.mkdir(parents=True)
+        (d / "req-0.json").write_text(json.dumps(entry))
+    return camp
+
+
+def test_e1c_refuses_non_boolean_c1_and_c2_evidence(tmp_path):
+    good = _e1c_camp(tmp_path / "good").e1c(FABLE, {1024: "x"}, smoke=True)["T1024"]
+    assert good["pass_"] and good["c1"]["identical"] is True
+    assert good["c2"]["identical"] is True
+    for k, value in enumerate(BAD):
+        for field in ("acceptance", "c2_rows", "c2_states"):
+            camp = _e1c_camp(tmp_path / f"{field}-{k}", **{field: value})
+            with pytest.raises(orchestrate.MalformedEvidence, match="malformed"):
+                camp.e1c(FABLE, {1024: "x"}, smoke=True)
+
+
+def _e2_camp(tmp_path, kernel=True):
+    camp = object.__new__(orchestrate.Campaign)
+    camp.out, camp.digests = tmp_path, {}
+    camp.job = lambda pick, name, mode, arm, requests: name
+    camp.run = lambda name: None
+    camp.c84_payloads = lambda pick, items, greedy, limit=None: [dict(name="a")]
+    for name in ("e2-off-0", "e2-on-1"):
+        d = tmp_path / FABLE / name
+        d.mkdir(parents=True)
+        entry = dict(
+            turns=[dict(final=dict(token_ids=[1, 2]), mtp_rounds=3, prompt={})],
+            telemetry=dict(speculative_argmax_from_hidden=4),
+            verdict={"pass": kernel},
+        )
+        (d / "req-0.json").write_text(json.dumps(entry))
+    return camp
+
+
+def test_e2_refuses_a_non_boolean_kernel_verdict(tmp_path):
+    assert (
+        _e2_camp(tmp_path / "good").e2(FABLE, [], {}, smoke=True)["verdict"] == "PASS"
+    )
+    for k, value in enumerate(BAD):
+        camp = _e2_camp(tmp_path / f"bad-{k}", kernel=value)
+        with pytest.raises(orchestrate.MalformedEvidence, match="verdict"):
+            camp.e2(FABLE, [], {}, smoke=True)
+
+
+def _e7b_report(**changes):
+    session = dict(
+        name="math500/1",
+        continuity=False,
+        censored=True,
+        reason="cache reuse stops",
+        events=["M4a"],
+        mtp_rounds=[3, 2, 2],
+    )
+    session.update(changes)
+    return dict(sessions=[session], status=orchestrate.e7b_status([session]))
+
+
+def _smoke_record(**changes):
+    record = dict(
+        reconstruction={"math500/1": {}, "math500/2": {}},
+        outcome=dict(e1c="PASS"),
+        e1c={"T1024": dict(pass_=True)},
+        e2=dict(verdict="PASS"),
+        e7b=_e7b_report(),
+        wall_s=60,
+    )
+    record.update(changes)
+    return record
+
+
+def test_the_smoke_gate_validates_the_one_expected_e7b_session():
+    gate = orchestrate.smoke_gate({FABLE: _smoke_record()})
+    assert gate["pass_"] and gate["fits"] and gate["e7b"][FABLE] == "INCOMPLETE", gate
+    timeout = dict(sessions=[dict(name="math500/1", censored=True, reason="timeout")])
+    timeout["status"] = "INCOMPLETE"
+    assert orchestrate.smoke_gate({FABLE: _smoke_record(e7b=timeout)})["pass_"]
+    observed = _e7b_report(continuity=True, censored=False, reason=None)
+    assert orchestrate.smoke_gate({FABLE: _smoke_record(e7b=observed)})["pass_"]
+    # not the expected session: a different item, two sessions, none
+    for e7b in (
+        _e7b_report(name="cjudge/9"),
+        dict(_e7b_report(), sessions=_e7b_report()["sessions"] * 2),
+        dict(sessions=[], status="INCOMPLETE"),
+    ):
+        got = orchestrate.smoke_gate({FABLE: _smoke_record(e7b=e7b)})
+        assert not got["pass_"] and any("E7b" in p for p in got["problems"]), e7b
+    assert not orchestrate.smoke_gate({FABLE: _smoke_record(e7b=None)})["pass_"]
+    assert not orchestrate.smoke_gate({})["pass_"]  # no pick ran
+
+
+@pytest.mark.parametrize(
+    "e7b",
+    [
+        dict(sessions=[{}], status="INCOMPLETE"),  # the review's minimal shape
+        _e7b_report(continuity="false"),
+        _e7b_report(censored="true"),
+        _e7b_report(censored=False),  # censored must agree with the reason
+        _e7b_report(reason=3),
+        _e7b_report(events="M4a"),
+        _e7b_report(mtp_rounds=[True]),
+        _e7b_report(name=None),
+        dict(_e7b_report(), status="OBSERVED"),  # the status is re-derived
+        dict(_e7b_report(), sessions="s"),
+        dict(
+            sessions=[dict(name="math500/1", censored=True, reason="late")],
+            status="INCOMPLETE",
+        ),
+    ],
+)
+def test_the_smoke_gate_refuses_a_malformed_e7b_report(e7b):
+    with pytest.raises(orchestrate.MalformedEvidence, match="malformed evidence"):
+        orchestrate.smoke_gate({FABLE: _smoke_record(e7b=e7b)})
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        _smoke_record(e1c={"T1024": dict(pass_="true")}),
+        _smoke_record(wall_s="60"),
+        _smoke_record(
+            e1c={
+                "T1024": dict(
+                    pass_=True, smoke_positives=dict(baseline_pass="true", fired={})
+                )
+            }
+        ),
+    ],
+)
+def test_the_smoke_gate_refuses_malformed_e1c_evidence(record):
+    with pytest.raises(orchestrate.MalformedEvidence, match="malformed evidence"):
+        orchestrate.smoke_gate({FABLE: record})
+
+
+def _smoke_summary(**changes):
+    picks = {FABLE: _smoke_record()}
+    summary = dict(
+        phase="smoke",
+        status="SMOKE_PASS",
+        exit_code=0,
+        picks=picks,
+        smoke_gate=orchestrate.smoke_gate(picks),
+    )
+    summary.update(changes)
+    return json.loads(json.dumps(summary))  # as loaded from summary.json
+
+
+def test_a_full_run_is_authorized_only_by_a_validated_smoke_summary():
+    sap = orchestrate.smoke_authorization_problems
+    assert sap(_smoke_summary()) == []
+    gate = _smoke_summary()["smoke_gate"]
+    for bad in (
+        _smoke_summary(
+            smoke_gate=dict(gate, pass_="false", fits="false")
+        ),  # H36's scenario
+        _smoke_summary(smoke_gate=dict(gate, fits=False)),
+        _smoke_summary(status="SMOKE_NOT_PASS"),
+        _smoke_summary(status="PASS"),
+        _smoke_summary(exit_code=2),
+        _smoke_summary(phase="full"),
+        _smoke_summary(smoke_gate=None),
+        # a stored gate that its own evidence does not reproduce
+        _smoke_summary(picks={FABLE: _smoke_record(e2=dict(verdict="FAIL"))}),
+        _smoke_summary(
+            picks={FABLE: _smoke_record(e7b=dict(sessions=[{}], status="X"))}
+        ),
+        _smoke_summary(picks={}),
+    ):
+        assert sap(bad), bad
+
+
+def test_main_refuses_a_malformed_smoke_summary_before_any_preflight(
+    tmp_path, monkeypatch
+):
+    (tmp_path / "fork").mkdir()
+    git = _git_repo(tmp_path / "fork")
+    (tmp_path / "fork" / "a").write_text("1")
+    git("add", "a")
+    git("commit", "-q", "-m", "one")
+    head = git("rev-parse", "HEAD")
+    monkeypatch.setenv("STACK_WORKDIR", str(tmp_path / "work"))
+
+    def reached(*a, **k):
+        raise AssertionError("reached preflight")
+
+    monkeypatch.setattr(orchestrate, "preflight", reached)
+    gate = _smoke_summary()["smoke_gate"]
+    summary = tmp_path / "summary.json"
+    summary.write_text(
+        json.dumps(_smoke_summary(smoke_gate=dict(gate, pass_="false", fits="false")))
+    )
+    argv = [
+        "--stack-root",
+        str(tmp_path),
+        "--fork-root",
+        str(tmp_path / "fork"),
+        "--out",
+        str(tmp_path / "work" / "p369" / "phase2" / "run-full"),
+        "--phase",
+        "full",
+        "--reviewed-head",
+        head,
+        "--smoke-summary",
+        str(summary),
+    ]
+    with pytest.raises(SystemExit, match="smoke"):
+        orchestrate.main(argv)
+    summary.write_text(json.dumps(_smoke_summary()))
+    with pytest.raises(
+        AssertionError, match="reached preflight"
+    ):  # a valid one gets past
+        orchestrate.main(argv)
