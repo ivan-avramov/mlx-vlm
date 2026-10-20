@@ -824,3 +824,113 @@ def test_p413_a_bound_drafter_never_renames_the_targets_modules():
         if not n.startswith(("_input_embed", "_lm_head_fn"))
     }
     assert all(tel._names[i].startswith("drafter.") for i in own - set(targets))
+
+
+# ------------------------------------------------------------------ P369 v13 code round 3 R1 / R2
+BIND_FIELDS = ("_input_embed", "_input_embed_scale", "_lm_head_fn", "_greedy_argmax_fn")
+
+
+def test_r1_the_startup_gate_leaves_the_loaded_drafter_unbound():
+    """Code round 3 R1: the boot check binds a COPY of the binding state only — the served drafter reaches its first
+    request exactly as loaded, so only production's request-time ``reset`` can bind it.
+    """
+    from p369_phase2 import worker
+
+    lm = served_moe_target()
+    drafter = served_moe_drafter(lm)
+    before = {k: getattr(drafter, k) for k in BIND_FIELDS}
+    keys = (set(drafter), set(vars(drafter)))
+    _, problems = worker.check_loaded_drafter(
+        lm, drafter, json.loads(json.dumps(SERVED_DRAFTER_SHAPE))
+    )
+    assert problems == []
+    assert {k: getattr(drafter, k) for k in BIND_FIELDS} == before
+    assert (set(drafter), set(vars(drafter))) == keys
+
+
+def test_r1_every_request_time_reset_is_checked_live_without_rebinding():
+    """Code round 3 R1: after production's own ``reset`` binds the drafter at a request's start, the worker checks the
+    LIVE identity (no harness bind) and refuses a reset that bound anything but the served target.
+    """
+    from p369_phase2 import worker
+
+    lm = served_moe_target()
+    drafter = served_moe_drafter(lm)
+    shape = json.loads(json.dumps(SERVED_DRAFTER_SHAPE))
+    checks = []
+    undo = worker.watch_drafter_resets(lm, drafter, shape, checks)
+    try:
+        drafter.reset(lm)
+        assert checks == [[]]
+        with pytest.raises(RuntimeError, match="served drafter mismatch"):
+            drafter.reset(served_moe_target(seed=3))
+    finally:
+        undo()
+    assert "reset" not in vars(drafter)  # the class method again
+
+
+@METAL
+def test_r2_a_drafter_running_a_foreign_routed_bank_fails_the_draft_verdict(served):
+    """Code round 3 R2 (direct bank path): the drafter's gate bank replaced by the TARGET's compatible bank — every
+    part name and selected experts are still recorded, so only ownership can refuse it.
+    """
+    lm, drafter = served
+    switch = drafter.layers[0].mlp.switch_mlp
+    foreign = lm.model.layers[0].mlp.switch_mlp.gate_proj
+
+    def swap(mp):
+        mp.setattr(switch, "gate_proj", foreign)
+
+    with pytest.MonkeyPatch.context() as mp:
+        tel, _, _ = _observed_turn(lm, drafter, sabotage=swap, monkeypatch=mp)
+    d = telemetry.draft_verdict(tel, drafter)
+    assert not d["pass"] and d["invocations"], d
+    assert any("model.layers.0.mlp.switch_mlp.gate_proj" in p for p in d["problems"]), d
+
+
+@METAL
+def test_r2_a_fused_helper_resolves_each_bank_by_identity(monkeypatch):
+    """Code round 3 R2 (fused path): ``exact_affine_switch_gate_up`` stands for its container's gate / up banks; each
+    is named by ITS module identity, so a foreign gate bank inside a drafter MoE frame is recorded as foreign.
+    """
+    import mlx.nn as nn
+
+    from mlx_vlm.models import switch_layers
+
+    mx.random.seed(4)
+
+    def glu_():
+        g = switch_layers.SwitchGLU(512, 512, EXPERTS)
+        g.set_dtype(mx.bfloat16)
+        nn.quantize(g, group_size=64, bits=4, mode="affine")
+        g.eval()
+        mx.eval(g.parameters())
+        return g
+
+    glu, other = glu_(), glu_()
+    monkeypatch.setattr(glu, "gate_proj", other.gate_proj)
+    tel = telemetry.KernelTelemetry(tiny_moe_target())
+    block = object()
+    tel._names.update(
+        {
+            id(block): "drafter.layers.0.mlp",
+            id(glu): "drafter.layers.0.mlp.switch_mlp",
+            id(glu.up_proj): "drafter.layers.0.mlp.switch_mlp.up_proj",
+            id(glu.down_proj): "drafter.layers.0.mlp.switch_mlp.down_proj",
+            id(other.gate_proj): "model.layers.0.mlp.switch_mlp.gate_proj",
+        }
+    )
+    x = mx.random.normal((1, 2, 512)).astype(mx.bfloat16)
+    indices = mx.array([[[0, 1], [2, 3]]], dtype=mx.int32)
+    with tel:
+        tel._draft_depth += 1
+        try:
+            run = tel._draft_moe_block(lambda b, x_: glu(x_, indices))
+            mx.eval(run(block, x))
+        finally:
+            tel._draft_depth -= 1
+    (frame,) = tel.draft_moe
+    assert "switch_mlp.gate_proj" not in frame["parts"], frame
+    assert any(
+        "model.layers.0.mlp.switch_mlp.gate_proj" in p for p in frame["parts"]
+    ), frame
