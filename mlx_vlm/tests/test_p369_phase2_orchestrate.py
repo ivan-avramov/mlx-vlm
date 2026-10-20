@@ -16,7 +16,9 @@ sys.path.insert(0, str(DEV))
 
 from p369_phase2 import orchestrate  # noqa: E402
 
-FABLE, UNIFORM = list(orchestrate.PICKS)
+FABLE, UNIFORM = list(orchestrate.PICKS)[
+    :2
+]  # the two Qwen3.8-27B picks (P369 v13 adds two more)
 
 
 # ------------------------------------------------------------------ P369 v13 V5 / V10: overlays from the 16-state generator

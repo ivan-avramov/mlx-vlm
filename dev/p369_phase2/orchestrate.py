@@ -30,11 +30,18 @@ except ImportError:  # run as a script: this directory is sys.path[0]
     import registry_states
 
 PRODUCTION = "7207179b"  # P400 + P401 (C188) + P405 F1 / F2 + K6 (C189 / C192); was 3395cef3, da27f0ef, 4e6d0e03
-PICKS = {
+PICKS = {  # P369 v13 §3.1: every MTP-certified registry entry; one entry per campaign (V9)
     "Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed": dict(
         kv="native16", verify_policy="joint_v1"
     ),
     "Qwen3.8-27B-mlx-uniform-4bit": dict(kv="tq4", verify_policy=None),
+    # no C84 bundles of their own: E2 / E7 use the reviewed borrowed panel of the uniform pick's items (V4)
+    "Qwen3.6-27B-Opus-Distill-OptiQ-4bit": dict(
+        kv="tq4", verify_policy=None, items_from="Qwen3.8-27B-mlx-uniform-4bit"
+    ),
+    "Ornith-1.0-35B-mlx-uniform-4bit": dict(
+        kv="native16", verify_policy=None, items_from="Qwen3.8-27B-mlx-uniform-4bit"
+    ),
 }
 THRESHOLDS = (1024, 8192, 32768, 65536)
 SMOKE_THRESHOLDS = (1024, 65536)  # the positive block rides the last (code round 2 C2)
@@ -83,6 +90,36 @@ MONITOR_S = 300
 
 
 # ------------------------------------------------------------------ pure parts (tested)
+def campaign_pick_problems(picks):
+    """P369 v13 V9: exactly one known entry per campaign (smoke and full bind one entry each)."""
+    if not picks or len(picks) != 1:
+        return [f"a campaign carries exactly one --pick, got {picks!r}"]
+    if picks[0] not in PICKS:
+        return [f"unknown pick {picks[0]!r}"]
+    return []
+
+
+def argv_scan_problems(pick, argv):
+    """P405 round 3 T15: the argv's verify scan (the CLI default ``per_query`` when absent) is the entry's."""
+    opts = dict(zip(argv, argv[1:]))
+    got = opts.get("--mtp-verify-scan", "per_query")
+    want = PICKS[pick]["verify_policy"] or "per_query"
+    return (
+        [] if got == want else [f"{pick}: argv verify scan {got!r}, expected {want!r}"]
+    )
+
+
+def borrowed_panel(pick, path):
+    """P369 v13 V4: the reviewed borrowed-panel fixture for an entry without C84 bundles (None for an entry with its
+    own); absent → Refused, never a silent reconstruction."""
+    if "items_from" not in PICKS[pick]:
+        return None
+    path = Path(path)
+    if not path.exists():
+        raise Refused(f"refused: {pick} needs its reviewed borrowed panel {path}")
+    return json.loads(path.read_text())
+
+
 def overlay_registry(text, pick, fixture):
     """P369 v13 V5 / V10: ``pick`` MTP-ON in ``text`` via the ONE byte-state generator — ``text`` must be one of the
     16 accepted states of the pinned ``fixture`` (else ValueError); the other entries keep their state and the pick's
@@ -1717,7 +1754,10 @@ class Campaign:
         )
         self.out = Path(args.out).resolve()
         self.dev = self.fork / "dev"
-        self.picks = args.pick or list(PICKS)
+        problems = campaign_pick_problems(args.pick)  # v13 V9
+        if problems:
+            raise SystemExit(f"refused: {problems}")
+        self.picks = list(args.pick)
         # code round 5 H23: construction reads nothing — the registry and params load in prepare(), inside
         # the persistence boundary, once the run directory exists
         self.env = worker_env(dict(os.environ))
@@ -1803,6 +1843,9 @@ class Campaign:
             overlay = self.out / f"overlay-{pick}.yaml"
             overlay.write_text(text)
             on = worker_argv(self.stack, overlay, pick)
+            problems = argv_scan_problems(pick, on)  # T15
+            if problems:
+                raise Refused(f"refused: {problems}")
             off = worker_argv(self.stack, self.stack / "main_models.yaml", pick)
             self.arms[pick] = dict(on=on, off=off)
             model = on[on.index("--model") + 1]

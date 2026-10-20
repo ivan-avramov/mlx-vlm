@@ -49,6 +49,10 @@ CODEC_SCHEDULES = dict(
     ),  # 255 × 1024 + 64 < the 262,144 cap
 )
 CODEC_METRICS = ("tps", "prefill_tps", "decode_peak", "prefill_peak")
+VERIFIER_PICKS = (  # the P400 §5.3 width-2 verifier ABBA: the two Qwen3.8-27B picks (C188)
+    "Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed",
+    "Qwen3.8-27B-mlx-uniform-4bit",
+)
 CODEC_PICKS = (
     "Qwen3.8-27B-mlx-uniform-4bit",
 )  # code round 2 K9: quantized-KV picks only (Fable is native)
@@ -498,7 +502,7 @@ def drive(args):
         picks={},
         started=time.strftime("%Y-%m-%dT%H:%M:%S"),
     )
-    picks = args.pick or list(orchestrate.PICKS)
+    picks = args.pick or list(VERIFIER_PICKS)
     argvs = {}
     for pick in picks:
         text, _ = orchestrate.overlay_registry(registry, pick, _fixture())
