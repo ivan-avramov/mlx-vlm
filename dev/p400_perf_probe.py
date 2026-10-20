@@ -13,6 +13,12 @@ Usage (from the stack root, detached, under the STACK venv like the orchestrator
 --python <fork venv python> --out $STACK_WORKDIR/p400/perf/<run>``. Code round 2: each arm is a clean tree at its expected
 commit (re-attested per leg), every globally consecutive leg is preceded by >= 600 s idle, every request decodes exactly 256
 tokens to the length cap, and each leg asserts the served MTP tuple and the KV codec its argv names.
+
+P405 R5 (``docs/specs/p405-kv-scheme-precedence.md`` v4, C192): ``codec --stack-root . --tree <wt> --ref <sha> --python <fork
+venv python> --out <dir>`` runs the codec-only ABBA on ONE clean tree — arm A affine (the pick's ``kv_quant_scheme`` set to
+``uniform`` in its overlay), arm B TurboQuant — at the deployed MTP-ON tuple (no forced block size), schedules ``short``
+(8,192 + 256 tokens, 3 warmup + 5 measured per leg) then ``long`` (261,120 + 64, 0 + 2), ≥ 10 min idle before every leg after
+the first; per request decode and prefill tok/s and the prefill / decode-phase peaks; descriptive statistics, no bound.
 """
 
 import argparse
@@ -34,6 +40,15 @@ SEED = 7
 ORDER = ("A", "B", "B", "A")
 BOUNDS = dict(tps_regression=0.03, peak_increase=0.01)
 MIN_IDLE_S = 600.0  # AGENTS.md: >= 10 min idle between arms
+# P405 R5 (code round 1 K5): the codec-only ABBA — one attested tree, arm A affine, arm B TurboQuant (descriptive)
+CODEC_ARMS = dict(A="uniform", B="turboquant")
+CODEC_SCHEDULES = dict(
+    short=dict(prompt=8192, tokens=256, warmup=3, measured=5),
+    long=dict(
+        prompt=261120, tokens=64, warmup=0, measured=2
+    ),  # 255 × 1024 + 64 < the 262,144 cap
+)
+CODEC_METRICS = ("tps", "prefill_tps", "decode_peak", "prefill_peak")
 
 
 # ------------------------------------------------------------------ pure parts (tested)
@@ -157,6 +172,88 @@ def tree_problems(trees, refs, attest):
     return problems
 
 
+def codec_overlay(text, pick, scheme):
+    """The registry with exactly ``pick``'s ``kv_quant_scheme:`` line set to ``scheme`` (comment kept); refuses
+    anything else."""
+    import re
+
+    lines = text.split("\n")
+    start = next(
+        (
+            i
+            for i, line in enumerate(lines)
+            if re.match(rf"^\s*- name: {re.escape(pick)}\s*$", line)
+        ),
+        None,
+    )
+    if start is None:
+        raise ValueError(f"{pick}: no registry block")
+    end = next(
+        (
+            i
+            for i in range(start + 1, len(lines))
+            if re.match(r"^\s*- name: ", lines[i])
+        ),
+        len(lines),
+    )
+    hits = [
+        i
+        for i in range(start, end)
+        if re.match(r"^\s*kv_quant_scheme:\s*\S+", lines[i])
+    ]
+    if len(hits) != 1:
+        raise ValueError(f"{pick}: {len(hits)} kv_quant_scheme lines, expected 1")
+    i = hits[0]
+    lines[i] = re.sub(r"(kv_quant_scheme:\s*)\S+", rf"\g<1>{scheme}", lines[i], count=1)
+    return "\n".join(lines)
+
+
+def codec_request_problems(probe, finish_reason, tokens):
+    """A codec request decodes exactly the schedule's ``tokens`` to the length cap with finite positive prefill and
+    decode rates and peaks (no width-2 requirement: the deployed tuple's own blocks)."""
+    problems = [
+        f"{name} {probe.get(name)!r} not finite positive"
+        for name in CODEC_METRICS
+        if not _positive(probe.get(name))
+    ]
+    if probe.get("tokens") != tokens:
+        problems.append(f"decoded {probe.get('tokens')} tokens, not {tokens}")
+    if finish_reason != "length":
+        problems.append(f"finish_reason {finish_reason!r}, not 'length'")
+    return problems
+
+
+def codec_stats(legs):
+    """Per schedule, per arm: n, median and [min, max] of each metric over the measured requests. Descriptive (R5): an
+    input to the codec decision, never a gate."""
+    out = {}
+    for schedule in sorted({leg["schedule"] for leg in legs}):
+        out[schedule] = {}
+        for arm in ("A", "B"):
+            reps = [
+                r
+                for leg in legs
+                if leg["arm"] == arm and leg["schedule"] == schedule
+                for r in leg["measured"]
+            ]
+            out[schedule][arm] = dict(
+                n=len(reps),
+                median={
+                    m: statistics.median(r[m] for r in reps) if reps else None
+                    for m in CODEC_METRICS
+                },
+                range={
+                    m: (
+                        [float(min(r[m] for r in reps)), float(max(r[m] for r in reps))]
+                        if reps
+                        else None
+                    )
+                    for m in CODEC_METRICS
+                },
+            )
+    return out
+
+
 def leg_schedule(picks):
     """Code round 2 C5: every globally consecutive leg (a pick's first included) is preceded by the idle."""
     plan = [
@@ -218,28 +315,36 @@ def leg(job_path):
             return real_attention(self, attn, x, *a, **k)
 
         sv.Qwen3_5BatchInvariantForward._attention = attention
+        codec = job.get(
+            "codec"
+        )  # P405 R5: a codec leg (schedule dict) or the P400 verifier leg
+        target = codec["prompt"] if codec else TARGET_PROMPT
+        n_tokens = codec["tokens"] if codec else DECODE_TOKENS
+        warmup = codec["warmup"] if codec else WARMUP
+        measured = codec["measured"] if codec else MEASURED
         base = dict(model=job["pick"], stream=False)
         text, tokens = worker.size_prompt(
             lambda t: worker.prompt_tokens(
                 client, [dict(role="user", content=t)], base
             ),
-            TARGET_PROMPT,
+            target,
             prefix=orchestrate.SIZE_PREFIX,
             suffix=orchestrate.SIZE_SUFFIX,
         )
         if text is None:
-            raise RuntimeError(
-                f"could not size the prompt to {TARGET_PROMPT} ({tokens})"
-            )
+            raise RuntimeError(f"could not size the prompt to {target} ({tokens})")
         gen_module = sys.modules["mlx_vlm.generate"]
         real_stream = gen_module.stream_generate
         probe = {}
 
         def stream(*a, **k):
             first, last = True, None
+            mx.synchronize()
+            mx.reset_peak_memory()  # the prefill phase starts (P405 R5)
             for chunk in real_stream(*a, **k):
                 if first:  # prefill done, first token out: the decode phase starts
                     mx.synchronize()
+                    probe["prefill_peak"] = int(mx.get_peak_memory())
                     mx.reset_peak_memory()
                     first = False
                 last = chunk
@@ -248,6 +353,7 @@ def leg(job_path):
             probe.update(
                 decode_peak=int(mx.get_peak_memory()),
                 tps=float(getattr(last, "generation_tps", 0.0) or 0.0),
+                prefill_tps=float(getattr(last, "prompt_tps", 0.0) or 0.0),
                 tokens=int(getattr(last, "generation_tokens", 0) or 0),
             )
 
@@ -255,12 +361,12 @@ def leg(job_path):
         payload = dict(
             model=job["pick"],
             messages=[dict(role="user", content=text)],
-            max_tokens=DECODE_TOKENS,
+            max_tokens=n_tokens,
             seed=SEED,
             stream=False,
         )
         reps = []
-        for i in range(WARMUP + MEASURED):
+        for i in range(warmup + measured):
             probe.clear()
             widths.clear()
             chat = f"p400-perf-{uuid.uuid4().hex}"
@@ -268,13 +374,17 @@ def leg(job_path):
                 "/v1/chat/completions",
                 headers={"X-MLX-VLM-Chat-Id": chat},
                 json=worker.routed(payload),
-                timeout=1800,
+                timeout=7200 if codec else 1800,  # a 261K prefill
             )
             if r.status_code != 200:
                 raise RuntimeError(f"request {i}: {r.status_code} {r.text[:300]}")
             worker.release_session(chat)
             finish = r.json()["choices"][0].get("finish_reason")
-            problems = request_problems(probe, finish, widths)
+            problems = (
+                codec_request_problems(probe, finish, n_tokens)
+                if codec
+                else request_problems(probe, finish, widths)
+            )
             if problems:
                 raise RuntimeError(f"request {i}: {problems}")
             reps.append(
@@ -282,7 +392,7 @@ def leg(job_path):
                     probe,
                     finish_reason=finish,
                     widths=sorted(set(widths)),
-                    warmup=i < WARMUP,
+                    warmup=i < warmup,
                 )
             )
         result.update(
@@ -380,6 +490,103 @@ def drive(args):
     print(json.dumps({p: v["verdict"] for p, v in report["picks"].items()}, indent=1))
 
 
+def drive_codec(args):
+    """P405 R5: per pick and schedule (short, then long), ABBA legs A = affine, B = TurboQuant on ONE clean tree at
+    ``--ref``, ≥ ``--idle-s`` before every globally consecutive leg, power checked per leg; every leg asserts the served
+    codec its overlay names (``served_check``)."""
+    sys.path.insert(0, str(DEV))
+    from p369_phase2 import orchestrate
+
+    stack = Path(args.stack_root).resolve()
+    out = Path(args.out).resolve()
+    out.mkdir(parents=True, exist_ok=False)
+    registry = (stack / "main_models.yaml").read_text()
+    tree = str(Path(args.tree).resolve())
+    ref = resolve_ref(tree, args.ref)
+    attest = attest_tree(tree)
+    if attest["head"] != ref or not attest["clean"]:
+        raise SystemExit(f"tree {tree}: {attest}, wanted clean at {ref}")
+    picks = args.pick or list(orchestrate.PICKS)
+    argvs = {}
+    for pick in picks:
+        for arm, scheme in CODEC_ARMS.items():
+            text, _ = orchestrate.overlay_registry(
+                codec_overlay(registry, pick, scheme), pick
+            )
+            overlay = out / f"overlay-{pick}-{arm}.yaml"
+            overlay.write_text(text)
+            argvs[pick, arm] = orchestrate.worker_argv(stack, overlay, pick)
+    report = dict(
+        mode="codec",
+        arms=CODEC_ARMS,
+        schedules=CODEC_SCHEDULES,
+        order=ORDER,
+        tree=tree,
+        ref=ref,
+        attest=attest,
+        idle_s=args.idle_s,
+        picks={},
+        started=time.strftime("%Y-%m-%dT%H:%M:%S"),
+    )
+    plan = [
+        dict(pick=pick, schedule=schedule, k=k, arm=arm)
+        for pick in picks
+        for schedule in CODEC_SCHEDULES
+        for k, arm in enumerate(ORDER)
+    ]
+    legs_of = {pick: [] for pick in picks}
+    last_end = None
+    for i, step in enumerate(plan):
+        pick, schedule, k, arm = step["pick"], step["schedule"], step["k"], step["arm"]
+        if i:
+            time.sleep(args.idle_s)  # >= 10 min idle between legs (AGENTS.md)
+        idle_before_s = None if last_end is None else time.monotonic() - last_end
+        power = orchestrate.power_state()
+        if not (power["ac_ok"] and power["battery_ok"]):
+            raise SystemExit(f"power not OK before {pick} {schedule} leg {k}: {power}")
+        name = f"{pick}-{schedule}-leg{k}-{arm}"
+        job, res = out / f"{name}.job.json", out / f"{name}.json"
+        job.write_text(
+            json.dumps(
+                dict(
+                    argv=argvs[pick, arm],
+                    pick=pick,
+                    arm=arm,
+                    out=str(res),
+                    codec=CODEC_SCHEDULES[schedule],
+                )
+            )
+        )
+        env = orchestrate.worker_env(dict(os.environ))
+        env["PYTHONPATH"] = tree
+        with open(out / f"{name}.log", "w") as log:
+            rc = subprocess.run(
+                [args.python, __file__, "leg", str(job)],
+                env=env,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                timeout=6 * 3600,
+                cwd=str(out),
+            ).returncode
+        last_end = time.monotonic()
+        if rc != 0:
+            raise SystemExit(f"{name} failed rc {rc}; see its log")
+        leg_result = json.loads(res.read_text())
+        if leg_result["tree"] != tree or leg_result["attest"] != attest:
+            raise SystemExit(
+                f"{name} loaded {leg_result['tree']} {leg_result['attest']}"
+            )
+        leg_result.update(schedule=schedule, power=power, idle_before_s=idle_before_s)
+        legs_of[pick].append(leg_result)
+        report["picks"][pick] = dict(
+            legs=legs_of[pick], stats=codec_stats(legs_of[pick])
+        )
+        (out / "report.json").write_text(json.dumps(report, indent=1))
+    report["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    (out / "report.json").write_text(json.dumps(report, indent=1))
+    print(json.dumps({p: v["stats"] for p, v in report["picks"].items()}, indent=1))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -397,13 +604,23 @@ def main(argv=None):
         required=True,
         help="the fork venv's python (mlx + the fork's deps) for the legs",
     )
+    c = sub.add_parser("codec")  # P405 R5
+    c.add_argument("--stack-root", required=True)
+    c.add_argument("--tree", required=True)
+    c.add_argument("--ref", required=True, help="the commit the tree must be at")
+    c.add_argument("--out", required=True)
+    c.add_argument("--pick", action="append")
+    c.add_argument("--idle-s", type=float, default=600.0)
+    c.add_argument("--python", required=True)
     lg = sub.add_parser("leg")
     lg.add_argument("job")
     args = ap.parse_args(argv)
-    if args.cmd == "drive" and args.idle_s < MIN_IDLE_S:
+    if args.cmd in ("drive", "codec") and args.idle_s < MIN_IDLE_S:
         ap.error(f"--idle-s must be at least {MIN_IDLE_S:.0f} (AGENTS.md)")
     if args.cmd == "drive":
         drive(args)
+    elif args.cmd == "codec":
+        drive_codec(args)
     else:
         leg(args.job)
 
