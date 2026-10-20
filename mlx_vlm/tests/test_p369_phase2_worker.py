@@ -1043,3 +1043,44 @@ def test_the_worker_script_imports_under_isolated_mode(tmp_path):
     )
     assert "ModuleNotFoundError" not in out.stderr, out.stderr[-2000:]
     assert "FileNotFoundError" in out.stderr, out.stderr[-2000:]
+
+
+# ------------------------------------------------------------------ smoke 12b: the in-support positive must be guaranteed
+def _logit_record(values, vocab=32):
+    import mlx.core as mx
+
+    row = [0.0] * vocab
+    for i, v in values.items():
+        row[i] = v
+    return compare.as_record(mx.array(row, dtype=mx.float32))
+
+
+SAMPLING = dict(temperature=0.6, top_p=0.95, top_k=20, min_p=0.0)
+PEAKED = {
+    3: 30.0
+}  # one token holds ~all the mass: the retained support is that token alone
+FLAT = {3: 2.0, 4: 1.9, 5: 1.8}
+
+
+def _changes(record, perturbed):
+    import numpy as np
+
+    a, b = compare.canonical(record, SAMPLING), compare.canonical(perturbed, SAMPLING)
+    return not np.array_equal(a, b)
+
+
+def test_the_in_support_perturbation_prefers_the_latest_multi_token_support():
+    """Smoke 12b: at the latest position the support was ONE token (TurboQuant data), so +0.5 on the top logit
+    changed nothing and the positive did not fire; ~2/3 of live positions have a single-token support.
+    """
+    latest = {0: _logit_record(FLAT), 1: _logit_record(FLAT), 2: _logit_record(PEAKED)}
+    position, perturbed = worker.in_support_perturbation(latest, SAMPLING, exclude=())
+    assert position == 1 and _changes(latest[1], perturbed)
+    position, _ = worker.in_support_perturbation(latest, SAMPLING, exclude=(1,))
+    assert position == 0  # excluded (forced) positions are never chosen
+
+
+def test_the_in_support_perturbation_moves_the_boundary_when_every_support_is_one_token():
+    latest = {0: _logit_record(PEAKED), 1: _logit_record(PEAKED)}
+    position, perturbed = worker.in_support_perturbation(latest, SAMPLING, exclude=())
+    assert position == 1 and _changes(latest[1], perturbed)
