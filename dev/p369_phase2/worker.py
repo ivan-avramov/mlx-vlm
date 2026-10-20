@@ -637,6 +637,34 @@ def _mutate_and_restore(caches, array, index, sha):
     return seen
 
 
+def cache_census(leaves):
+    """``{leaf class name: count}`` — what the state hash and the smoke positives actually saw (smoke 4)."""
+    census = {}
+    for leaf in leaves:
+        census[type(leaf).__name__] = census.get(type(leaf).__name__, 0) + 1
+    return census
+
+
+def kv_positive_targets(leaves):
+    """``[(kind, array)]``, one per KV leaf: ``tq_norm`` (the key norms of either TurboQuant class — its keys are a
+    ``TurboQuantMSEState`` NamedTuple) or ``old_prefix_k`` (a native leaf's key array). Smoke 4: the old checks matched
+    one TurboQuant class only and skipped tuple-shaped keys, so no KV positive fired on the uniform pick.
+    """
+    import mlx.core as mx
+
+    tq = sys.modules.get("mlx_vlm.turboquant")
+    targets = []
+    for leaf in leaves:
+        keys = getattr(leaf, "keys", None)
+        if keys is None:
+            continue
+        if tq is not None and isinstance(leaf, tq._TurboQuantAttentionMixin):
+            targets.append(("tq_norm", keys[0]))
+        elif isinstance(keys, mx.array):
+            targets.append(("old_prefix_k", keys))
+    return targets
+
+
 def smoke_positives(on, off, n, params, exclude=()):
     """Q32 on live data: the unmodified ON / OFF data pass, and each injected change is detected (rows at the
     ``exclude``d forced positions are not compared, P398)."""
@@ -687,19 +715,14 @@ def smoke_positives(on, off, n, params, exclude=()):
     caches = off._cache
     sha = observe.state_hash(caches)
     leaves = list(iter_leaf_caches(caches))
-    tq = sys.modules.get("mlx_vlm.turboquant")
+    for kind, array in kv_positive_targets(
+        leaves
+    ):  # smoke 4: either TurboQuant class or native KV
+        if kind not in fired:
+            index = (..., 0) if kind == "tq_norm" else (..., 0, 0)
+            fired[kind] = _mutate_and_restore(caches, array, index, sha)
     for leaf in leaves:
-        kind = type(leaf).__name__
-        if tq is not None and isinstance(leaf, tq.TurboQuantKVCache):
-            if "tq_norm" not in fired and leaf.keys is not None:
-                norms = leaf.keys[0]
-                fired["tq_norm"] = _mutate_and_restore(caches, norms, (..., 0), sha)
-        elif hasattr(leaf, "keys") and getattr(leaf, "keys", None) is not None:
-            if "old_prefix_k" not in fired and not isinstance(leaf.keys, (list, tuple)):
-                fired["old_prefix_k"] = _mutate_and_restore(
-                    caches, leaf.keys, (..., 0, 0), sha
-                )
-        elif kind == "ArraysCache" and "recurrent" not in fired:
+        if type(leaf).__name__ == "ArraysCache" and "recurrent" not in fired:
             arrays = [a for a in leaf.state if a is not None]
             fired["recurrent"] = _mutate_and_restore(caches, arrays[-1], (..., 0), sha)
     # probe logit: one ON snapshot's probe changed must fail the state comparison there.
@@ -1097,6 +1120,10 @@ def run_job(job, out_dir, result):
                 )
                 entry["forced_positions"] = forced
                 ident = instance_identity(rg)  # P397: held by reference, re-read live
+                from mlx_vlm.speculative.cache_state import iter_leaf_caches
+
+                # smoke 4: the leaf classes the state hash and the smoke positives saw
+                entry["leaf_census"] = cache_census(iter_leaf_caches(on._cache or []))
                 metrics = server.runtime.metrics
                 replays = []
                 wait_idle(rg, metrics)

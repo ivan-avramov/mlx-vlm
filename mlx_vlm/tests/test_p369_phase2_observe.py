@@ -585,5 +585,5 @@ def test_state_hash_sees_the_codec_of_a_batch_turboquant_cache_too():
     """
     a, b = _batch_turboquant(bits=4), _batch_turboquant(bits=4)
     assert observe.state_hash([a]) == observe.state_hash([b])
-    b._kv_quant_mode = "prod"
+    b.key_codec = _turboquant(bits=3.5, key_bits=3.5, value_bits=3.5).key_codec
     assert observe.state_hash([a]) != observe.state_hash([b])

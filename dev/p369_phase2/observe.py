@@ -58,7 +58,8 @@ def _logical_metadata(leaf):
     from mlx_vlm.models.cache import ArraysCache
 
     tq = sys.modules.get("mlx_vlm.turboquant")
-    if tq is not None and isinstance(leaf, tq.TurboQuantKVCache):
+    # smoke 4: either TurboQuant class (single or batch) carries codec metadata outside its state
+    if tq is not None and isinstance(leaf, tq._TurboQuantAttentionMixin):
 
         def codec(c):
             if c is None:
@@ -67,7 +68,9 @@ def _logical_metadata(leaf):
 
         return (
             "turboquant",
-            leaf._kv_quant_mode,
+            getattr(
+                leaf, "_kv_quant_mode", None
+            ),  # BatchTurboQuantKVCache has no mode attribute
             codec(leaf.key_codec),
             codec(leaf.value_codec),
         )
