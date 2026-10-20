@@ -840,35 +840,30 @@ def test_a_dry_run_that_misses_tokenization_or_reaches_generation_refuses(
 
 
 # ------------------------------------------------------------------ smoke 7 (live): no branch-local imports in run_job
-def test_run_job_uses_each_import_only_after_it_inside_its_block():
-    """A ``from … import`` inside one mode's branch makes the name local to the WHOLE function, so a use
-    outside that block — or before the import — raises UnboundLocalError (smoke 7: ``compare`` imported in
-    the e1c_pair branch, used by e1c_off for the forced schedule; review micro-round E11: order too).
-    run_job's branches have no unit test, so the shape is checked for EVERY import in run_job, function-level
-    ones included: each use lies inside the statement block holding the import and after the import line
-    (straight-line source order; run_job has no loops that re-enter a block above its import).
+def import_violations(fn):
+    """``(name, use line, import line)`` for every use of an import-bound name in function ``fn`` (an AST
+    FunctionDef) that is not inside the statement block holding the import and after the import line —
+    the shape that raises UnboundLocalError (smoke 7). Straight-line source order: valid for a function with
+    no loop re-entering a block above an import (true of run_job, review micro-round 7).
     """
     import ast
-    import inspect
-    import textwrap
 
-    fn = ast.parse(textwrap.dedent(inspect.getsource(worker.run_job))).body[0]
-    blocks = []  # (statement list, its line span)
+    blocks = []
     for node in ast.walk(fn):
         for field in ("body", "orelse", "finalbody", "handlers"):
             stmts = getattr(node, field, None)
             if isinstance(stmts, list) and stmts and isinstance(stmts[0], ast.AST):
-                blocks.append((stmts, (stmts[0].lineno, stmts[-1].end_lineno)))
+                blocks.append((stmts, stmts[-1].end_lineno))
     loads = [
         (n.id, n.lineno)
         for n in ast.walk(fn)
         if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)
     ]
-    bad, seen = [], 0
-    for stmts, (_, hi) in blocks:
+    bad, imports = [], 0
+    for stmts, hi in blocks:
         for stmt in stmts:
             if isinstance(stmt, (ast.Import, ast.ImportFrom)):
-                seen += 1
+                imports += 1
                 for alias in stmt.names:
                     name = (alias.asname or alias.name).split(".")[0]
                     bad += [
@@ -876,18 +871,35 @@ def test_run_job_uses_each_import_only_after_it_inside_its_block():
                         for n, line in loads
                         if n == name and not stmt.end_lineno < line <= hi
                     ]
-    assert (
-        seen >= 4
-    ), seen  # the guard sees run_job's imports (function-level and branch-local)
+    return bad, imports
+
+
+def test_run_job_uses_each_import_only_after_it_inside_its_block():
+    """A ``from … import`` inside one mode's branch makes the name local to the WHOLE function, so a use
+    outside that block — or before the import — raises UnboundLocalError (smoke 7: ``compare`` imported in
+    the e1c_pair branch, used by e1c_off; review micro-rounds E11 / E12). run_job's branches have no unit
+    test, so every import in it (function-level included) is checked by ``import_violations``.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    fn = ast.parse(textwrap.dedent(inspect.getsource(worker.run_job))).body[0]
+    bad, imports = import_violations(fn)
+    assert imports >= 4, imports
     assert bad == [], bad
 
 
-def test_the_import_guard_catches_a_use_before_the_import():
-    """The guard's own negative cases (E11): a use before a same-block import and a use after a branch."""
+def test_the_import_guard_reports_exact_violations():
+    """E12: the SAME helper on synthetic negatives — a use before a same-block import, a use outside the
+    importing branch, and a function-level import after its use — with the exact violations.
+    """
     import ast
 
     src = """
 def f(mode):
+    y = late.go()
+    from p import late
     if mode:
         x = compare.go()
         from p import compare
@@ -895,16 +907,8 @@ def f(mode):
         from p import other
     other.go()
 """
-    fn = ast.parse(src).body[0]
-    loads = [(n.id, n.lineno) for n in ast.walk(fn) if isinstance(n, ast.Name)]
-    stmts = fn.body[0].body
-    imp = stmts[1]
-    hi = stmts[-1].end_lineno
-    assert [
-        (n, ln) for n, ln in loads if n == "compare" and not imp.end_lineno < ln <= hi
-    ]
-    other = fn.body[0].orelse[0].body[0]
-    hi2 = other.end_lineno
-    assert [
-        (n, ln) for n, ln in loads if n == "other" and not other.end_lineno < ln <= hi2
-    ]
+    bad, imports = import_violations(ast.parse(src).body[0])
+    assert imports == 3
+    assert sorted(bad) == [("compare", 6, 7), ("late", 3, 4), ("other", 10, 9)], bad
+    ok = "def g():\n    from p import a\n    a.go()\n"
+    assert import_violations(ast.parse(ok).body[0]) == ([], 1)
