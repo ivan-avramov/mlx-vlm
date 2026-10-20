@@ -2195,3 +2195,59 @@ def test_an_explicit_wall_limit_must_be_finite_and_positive(raw):
     with pytest.raises(argparse.ArgumentTypeError):
         orchestrate.positive_seconds(raw)
     assert orchestrate.positive_seconds("3600") == 3600.0
+
+
+# ------------------------------------------------------------------ P369 v13 §3.1: four entries, one per campaign
+QWEN36 = "Qwen3.6-27B-Opus-Distill-OptiQ-4bit"
+ORNITH = "Ornith-1.0-35B-mlx-uniform-4bit"
+
+
+def test_the_harness_knows_all_four_mtp_certified_entries():
+    assert set(orchestrate.PICKS) == set(rs.ENTRY_OFF)
+    assert (
+        orchestrate.PICKS[QWEN36]["verify_policy"] is None
+    )  # the runtime form of per_query (T15)
+    assert orchestrate.PICKS[ORNITH]["verify_policy"] is None
+    assert orchestrate.PICKS[QWEN36]["items_from"] == UNIFORM  # borrowed panel (V4)
+    assert orchestrate.PICKS[ORNITH]["items_from"] == UNIFORM
+
+
+@pytest.mark.parametrize(
+    ("picks", "ok"),
+    [
+        ([UNIFORM], True),
+        ([ORNITH], True),
+        (None, False),
+        ([], False),
+        ([FABLE, UNIFORM], False),
+        (["x"], False),
+    ],
+)
+def test_a_campaign_carries_exactly_one_entry(picks, ok):
+    """v13 V9: every smoke / full binding carries exactly one entry (independently authorized campaigns)."""
+    assert (orchestrate.campaign_pick_problems(picks) == []) is ok, picks
+
+
+@pytest.mark.parametrize(
+    ("pick", "argv", "ok"),
+    [
+        (UNIFORM, ["--model", "m"], True),  # no flag: the CLI default per_query
+        (UNIFORM, ["--model", "m", "--mtp-verify-scan", "per_query"], True),
+        (UNIFORM, ["--model", "m", "--mtp-verify-scan", "joint_v1"], False),
+        (FABLE, ["--model", "m", "--mtp-verify-scan", "joint_v1"], True),
+        (FABLE, ["--model", "m"], False),
+        (QWEN36, ["--model", "m"], True),
+    ],
+)
+def test_the_argv_selects_the_entrys_verify_scan(pick, argv, ok):
+    """P405 round 3 T15: `verify_policy=None` is checked against the argv resolving to per_query."""
+    assert (orchestrate.argv_scan_problems(pick, argv) == []) is ok, (pick, argv)
+
+
+def test_a_borrowed_entry_refuses_until_its_reviewed_panel_exists(tmp_path):
+    """v13 V4: no borrowed-panel fixture, no campaign for the entry (never a silent reconstruction)."""
+    with pytest.raises(orchestrate.Refused, match="borrowed panel"):
+        orchestrate.borrowed_panel(ORNITH, tmp_path / "absent.json")
+    assert (
+        orchestrate.borrowed_panel(UNIFORM, tmp_path / "absent.json") is None
+    )  # own C84 bundles
