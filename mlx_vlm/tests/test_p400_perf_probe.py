@@ -214,3 +214,89 @@ def test_non_finite_or_non_positive_measurements_are_refused():
     assert probe.verdict(stats)["status"] == "INVALID"
     stats = probe.arm_stats(_legs([10.0] * 10, [10.0] * 10, 1000, 0))
     assert probe.verdict(stats)["status"] == "INVALID"
+
+
+# ------------------------------------------------------------------ P405 R5 (code round 1 K5): codec-only ABBA
+REGISTRY = """models:
+  - name: Qwen3.8-27B-mlx-uniform-4bit
+    kv_quant_scheme: turboquant
+    kv_bits: 4                     # turboquant 4-bit KV
+  - name: other
+    kv_quant_scheme: turboquant
+"""
+
+
+def test_codec_overlay_changes_exactly_the_picks_scheme_line():
+    out = probe.codec_overlay(REGISTRY, "Qwen3.8-27B-mlx-uniform-4bit", "uniform")
+    assert out.count("kv_quant_scheme: uniform") == 1
+    assert out.split("- name: other")[1].count("kv_quant_scheme: turboquant") == 1
+    assert (
+        probe.codec_overlay(REGISTRY, "Qwen3.8-27B-mlx-uniform-4bit", "turboquant")
+        == REGISTRY
+    )
+    import pytest
+
+    with pytest.raises(ValueError, match="kv_quant_scheme"):
+        probe.codec_overlay(
+            REGISTRY.replace(
+                "    kv_quant_scheme: turboquant\n    kv_bits", "    kv_bits"
+            ),
+            "Qwen3.8-27B-mlx-uniform-4bit",
+            "uniform",
+        )
+    with pytest.raises(ValueError, match="no registry block"):
+        probe.codec_overlay(REGISTRY, "absent", "uniform")
+
+
+def test_codec_schedules_are_the_pre_registered_ones():
+    assert probe.CODEC_ARMS == dict(A="uniform", B="turboquant")
+    assert probe.CODEC_SCHEDULES == dict(
+        short=dict(prompt=8192, tokens=256, warmup=3, measured=5),
+        long=dict(prompt=261120, tokens=64, warmup=0, measured=2),
+    )
+
+
+def test_codec_requests_need_the_schedules_token_count_and_positive_prefill():
+    good = dict(tps=10.0, tokens=64, decode_peak=1, prefill_tps=300.0, prefill_peak=2)
+    assert probe.codec_request_problems(good, "length", 64) == []
+    assert probe.codec_request_problems(dict(good, tokens=63), "length", 64)
+    assert probe.codec_request_problems(good, "stop", 64)
+    for bad in (
+        dict(prefill_tps=0.0),
+        dict(prefill_peak=float("nan")),
+        dict(tps=float("inf")),
+    ):
+        assert probe.codec_request_problems(dict(good, **bad), "length", 64), bad
+
+
+def test_codec_stats_are_descriptive_per_arm_and_schedule():
+    def leg(arm, schedule, x):
+        return dict(
+            arm=arm,
+            schedule=schedule,
+            measured=[
+                dict(
+                    tps=x,
+                    prefill_tps=10 * x,
+                    decode_peak=100 * x,
+                    prefill_peak=1000 * x,
+                )
+            ]
+            * 2,
+        )
+
+    legs = [
+        leg("A", "long", 1.0),
+        leg("B", "long", 2.0),
+        leg("B", "long", 4.0),
+        leg("A", "long", 3.0),
+    ]
+    stats = probe.codec_stats(legs)
+    assert (
+        stats["long"]["A"]["median"]["tps"] == 2.0
+        and stats["long"]["B"]["median"]["tps"] == 3.0
+    )
+    assert stats["long"]["A"]["range"]["prefill_peak"] == [1000.0, 3000.0]
+    assert (
+        stats["long"]["A"]["n"] == 4 and "verdict" not in stats["long"]
+    )  # descriptive: no bound, no verdict
