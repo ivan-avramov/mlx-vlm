@@ -1,0 +1,133 @@
+{
+ "Ornith-1.0-35B-mlx-uniform-4bit": {
+  "drafter": {
+   "files": {
+    "config.json": "0a522ccb624236f29f2562785f0722d032cc8731247385e617fee7c539bb1fec",
+    "model.safetensors": "ce53f6bbf9addbd0dc593d78bc773ce04fb10a1b671ba161427f2592b0d3ab28",
+    "tokenizer.json": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+    "tokenizer_config.json": "316230d6a809701f4db5ea8f8fc862bc3a6f3229c937c174e674ff3ca0a64ac8",
+    "vocab.json": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003"
+   },
+   "hf_path": "caslca/Ornith-1.0-35B-mlx-uniform-4bit-mtp-drafter",
+   "revision": "92deafbc1b669e585ee829b0e33fd7050e8d33c8"
+  },
+  "target": {
+   "files": {
+    "chat_template.jinja": "182e77dd83bd8e9ca818b240b82e28f243762cd5dda32e6eef327df7b1cd107e",
+    "config.json": "550efce0158addbcab424cfc92bdaa297138a949bfc71c724918994b7b692d2f",
+    "generation_config.json": "896eeba60a1195e034dc6b9a7bbddd64b6174992348f5dc7d75daaa93d0bdd45",
+    "model-00001-of-00004.safetensors": "2a34b0daa08c1decdeb817301ec4927bfdfa5e573559a3f541f73834383b21d0",
+    "model-00002-of-00004.safetensors": "5eab94545fdddd6db8c6d8cd54a3481ba26f2d9fc6d48ee47ea94951c631680b",
+    "model-00003-of-00004.safetensors": "8fc467f4036656f488afc86776757ad3cbd4910ab9031f84bb28c55768a904fb",
+    "model-00004-of-00004.safetensors": "c700f3b3a89d613dfaf5b430f8e3b70e1aeb0e5b7ad4fe3aebf8c64e3644ce17",
+    "model.safetensors.index.json": "0b28df60e33753a14e816d3b31577ae2c93884c58430a4a6de6ae9ea483842ea",
+    "preprocessor_config.json": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516",
+    "processor_config.json": "45fc17c8dd2474af6b493b52483c26c0584b0082d368c480f9fa611e73070040",
+    "tokenizer.json": "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523",
+    "tokenizer_config.json": "792fa3f0cb88b111e54ef3134c873531008c4df471d108da17903426e308aa7b",
+    "video_preprocessor_config.json": "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13",
+    "vocab.json": "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003"
+   },
+   "hf_path": "caslca/Ornith-1.0-35B-mlx-uniform-4bit",
+   "revision": "f3edbf91b27130f95a0cfba6134fdfe2966a3a80"
+  }
+ },
+ "Qwen3.6-27B-Opus-Distill-OptiQ-4bit": {
+  "drafter": {
+   "files": {
+    "config.json": "984910f055c3a806b151eefbf188a8c082da2df5a0164a89d77ec4a951e556e6",
+    "model.safetensors": "e3618004eb4fd93a1f324afbf4a872b2e160127b3c86903277469f1072d206fd",
+    "tokenizer.json": "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523",
+    "tokenizer_config.json": "fa433896b2b0eb2cf80e45d41c24a2ebac7ae45554bdd45b4e407ea5819d660d"
+   },
+   "hf_path": "caslca/Qwen3.6-27B-Opus-Distill-OptiQ-4bit-mtp-drafter",
+   "revision": "a9f69509740c173afff42da311f3070d79da2580"
+  },
+  "target": {
+   "files": {
+    "chat_template.jinja": "e84f32a23fdda27689f868aa4a1a5621f41133e51a48d7f3efcbea2839574259",
+    "config.json": "38e2892e3abe3d5b79454ba1736a65b26c37ecf6c3cb280f2b73335296a71fa3",
+    "generation_config.json": "5dcf8a18abad772b12e4b9098342ecc80f97ee2e2f145fb9f0925a7af3d17ece",
+    "model-00001-of-00004.safetensors": "ecc5fe86e4b13b2466ee15906432612cfd6c792abd4e9e54ecbd2bd04d77faf5",
+    "model-00002-of-00004.safetensors": "a0bf612522de38aaaa86672c20fbf0f743fe371de613f3c0ae11c74b164e276c",
+    "model-00003-of-00004.safetensors": "87edcd82851764e11935f39f8d928e5d0c47b372f0e88cc9aeb61f68fff04eef",
+    "model-00004-of-00004.safetensors": "2299ecf09cc6a42c568330603081ef042bb9c06ef927751b94fee498aa3fa386",
+    "model-vision.safetensors": "774825e8ad7c99ae7c41dc08094e1dbe1ed4ba387e726000294aa4bf184ec444",
+    "model.safetensors.index.json": "7bddfd059cd144748c4ef04fb5ee03fa1df94052cc39dbee3ce7cf61ce46ca87",
+    "optiq/mtp.safetensors": "b1d8d94ffd12ed6addf5911662e65abd3229efaab1751713a28ccd9d906cfde7",
+    "optiq_metadata.json": "d5d85d334c2ba025188eac62f2851cea430d063fca6423f9fd846e3df6e14de6",
+    "preprocessor_config.json": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516",
+    "processor_config.json": "d89ef49ce9cd37fbf510158e13c1ef063d9286411c1ec9049932dbe0487143b1",
+    "tokenizer.json": "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523",
+    "tokenizer_config.json": "fa433896b2b0eb2cf80e45d41c24a2ebac7ae45554bdd45b4e407ea5819d660d",
+    "video_preprocessor_config.json": "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13"
+   },
+   "hf_path": "caslca/Qwen3.6-27B-Opus-Distill-OptiQ-4bit",
+   "revision": "6eca8612419d07181ca1474542f1a497f5dcbfac"
+  }
+ },
+ "Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed": {
+  "drafter": {
+   "files": {
+    "config.json": "10cc41e0500bbde5d89793255ab4db5de5624c917a3bfcef66876062fc14fd26",
+    "model.safetensors": "ff4d5cfc53e8de65afc6bf2b0734ede4b32c7a4b9e7ac5d5b047413630cc0353",
+    "repair_audit.json": "c2680ce9197a5956729613de18f7721fb64ad60bb25a5e45188115c74e2737bc",
+    "tokenizer.json": "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523",
+    "tokenizer_config.json": "95c557768e6b88a7128befc7bfd3c7de50e5d51af9b8b33a9f4dee0e04f99679"
+   },
+   "hf_path": "caslca/Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed-mtp-drafter",
+   "revision": "0caad904fdd7706310f42f342226e7ae9b2d55dc"
+  },
+  "target": {
+   "files": {
+    "chat_template.jinja": "c73e681e5ea7c5396fb5570d7d451c46e0a352b5e73b4814f8ebd4cd447a6e4e",
+    "config.json": "03c5fb6c32a96e8c29996bd148f8119b5f30348170f65e1b614321fe77b41dba",
+    "generation_config.json": "0041afa8e8018a37c7f0334362d6959b0faf2b0ba49e12307f3ad45209ed6bac",
+    "model-00001-of-00004.safetensors": "7077792bbca8d4b7387088b80d5ba997a8668972caeea7a067e3213d5e0f21fa",
+    "model-00002-of-00004.safetensors": "d3f645dd1d1fe2fb31d6b03234a2a6e86ab75b14323f8369b06db9f7fe03cb2a",
+    "model-00003-of-00004.safetensors": "0330940b22d900a89e238ecbbbfac0721dcaf0e162b75c46a38fce28162d268e",
+    "model-00004-of-00004.safetensors": "264a638c36c46af71551fbbd8deeb3e0e45d6a02c3f2cefffac26d7f1f4923e0",
+    "model.safetensors.index.json": "3fee6a3f5b6291926008291e2ec720dd6c36bbd6804d98819ba01335619f2888",
+    "optiq/metadata.json": "07f8280688dce73605de794501c31230aaa77e85763af8a811a4198a2af4e4be",
+    "optiq/mtp.safetensors": "e3054bcb1b6fa35f482f6cca7cb3032ba9aa31a3cfb4d1e358d5ebb20b78d0f8",
+    "optiq/optiq_vision.safetensors": "39706d9f46451b73b641fdb044c28f9993972e425ab616d2f8967b1d6251a82d",
+    "optiq/sensitivity.json": "75cc5851164400ac509da5a4841064832b757bc9bd2eb5d15ad94510ec959cfe",
+    "tokenizer.json": "87a7830d63fcf43bf241c3c5242e96e62dd3fdc29224ca26fed8ea333db72de4",
+    "tokenizer_config.json": "764a610576ac4e417a0addb170031be84ac3f0f3acb5d3fb0cd13ec36adf6ad4"
+   },
+   "hf_path": "caslca/Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed",
+   "revision": "1dd70b36b8a800568576ad12fdeef3c7d3c2dc61"
+  }
+ },
+ "Qwen3.8-27B-mlx-uniform-4bit": {
+  "drafter": {
+   "files": {
+    "config.json": "d21941a0a61ccad4db9ba48510ad31aef9c194b96a50f580d437e9d4df5769b7",
+    "model.safetensors": "58464ddaa64fa75a2c38a27e39b282229e305464dbee4f56e4deece2cea77cd8",
+    "tokenizer.json": "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523",
+    "tokenizer_config.json": "95c557768e6b88a7128befc7bfd3c7de50e5d51af9b8b33a9f4dee0e04f99679"
+   },
+   "hf_path": "caslca/Qwen3.8-27B-mlx-uniform-4bit-mtp-drafter",
+   "revision": "81e6bd35f48a6a1ce9c34fafce8ffba81d62b196"
+  },
+  "target": {
+   "files": {
+    "chat_template.jinja": "12827f24b742ea4e80cdc12dbcf9622227056b9f797252a3149263d4f9aaadce",
+    "config.json": "357c5d0b3dae24e5c7b562bf631ad82ca29a5ed9fb0e57075e3decdb43410563",
+    "generation_config.json": "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e",
+    "model-00001-of-00003.safetensors": "075eac5fbba3951bc4870c1ac65d684c32e0abb24284201bd27f49df56735963",
+    "model-00002-of-00003.safetensors": "6c99c446987a432beb1f6ef7d6fde6db02682f1ebe1a913760953140e0fa4e47",
+    "model-00003-of-00003.safetensors": "0e267246064a1e635077dd05e22181f5eda44a1fa8a67dcf46c903f858bbe35b",
+    "model-vision.safetensors": "75fb4fcc9e0c7728d09f1584c61660d0fbc4e4f6cf969a12d24d1f97f628f6e1",
+    "model.safetensors.index.json": "2ced7abff69ea95a844dd7bae67428cf7fd7bb40c9478523ed1a08a1e8960225",
+    "optiq/mtp.safetensors": "e3054bcb1b6fa35f482f6cca7cb3032ba9aa31a3cfb4d1e358d5ebb20b78d0f8",
+    "preprocessor_config.json": "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516",
+    "tokenizer.json": "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523",
+    "tokenizer_config.json": "95c557768e6b88a7128befc7bfd3c7de50e5d51af9b8b33a9f4dee0e04f99679",
+    "video_preprocessor_config.json": "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13"
+   },
+   "hf_path": "caslca/Qwen3.8-27B-mlx-uniform-4bit",
+   "revision": "6302ea426ea0b8cae0e5082f73353bae7640dc58"
+  }
+ }
+}

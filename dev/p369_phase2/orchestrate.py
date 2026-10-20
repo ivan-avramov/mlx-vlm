@@ -1668,6 +1668,26 @@ def e7_timeout():
     return int(102400 / 8 + 600)
 
 
+SNAPSHOT_SKIP = (
+    "README.md",
+    ".gitattributes",
+)  # documentation only (v13 V11: verified on the Hub)
+
+
+def snapshot_files(snap):
+    """P369 v13 V6: every file of a snapshot the loader can read — weights, configs, tokenizer, chat template,
+    sidecars in subdirectories — as relative posix paths; only README / .gitattributes / ``evaluation/`` excluded.
+    """
+    snap = Path(snap)
+    out = []
+    for p in sorted(snap.rglob("*")):
+        rel = p.relative_to(snap).as_posix()
+        if not p.is_file() or rel in SNAPSHOT_SKIP or rel.startswith("evaluation/"):
+            continue
+        out.append(rel)
+    return out
+
+
 def weights_record(hf_path):
     root = hf_hub_cache(
         os.environ, Path.home()
@@ -1675,12 +1695,43 @@ def weights_record(hf_path):
     repo = root / ("models--" + hf_path.replace("/", "--"))
     ref = (repo / "refs" / "main").read_text().strip()
     snap = repo / "snapshots" / ref
-    files = sorted(p for p in snap.iterdir() if p.suffix in (".safetensors", ".json"))
     return dict(
         hf_path=hf_path,
         revision=ref,
-        files={p.name: sha256_file(p.resolve()) for p in files},
+        files={
+            rel: sha256_file((snap / rel).resolve()) for rel in snapshot_files(snap)
+        },
     )
+
+
+PINS = Path(__file__).resolve().parent / "pins.json"
+
+
+def load_pins(path=PINS):
+    """P369 v13 V6 / V11: the reviewed per-entry target / drafter revisions and file sha256s."""
+    return json.loads(Path(path).read_text())
+
+
+def pins_problems(pins, pick, target, drafter):
+    """Every loaded snapshot must be EXACTLY the pinned one: revision, the file set and each sha256."""
+    if pick not in pins:
+        return [f"{pick}: no reviewed pins"]
+    problems = []
+    for role, got in (("target", target), ("drafter", drafter)):
+        want = pins[pick][role]
+        if got["hf_path"] != want["hf_path"] or got["revision"] != want["revision"]:
+            problems.append(
+                f"{pick} {role}: {got['hf_path']}@{got['revision']} != pinned "
+                f"{want['hf_path']}@{want['revision']}"
+            )
+        if got["files"] != want["files"]:
+            diff = sorted(
+                p
+                for p in set(got["files"]) | set(want["files"])
+                if got["files"].get(p) != want["files"].get(p)
+            )
+            problems.append(f"{pick} {role}: files differ from the pins: {diff}")
+    return problems
 
 
 def fork_versions(fork_root):
@@ -1859,6 +1910,11 @@ class Campaign:
                 target=weights_record(model),
                 drafter=weights_record(drafter),
             )
+            problems = pins_problems(  # v13 V6 / V11
+                load_pins(), pick, entry["target"], entry["drafter"]
+            )
+            if problems:
+                raise Refused(f"refused: {problems}")
             self.attested[pick] = {
                 role: dict(revision=entry[role]["revision"], files=entry[role]["files"])
                 for role in ("target", "drafter")
