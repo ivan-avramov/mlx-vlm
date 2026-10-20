@@ -1578,7 +1578,10 @@ def test_main_refuses_a_malformed_smoke_summary_before_any_preflight(
 
 
 # ------------------------------------------------------------------ C185 (plan v8 §3 E2): the same-instance triple
-def _turn(tokens, *, rounds=3, argmax=4, sha="d", finish="length"):
+D64, E64, F64 = "d" * 64, "e" * 64, "f" * 64
+
+
+def _turn(tokens, *, rounds=3, argmax=4, sha=D64, finish="length"):
     return dict(
         final=dict(token_ids=list(tokens), finish_reason=finish),
         mtp_rounds=rounds,
@@ -1626,27 +1629,27 @@ def test_e2_verdict_refuses_non_boolean_flags():
 
 
 def test_e2_summary_decides_on_the_same_instance_pair_only():
-    got = orchestrate.e2_summary({"a": _pair()}, {"a": _cross()}, digests={"a": "d"})
+    got = orchestrate.e2_summary({"a": _pair()}, {"a": _cross()}, digests={"a": D64})
     assert got["verdict"] == "PASS" and got["identity"] == {"a": True}
     assert got["c1_identical"] is True and got["cross_load"]["summary"] == "identical"
     # a cross-load difference is reported and never changes the verdict (C185, like C2)
     far = orchestrate.e2_summary(
-        {"a": _pair()}, {"a": _cross((1, 3))}, digests={"a": "d"}
+        {"a": _pair()}, {"a": _cross((1, 3))}, digests={"a": D64}
     )
     assert far["verdict"] == "PASS"
     assert far["cross_load"] == dict(per_request={"a": False}, summary="unestablished")
     # ON vs OFF1 decides
     fail = orchestrate.e2_summary(
-        {"a": _pair(on=(1, 3))}, {"a": _cross()}, digests={"a": "d"}
+        {"a": _pair(on=(1, 3))}, {"a": _cross()}, digests={"a": D64}
     )
     assert fail["verdict"] == "FAIL" and fail["identity"] == {"a": False}
     # OFF1 vs OFF2 (tokens or finish) differing is ABORT, whatever ON did
     for pair in (_pair(off2=(1, 3)), _pair(on=(1, 3), off2=(1, 3))):
-        got = orchestrate.e2_summary({"a": pair}, {"a": _cross()}, digests={"a": "d"})
+        got = orchestrate.e2_summary({"a": pair}, {"a": _cross()}, digests={"a": D64})
         assert got["verdict"] == "ABORT" and got["c1_identical"] is False, got
     finish = _pair()
     finish["off"][1]["final"]["finish_reason"] = "stop"
-    got = orchestrate.e2_summary({"a": finish}, {"a": _cross()}, digests={"a": "d"})
+    got = orchestrate.e2_summary({"a": finish}, {"a": _cross()}, digests={"a": D64})
     assert got["verdict"] == "ABORT"
 
 
@@ -1655,19 +1658,19 @@ def test_e2_summary_needs_engagement_and_equal_digests():
         (_pair(rounds=0), "no MTP rounds"),
         (_pair(argmax=0), "no argmax readout"),
         (_pair(kernel=False), "kernel verdict"),
-        (_pair(sha="x"), "digest"),
+        (_pair(sha=E64), "digest"),
     ):
-        got = orchestrate.e2_summary({"a": pair}, {"a": _cross()}, digests={"a": "d"})
+        got = orchestrate.e2_summary({"a": pair}, {"a": _cross()}, digests={"a": D64})
         assert got["verdict"] == "INCOMPLETE", why
     # the three trajectories share one templated prompt (straddles have no reconstruction digest)
     split = _pair()
-    split["off"][0]["prompt"]["sha256"] = "y"
+    split["off"][0]["prompt"]["sha256"] = F64
     got = orchestrate.e2_summary({"T1024": split}, {"T1024": _cross()}, digests={})
     assert got["verdict"] == "INCOMPLETE" and got["prompt_digest_problems"]
     # the cross-load arm's prompt is bound to the reconstruction too
     cross = _cross()
-    cross["turns"][0]["prompt"]["sha256"] = "x"
-    got = orchestrate.e2_summary({"a": _pair()}, {"a": cross}, digests={"a": "d"})
+    cross["turns"][0]["prompt"]["sha256"] = E64
+    got = orchestrate.e2_summary({"a": _pair()}, {"a": cross}, digests={"a": D64})
     assert got["prompt_digest_problems"] and got["verdict"] == "INCOMPLETE"
 
 
@@ -1675,19 +1678,19 @@ def test_e2_summary_refuses_malformed_evidence():
     for value in BAD:
         with pytest.raises(orchestrate.MalformedEvidence, match="verdict"):
             orchestrate.e2_summary(
-                {"a": _pair(kernel=value)}, {"a": _cross()}, digests={"a": "d"}
+                {"a": _pair(kernel=value)}, {"a": _cross()}, digests={"a": D64}
             )
     two = _pair()
     two["off"] = two["off"][:1]
     with pytest.raises(orchestrate.MalformedEvidence, match="off"):
-        orchestrate.e2_summary({"a": two}, {"a": _cross()}, digests={"a": "d"})
+        orchestrate.e2_summary({"a": two}, {"a": _cross()}, digests={"a": D64})
     with pytest.raises(orchestrate.MalformedEvidence, match="cross"):
-        orchestrate.e2_summary({"a": _pair()}, {}, digests={"a": "d"})
+        orchestrate.e2_summary({"a": _pair()}, {}, digests={"a": D64})
 
 
 def _e2_pair_camp(tmp_path, pair, cross):
     camp = object.__new__(orchestrate.Campaign)
-    camp.out, camp.digests, camp.jobs = tmp_path, {FABLE: {"a": "d"}}, []
+    camp.out, camp.digests, camp.jobs = tmp_path, {FABLE: {"a": D64}}, []
     camp.job = lambda pick, name, mode, arm, requests: (name, mode, arm, requests)
     camp.run = lambda job: camp.jobs.append(job)
     camp.c84_payloads = lambda pick, items, greedy, limit=None: [
@@ -1709,3 +1712,51 @@ def test_e2_runs_the_triple_in_the_on_worker_and_one_cross_load_off_arm(tmp_path
     assert (n2, m2, a2) == ("e2-off", "e2", "off")
     # ON + OFF1 + OFF2 in one request's budget; the cross-load arm runs it once
     assert r1[0]["timeout_s"] == 3 * r2[0]["timeout_s"]
+
+
+# ------------------------------------------------------------------ C185 review round 1 E1 E2
+@pytest.mark.parametrize(
+    ("where", "key", "value"),
+    [
+        ("on", "token_ids", None),
+        ("on", "token_ids", [1, True]),
+        ("on", "token_ids", (1, 2)),
+        ("off1", "token_ids", None),
+        ("off2", "finish_reason", None),
+        ("cross", "token_ids", [1.0, 2.0]),
+        ("on", "mtp_rounds", True),
+        ("on", "mtp_rounds", "3"),
+        ("on", "argmax", True),
+        ("off1", "mtp_rounds", None),
+    ],
+)
+def test_e2_summary_refuses_malformed_turn_evidence(where, key, value):
+    pair, cross = _pair(), _cross()
+    turn = dict(
+        on=pair["turns"][0],
+        off1=pair["off"][0],
+        off2=pair["off"][1],
+        cross=cross["turns"][0],
+    )[where]
+    if key == "argmax":
+        turn["telemetry"]["speculative_argmax_from_hidden"] = value
+    elif key == "mtp_rounds":
+        turn["mtp_rounds"] = value
+    else:
+        turn["final"][key] = value
+    with pytest.raises(orchestrate.MalformedEvidence, match="malformed evidence"):
+        orchestrate.e2_summary({"a": pair}, {"a": cross}, digests={"a": D64})
+
+
+@pytest.mark.parametrize("sha", [None, "", "d", "D" * 64, 64])
+def test_e2_summary_needs_a_valid_digest_on_every_trajectory(sha):
+    # straddles have no reconstruction digest: four equal missing digests must not bind the prompt
+    pair, cross = _pair(sha=sha), _cross()
+    for turn in pair["off"] + cross["turns"]:
+        turn["prompt"]["sha256"] = sha
+    got = orchestrate.e2_summary({"T1024": pair}, {"T1024": cross}, digests={})
+    assert got["verdict"] == "INCOMPLETE" and got["prompt_digest_problems"], got
+    for turn in pair["turns"] + pair["off"] + cross["turns"]:
+        del turn["prompt"]["sha256"]
+    got = orchestrate.e2_summary({"T1024": pair}, {"T1024": cross}, digests={})
+    assert got["verdict"] == "INCOMPLETE" and got["prompt_digest_problems"], got

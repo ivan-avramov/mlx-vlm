@@ -597,3 +597,107 @@ def test_e2_detached_problems():
         assert any(why in p for p in got), (why, got)
     with pytest.raises(ValueError, match="two detached replays"):
         worker.e2_detached_problems(on, offs[:1], [[]])
+
+
+# ------------------------------------------------------------------ C185 review round 1 E3 E4: the triple coordinator
+class _RG:
+    def __init__(self):
+        self.model, self.mtp_verify_policy = object(), object()
+        self.draft_model, self.draft_kind = "drafter", "mtp"
+
+
+def test_same_instance_rereads_the_live_target_and_policy():
+    rg = _RG()
+    ident = worker.instance_identity(rg)
+    assert worker.same_instance(rg, ident)
+    rg.mtp_verify_policy = object()  # a replaced policy (the review's scenario)
+    assert not worker.same_instance(rg, ident)
+    rg = _RG()
+    ident = worker.instance_identity(rg)
+    rg.model = object()
+    assert not worker.same_instance(rg, ident)
+
+
+@pytest.fixture
+def triple(monkeypatch):
+    """``e2_pair_entry`` with the production calls faked: every turn records the drafter state it ran under."""
+    from p369_phase2 import telemetry
+
+    calls, rg = [], _RG()
+    state = dict(off_rounds=0, fail_at=None, swap_at=None)
+
+    def turn(client, capture, tel, payload, key, timeout):
+        calls.append(("turn", key, rg.draft_model, rg.draft_kind))
+        if key == state["fail_at"]:
+            raise RuntimeError("request failed 500")
+        if key == state["swap_at"]:
+            rg.mtp_verify_policy = object()
+        on = rg.draft_model is not None
+        return dict(
+            final=dict(token_ids=[1, 2], cached_tokens=0, finish_reason="length"),
+            chat_id=f"chat-{len(calls)}",
+            mtp_rounds=3 if on else state["off_rounds"],
+            verify_scope_calls=5 if on else 0,
+            telemetry=dict(speculative_argmax_from_hidden=4 if on else 0),
+        )
+
+    monkeypatch.setattr(worker, "greedy_turn", turn)
+    monkeypatch.setattr(worker, "wait_idle", lambda rg_, m: calls.append(("idle",)))
+    monkeypatch.setattr(
+        worker, "release_session", lambda cid: calls.append(("release", cid))
+    )
+    monkeypatch.setattr(telemetry, "KernelTelemetry", lambda lm: object())
+    monkeypatch.setattr(telemetry, "verdict", lambda tel, manifest: {"pass": True})
+    spec = dict(name="a", payload=dict(model="m"))
+
+    def run():
+        return worker.e2_pair_entry(rg, None, None, None, None, {}, spec, 10.0)
+
+    return run, calls, rg, state
+
+
+def test_e2_pair_entry_runs_on_then_two_detached_replays_in_order(triple):
+    run, calls, rg, _ = triple
+    entry = run()
+    assert calls == [
+        ("turn", "a", "drafter", "mtp"),
+        ("idle",),
+        ("release", "chat-1"),
+        ("turn", "a#OFF1", None, None),
+        ("idle",),
+        ("release", "chat-4"),
+        ("turn", "a#OFF2", None, None),
+        ("idle",),
+        ("release", "chat-7"),
+    ]
+    assert (rg.draft_model, rg.draft_kind) == ("drafter", "mtp")  # restored
+    assert [t["chat_id"] for t in entry["turns"] + entry["off"]] == [
+        "chat-1",
+        "chat-4",
+        "chat-7",
+    ]
+    assert entry["verdict"] == {"pass": True}
+    assert entry["telemetry"]["speculative_argmax_from_hidden"] == 4
+
+
+def test_e2_pair_entry_refuses_a_replaced_policy(triple):
+    run, _, rg, state = triple
+    state["swap_at"] = "a#OFF1"
+    with pytest.raises(RuntimeError, match="verify policy"):
+        run()
+    assert (rg.draft_model, rg.draft_kind) == ("drafter", "mtp")
+
+
+def test_e2_pair_entry_restores_the_drafter_when_a_replay_fails(triple):
+    run, calls, rg, state = triple
+    state["fail_at"] = "a#OFF2"
+    with pytest.raises(RuntimeError, match="request failed"):
+        run()
+    assert (rg.draft_model, rg.draft_kind) == ("drafter", "mtp")
+
+
+def test_e2_pair_entry_raises_on_a_speculative_replay(triple):
+    run, _, _, state = triple
+    state["off_rounds"] = 2
+    with pytest.raises(RuntimeError, match="OFF1 ran 2 MTP rounds"):
+        run()
