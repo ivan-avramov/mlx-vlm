@@ -228,6 +228,18 @@ def codec_arm_problems(argv_a, argv_b):
     return problems
 
 
+def request_record(probe, finish_reason, widths, live, *, warmup):
+    """One request's result row: the measurement, its finish, the verify widths, and the FULL validated live cache
+    manifest (P405 code round 3 K10)."""
+    return dict(
+        probe,
+        finish_reason=finish_reason,
+        live_cache=live,
+        widths=sorted(set(widths)),
+        warmup=warmup,
+    )
+
+
 def leg_cache_problems(observed, template, argv):
     """Code round 2 K7: the LIVE target cache of a measured request matches, layer by layer, what its argv implies."""
     from p369_phase2 import kvmanifest
@@ -439,16 +451,9 @@ def leg(job_path):
             )
             if problems:
                 raise RuntimeError(f"request {i}: {problems}")
-            reps.append(
-                dict(
-                    probe,
-                    finish_reason=finish,
-                    live_cache_kinds=sorted({m["kind"] for m in live}),
-                    widths=sorted(set(widths)),
-                    warmup=i < warmup,
-                )
-            )
+            reps.append(request_record(probe, finish, widths, live, warmup=i < warmup))
         result.update(
+            cache_template=template,  # K10: once per leg
             prompt_tokens=tokens,
             warmup=[r for r in reps if r["warmup"]],
             measured=[r for r in reps if not r["warmup"]],

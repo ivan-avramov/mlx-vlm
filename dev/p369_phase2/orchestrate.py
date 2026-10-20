@@ -1638,29 +1638,18 @@ SIZE_PREFIX = (
 SIZE_SUFFIX = "Now write the story."
 SHORT_PROMPT = "Explain, step by step, why the sum of two odd integers is even."
 ESTIMATE_LIMIT_S = 3.5 * 3600
-# C193 (operator 2026-10-20): recorded rulings that lift ONLY the smoke gate's `fits` for one pick's full run (its
-# total-wall watchdog stays the cap); the P369 v13 phase-based projection replaces this in the v13 build.
-PROJECTION_RULINGS = (
-    {  # code round 2 K8: the ruling carries its authorized wall cap (P369 v13 V17)
-        "C193": dict(pick="Qwen3.8-27B-mlx-uniform-4bit", wall_limit_s=20400),
-    }
-)
+# C193 (operator 2026-10-20): recorded rulings that lift ONLY the smoke gate's `fits` for one pick's full run; the
+# P369 v13 phase-based projection replaces this in the v13 build. C194 ("no hard stop"): a ruling brings NO campaign
+# wall cap — C184 stands; the per-request watchdogs remain the only automatic stops.
+PROJECTION_RULINGS = {"C193": dict(pick="Qwen3.8-27B-mlx-uniform-4bit")}
 
 
-def ruling_wall_limit(ruling, wall_limit_s):
-    """The full run's wall limit under a projection ruling: the ruling's cap, or a tighter explicit one; a looser
-    explicit limit refuses. Without a ruling, C184's default (no campaign hard stop) stands.
-    """
-    if ruling is None:
-        return wall_limit_s
-    cap = PROJECTION_RULINGS[ruling]["wall_limit_s"]
-    if wall_limit_s is None:
-        return cap
-    if wall_limit_s > cap:
-        raise SystemExit(
-            f"--wall-limit-s {wall_limit_s} exceeds ruling {ruling}'s cap {cap}"
-        )
-    return wall_limit_s
+def positive_seconds(raw):
+    """``--wall-limit-s``: finite seconds > 0 (P405 code round 3 K11: nan made the stop a silent no-op)."""
+    value = float(raw)
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError(f"expected finite seconds > 0, got {raw!r}")
+    return value
 
 
 def campaign_deadline(wall_limit_s, *, now):
@@ -2379,7 +2368,7 @@ def main(argv=None):
     )
     ap.add_argument(
         "--wall-limit-s",
-        type=float,
+        type=positive_seconds,
         help="an operator-set hard total-wall stop (default: none, C184)",
     )
     ap.add_argument(
@@ -2412,7 +2401,6 @@ def main(argv=None):
         problems = smoke_authorization_problems(  # code round 6 H36; C193
             smoke, projection_ruling=args.projection_ruling
         )
-        args.wall_limit_s = ruling_wall_limit(args.projection_ruling, args.wall_limit_s)
         if problems:
             raise SystemExit(f"full: the smoke summary does not authorize: {problems}")
     checks = preflight(args, out.parent)
