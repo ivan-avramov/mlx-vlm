@@ -11,7 +11,6 @@ import json
 from pathlib import Path
 
 import mlx.core as mx
-import pytest
 from mlx.utils import tree_flatten
 
 from mlx_vlm.models.qwen3_5_moe.config import TextConfig as MoeTextConfig
@@ -121,3 +120,217 @@ def test_an_adversarial_nested_qwen3_next_source_never_yields_a_dense_drafter_wi
     assert layers == [
         "Qwen3_5MoeDecoderLayer"
     ], f"a nested {written['text_config']['model_type']!r} source built {layers}"
+
+
+# ------------------------------------------------------------------ V3 / V15: the harness observes the MoE stack
+import copy  # noqa: E402
+import sys  # noqa: E402
+
+DEV = Path(__file__).resolve().parents[2] / "dev"
+sys.path.insert(0, str(DEV))
+
+from p369_phase2 import observe, telemetry  # noqa: E402
+from test_mtp_exactness import PROMPT, deployed_sampling, fake_model  # noqa: E402
+from test_mtp_stop_state import turn  # noqa: E402
+
+from mlx_vlm.generate.common import PromptCacheState  # noqa: E402
+from mlx_vlm.models.qwen3_5_moe.config import (
+    ModelConfig as MoeModelConfig,
+)  # noqa: E402
+from mlx_vlm.models.qwen3_5_moe.config import (
+    VisionConfig as MoeVisionConfig,
+)  # noqa: E402
+from mlx_vlm.models.qwen3_5_moe.language import (
+    LanguageModel as MoeLanguageModel,
+)  # noqa: E402
+
+LAYERS = 4  # full attention every 2nd: GDN, attention, GDN, attention
+PARAMS = deployed_sampling("Qwen3.8-27B-mlx-uniform-4bit")
+
+
+def tiny_moe_target(seed=0):
+    mx.random.seed(seed)
+    cfg = MoeTextConfig.from_dict(
+        dict(tiny_moe_text(), num_hidden_layers=LAYERS, full_attention_interval=2)
+    )
+    vision = MoeVisionConfig(
+        model_type="qwen3_5_moe",
+        depth=1,
+        hidden_size=8,
+        intermediate_size=16,
+        out_hidden_size=32,
+        num_heads=1,
+        in_channels=3,
+        patch_size=4,
+        temporal_patch_size=2,
+        spatial_merge_size=1,
+        num_position_embeddings=4,
+    )
+    lm = MoeLanguageModel(
+        cfg,
+        config=MoeModelConfig(
+            text_config=cfg, vision_config=vision, model_type="qwen3_5_moe"
+        ),
+    )
+    lm.model.norm.weight = lm.model.norm.weight * 12.0
+    mx.eval(lm.parameters())
+    return lm
+
+
+def tiny_moe_drafter(lm, seed=1):
+    tc = copy.deepcopy(lm.config.text_config)
+    tc.mtp_num_hidden_layers = 1
+    mx.random.seed(seed)
+    d = Qwen3_5MTPDraftModel(MTPConfig(text_config=tc, block_size=3))
+    mx.eval(d.parameters())
+    return d
+
+
+def test_v3a_the_target_is_structurally_moe():
+    lm = tiny_moe_target()
+    assert type(lm).__name__ == "LanguageModel" and type(lm).__module__.endswith(
+        "qwen3_5_moe.language"
+    )
+    layers = lm.model.layers
+    assert len(layers) == LAYERS
+    assert [type(layer).__name__ for layer in layers] == [
+        "Qwen3_5MoeDecoderLayer"
+    ] * LAYERS
+    assert [layer.is_linear for layer in layers] == [
+        True,
+        False,
+        True,
+        False,
+    ]  # GDN / full-attention split
+    moe = [
+        layer.mlp
+        for layer in layers
+        if type(layer.mlp).__name__ == "Qwen3_5MoeSparseMoeBlock"
+    ]
+    assert len(moe) == LAYERS and {(m.num_experts, m.top_k) for m in moe} == {
+        (EXPERTS, TOP_K)
+    }
+
+
+def test_v3c_the_manifest_requires_every_routed_bank_projection():
+    lm = tiny_moe_target()
+    manifest = telemetry.manifest_from_model(lm)
+    routed = {n: i for n, i in manifest.items() if i["kind"] == "routed"}
+    want = {
+        f"model.layers.{i}.mlp.switch_mlp.{p}"
+        for i in range(LAYERS)
+        for p in ("gate_proj", "up_proj", "down_proj")
+    }
+    assert set(routed) == want
+    assert all(
+        i["on_path"] and i["expected"] == dict(routed=["routed_gather"])
+        for i in routed.values()
+    )
+
+
+def _observed_turn(lm, drafter, *, sabotage=None, monkeypatch=None):
+    tel = telemetry.KernelTelemetry(lm, drafter=drafter)
+    keys = observe.KeyLengths()  # the verifier block boundaries
+    with tel, keys, observe.Recorder(mode="on", lm=lm, probe_token=5) as rec:
+        if sabotage:
+            sabotage(monkeypatch)
+        out, _ = turn(
+            fake_model(lm),
+            PROMPT,
+            PromptCacheState(),
+            drafter=drafter,
+            n=12,
+            seed=5,
+            params=PARAMS,
+        )
+    rec.blocks = keys.blocks
+    return tel, rec, list(out)
+
+
+def test_v3b_v3c_v15_one_mtp_request_is_fully_observed():
+    """(b) recorder rows, emission cuts, commit snapshots and verifier blocks on the MoE stack; (c) the router, shared
+    expert and each routed bank projection exactly once per verify-scope invocation; V15 the drafter's own MoE path —
+    router, shared expert and routed gate / up / down — in its draft scope, with the selected experts recorded.
+    """
+    lm = tiny_moe_target()
+    drafter = tiny_moe_drafter(lm)
+    tel, rec, out = _observed_turn(lm, drafter)
+    assert len(out) == 12 and rec.rows and rec.commits and rec.blocks
+    v = telemetry.verdict(tel, telemetry.manifest_from_model(lm))
+    assert v["pass"], v["problems"]
+    invocations = telemetry.routed_invocations(tel, scope="verify")
+    assert invocations and all(
+        sorted(i["projections"]) == ["down_proj", "gate_proj", "up_proj"]
+        for i in invocations
+    )
+    assert any(
+        i["width"] > 1 for i in invocations
+    )  # a real verify block, not only singletons
+    d = telemetry.draft_verdict(tel, drafter)
+    assert d["pass"], d["problems"]
+    assert d["invocations"] and all(i["selected_experts"] for i in d["invocations"])
+
+
+def test_v3e_a_verifier_bypassing_a_routed_projection_fails_the_verdict(monkeypatch):
+    from mlx_vlm.models.qwen3_5 import speculative_verifier as sv
+
+    def no_gate(
+        self, switch_mlp, x, indices
+    ):  # sabotage: the routed gate bank never runs
+        flat = x.reshape(-1, x.shape[-1])
+        flat = mx.expand_dims(flat, (-2, -3))
+        idx = indices.reshape(-1, indices.shape[-1])
+        up = switch_mlp.up_proj(flat, idx, sorted_indices=False)
+        out = switch_mlp.down_proj(up, idx, sorted_indices=False)
+        return out.squeeze(-2).reshape(*x.shape[:2], indices.shape[-1], -1)
+
+    lm = tiny_moe_target()
+    drafter = tiny_moe_drafter(lm)
+    tel, _, _ = _observed_turn(
+        lm,
+        drafter,
+        sabotage=lambda mp: mp.setattr(
+            sv.Qwen3_5BatchInvariantForward, "_switch_glu", no_gate
+        ),
+        monkeypatch=monkeypatch,
+    )
+    assert not telemetry.verdict(tel, telemetry.manifest_from_model(lm))["pass"]
+
+
+def test_v15_a_drafter_skipping_its_routed_experts_fails_the_draft_verdict(monkeypatch):
+    from mlx_vlm.models.qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
+
+    def shared_only(self, x):  # sabotage: only the shared expert runs
+        return self.shared_expert(x) * mx.sigmoid(self.shared_expert_gate(x))
+
+    lm = tiny_moe_target()
+    drafter = tiny_moe_drafter(lm)
+    tel, _, _ = _observed_turn(
+        lm,
+        drafter,
+        sabotage=lambda mp: mp.setattr(
+            Qwen3_5MoeSparseMoeBlock, "__call__", shared_only
+        ),
+        monkeypatch=monkeypatch,
+    )
+    assert not telemetry.draft_verdict(tel, drafter)["pass"]
+
+
+def test_v3e_an_absent_routed_hook_fails_the_verdict(monkeypatch):
+    """Disabling the new routed hook (the projections run unobserved) must fail coverage, never pass."""
+    from mlx_vlm.models import switch_layers
+
+    real = {
+        c: c.__call__
+        for c in (switch_layers.SwitchLinear, switch_layers.QuantizedSwitchLinear)
+    }
+    lm = tiny_moe_target()
+    drafter = tiny_moe_drafter(lm)
+
+    def unhook(mp):
+        for cls, fn in real.items():
+            mp.setattr(cls, "__call__", fn)
+
+    tel, _, _ = _observed_turn(lm, drafter, sabotage=unhook, monkeypatch=monkeypatch)
+    assert not telemetry.verdict(tel, telemetry.manifest_from_model(lm))["pass"]
+    assert not telemetry.draft_verdict(tel, drafter)["pass"]
