@@ -458,13 +458,35 @@ def pick_outcome(verdicts):
             node = node.get(key) if isinstance(node, dict) else None
         return exact_bool(node, f"{name}.{path}")
 
+    def rejected(name, v):  # P399: attempts retried for validity are observations too
+        attempts = v.get("rejected") if isinstance(v, dict) else None
+        if not isinstance(attempts, list):
+            raise MalformedEvidence(
+                f"malformed evidence: {name}.rejected = {attempts!r}"
+            )
+        return [
+            {
+                key: exact_bool(
+                    a.get(key) if isinstance(a, dict) else None,
+                    f"{name}.rejected[{k}].{key}",
+                )
+                for key in ("neutral", "c1")
+            }
+            for k, a in enumerate(attempts)
+        ]
+
     keys = ("c1.identical", "neutral", "evidence_ok", "pass_", "c2.identical")
     values = [  # code round 6 H34: every cell's flags validated before any decides
-        {key: flag(name, v, key) for key in keys} for name, v in verdicts.items()
+        dict({key: flag(name, v, key) for key in keys}, rejected=rejected(name, v))
+        for name, v in verdicts.items()
     ]
-    if any(not v["c1.identical"] for v in values):
+    if any(
+        not v["c1.identical"] or any(not a["c1"] for a in v["rejected"]) for v in values
+    ):
         e1c = "ABORT"
-    elif any(not v["neutral"] for v in values):
+    elif any(
+        not v["neutral"] or any(not a["neutral"] for a in v["rejected"]) for v in values
+    ):
         e1c = "FAIL"
     elif any(not v["evidence_ok"] or not v["pass_"] for v in values):
         e1c = "INCOMPLETE"
@@ -1814,13 +1836,30 @@ class Campaign:
             for i, ((t, text), req) in enumerate(zip(pending, requests)):
                 path = self.out / pick / name / f"req-{i}.json"
                 entry = json.loads(path.read_text())
-                attempts.setdefault(req["name"], []).append(
-                    dict(seed=seed, path=str(path))
-                )
                 n = len(entry["final"]["token_ids"])
                 valid = t is None or (
                     exact_bool(entry.get("straddle"), f"{req['name']}.straddle")
                     and n >= 65
+                )
+                # P399: every attempt is a same-instance observation, valid or not
+                seen = e1c_verdict(
+                    entry,
+                    entry["pair"],
+                    threshold=t,
+                    verify_policy=PICKS[pick]["verify_policy"],
+                )
+                attempts.setdefault(req["name"], []).append(
+                    dict(
+                        seed=seed,
+                        path=str(path),
+                        valid=valid,
+                        neutral=seen["neutral"],
+                        c1=exact_bool(
+                            entry["c1"]["acceptance"].get("pass"),
+                            f"{req['name']}.c1.acceptance.pass",
+                        ),
+                        problems=seen["problems"],
+                    )
                 )
                 if valid:
                     accepted[req["name"]] = dict(
@@ -1830,8 +1869,9 @@ class Campaign:
                     still.append((t, text))
             pending = still
         if pending:
-            raise RuntimeError(
-                f"{pick}: E1c cells invalid after {len(SEEDS)} seeds: {pending}"
+            raise RuntimeError(  # P399: with every attempt's same-instance evidence
+                f"{pick}: E1c cells invalid after {len(SEEDS)} seeds: "
+                f"{[t for t, _ in pending]}; attempts {attempts}"
             )
         names = list(accepted)
         requests = []
@@ -1879,6 +1919,7 @@ class Campaign:
                 smoke_positives=on.get("smoke_positives"),
                 forced_positions=on.get("forced_positions"),  # P398: not compared
                 attempts=attempts[name],
+                rejected=[a for a in attempts[name] if not a["valid"]],
             )
             verdicts[name] = v
         return verdicts
