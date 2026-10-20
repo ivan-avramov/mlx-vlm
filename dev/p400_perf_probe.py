@@ -167,30 +167,26 @@ def leg_schedule(picks):
     return plan
 
 
-def kv_expected(argv):
-    """The KV codec the argv asks for: ``bits`` None = native KV (``--kv-bits`` absent or 0; the scheme is moot)."""
-    opts = dict(zip(argv, argv[1:]))
-    bits = float(opts.get("--kv-bits") or 0) or None
-    return dict(
-        bits=bits, scheme=opts.get("--kv-quant-scheme", "uniform") if bits else None
-    )
-
-
 def served_check(worker, rg, argv, pick):
-    """Code round 2 C6 (+ P405): the deployed MTP tuple and the KV codec the argv names are what the worker serves."""
-    from p369_phase2 import orchestrate
+    """Code round 2 C6 (+ P405 F3): the deployed MTP tuple and EVERY resolved KV field the argv names are what the worker
+    serves."""
+    from p369_phase2 import kvmanifest, orchestrate
 
+    want = kvmanifest.kv_from_argv(argv)
     state = worker.served_state()
     worker.assert_served(
         state,
-        dict(drafter=True, verify_policy=orchestrate.PICKS[pick]["verify_policy"]),
+        dict(
+            drafter=True,
+            verify_policy=orchestrate.PICKS[pick]["verify_policy"],
+            kv=want,
+        ),
     )
-    want = kv_expected(argv)
-    bits = float(rg.kv_bits or 0) or None
-    got = dict(bits=bits, scheme=rg.kv_quant_scheme if bits else None)
-    if got != want:
-        raise RuntimeError(f"served KV {got} != the argv's {want}")
-    return dict(state, kv=got)
+    got = kvmanifest.served_kv(rg, os.environ)
+    problems = kvmanifest.kv_problems(got, want)
+    if problems:
+        raise RuntimeError(f"served KV differs from the argv: {problems}")
+    return dict(state=state, kv=got)
 
 
 # ------------------------------------------------------------------ one leg (a child process)

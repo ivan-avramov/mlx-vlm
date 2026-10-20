@@ -21,6 +21,11 @@ import uuid
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
+try:
+    from p369_phase2 import kvmanifest
+except ImportError:  # run as a script: this directory is sys.path[0]
+    import kvmanifest
+
 FILLER = "alpha beta gamma delta epsilon zeta eta theta iota kappa".split()
 NUDGES = list("abcdefghijklmnopqrstuvwxyz0123456789")
 
@@ -171,6 +176,7 @@ def served_state():
         apc_env=os.environ.get("APC_ENABLED"),
         session_max=getattr(session_manager, "_session_cache_max", None),
         session_max_env=os.environ.get("MLX_VLM_CACHE_SESSION_MAX"),
+        kv=kvmanifest.served_kv(rg, os.environ),  # P405 F3: every resolved KV field
     )
 
 
@@ -192,6 +198,12 @@ def assert_served(state, expect):
         problems.append(
             f"session max {state['session_max']} / env {state['session_max_env']}"
         )
+    if "kv" not in expect:  # P405 F3: fail closed
+        problems.append("no KV expectation")
+    else:
+        problems += [
+            f"KV {p}" for p in kvmanifest.kv_problems(state["kv"], expect["kv"])
+        ]
     if problems:
         raise RuntimeError("served state mismatch: " + "; ".join(problems))
 
@@ -1130,6 +1142,11 @@ def run_job(job, out_dir, result):
 
                 # smoke 4: the leaf classes the state hash and the smoke positives saw
                 entry["leaf_census"] = cache_census(iter_leaf_caches(on._cache or []))
+                # P405 F3: the exact per-layer manifest, and the model's unquantized template it is checked against
+                entry["leaf_manifest"] = dict(
+                    observed=kvmanifest.manifest(on._cache or []),
+                    template=kvmanifest.manifest(lm.make_cache()),
+                )
                 metrics = server.runtime.metrics
                 replays = []
                 wait_idle(rg, metrics)

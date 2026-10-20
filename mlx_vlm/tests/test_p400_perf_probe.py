@@ -124,8 +124,15 @@ def test_the_leg_asserts_the_served_tuple_and_kv_codec_its_argv_asks_for(monkeyp
     argv = ["--model", "m", "--kv-bits", "4", "--kv-quant-scheme", "turboquant"]
     argv += ["--quantized-kv-start", "0"]
     got = probe.served_check(Worker, _RG(4.0, "turboquant"), argv, pick)
-    assert calls == [(dict(state=1), dict(drafter=True, verify_policy="joint_v1"))]
-    assert got["kv"]["kv_quant_scheme"] == "turboquant" and got["state"] == 1
+    from p369_phase2 import kvmanifest
+
+    want = kvmanifest.kv_from_argv(argv)
+    assert calls == [
+        (dict(state=1), dict(drafter=True, verify_policy="joint_v1", kv=want))
+    ]
+    assert got["kv"]["kv_quant_scheme"] == "turboquant" and got["state"] == dict(
+        state=1
+    )
     import pytest
 
     for rg in (

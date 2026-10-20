@@ -23,6 +23,11 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+try:
+    from p369_phase2 import kvmanifest
+except ImportError:  # run as a script: this directory is sys.path[0]
+    import kvmanifest
+
 PRODUCTION = "da27f0ef"  # P400 + P401 (C188); was 4e6d0e03 (the P369 production fixes)
 PICKS = {
     "Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed": dict(
@@ -791,6 +796,30 @@ def kv_positive_kind(census, where):
     )
 
 
+def leaf_manifest_problems(pick, name, cell, kv):
+    """P405 F3: the positive cell's live cache matches, layer path by layer path, what its argv's KV codec implies."""
+    where = f"{pick} {name}"
+    lm = cell.get("leaf_manifest")
+    if not (
+        isinstance(lm, dict)
+        and isinstance(lm.get("observed"), list)
+        and isinstance(lm.get("template"), list)
+        and lm["template"]
+    ):
+        raise MalformedEvidence(f"malformed evidence: {where}.leaf_manifest = {lm!r}")
+    if not isinstance(kv, dict) or set(kv) != set(kvmanifest.KV_FIELDS) | {
+        "tq_kv_quant_mode"
+    }:
+        raise MalformedEvidence(f"malformed evidence: {pick}.kv = {kv!r}")
+    try:
+        found = kvmanifest.manifest_problems(lm["observed"], lm["template"], kv)
+    except (
+        ValueError
+    ) as exc:  # a codec the manifest does not model: refused, never guessed
+        found = [str(exc)]
+    return [f"{where}: leaf manifest {p}" for p in found]
+
+
 def smoke_gate(picks):
     """Every live positive fired (TurboQuant's required where TurboQuant KV is served), every E1c cell
     passed, E2 passed, exactly the first reconstructed C84 item's E7b session ran and reported (its
@@ -821,6 +850,7 @@ def smoke_gate(picks):
                 need.add(kv_positive_kind(v.get("leaf_census"), f"{pick} {name}"))
                 if not baseline or not need <= seen:
                     problems.append(f"{pick}: smoke positives {sp}")
+                problems += leaf_manifest_problems(pick, name, v, record.get("kv"))
         # code round 2 C2: exactly the scheduled cells, the positive block on the last one only
         cells = record.get("e1c") or {}
         scheduled = [f"T{t}" for t in SMOKE_THRESHOLDS]
@@ -1794,6 +1824,7 @@ class Campaign:
             drafter=arm == "on",
             verify_policy=PICKS[pick]["verify_policy"] if arm == "on" else None,
             revisions=revisions,  # code round 2 H9: what the worker must actually load
+            kv=kvmanifest.kv_from_argv(self.arms[pick][arm]),  # P405 F3
         )
         timeout = sum(int(r["timeout_s"]) for r in requests) + 900
         return dict(
@@ -1954,6 +1985,7 @@ class Campaign:
                 leaf_census=on.get(
                     "leaf_census"
                 ),  # smoke 9: what the hash / positives saw
+                leaf_manifest=on.get("leaf_manifest"),  # P405 F3
                 attempts=attempts[name],
                 rejected=[a for a in attempts[name] if not a["valid"]],
             )
@@ -2143,6 +2175,7 @@ class Campaign:
         """
         started = time.monotonic()
         record = self.summary["picks"].setdefault(pick, {})
+        record["kv"] = kvmanifest.kv_from_argv(self.arms[pick]["on"])  # P405 F3
 
         def save():  # C184: every finished step reaches summary.json at once
             record["wall_s"] = round(time.monotonic() - started)

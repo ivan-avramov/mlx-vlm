@@ -797,6 +797,7 @@ def test_run_pick_saves_each_step_as_it_finishes(monkeypatch):
     saved = []
     camp = object.__new__(orchestrate.Campaign)
     camp.stack, camp.bench_paths = None, []
+    camp.arms = {FABLE: dict(on=["--kv-bits", "0"], off=["--kv-bits", "0"])}  # P405 F3
     monkeypatch.setattr(orchestrate, "c84_items", lambda stack, pick: [])
     camp.check_bench = lambda pick: None
     camp.size = lambda pick, thresholds: {}
@@ -1254,6 +1255,7 @@ def test_the_whole_lifecycle_is_one_persistence_boundary(tmp_path, monkeypatch):
 def _smoke_camp(monkeypatch, calls):
     camp = object.__new__(orchestrate.Campaign)
     camp.stack, camp.bench_paths = None, []
+    camp.arms = {FABLE: dict(on=["--kv-bits", "0"], off=["--kv-bits", "0"])}  # P405 F3
     monkeypatch.setattr(orchestrate, "c84_items", lambda stack, pick: ["i0", "i1"])
     camp.check_bench = lambda pick: None
     camp.size = lambda pick, thresholds: {}
@@ -2001,6 +2003,7 @@ def test_the_smoke_gate_wants_the_kv_positive_of_the_leaf_actually_served(
             "T65536": dict(
                 pass_=True,
                 leaf_census=census,
+                leaf_manifest=_smoke_e1c()["T65536"]["leaf_manifest"],
                 smoke_positives=dict(baseline_pass=True, fired=fired),
             ),
         }
@@ -2015,6 +2018,7 @@ def test_the_smoke_gate_wants_the_kv_positive_of_the_leaf_actually_served(
                 "T65536": dict(
                     pass_=True,
                     leaf_census=census,
+                    leaf_manifest=_smoke_e1c()["T65536"]["leaf_manifest"],
                     smoke_positives=dict(baseline_pass=True, fired=wrong),
                 ),
             }
