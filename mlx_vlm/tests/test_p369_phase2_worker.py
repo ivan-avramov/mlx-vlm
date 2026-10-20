@@ -1086,7 +1086,14 @@ def test_the_in_support_perturbation_moves_the_boundary_when_every_support_is_on
     assert position == 1 and _changes(latest[1], perturbed)
 
 
-# ------------------------------------------------------------------ P369 v13 V11: the LOADED drafter's architecture
+# ------------------------------------------------------------------ P369 v13 V11 / code round 1 M3: the LOADED drafter
+EMBED, HEAD = object(), object()
+
+
+def _bank(cls="QuantizedSwitchLinear", bits=4, group_size=64):
+    return type(cls, (), dict(bits=bits, group_size=group_size))()
+
+
 def _drafter(
     text_type="qwen3_5_text",
     layer="Qwen3_5DecoderLayer",
@@ -1094,6 +1101,9 @@ def _drafter(
     hidden=5120,
     experts=None,
     bits=4,
+    block_size=3,
+    head=HEAD,
+    banks=None,
 ):
     tc = types.SimpleNamespace(
         model_type=text_type,
@@ -1102,27 +1112,50 @@ def _drafter(
         num_experts=experts and experts[0],
         num_experts_per_tok=experts and experts[1],
     )
-    quant = types.SimpleNamespace(bits=bits, group_size=64)
     layer_cls = type(layer, (), {})
-    d = types.SimpleNamespace(
-        config=types.SimpleNamespace(model_type="qwen3_5_mtp", text_config=tc),
-        layers=[layer_cls() for _ in range(depth)],
+    layers = []
+    for _ in range(depth):
+        lay = layer_cls()
+        if experts:
+            parts = banks or {p: _bank() for p in ("gate_proj", "up_proj", "down_proj")}
+            lay.mlp = types.SimpleNamespace(switch_mlp=types.SimpleNamespace(**parts))
+        layers.append(lay)
+    return types.SimpleNamespace(
+        config=types.SimpleNamespace(
+            model_type="qwen3_5_mtp", text_config=tc, block_size=block_size
+        ),
+        layers=layers,
         _input_embed=EMBED,
-        _lm_head_fn=len,
-        quantized=[quant],
+        _lm_head_fn=head,
+        quantized=[types.SimpleNamespace(bits=bits, group_size=64)],
     )
-    return d
 
 
-EMBED = object()
-TARGET = dict(hidden=5120, vocab=248320, embed=id(EMBED))
-DENSE = dict(layer="Qwen3_5DecoderLayer", depth=1, experts=None, quant=[(4, 64)])
-MOE = dict(layer="Qwen3_5MoeDecoderLayer", depth=1, experts=(256, 8), quant=[(4, 64)])
+TARGET = dict(hidden=5120, vocab=248320, embed=id(EMBED), head=["module", id(HEAD)])
+DENSE = dict(
+    layer="Qwen3_5DecoderLayer",
+    depth=1,
+    experts=None,
+    quant=[(4, 64)],
+    text_type="qwen3_5_text",
+    block_size=3,
+)
+MOE = dict(
+    layer="Qwen3_5MoeDecoderLayer",
+    depth=1,
+    experts=(256, 8),
+    quant=[(4, 64)],
+    text_type="qwen3_5_moe_text",
+    block_size=3,
+    banks=("QuantizedSwitchLinear", 4, 64),
+)
 
 
-def _identity(d):
+def _identity(d, requested=None):
     return worker.drafter_identity(
-        d, quantized=lambda m: [(q.bits, q.group_size) for q in m.quantized]
+        d,
+        requested_block=requested,
+        quantized=lambda m: [(q.bits, q.group_size) for q in m.quantized],
     )
 
 
@@ -1130,29 +1163,64 @@ def test_a_loaded_dense_drafter_matching_its_target_passes():
     assert worker.drafter_problems(_identity(_drafter()), TARGET, DENSE) == []
 
 
-def test_a_loaded_moe_drafter_must_build_moe_layers():
-    """V12 / V14: a nested `qwen3_next` text type would build DENSE layers holding expert weights."""
+def test_a_loaded_moe_drafter_must_build_moe_layers_with_int4_g64_banks():
+    """V12 / V14 / M3: MoE layers, the nested MoE text type, and EACH routed bank int4 / g64."""
     moe = _drafter(
         "qwen3_5_moe_text", "Qwen3_5MoeDecoderLayer", hidden=2048, experts=(256, 8)
     )
-    assert worker.drafter_problems(_identity(moe), dict(TARGET, hidden=2048), MOE) == []
+    tgt = dict(TARGET, hidden=2048)
+    assert worker.drafter_problems(_identity(moe), tgt, MOE) == []
     dense_built = _drafter(
         "qwen3_next", "Qwen3_5DecoderLayer", hidden=2048, experts=(256, 8)
     )
-    assert worker.drafter_problems(
-        _identity(dense_built), dict(TARGET, hidden=2048), MOE
+    assert worker.drafter_problems(_identity(dense_built), tgt, MOE)
+    partly_dense = _drafter(
+        "qwen3_5_moe_text",
+        "Qwen3_5MoeDecoderLayer",
+        hidden=2048,
+        experts=(256, 8),
+        banks=dict(gate_proj=_bank(), up_proj=_bank(), down_proj=_bank("SwitchLinear")),
     )
+    assert worker.drafter_problems(_identity(partly_dense), tgt, MOE)
+    g32 = _drafter(
+        "qwen3_5_moe_text",
+        "Qwen3_5MoeDecoderLayer",
+        hidden=2048,
+        experts=(256, 8),
+        banks={p: _bank(group_size=32) for p in ("gate_proj", "up_proj", "down_proj")},
+    )
+    assert worker.drafter_problems(_identity(g32), tgt, MOE)
 
 
 @pytest.mark.parametrize(
-    ("change", "target"),
+    ("change", "target", "requested"),
     [
-        (dict(depth=2), TARGET),
-        (dict(hidden=4096), TARGET),
-        (dict(bits=8), TARGET),
-        ({}, dict(TARGET, vocab=1)),
-        ({}, dict(TARGET, embed=id(object()))),  # not bound to the target's embeddings
+        (dict(depth=2), TARGET, None),
+        (dict(hidden=4096), TARGET, None),
+        (dict(bits=8), TARGET, None),
+        ({}, dict(TARGET, vocab=1), None),
+        (
+            {},
+            dict(TARGET, embed=id(object())),
+            None,
+        ),  # not bound to the target's embeddings
+        (dict(text_type="qwen3_next"), TARGET, None),  # M3: the nested text type
+        (dict(block_size=4), TARGET, None),  # M3: the certified block size
+        ({}, TARGET, 5),  # M3: an effective proposal width other than the certified one
+        (dict(head=len), TARGET, None),  # M3: a callable head that is not THIS target's
     ],
 )
-def test_the_loaded_drafter_must_match_the_certified_shape(change, target):
-    assert worker.drafter_problems(_identity(_drafter(**change)), target, DENSE)
+def test_the_loaded_drafter_must_match_the_certified_shape(change, target, requested):
+    assert worker.drafter_problems(
+        _identity(_drafter(**change), requested), target, DENSE
+    )
+
+
+def test_the_head_identity_names_a_tied_embedding_method():
+    class Embed:
+        def as_linear(self, x):
+            return x
+
+    e = Embed()
+    assert worker._callable_identity(e.as_linear) == ["method", id(e), "as_linear"]
+    assert worker._callable_identity(HEAD) == ["module", id(HEAD)]
