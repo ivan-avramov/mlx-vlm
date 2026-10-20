@@ -187,6 +187,65 @@ def tiny_moe_drafter(lm, seed=1):
     return d
 
 
+def served_moe_target(seed=0):
+    """The SERVED shape for bitwise / verdict claims (P390: bitwise claims are made on bf16 quantized fixtures, not dense
+    float32): bf16, hidden 512, every linear and routed bank affine int4 / g64, a GDN + full-attention hybrid.
+    """
+    import mlx.nn as nn
+
+    mx.random.seed(seed)
+    text = dict(
+        tiny_moe_text(),
+        hidden_size=512,
+        num_attention_heads=8,
+        head_dim=64,
+        linear_key_head_dim=32,
+        linear_value_head_dim=32,
+        moe_intermediate_size=128,
+        shared_expert_intermediate_size=128,
+        num_hidden_layers=2,
+        full_attention_interval=2,
+    )
+    cfg = MoeTextConfig.from_dict(text)
+    vision = MoeVisionConfig(
+        model_type="qwen3_5_moe",
+        depth=1,
+        hidden_size=8,
+        intermediate_size=16,
+        out_hidden_size=512,
+        num_heads=1,
+        in_channels=3,
+        patch_size=4,
+        temporal_patch_size=2,
+        spatial_merge_size=1,
+        num_position_embeddings=4,
+    )
+    lm = MoeLanguageModel(
+        cfg,
+        config=MoeModelConfig(
+            text_config=cfg, vision_config=vision, model_type="qwen3_5_moe"
+        ),
+    )
+    lm.model.norm.weight = lm.model.norm.weight * 10.0
+    lm.set_dtype(mx.bfloat16)
+    nn.quantize(lm, group_size=64, bits=4, mode="affine")
+    mx.eval(lm.parameters())
+    return lm
+
+
+def served_moe_drafter(lm, seed=1):
+    import mlx.nn as nn
+
+    d = tiny_moe_drafter(lm, seed=seed)
+    d.set_dtype(mx.bfloat16)
+    nn.quantize(d, group_size=64, bits=4, mode="affine")
+    mx.eval(d.parameters())
+    return d
+
+
+SERVED_LAYERS = 2
+
+
 def test_v3a_the_target_is_structurally_moe():
     lm = tiny_moe_target()
     assert type(lm).__name__ == "LanguageModel" and type(lm).__module__.endswith(
@@ -214,22 +273,27 @@ def test_v3a_the_target_is_structurally_moe():
 
 
 def test_v3c_the_manifest_requires_every_routed_bank_projection():
-    lm = tiny_moe_target()
+    lm = served_moe_target()
     manifest = telemetry.manifest_from_model(lm)
     routed = {n: i for n, i in manifest.items() if i["kind"] == "routed"}
     want = {
         f"model.layers.{i}.mlp.switch_mlp.{p}"
-        for i in range(LAYERS)
+        for i in range(SERVED_LAYERS)
         for p in ("gate_proj", "up_proj", "down_proj")
     }
     assert set(routed) == want
     assert all(
-        i["on_path"] and i["expected"] == dict(routed=["routed_gather"])
+        i["on_path"] and i["expected"] == dict(routed=["routed_gather_quantized"])
         for i in routed.values()
     )
 
 
-def _observed_turn(lm, drafter, *, sabotage=None, monkeypatch=None):
+METAL = pytest.mark.skipif(
+    not mx.metal.is_available(), reason="the served kernels are Metal"
+)
+
+
+def _observed_turn(lm, drafter, *, sabotage=None, monkeypatch=None, n=12):
     tel = telemetry.KernelTelemetry(lm, drafter=drafter)
     keys = observe.KeyLengths()  # the verifier block boundaries
     with tel, keys, observe.Recorder(mode="on", lm=lm, probe_token=5) as rec:
@@ -240,7 +304,7 @@ def _observed_turn(lm, drafter, *, sabotage=None, monkeypatch=None):
             PROMPT,
             PromptCacheState(),
             drafter=drafter,
-            n=12,
+            n=n,
             seed=5,
             params=PARAMS,
         )
@@ -248,190 +312,104 @@ def _observed_turn(lm, drafter, *, sabotage=None, monkeypatch=None):
     return tel, rec, list(out)
 
 
-def test_v3b_v3c_v15_one_mtp_request_is_fully_observed():
-    """(b) recorder rows, emission cuts, commit snapshots and verifier blocks on the MoE stack; (c) the router, shared
-    expert and each routed bank projection exactly once per verify-scope invocation; V15 the drafter's own MoE path —
-    router, shared expert and routed gate / up / down — in its draft scope, with the selected experts recorded.
-    """
-    lm = tiny_moe_target()
-    drafter = tiny_moe_drafter(lm)
+@pytest.fixture(scope="module")
+def served():
+    lm = served_moe_target()
+    return lm, served_moe_drafter(lm)
+
+
+def _verdict(tel, lm):
+    return telemetry.verdict(tel, telemetry.manifest_from_model(lm))
+
+
+@METAL
+def test_v3b_v3c_v15_one_mtp_request_is_fully_observed(served):
+    """(b) recorder rows, commits and verifier blocks on the MoE stack; (c) the router, shared expert and each routed
+    bank projection exactly once per verify-scope invocation, incl. a width > 1 block; V15 the drafter's own MoE path
+    in its draft scope, with selected experts."""
+    lm, drafter = served
     tel, rec, out = _observed_turn(lm, drafter)
     assert len(out) == 12 and rec.rows and rec.commits and rec.blocks
-    v = telemetry.verdict(tel, telemetry.manifest_from_model(lm))
+    v = _verdict(tel, lm)
     assert v["pass"], v["problems"]
     invocations = telemetry.routed_invocations(tel, scope="verify")
     assert invocations and all(
         sorted(i["projections"]) == ["down_proj", "gate_proj", "up_proj"]
         for i in invocations
     )
-    assert any(
-        i["width"] > 1 for i in invocations
-    )  # a real verify block, not only singletons
+    assert any(i["width"] > 1 for i in invocations)
     d = telemetry.draft_verdict(tel, drafter)
     assert d["pass"], d["problems"]
     assert d["invocations"] and all(i["selected_experts"] for i in d["invocations"])
 
 
-def test_v3e_a_verifier_bypassing_a_routed_projection_fails_the_verdict(monkeypatch):
-    from mlx_vlm.models.qwen3_5 import speculative_verifier as sv
-
-    def no_gate(
-        self, switch_mlp, x, indices
-    ):  # sabotage: the routed gate bank never runs
-        flat = x.reshape(-1, x.shape[-1])
-        flat = mx.expand_dims(flat, (-2, -3))
-        idx = indices.reshape(-1, indices.shape[-1])
-        up = switch_mlp.up_proj(flat, idx, sorted_indices=False)
-        out = switch_mlp.down_proj(up, idx, sorted_indices=False)
-        return out.squeeze(-2).reshape(*x.shape[:2], indices.shape[-1], -1)
-
-    lm = tiny_moe_target()
-    drafter = tiny_moe_drafter(lm)
-    tel, _, _ = _observed_turn(
-        lm,
-        drafter,
-        sabotage=lambda mp: mp.setattr(
-            sv.Qwen3_5BatchInvariantForward, "_switch_glu", no_gate
-        ),
-        monkeypatch=monkeypatch,
-    )
-    assert not telemetry.verdict(tel, telemetry.manifest_from_model(lm))["pass"]
+@METAL
+def test_v3e_a_verifier_bypassing_a_routed_projection_fails_the_verdict(
+    served, monkeypatch
+):
+    """The invocation observer stays; the target's routed gate bank is replaced by a plain function that runs the up
+    bank instead — each invocation then records up / up / down and the verdict must refuse it.
+    """
+    lm, drafter = served
+    for layer in lm.model.layers:
+        switch = layer.mlp.switch_mlp
+        up = switch.up_proj
+        monkeypatch.setattr(
+            switch, "gate_proj", lambda x, idx, *a, _up=up, **k: _up(x, idx, *a, **k)
+        )
+    tel, _, _ = _observed_turn(lm, drafter)
+    v = _verdict(tel, lm)
+    assert not v["pass"] and any(
+        "routed invocation ran" in p for p in v["problems"]
+    ), v["problems"]
 
 
-def test_v15_a_drafter_skipping_its_routed_experts_fails_the_draft_verdict(monkeypatch):
-    from mlx_vlm.models.qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
+@METAL
+def test_v15_a_drafter_skipping_its_routed_experts_fails_the_draft_verdict(
+    served, monkeypatch
+):
+    """The drafter's MoE block still runs under its observer; only the routed experts are skipped."""
+    lm, drafter = served
+    mlp = drafter.layers[0].mlp
+    zeros = lambda x, inds, *a, **k: mx.zeros(
+        (*inds.shape, x.shape[-1]), dtype=x.dtype
+    )  # noqa: E731
+    monkeypatch.setattr(mlp, "switch_mlp", zeros)
+    tel, _, _ = _observed_turn(lm, drafter)
+    d = telemetry.draft_verdict(tel, drafter)
+    assert (
+        not d["pass"] and d["invocations"] and any("ran" in p for p in d["problems"])
+    ), d
 
-    def shared_only(self, x):  # sabotage: only the shared expert runs
-        return self.shared_expert(x) * mx.sigmoid(self.shared_expert_gate(x))
 
-    lm = tiny_moe_target()
-    drafter = tiny_moe_drafter(lm)
-    tel, _, _ = _observed_turn(
-        lm,
-        drafter,
-        sabotage=lambda mp: mp.setattr(
-            Qwen3_5MoeSparseMoeBlock, "__call__", shared_only
-        ),
-        monkeypatch=monkeypatch,
-    )
-    assert not telemetry.draft_verdict(tel, drafter)["pass"]
-
-
-def test_v3e_an_absent_routed_hook_fails_the_verdict(monkeypatch):
-    """Disabling the new routed hook (the projections run unobserved) must fail coverage, never pass."""
+@METAL
+def test_v3e_an_absent_routed_hook_fails_the_verdict(served, monkeypatch):
+    """Disabling the routed BANK hook (the projections run unobserved) fails coverage, never passes."""
     from mlx_vlm.models import switch_layers
 
     real = {
         c: c.__call__
         for c in (switch_layers.SwitchLinear, switch_layers.QuantizedSwitchLinear)
     }
-    lm = tiny_moe_target()
-    drafter = tiny_moe_drafter(lm)
+    lm, drafter = served
 
     def unhook(mp):
         for cls, fn in real.items():
             mp.setattr(cls, "__call__", fn)
 
     tel, _, _ = _observed_turn(lm, drafter, sabotage=unhook, monkeypatch=monkeypatch)
-    assert not telemetry.verdict(tel, telemetry.manifest_from_model(lm))["pass"]
+    v = _verdict(tel, lm)
+    assert not v["pass"] and any(
+        "never observed" in p or "routed invocation ran" in p for p in v["problems"]
+    )
     assert not telemetry.draft_verdict(tel, drafter)["pass"]
-
-
-# ------------------------------------------------------------------ V3 (d): the MoE analogue of P400, measured
-def _moe_prefilled(lm, prompt=PROMPT):
-    cache = lm.make_cache()
-    lm(mx.array([prompt], dtype=mx.int32), cache=cache)
-    mx.eval([c.state for c in cache])
-    return cache
-
-
-def _capture_experts(monkeypatch):
-    """Per-call selected experts: the verifier's ``_switch_glu`` (block) and the plain MoE block's routing (singletons)."""
-    from mlx_vlm.models import switch_layers
-    from mlx_vlm.models.qwen3_5 import speculative_verifier as sv
-
-    seen = dict(block=[], plain=[])
-    real_glu = sv.Qwen3_5BatchInvariantForward._switch_glu
-    real_switch = switch_layers.SwitchGLU.__call__
-
-    def glu(self, switch_mlp, x, indices):
-        seen["block"].append(indices)
-        return real_glu(self, switch_mlp, x, indices)
-
-    def switch(self, x, indices, *a, **k):
-        seen["plain"].append(indices)
-        return real_switch(self, x, indices, *a, **k)
-
-    monkeypatch.setattr(sv.Qwen3_5BatchInvariantForward, "_switch_glu", glu)
-    monkeypatch.setattr(switch_layers.SwitchGLU, "__call__", switch)
-    return seen
-
-
-@pytest.mark.skipif(
-    not mx.metal.is_available(), reason="the served verifier kernels are Metal"
-)
-@pytest.mark.parametrize("width", [2, 3])
-@pytest.mark.parametrize("quantized", [False, True], ids=["dense", "int4"])
-def test_v3d_a_moe_verify_block_equals_sequential_singletons(
-    monkeypatch, width, quantized
-):
-    """One width-``width`` ``speculative_verify`` call vs ``width`` plain singleton calls on an INDEPENDENT, identically
-    prefilled cache, on the MoE stack (routed banks dispatched for the whole block at once — the MoE analogue of P400):
-    logits rows, every full-attention KV and recurrent state, and each layer's selected experts, bitwise.
-    """
-    import mlx.nn as nn
-
-    lm = tiny_moe_target()
-    if quantized:  # the served Ornith banks are QuantizedSwitchLinear (int4)
-        nn.quantize(lm, group_size=32, bits=4)
-        mx.eval(lm.parameters())
-        assert any(
-            type(m).__name__ == "QuantizedSwitchLinear" for _, m in lm.named_modules()
-        )
-    block_cache, plain_cache = _moe_prefilled(lm), _moe_prefilled(lm)
-    seen = _capture_experts(monkeypatch)
-    tokens = mx.array([[5, 9, 13][:width]], dtype=mx.int32)
-    verify = lm(tokens, cache=block_cache, speculative_verify=True)
-    rows = [
-        lm(tokens[:, i : i + 1], cache=plain_cache).logits[:, -1, :]
-        for i in range(width)
-    ]
-    mx.eval(verify.logits, rows, seen["block"], seen["plain"])
-    for i in range(width):
-        assert mx.array_equal(verify.logits[:, i, :], rows[i]).item(), f"logits row {i}"
-    # experts: block call k covers tokens 0..width-1 of layer k; singleton j of layer k is plain call j * LAYERS + k
-    assert len(seen["block"]) == LAYERS and len(seen["plain"]) == LAYERS * width
-    for k, block_idx in enumerate(seen["block"]):
-        for j in range(width):
-            plain_idx = seen["plain"][j * LAYERS + k]
-            got = mx.sort(block_idx[0, j], axis=-1)
-            want = mx.sort(plain_idx.reshape(-1, plain_idx.shape[-1])[0], axis=-1)
-            assert mx.array_equal(got, want).item(), f"layer {k} token {j} experts"
-    from mlx_vlm.speculative.cache_state import iter_leaf_caches
-
-    compared = 0
-    for a, b in zip(iter_leaf_caches(block_cache), iter_leaf_caches(plain_cache)):
-        fa, fb = tree_flatten(a.state), tree_flatten(b.state)
-        for (key, x), (_, y) in zip(fa, fb):
-            if isinstance(x, mx.array):
-                assert x.shape == y.shape and mx.array_equal(x, y).item(), (
-                    type(a).__name__,
-                    key,
-                )
-                compared += 1
-    assert compared > 0
-
-
-# ------------------------------------------------------------------ P369 v13 code round 1 M4–M8 (Metal; run after the GPU campaign)
-METAL = pytest.mark.skipif(
-    not mx.metal.is_available(), reason="the served kernels are Metal"
-)
 
 
 @METAL
 def test_m4_the_split_artifact_itself_binds_and_runs_a_draft_verify_round(tmp_path):
     """M4: the split → strict-load result is bound to a MoE target and executed (not a freshly constructed drafter),
-    with its certified shape asserted."""
+    with its certified shape asserted (float tiny fixture: the split artifact's own dims).
+    """
     written, drafter, kind = _split_and_load(tmp_path, "qwen3_5_moe_text")
     assert drafter.config.block_size == 3  # depth 1 + the splitter's block_size_extra 2
     mlp = drafter.layers[0].mlp
@@ -460,8 +438,7 @@ def test_m5_a_fused_helper_records_each_bank_exactly_once():
     glu = switch_layers.SwitchGLU(64, 64, EXPERTS)
     nn.quantize(glu, group_size=64, bits=4)
     mx.eval(glu.parameters())
-    lm = tiny_moe_target()
-    tel = telemetry.KernelTelemetry(lm)
+    tel = telemetry.KernelTelemetry(tiny_moe_target())
     tel._names[id(glu)] = "probe.switch_mlp"
     for p in ("gate_proj", "up_proj", "down_proj"):
         tel._names[id(getattr(glu, p))] = f"probe.switch_mlp.{p}"
@@ -476,13 +453,12 @@ def test_m5_a_fused_helper_records_each_bank_exactly_once():
 
 
 @METAL
-def test_m6_an_absent_invocation_hook_fails_the_verdict(monkeypatch):
+def test_m6_an_absent_invocation_hook_fails_the_verdict(served, monkeypatch):
     """M6: the bank hooks still run but the per-invocation observer is gone — never a pass."""
     from mlx_vlm.models.qwen3_5 import speculative_verifier as sv
 
     real = sv.Qwen3_5BatchInvariantForward._switch_glu
-    lm = tiny_moe_target()
-    drafter = tiny_moe_drafter(lm)
+    lm, drafter = served
     tel, _, _ = _observed_turn(
         lm,
         drafter,
@@ -491,25 +467,26 @@ def test_m6_an_absent_invocation_hook_fails_the_verdict(monkeypatch):
         ),
         monkeypatch=monkeypatch,
     )
-    v = telemetry.verdict(tel, telemetry.manifest_from_model(lm))
-    assert not v["pass"] and any(
-        "frame" in p or "invocation" in p for p in v["problems"]
-    ), v["problems"]
+    v = _verdict(tel, lm)
+    assert not v["pass"] and any("invocation" in p for p in v["problems"]), v[
+        "problems"
+    ]
 
 
 @METAL
-def test_m7_cuts_full_and_partial_and_every_commit_probe_is_neutral():
+def test_m7_cuts_full_and_partial_and_every_commit_probe_is_neutral(served):
     """M7: concrete emission-cut categories (a fully accepted block and a partial one) and a neutral probe at every
-    commit, on the MoE stack."""
+    commit, on the served MoE stack."""
     from test_mtp_exactness import scripted
 
-    lm = tiny_moe_target()
+    lm, _ = served
     plain, _ = turn(
         fake_model(lm), PROMPT, PromptCacheState(), n=16, seed=5, params=PARAMS
     )
     plain = list(plain)
-    drafter = scripted(  # follows the plain path except every 5th position: full accepts and rejections
-        tiny_moe_drafter(lm),
+    drafter = served_moe_drafter(lm)
+    scripted(  # in place: follows the plain path except every 5th position — full accepts and rejections
+        drafter,
         lambda p: (
             (plain[p] if p % 5 else (plain[p] + 1) % 64) if p < len(plain) else None
         ),
@@ -543,72 +520,32 @@ def test_m7_cuts_full_and_partial_and_every_commit_probe_is_neutral():
 def test_m7_omitting_the_router_or_the_shared_expert_inside_an_observed_block_fails(
     monkeypatch, part
 ):
-    """M7: the MoE-block observer stays; only one part runs unobserved (a plain function with the same math)."""
-    lm = tiny_moe_target()
-    drafter = tiny_moe_drafter(lm)
+    """M7: the MoE-block observer stays; only one part runs unobserved (a plain function standing in)."""
+    lm = served_moe_target()
+    drafter = served_moe_drafter(lm)
     mlp = drafter.layers[0].mlp
     if part == "router":
-        weight = mlp.gate.weight
-        monkeypatch.setattr(mlp, "gate", lambda x: x @ weight.T)
-    else:
-        real = mlp.shared_expert
+        real = mlp.gate
         monkeypatch.setattr(
             mlp,
-            "shared_expert",
-            lambda x: real.down_proj(
-                nn_silu(real.gate_proj.weight, x) * (x @ real.up_proj.weight.T)
-            ),
+            "gate",
+            lambda x: mx.zeros((*x.shape[:-1], EXPERTS), dtype=x.dtype)
+            + 0 * real.scales.sum(),
         )
+    else:
+        monkeypatch.setattr(mlp, "shared_expert", lambda x: mx.zeros_like(x))
     tel, _, _ = _observed_turn(lm, drafter)
     d = telemetry.draft_verdict(tel, drafter)
     assert (
-        not d["pass"] and d["invocations"]
-    ), d  # the block WAS observed; a part was missing
+        not d["pass"] and d["invocations"] and any("ran" in p for p in d["problems"])
+    ), d
 
 
-def nn_silu(weight, x):
-    import mlx.nn as nn
-
-    return nn.silu(x @ weight.T)
-
-
-def tiny_moe_target_g64(seed=0):
-    """A g64-capable tiny MoE target (every routed bank's input dims are multiples of 64) — M8."""
-    import mlx.nn as nn
-
-    mx.random.seed(seed)
-    text = dict(
-        tiny_moe_text(),
-        hidden_size=64,
-        moe_intermediate_size=64,
-        shared_expert_intermediate_size=64,
-        num_hidden_layers=LAYERS,
-        full_attention_interval=2,
-    )
-    cfg = MoeTextConfig.from_dict(text)
-    vision = MoeVisionConfig(
-        model_type="qwen3_5_moe",
-        depth=1,
-        hidden_size=8,
-        intermediate_size=16,
-        out_hidden_size=64,
-        num_heads=1,
-        in_channels=3,
-        patch_size=4,
-        temporal_patch_size=2,
-        spatial_merge_size=1,
-        num_position_embeddings=4,
-    )
-    lm = MoeLanguageModel(
-        cfg,
-        config=MoeModelConfig(
-            text_config=cfg, vision_config=vision, model_type="qwen3_5_moe"
-        ),
-    )
-    lm.model.norm.weight = lm.model.norm.weight * 12.0
-    nn.quantize(lm, group_size=64, bits=4)
-    mx.eval(lm.parameters())
-    return lm
+def _moe_prefilled(lm, prompt=PROMPT):
+    cache = lm.make_cache()
+    lm(mx.array([prompt], dtype=mx.int32), cache=cache)
+    mx.eval([c.state for c in cache])
+    return cache
 
 
 def _capture_routed(monkeypatch):
@@ -638,15 +575,17 @@ def _capture_routed(monkeypatch):
 
 @METAL
 @pytest.mark.parametrize("width", [2, 3])
-def test_m8_a_g64_int4_moe_verify_block_equals_sequential_singletons(
-    monkeypatch, width
+def test_v3d_m8_a_served_moe_verify_block_equals_sequential_singletons(
+    served, monkeypatch, width
 ):
-    """M8: Ornith's certified bank format (every routed bank int4 / g64); routed outputs, experts, logits and every cache
-    leaf (count, type, offset, keys, arrays — both directions) bitwise."""
+    """V3 (d) / M8 — the MoE analogue of P400, measured not assumed, on the SERVED shape (bf16, every routed bank
+    QuantizedSwitchLinear int4 / g64): one width-``width`` ``speculative_verify`` call vs sequential singletons on an
+    INDEPENDENT, identically prefilled cache — logits rows, each layer's selected experts and routed outputs, and every
+    cache leaf (count, type, offset, keys, arrays — both directions) bitwise."""
     from mlx_vlm.speculative.cache_state import iter_leaf_caches
 
-    lm = tiny_moe_target_g64()
-    banks = [m for n, m in lm.named_modules() if ".switch_mlp." in n]
+    lm, _ = served
+    banks = [m for _, m in lm.named_modules() if "SwitchLinear" in type(m).__name__]
     assert banks and all(
         type(b).__name__ == "QuantizedSwitchLinear"
         and (b.bits, b.group_size) == (4, 64)
@@ -660,28 +599,28 @@ def test_m8_a_g64_int4_moe_verify_block_equals_sequential_singletons(
         lm(tokens[:, i : i + 1], cache=plain_cache).logits[:, -1, :]
         for i in range(width)
     ]
-    mx.eval(verify.logits, rows, *seen.values())
+    mx.eval(verify.logits, rows, *[a for v in seen.values() for a in v])
     for i in range(width):
         assert mx.array_equal(verify.logits[:, i, :], rows[i]).item(), f"logits row {i}"
-    assert len(seen["block"]) == LAYERS and len(seen["plain"]) == LAYERS * width
-    for k in range(LAYERS):
+    assert (
+        len(seen["block"]) == SERVED_LAYERS
+        and len(seen["plain"]) == SERVED_LAYERS * width
+    )
+    for k in range(SERVED_LAYERS):
         for j in range(width):
-            p = j * LAYERS + k
+            p = j * SERVED_LAYERS + k
             got_idx, want_idx = (
                 seen["block"][k][0, j],
                 seen["plain"][p].reshape(-1, TOP_K)[0],
             )
-            order_got, order_want = mx.argsort(got_idx), mx.argsort(want_idx)
-            assert mx.array_equal(got_idx[order_got], want_idx[order_want]).item(), (
-                k,
-                j,
-            )
-            got_out = seen["block_out"][k][0, j][order_got]
-            want_out = seen["plain_out"][p].reshape(
+            og, ow = mx.argsort(got_idx), mx.argsort(want_idx)
+            assert mx.array_equal(got_idx[og], want_idx[ow]).item(), (k, j)
+            got = seen["block_out"][k][0, j][og]
+            want = seen["plain_out"][p].reshape(
                 -1, TOP_K, seen["plain_out"][p].shape[-1]
-            )[0][order_want]
+            )[0][ow]
             assert mx.array_equal(
-                got_out, want_out
+                got, want
             ).item(), f"layer {k} token {j} routed output"
     a_leaves, b_leaves = list(iter_leaf_caches(block_cache)), list(
         iter_leaf_caches(plain_cache)
