@@ -1917,3 +1917,58 @@ def test_e2_summary_refuses_extra_cross_load_requests():
         orchestrate.e2_summary(
             {"a": _pair()}, {"a": _cross(), "b": _cross()}, digests={"a": D64}
         )
+
+
+# ------------------------------------------------------------------ smoke 9: the KV positive follows the live leaf census
+@pytest.mark.parametrize(
+    ("census", "kv_kind"),
+    [
+        ({"ArraysCache": 48, "PreallocQuantizedKVCache": 16}, "quantized_scale"),
+        ({"ArraysCache": 48, "TurboQuantKVCache": 16}, "tq_norm"),
+        ({"ArraysCache": 48, "PreallocKVCache": 16}, "old_prefix_k"),
+    ],
+)
+def test_the_smoke_gate_wants_the_kv_positive_of_the_leaf_actually_served(
+    census, kv_kind
+):
+    """The registry said TurboQuant for Qwen3.8-27B-mlx-uniform-4bit but the server builds affine KV (P405): the gate
+    derives the required KV positive from the E1c entry's leaf census, never from the registry label.
+    """
+    fired = {
+        k: True for k in ("raw_ulp", "in_support", "recurrent", "probe_logit", kv_kind)
+    }
+    record = _smoke_record(
+        e1c={
+            "T65536": dict(
+                pass_=True,
+                leaf_census=census,
+                smoke_positives=dict(baseline_pass=True, fired=fired),
+            )
+        }
+    )
+    for pick in (FABLE, UNIFORM):
+        assert orchestrate.smoke_gate({pick: record})["pass_"], (pick, census)
+        wrong = dict(fired)
+        del wrong[kv_kind]
+        bad = _smoke_record(
+            e1c={
+                "T65536": dict(
+                    pass_=True,
+                    leaf_census=census,
+                    smoke_positives=dict(baseline_pass=True, fired=wrong),
+                )
+            }
+        )
+        assert not orchestrate.smoke_gate({pick: bad})["pass_"], (pick, census)
+
+
+def test_the_smoke_gate_refuses_a_positive_without_a_leaf_census():
+    record = _smoke_record(
+        e1c={
+            "T65536": dict(
+                pass_=True, smoke_positives=dict(baseline_pass=True, fired={})
+            )
+        }
+    )
+    with pytest.raises(orchestrate.MalformedEvidence, match="leaf_census"):
+        orchestrate.smoke_gate({UNIFORM: record})

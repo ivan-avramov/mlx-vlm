@@ -953,3 +953,16 @@ def test_cache_census_names_every_leaf_class():
         "TurboQuantKVCache": 1,
         "BatchTurboQuantKVCache": 1,
     }
+
+
+def test_an_affine_quantized_kv_leaf_gets_its_own_positive():
+    """Smoke 9: the live Qwen3.8-27B-mlx-uniform-4bit KV is affine-quantized (PreallocQuantizedKVCache, P405) — its
+    keys are a (packed, scales, biases) tuple; the positive changes a scale."""
+    from mlx_vlm.models.cache import KVCache
+
+    native = KVCache()
+    native.update_and_fetch(mx.ones((1, 2, 64, 64)), mx.ones((1, 2, 64, 64)))
+    affine = native.to_quantized(group_size=64, bits=4)
+    got = worker.kv_positive_targets([affine])
+    assert [kind for kind, _ in got] == ["quantized_scale"], got
+    assert got[0][1] is affine.keys[1]
