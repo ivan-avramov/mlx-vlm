@@ -2161,3 +2161,51 @@ def test_the_smoke_gate_refuses_a_missing_or_wrong_drafter_manifest():
     del missing["e1c"]["T65536"]["drafter_manifest"]
     with pytest.raises(orchestrate.MalformedEvidence, match="drafter_manifest"):
         orchestrate.smoke_gate({UNIFORM: missing})
+
+
+# ------------------------------------------------------------------ C193: a recorded projection ruling lifts only `fits`
+def _over_budget_summary(pick=UNIFORM, **record_changes):
+    """A smoke whose evidence all passed but whose × 6 projection exceeds ESTIMATE_LIMIT_S (smoke 12b's shape)."""
+    record = _tq_record(_tq_observed())
+    record.update(wall_s=2190, **record_changes)
+    picks = {pick: record}
+    gate = orchestrate.smoke_gate(picks)
+    assert gate["pass_"] and not gate["fits"], gate
+    summary = dict(
+        phase="smoke",
+        status="SMOKE_NOT_PASS",
+        exit_code=2,
+        picks=picks,
+        smoke_gate=gate,
+    )
+    return json.loads(json.dumps(summary))
+
+
+def test_without_a_ruling_an_over_budget_smoke_does_not_authorize():
+    assert orchestrate.smoke_authorization_problems(_over_budget_summary())
+
+
+def test_the_c193_ruling_authorizes_only_its_pick_and_only_the_projection():
+    sap = orchestrate.smoke_authorization_problems
+    assert orchestrate.PROJECTION_RULINGS == {"C193": UNIFORM}
+    assert sap(_over_budget_summary(), projection_ruling="C193") == []
+    assert sap(
+        _over_budget_summary(pick=FABLE), projection_ruling="C193"
+    )  # another pick
+    assert sap(_over_budget_summary(), projection_ruling="C999")  # an unknown ruling
+    failing = _over_budget_summary()
+    failing["picks"][UNIFORM]["e2"] = dict(verdict="FAIL")
+    failing["smoke_gate"] = orchestrate.smoke_gate(failing["picks"])
+    assert sap(
+        failing, projection_ruling="C193"
+    )  # evidence failed: the ruling never covers it
+    tampered = _over_budget_summary()
+    tampered["smoke_gate"]["projected_full_s"] = 1
+    assert sap(
+        tampered, projection_ruling="C193"
+    )  # the stored gate must equal its recomputation
+    exit_one = _over_budget_summary()
+    exit_one["exit_code"] = 1
+    assert sap(
+        exit_one, projection_ruling="C193"
+    )  # a harness error is not an over-budget smoke
