@@ -1760,3 +1760,39 @@ def test_e2_summary_needs_a_valid_digest_on_every_trajectory(sha):
         del turn["prompt"]["sha256"]
     got = orchestrate.e2_summary({"T1024": pair}, {"T1024": cross}, digests={})
     assert got["verdict"] == "INCOMPLETE" and got["prompt_digest_problems"], got
+
+
+# ------------------------------------------------------------------ C185 review round 2 E5 E1
+def test_e2_output_identity_includes_the_finish_reason():
+    # E5: equal token ids with a different finish reason are a different generation outcome
+    pair = _pair()
+    pair["turns"][0]["final"]["finish_reason"] = "stop"
+    got = orchestrate.e2_summary({"a": pair}, {"a": _cross()}, digests={"a": D64})
+    assert got["verdict"] == "FAIL" and got["identity"] == {"a": False}, got
+    cross = _cross()
+    cross["turns"][0]["final"]["finish_reason"] = "stop"
+    got = orchestrate.e2_summary({"a": _pair()}, {"a": cross}, digests={"a": D64})
+    assert got["verdict"] == "PASS"
+    assert got["cross_load"]["per_request"] == {"a": False}
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda pair, cross: pair.update(turns=[]),
+        lambda pair, cross: pair.update(turns=None),
+        lambda pair, cross: pair["turns"][0].update(telemetry=["bad"]),
+        lambda pair, cross: pair["turns"][0].update(final=["bad"]),
+        lambda pair, cross: pair["off"].__setitem__(0, "bad"),
+        lambda pair, cross: cross.update(turns=[]),
+        lambda pair, cross: cross.update(turns="x"),
+    ],
+)
+def test_e2_summary_refuses_malformed_containers(mutate):
+    # E1 (round 2): every malformed shape is MalformedEvidence, never an AttributeError / IndexError
+    pair, cross = _pair(), _cross()
+    mutate(pair, cross)
+    with pytest.raises(orchestrate.MalformedEvidence, match="malformed evidence"):
+        orchestrate.e2_summary({"a": pair}, {"a": cross}, digests={"a": D64})
+    with pytest.raises(orchestrate.MalformedEvidence, match="malformed evidence"):
+        orchestrate.e2_summary({"a": "entry"}, {"a": _cross()}, digests={"a": D64})
