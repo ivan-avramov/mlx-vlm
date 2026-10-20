@@ -267,11 +267,42 @@ def target_identity(model):
 
 def check_loaded_drafter(model, drafter, shape, *, requested_block=None):
     """Code round 2 M3: a drafter as loaded is unbound (``reset`` binds it at each request's start); bind it to the
-    served target — exactly what ``reset`` does — then compare its identity with the certified ``shape``.
+    served target — exactly what ``reset`` does — then compare its identity with the certified ``shape``. Code round 3
+    R1: the binding is undone afterwards (module children and attributes restored exactly), so the served drafter
+    reaches its first request as loaded and only production's ``reset`` binds it (``watch_drafter_resets``).
     """
-    drafter.bind(model)
-    ident = drafter_identity(drafter, requested_block=requested_block)
+    items, attrs = dict(drafter), dict(vars(drafter))
+    try:
+        drafter.bind(model)
+        ident = drafter_identity(drafter, requested_block=requested_block)
+    finally:
+        dict.clear(drafter)
+        dict.update(drafter, items)
+        vars(drafter).clear()
+        vars(drafter).update(attrs)
     return ident, drafter_problems(ident, target_identity(model), shape)
+
+
+def watch_drafter_resets(model, drafter, shape, checks, *, requested_block=None):
+    """Code round 3 R1: after each production ``reset`` (the request-time bind), the LIVE identity — no harness bind —
+    must match ``shape`` and ``model``; one problem list per reset is appended to ``checks``, a mismatch raises.
+    Returns the undo."""
+    real = drafter.reset
+
+    def reset(*args, **kwargs):
+        out = real(*args, **kwargs)
+        problems = drafter_problems(
+            drafter_identity(drafter, requested_block=requested_block),
+            target_identity(model),
+            shape,
+        )
+        checks.append(problems)
+        if problems:
+            raise RuntimeError("served drafter mismatch: " + "; ".join(problems))
+        return out
+
+    drafter.reset = reset
+    return lambda: delattr(drafter, "reset")
 
 
 def drafter_problems(identity, target, expect):
@@ -1249,6 +1280,15 @@ def run_job(job, out_dir, result):
             result["drafter_identity"] = dict(ident, embed=None, head=None)
             if problems:
                 raise RuntimeError("served drafter mismatch: " + "; ".join(problems))
+            stack.callback(  # code round 3 R1: every request-time bind, checked live
+                watch_drafter_resets(
+                    rg.model,
+                    rg.draft_model,
+                    shape,
+                    result.setdefault("drafter_live_checks", []),
+                    requested_block=os.environ.get("MLX_VLM_DRAFT_BLOCK_SIZE") or None,
+                )
+            )
         policy = getattr(rg, "mtp_verify_policy", None)
         manifest = telemetry.manifest_from_model(lm)
         result["manifest"] = manifest

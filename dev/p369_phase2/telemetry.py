@@ -293,10 +293,14 @@ class KernelTelemetry:
         if projections is None:
             name = self._names.get(id(module), "?")
             banks = [(name.rsplit(".", 1)[-1], name, module)]
-        else:
-            base = self._names.get(id(module), "?")
+        else:  # code round 3 R2: each bank named by ITS module identity, never synthesized from the container
             banks = [
-                (p, f"{base}.{p}", getattr(module, p, module)) for p in projections
+                (
+                    p,
+                    self._names.get(id(getattr(module, p, None)), "?"),
+                    getattr(module, p),
+                )
+                for p in projections
             ]
         tokens = int(indices.size // indices.shape[-1]) if indices is not None else 0
         experts = (
@@ -327,11 +331,16 @@ class KernelTelemetry:
                         frame=frame["id"] if frame is not None else None,
                     )
                 )
-        if self._draft_stack:
-            self._draft_stack[-1]["parts"].extend(
-                f"switch_mlp.{p}" for p, _, _ in banks
+        if (
+            self._draft_stack
+        ):  # code round 3 R2: a bank outside the frame's block is recorded as foreign
+            frame = self._draft_stack[-1]
+            prefix = frame["block"] + "."
+            frame["parts"].extend(
+                n[len(prefix) :] if n.startswith(prefix) else f"foreign:{n}"
+                for _, n, _ in banks
             )
-            self._draft_stack[-1]["experts"].update(experts)
+            frame["experts"].update(experts)
 
     def _routed_bank(self, real):
         telemetry = self
