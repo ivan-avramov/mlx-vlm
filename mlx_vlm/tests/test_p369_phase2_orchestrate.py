@@ -525,6 +525,31 @@ def test_supervise_kills_a_request_past_its_deadline_and_records_it(
     assert record["index"] == 1 and record["name"] == "req-1"
 
 
+def test_a_term_ignoring_worker_is_reaped_when_its_grace_ends(
+    tmp_path, sleeper, monkeypatch
+):
+    """P396: the grace loop's last ps scan keeps PS_MARGIN_S (as reap's do). A scan bounded by the grace end
+    alone runs ps with the few ms left, times out, and turned the SIGKILL reap of a TERM-ignoring worker into
+    a harness error (the ignore-term flake). Modelled deterministically: ps needs at least 0.3 s.
+    """
+    import subprocess
+    import time
+
+    real = subprocess.run
+
+    def slow_ps(cmd, *a, **k):
+        if cmd[0] == "ps" and k.get("timeout") is not None and k["timeout"] < 0.3:
+            raise subprocess.TimeoutExpired(cmd, k["timeout"])
+        return real(cmd, *a, **k)
+
+    proc = sleeper("ignore-term", "progress")
+    while not (tmp_path / "progress.json").exists():  # written after SIGTERM is ignored
+        time.sleep(0.01)
+    monkeypatch.setattr(orchestrate.subprocess, "run", slow_ps)
+    orchestrate._stop(proc, 0.5)
+    assert proc.returncode is not None
+
+
 def test_supervise_times_out_a_silent_boot(tmp_path, sleeper):
     import time
 
