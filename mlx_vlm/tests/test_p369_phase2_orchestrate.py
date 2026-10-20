@@ -1457,6 +1457,9 @@ def _smoke_record(**changes):
         e2=dict(verdict="PASS"),
         e7b=_e7b_report(),
         wall_s=60,
+        step_s=dict(
+            prep=5, e1c=20, e2=5, e7b=10
+        ),  # v13 V13: the per-phase smoke timings
         kv=dict(NATIVE_KV),
     )
     record.update(changes)
@@ -2417,3 +2420,27 @@ def test_the_panel_phase_counts_without_generating_and_writes_the_entrys_panel(
     assert json.loads((tmp_path / "borrowed_panel.json").read_text()) == panel
     with pytest.raises(orchestrate.Refused, match="own C84"):
         camp.make_panel(UNIFORM)
+
+
+# ------------------------------------------------------------------ P369 v13 V13: the phase-based projection
+def test_the_projection_scales_each_measured_phase_by_its_full_cardinality():
+    steps = dict(prep=120, e1c=600, e2=100, e7b=300)
+    got = orchestrate.phase_projection(steps)
+    f = sum(orchestrate.THRESHOLDS) / sum(orchestrate.SMOKE_THRESHOLDS)
+    want = 120 * 1.5 + 600 * f + 100 * 10 + 600 * f + 300 * (20 / 3 + 5)
+    assert abs(got["nominal_s"] - want) < 1e-6
+    assert got["tail_reserve_s"] == orchestrate.TAIL_RESERVE_S == 7200
+    assert got["with_tail_s"] == got["nominal_s"] + 7200
+
+
+def test_the_smoke_gate_uses_the_phase_projection_and_needs_the_step_timings():
+    record = _smoke_record(step_s=dict(prep=60, e1c=300, e2=60, e7b=120))
+    gate = orchestrate.smoke_gate({FABLE: record})
+    assert (
+        gate["projected_full_s"]
+        == orchestrate.phase_projection(record["step_s"])["nominal_s"]
+    )
+    assert gate["projected_with_tail_s"] == gate["projected_full_s"] + 7200
+    del record["step_s"]
+    with pytest.raises(orchestrate.MalformedEvidence, match="step_s"):
+        orchestrate.smoke_gate({FABLE: record})
