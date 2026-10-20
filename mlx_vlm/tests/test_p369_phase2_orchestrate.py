@@ -17,71 +17,37 @@ sys.path.insert(0, str(DEV))
 from p369_phase2 import orchestrate  # noqa: E402
 
 FABLE, UNIFORM = list(orchestrate.PICKS)
-MARK = "# P369 INTERIM (C177 2026-10-17): MTP OFF on the daily driver"
-
-REGISTRY = f"""models:
-  - name: {UNIFORM}
-    type: vision
-    kv_bits: 4
-    # draft_kind: mtp  {MARK}
-    # draft_model: caslca/{UNIFORM}-mtp-drafter  # UPLOADED 2026-08-26 (public)
-    presentation:
-      role: main
-
-  - name: Other-Model
-    type: vision
-    # draft_kind: mtp  {MARK}
-    # draft_model: caslca/other-drafter
-
-  - name: {FABLE}
-    type: vision
-    kv_bits: 0
-    # mtp_verify_scan: joint_v1  {MARK} (joint_v1 requires draft_kind mtp)
-    generation_defaults:
-      temperature: 0.5
-    # draft_kind: mtp  {MARK}
-    # draft_model: caslca/{FABLE}-mtp-drafter
-    presentation:
-      role: main
-"""
 
 
-@pytest.mark.parametrize(
-    ("pick", "want"),
-    [
-        (
-            FABLE,
-            [
-                "mtp_verify_scan: joint_v1",
-                "draft_kind: mtp",
-                f"draft_model: caslca/{FABLE}-mtp-drafter",
-            ],
-        ),
-        (UNIFORM, ["draft_kind: mtp", f"draft_model: caslca/{UNIFORM}-mtp-drafter"]),
-    ],
-)
-def test_overlay_restores_exactly_the_c177_lines_of_the_pick(pick, want):
-    text, restored = orchestrate.overlay_registry(REGISTRY, pick)
-    assert restored == want
-    before, after = REGISTRY.split("\n"), text.split("\n")
-    changed = [(a, b) for a, b in zip(before, after) if a != b]
-    assert len(before) == len(after) and len(changed) == len(want)
-    assert all(b.strip() in want for _, b in changed)
-    other = [b for b in after if "other-drafter" in b]
-    assert other == [
-        "    # draft_model: caslca/other-drafter"
-    ]  # another pick untouched
+# ------------------------------------------------------------------ P369 v13 V5 / V10: overlays from the 16-state generator
+from p369_phase2 import registry_states as rs  # noqa: E402
+
+FIXTURE_TEXT = rs.fixture_text(DEV.parent / "mlx_vlm" / "tests" / "fixtures")
+ALL_OFF = rs.apply(
+    FIXTURE_TEXT, frozenset(rs.ENTRY_OFF)
+)  # today's live shape (C177 + C191)
 
 
-def test_overlay_refuses_a_registry_without_the_marked_lines():
-    restored_text, _ = orchestrate.overlay_registry(REGISTRY, FABLE)
-    with pytest.raises(ValueError, match="expected 3 C177 lines"):
-        orchestrate.overlay_registry(restored_text, FABLE)
-    unmarked = REGISTRY.replace(MARK, "# some other note")
-    with pytest.raises(ValueError, match="expected 2 C177 lines"):
-        orchestrate.overlay_registry(unmarked, UNIFORM)
-    with pytest.raises(ValueError, match="no registry block"):
-        orchestrate.overlay_registry(REGISTRY, "Missing-Model")
+@pytest.mark.parametrize("pick", list(rs.ENTRY_OFF))
+def test_overlay_restores_exactly_the_picks_atomic_block(pick):
+    text, restored = orchestrate.overlay_registry(ALL_OFF, pick, FIXTURE_TEXT)
+    assert restored == [line for line, _ in rs.ENTRY_OFF[pick]]
+    assert rs.block(text, pick) == rs.block(FIXTURE_TEXT, pick)
+    assert rs.classify(text, FIXTURE_TEXT) == frozenset(rs.ENTRY_OFF) - {
+        pick
+    }  # the others untouched
+
+
+def test_overlay_of_an_entry_already_on_changes_nothing():
+    text, restored = orchestrate.overlay_registry(FIXTURE_TEXT, UNIFORM, FIXTURE_TEXT)
+    assert (text, restored) == (FIXTURE_TEXT, [])
+
+
+def test_overlay_refuses_a_registry_outside_the_16_states():
+    with pytest.raises(ValueError, match="not one of the 16"):
+        orchestrate.overlay_registry(ALL_OFF + "# edited\n", FABLE, FIXTURE_TEXT)
+    with pytest.raises(ValueError, match="registry blocks"):
+        orchestrate.overlay_registry(ALL_OFF, "Missing-Model", FIXTURE_TEXT)
 
 
 @pytest.mark.requires_stack_registry
@@ -90,19 +56,13 @@ def test_overlay_on_the_live_stack_registry():
     import yaml
 
     sys.path.insert(0, str(DEV.parent / "mlx_vlm" / "tests"))
-    from test_mtp_verify_scan import _fixture_verbatim, live_registry
+    from test_mtp_verify_scan import live_registry
 
-    path, state = live_registry()
-    text = path.read_text()
-    want = {e["name"]: e for e in yaml.safe_load(_fixture_verbatim())["models"]}
-    for pick in orchestrate.PICKS:
-        if (
-            state == "mtp_on"
-        ):  # nothing to restore: the live registry IS the certified one
-            with pytest.raises(ValueError, match="C177 lines"):
-                orchestrate.overlay_registry(text, pick)
-            continue
-        new, _ = orchestrate.overlay_registry(text, pick)
+    path, _ = live_registry()
+    text = path.read_bytes().decode("utf-8")
+    want = {e["name"]: e for e in yaml.safe_load(FIXTURE_TEXT)["models"]}
+    for pick in rs.ENTRY_OFF:
+        new, _ = orchestrate.overlay_registry(text, pick, FIXTURE_TEXT)
         got = {e["name"]: e for e in yaml.safe_load(new)["models"]}
         assert got[pick] == want[pick], pick
 
@@ -854,7 +814,7 @@ def test_overlay_restores_the_fixture_entries_from_the_expected_interim():
     fixture = _fixture_verbatim()
     want = {e["name"]: e for e in yaml.safe_load(fixture)["models"]}
     for pick in orchestrate.PICKS:
-        text, _ = orchestrate.overlay_registry(expected_interim(fixture), pick)
+        text, _ = orchestrate.overlay_registry(expected_interim(fixture), pick, fixture)
         got = {e["name"]: e for e in yaml.safe_load(text)["models"]}
         assert got[pick] == want[pick], pick
 

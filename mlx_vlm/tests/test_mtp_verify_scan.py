@@ -2560,3 +2560,19 @@ def test_p387_an_empty_registry_variable_fails(monkeypatch, tmp_path):
     monkeypatch.setattr(sys.modules[__name__], "SIBLING_REGISTRY", sibling)
     with pytest.raises(pytest.fail.Exception, match="empty"):
         live_registry()  # set-but-empty is a configuration error, never "fall back to the sibling"
+
+
+def test_p369_v13_the_live_classifier_accepts_every_one_of_the_16_states():
+    """P369 v13 V10: each MTP-certified entry is ON or OFF independently (C177 ×2, P406 / C191 ×2); today's live
+    registry (all four OFF) was refused by the two-state classifier."""
+    import itertools
+
+    sys.path.insert(0, str(REPO / "dev"))
+    from p369_phase2 import registry_states as rs
+
+    fixture = _fixture_verbatim()
+    for k in range(len(rs.ENTRY_OFF) + 1):
+        for off in itertools.combinations(rs.ENTRY_OFF, k):
+            assert live_registry_state(rs.apply(fixture, off)) is not None, off
+    assert live_registry_state(rs.apply(fixture, ())) == "mtp_on"
+    assert live_registry_state(expected_interim(fixture)) == "c177_interim"
