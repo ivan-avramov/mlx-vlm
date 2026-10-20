@@ -2324,6 +2324,7 @@ def _items():
             name=f"math500/{i}",
             seed=i,
             item_sha256=str(i) * 64,
+            corpus_sha256="c" * 64,
             messages=[dict(role="user", content=f"q{i}")],
         )
         for i in range(3)
@@ -2361,6 +2362,8 @@ def test_the_panel_binds_bundles_items_messages_and_per_entry_digests():
         "count",
         "digest",
         "entry",
+        "corpus",
+        "source",
     ],
 )
 def test_the_panel_refuses_any_drift(change):
@@ -2389,6 +2392,15 @@ def test_the_panel_refuses_any_drift(change):
         counts["math500/1"]["sha256"] = "f" * 64
     elif change == "entry":
         pick = ORNITH  # not in this panel
+    elif change == "corpus":  # code round 1 M9: the dataset itself changed (same ids)
+        items[0]["corpus_sha256"] = "d" * 64
+    elif (
+        change == "source"
+    ):  # code round 1 M9: a panel labelled with another source pick
+        panel = _panel()
+        panel["source_pick"] = FABLE
+        assert orchestrate.panel_problems(panel, pick, bundles, items, counts)
+        return
     assert orchestrate.panel_problems(_panel(), pick, bundles, items, counts), change
 
 
@@ -2459,7 +2471,7 @@ def _ornith_record(draft_kernels):
 
 
 def test_a_moe_drafter_entrys_smoke_needs_a_passing_draft_path_inventory():
-    ok = dict(moe=True, problems=[], invocations=[{}], **{"pass": True})
+    ok = _inventory()
     assert orchestrate.smoke_gate({ORNITH: _ornith_record(ok)})["pass_"]
     bad = dict(ok, problems=["drafter MoE block ran ['gate']"], **{"pass": False})
     gate = orchestrate.smoke_gate({ORNITH: _ornith_record(bad)})
@@ -2469,7 +2481,70 @@ def test_a_moe_drafter_entrys_smoke_needs_a_passing_draft_path_inventory():
 
 
 def test_a_dense_drafter_entry_does_not_need_the_draft_path_inventory():
-    assert orchestrate.smoke_gate({UNIFORM: _ornith_record(...)})["pass_"]  # unchanged for dense
+    assert orchestrate.smoke_gate({UNIFORM: _ornith_record(...)})[
+        "pass_"
+    ]  # unchanged for dense
     assert orchestrate.needs_draft_inventory(
         ORNITH
     ) and not orchestrate.needs_draft_inventory(UNIFORM)
+
+
+# ------------------------------------------------------------------ P369 v13 code round 1 M1 / M2 / M10
+def test_m1_the_registry_is_read_as_bytes_so_crlf_refuses(tmp_path):
+    lf = tmp_path / "lf.yaml"
+    lf.write_bytes(ALL_OFF.encode("utf-8"))
+    crlf = tmp_path / "crlf.yaml"
+    crlf.write_bytes(ALL_OFF.replace("\n", "\r\n").encode("utf-8"))
+    assert orchestrate.read_registry(lf) == ALL_OFF
+    assert (
+        rs.classify(orchestrate.read_registry(crlf), FIXTURE_TEXT) is None
+    )  # never normalized to LF
+
+
+def _draft_parts():
+    from p369_phase2 import telemetry
+
+    return sorted(telemetry.DRAFT_MOE_PARTS)
+
+
+def _inventory(**changes):
+    inv = dict(
+        moe=True,
+        problems=[],
+        invocations=[
+            dict(
+                block="drafter.layers.0.mlp",
+                parts=_draft_parts(),
+                selected_experts=[0, 3],
+            )
+        ],
+        **{"pass": True},
+    )
+    inv.update(changes)
+    return inv
+
+
+@pytest.mark.parametrize(
+    "kind", ["empty", "shapeless", "moe_false", "router_only", "no_experts"]
+)
+def test_m2_the_gate_checks_the_whole_draft_inventory_not_its_pass_flag(kind):
+    inventory = dict(
+        empty=dict(moe=True, problems=[], invocations=[], **{"pass": True}),
+        shapeless=dict(moe=True, problems=[], invocations=[{}], **{"pass": True}),
+        moe_false=_inventory(moe=False),
+        router_only=_inventory(
+            invocations=[dict(block="b", parts=["gate"], selected_experts=[1])]
+        ),
+        no_experts=_inventory(
+            invocations=[dict(block="b", parts=_draft_parts(), selected_experts=[])]
+        ),
+    )[kind]
+    gate = orchestrate.smoke_gate({ORNITH: _ornith_record(inventory)})
+    assert not gate["pass_"], kind
+
+
+@pytest.mark.parametrize("bad", [-1, float("-inf"), float("nan"), float("inf")])
+def test_m10_phase_timings_must_be_finite_and_non_negative(bad):
+    record = _smoke_record(step_s=dict(prep=5, e1c=bad, e2=5, e7b=10))
+    with pytest.raises(orchestrate.MalformedEvidence, match="step_s"):
+        orchestrate.smoke_gate({FABLE: record})
