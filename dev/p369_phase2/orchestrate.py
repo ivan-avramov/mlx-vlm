@@ -31,6 +31,7 @@ PICKS = {
     "Qwen3.8-27B-mlx-uniform-4bit": dict(kv="tq4", verify_policy=None),
 }
 THRESHOLDS = (1024, 8192, 32768, 65536)
+SMOKE_THRESHOLDS = (1024, 65536)  # the positive block rides the last (code round 2 C2)
 C84_AXES = ("math500", "humanevalplus", "mbppplus", "cjudge")
 # Code round 1 H3: the worker env is an ALLOWLIST (process / locale / Hugging Face cache plumbing); every
 # generation knob (MLX_*, KV_*, TQ_*, APC_*, MIN_OUTPUT_TOKENS, future ones) is dropped, then exactly
@@ -820,6 +821,15 @@ def smoke_gate(picks):
                 need.add(kv_positive_kind(v.get("leaf_census"), f"{pick} {name}"))
                 if not baseline or not need <= seen:
                     problems.append(f"{pick}: smoke positives {sp}")
+        # code round 2 C2: exactly the scheduled cells, the positive block on the last one only
+        cells = record.get("e1c") or {}
+        scheduled = [f"T{t}" for t in SMOKE_THRESHOLDS]
+        if sorted(cells) != sorted(scheduled):
+            problems.append(f"{pick}: E1c smoke cells {sorted(cells)} != {scheduled}")
+        for name in scheduled:
+            has = (cells.get(name) or {}).get("smoke_positives") is not None
+            if has != (name == scheduled[-1]):
+                problems.append(f"{pick} {name}: smoke positives present={has}")
         e2 = record.get("e2")
         if e2 is None or e2.get("verdict") != "PASS":
             problems.append(f"{pick}: E2 smoke {e2}")
@@ -2138,7 +2148,7 @@ class Campaign:
             record["wall_s"] = round(time.monotonic() - started)
             self.write_summary()
 
-        thresholds = (1024, 65536) if smoke else THRESHOLDS
+        thresholds = SMOKE_THRESHOLDS if smoke else THRESHOLDS
         prompts = self.size(pick, thresholds)
         self.check_bench(pick)  # still exactly the bound bench inputs, before...
         items = c84_items(self.stack, pick)

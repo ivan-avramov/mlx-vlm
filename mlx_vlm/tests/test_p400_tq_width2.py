@@ -1,7 +1,9 @@
 """P400: MTP exactness on each pick's DEPLOYED KV codec, incl. the width-2 verify block (fork-only).
 
-`Qwen3.8-27B-mlx-uniform-4bit` serves TurboQuant 4-bit KV; `Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed` native16. The
-quantized exactness fixtures never enabled TurboQuant KV, which hid P400: a length-2 verify block went through ONE batched
+`Qwen3.8-27B-mlx-uniform-4bit`'s registry entry asks TurboQuant 4-bit KV, but the server currently builds AFFINE 4-bit KV
+for it (P405: ``--kv-quant-scheme turboquant`` is ignored), so both quantized codecs are covered — TurboQuant (the registry's
+intent) and affine (what is served today); `Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed` serves native16. The quantized
+exactness fixtures never enabled quantized KV, which hid P400: a length-2 verify block went through ONE batched
 SDPA call (on a TurboQuant cache: ``quantized_attention`` with ``L = 2``, the multi-query path), not plain decoding's
 singleton calls. Every case asserts the cache codec it ran on and the verifier widths it saw, so a plumbing fallback to native
 KV cannot pass. Metal only (the exact verifier kernels).

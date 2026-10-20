@@ -9,8 +9,10 @@ Per arm: the median of its 10 measured requests (and the max peak). Bounds: medi
 decode-phase peak increase ≤ 1 %. The production tree is chosen by ``PYTHONPATH``; each leg records the tree it loaded.
 
 Usage (from the stack root, detached, under the STACK venv like the orchestrator): ``.venv/bin/python
-<p400>/dev/p400_perf_probe.py drive --stack-root . --old-tree <p369 wt> --new-tree <p400 wt> --python <fork venv python>
---out $STACK_WORKDIR/p400/perf/<run>``.
+<p400>/dev/p400_perf_probe.py drive --stack-root . --old-tree <old wt> --old-ref <sha> --new-tree <new wt> --new-ref <sha>
+--python <fork venv python> --out $STACK_WORKDIR/p400/perf/<run>``. Code round 2: each arm is a clean tree at its expected
+commit (re-attested per leg), every globally consecutive leg is preceded by >= 600 s idle, every request decodes exactly 256
+tokens to the length cap, and each leg asserts the served MTP tuple and the KV codec its argv names.
 """
 
 import argparse
@@ -30,6 +32,7 @@ WARMUP, MEASURED = 3, 5
 SEED = 7
 ORDER = ("A", "B", "B", "A")
 BOUNDS = dict(tps_regression=0.03, peak_increase=0.01)
+MIN_IDLE_S = 600.0  # AGENTS.md: >= 10 min idle between arms
 
 
 # ------------------------------------------------------------------ pure parts (tested)
@@ -65,6 +68,86 @@ def verdict(stats, bounds=BOUNDS):
     )
 
 
+def request_problems(probe, finish_reason, widths):
+    """Code round 2 C3: a measured request decodes exactly DECODE_TOKENS to the length cap and saw a width-2 block."""
+    problems = []
+    if not probe or not probe.get("tps", 0) > 0:
+        problems.append(f"no decode measurement {probe}")
+    elif probe.get("tokens") != DECODE_TOKENS:
+        problems.append(f"decoded {probe.get('tokens')} tokens, not {DECODE_TOKENS}")
+    if finish_reason != "length":
+        problems.append(f"finish_reason {finish_reason!r}, not 'length'")
+    if 2 not in widths:
+        problems.append(f"no width-2 verify block ({sorted(set(widths))})")
+    return problems
+
+
+def attest_tree(path):
+    """The tree's HEAD and whether its working tree is clean (code round 2 C4)."""
+    git = ["git", "-C", str(path)]
+    head = subprocess.run(
+        git + ["rev-parse", "HEAD"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    dirty = subprocess.run(
+        git + ["status", "--porcelain"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    return dict(head=head, clean=not dirty)
+
+
+def tree_problems(trees, refs, attest):
+    """Code round 2 C4: two distinct clean trees, each at its expected commit. ``attest``: path → attest_tree()."""
+    problems = []
+    if trees["A"] == trees["B"]:
+        problems.append(f"both arms load {trees['A']}")
+    if refs["A"] == refs["B"]:
+        problems.append(f"both arms expect commit {refs['A']}")
+    for arm in ("A", "B"):
+        got = attest[trees[arm]]
+        if not got["head"].startswith(refs[arm]):
+            problems.append(
+                f"arm {arm}: {trees[arm]} at {got['head']}, not {refs[arm]}"
+            )
+        if not got["clean"]:
+            problems.append(f"arm {arm}: {trees[arm]} has uncommitted changes")
+    return problems
+
+
+def leg_schedule(picks):
+    """Code round 2 C5: every globally consecutive leg (a pick's first included) is preceded by the idle."""
+    plan = [
+        dict(pick=pick, k=k, arm=arm) for pick in picks for k, arm in enumerate(ORDER)
+    ]
+    for i, step in enumerate(plan):
+        step["idle_before"] = i > 0
+    return plan
+
+
+def kv_expected(argv):
+    """The KV codec the argv asks for: ``bits`` None = native KV (``--kv-bits`` absent or 0; the scheme is moot)."""
+    opts = dict(zip(argv, argv[1:]))
+    bits = float(opts.get("--kv-bits") or 0) or None
+    return dict(
+        bits=bits, scheme=opts.get("--kv-quant-scheme", "uniform") if bits else None
+    )
+
+
+def served_check(worker, rg, argv, pick):
+    """Code round 2 C6 (+ P405): the deployed MTP tuple and the KV codec the argv names are what the worker serves."""
+    from p369_phase2 import orchestrate
+
+    state = worker.served_state()
+    worker.assert_served(
+        state,
+        dict(drafter=True, verify_policy=orchestrate.PICKS[pick]["verify_policy"]),
+    )
+    want = kv_expected(argv)
+    bits = float(rg.kv_bits or 0) or None
+    got = dict(bits=bits, scheme=rg.kv_quant_scheme if bits else None)
+    if got != want:
+        raise RuntimeError(f"served KV {got} != the argv's {want}")
+    return dict(state, kv=got)
+
+
 # ------------------------------------------------------------------ one leg (a child process)
 def leg(job_path):
     job = json.loads(Path(job_path).read_text())
@@ -76,8 +159,14 @@ def leg(job_path):
 
     worker.ROUTED_MODEL = worker.argv_model(job["argv"])
     client = worker.boot(job["argv"])
-    result = dict(arm=job["arm"], tree=str(Path(mlx_vlm.__file__).resolve().parents[1]))
+    tree = Path(mlx_vlm.__file__).resolve().parents[1]
+    result = dict(arm=job["arm"], tree=str(tree), attest=attest_tree(tree))
     with client:
+        import mlx_vlm.server as server
+
+        result["served"] = served_check(
+            worker, server.runtime.response_generator, job["argv"], job["pick"]
+        )
         from mlx_vlm.models.qwen3_5 import speculative_verifier as sv
 
         widths = []
@@ -143,13 +232,18 @@ def leg(job_path):
             if r.status_code != 200:
                 raise RuntimeError(f"request {i}: {r.status_code} {r.text[:300]}")
             worker.release_session(chat)
-            if not probe or probe["tps"] <= 0:
-                raise RuntimeError(f"request {i}: no decode measurement {probe}")
-            if 2 not in widths:
-                raise RuntimeError(
-                    f"request {i}: no width-2 verify block ({sorted(set(widths))})"
+            finish = r.json()["choices"][0].get("finish_reason")
+            problems = request_problems(probe, finish, widths)
+            if problems:
+                raise RuntimeError(f"request {i}: {problems}")
+            reps.append(
+                dict(
+                    probe,
+                    finish_reason=finish,
+                    widths=sorted(set(widths)),
+                    warmup=i < WARMUP,
                 )
-            reps.append(dict(probe, widths=sorted(set(widths)), warmup=i < WARMUP))
+            )
         result.update(
             prompt_tokens=tokens,
             warmup=[r for r in reps if r["warmup"]],
@@ -170,53 +264,74 @@ def drive(args):
     trees = dict(
         A=str(Path(args.old_tree).resolve()), B=str(Path(args.new_tree).resolve())
     )
+    refs = dict(A=args.old_ref, B=args.new_ref)
+    attest = {path: attest_tree(path) for path in set(trees.values())}
+    problems = tree_problems(trees, refs, attest)
+    if problems:
+        raise SystemExit(f"arm trees: {problems}")
     report = dict(
-        order=ORDER, trees=trees, picks={}, started=time.strftime("%Y-%m-%dT%H:%M:%S")
+        order=ORDER,
+        trees=trees,
+        refs=refs,
+        attest=attest,
+        idle_s=args.idle_s,
+        picks={},
+        started=time.strftime("%Y-%m-%dT%H:%M:%S"),
     )
-    for pick in args.pick or list(orchestrate.PICKS):
+    picks = args.pick or list(orchestrate.PICKS)
+    argvs = {}
+    for pick in picks:
         text, _ = orchestrate.overlay_registry(registry, pick)
         overlay = out / f"overlay-{pick}.yaml"
         overlay.write_text(text)
-        argv = orchestrate.worker_argv(stack, overlay, pick) + [
+        argvs[pick] = orchestrate.worker_argv(stack, overlay, pick) + [
             "--draft-block-size",
             "2",
         ]
-        legs = []
-        for k, arm in enumerate(ORDER):
-            if k:
-                time.sleep(args.idle_s)  # >= 10 min idle between legs (AGENTS.md)
-            power = orchestrate.power_state()
-            if not (power["ac_ok"] and power["battery_ok"]):
-                raise SystemExit(f"power not OK before leg {k}: {power}")
-            job = out / f"{pick}-leg{k}-{arm}.job.json"
-            res = out / f"{pick}-leg{k}-{arm}.json"
-            job.write_text(
-                json.dumps(dict(argv=argv, pick=pick, arm=arm, out=str(res)))
+    legs_of = {pick: [] for pick in picks}
+    last_end = None
+    for step in leg_schedule(picks):
+        pick, k, arm, argv = step["pick"], step["k"], step["arm"], argvs[step["pick"]]
+        legs = legs_of[pick]
+        if step["idle_before"]:
+            time.sleep(args.idle_s)  # >= 10 min idle between legs (AGENTS.md)
+        idle_before_s = None if last_end is None else time.monotonic() - last_end
+        power = orchestrate.power_state()
+        if not (power["ac_ok"] and power["battery_ok"]):
+            raise SystemExit(f"power not OK before leg {k}: {power}")
+        job = out / f"{pick}-leg{k}-{arm}.job.json"
+        res = out / f"{pick}-leg{k}-{arm}.json"
+        job.write_text(json.dumps(dict(argv=argv, pick=pick, arm=arm, out=str(res))))
+        env = orchestrate.worker_env(dict(os.environ))
+        env["PYTHONPATH"] = trees[arm]
+        log = open(out / f"{pick}-leg{k}-{arm}.log", "w")
+        rc = subprocess.run(
+            [args.python, __file__, "leg", str(job)],
+            env=env,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            timeout=3 * 3600,
+            cwd=str(out),
+        ).returncode
+        log.close()
+        last_end = time.monotonic()
+        if rc != 0:
+            raise SystemExit(f"{pick} leg {k} ({arm}) failed rc {rc}; see its log")
+        leg_result = json.loads(res.read_text())
+        if leg_result["tree"] != trees[arm]:
+            raise SystemExit(
+                f"leg {k} loaded {leg_result['tree']}, wanted {trees[arm]}"
             )
-            env = orchestrate.worker_env(dict(os.environ))
-            env["PYTHONPATH"] = trees[arm]
-            log = open(out / f"{pick}-leg{k}-{arm}.log", "w")
-            rc = subprocess.run(
-                [args.python, __file__, "leg", str(job)],
-                env=env,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                timeout=3 * 3600,
-                cwd=str(out),
-            ).returncode
-            log.close()
-            if rc != 0:
-                raise SystemExit(f"{pick} leg {k} ({arm}) failed rc {rc}; see its log")
-            leg_result = json.loads(res.read_text())
-            if leg_result["tree"] != trees[arm]:
-                raise SystemExit(
-                    f"leg {k} loaded {leg_result['tree']}, wanted {trees[arm]}"
-                )
-            leg_result["power"] = power
-            legs.append(leg_result)
-        stats = arm_stats(legs)
-        report["picks"][pick] = dict(legs=legs, stats=stats, verdict=verdict(stats))
-        (out / "report.json").write_text(json.dumps(report, indent=1))
+        if leg_result["attest"] != attest[trees[arm]]:
+            raise SystemExit(
+                f"leg {k} tree {leg_result['attest']}, attested {attest[trees[arm]]}"
+            )
+        leg_result.update(power=power, idle_before_s=idle_before_s)
+        legs.append(leg_result)
+        if k == len(ORDER) - 1:
+            stats = arm_stats(legs)
+            report["picks"][pick] = dict(legs=legs, stats=stats, verdict=verdict(stats))
+            (out / "report.json").write_text(json.dumps(report, indent=1))
     report["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     (out / "report.json").write_text(json.dumps(report, indent=1))
     print(json.dumps({p: v["verdict"] for p, v in report["picks"].items()}, indent=1))
@@ -229,6 +344,8 @@ def main(argv=None):
     d.add_argument("--stack-root", required=True)
     d.add_argument("--old-tree", required=True)
     d.add_argument("--new-tree", required=True)
+    d.add_argument("--old-ref", required=True, help="the commit arm A must be at")
+    d.add_argument("--new-ref", required=True, help="the commit arm B must be at")
     d.add_argument("--out", required=True)
     d.add_argument("--pick", action="append")
     d.add_argument("--idle-s", type=float, default=600.0)
@@ -240,6 +357,8 @@ def main(argv=None):
     lg = sub.add_parser("leg")
     lg.add_argument("job")
     args = ap.parse_args(argv)
+    if args.cmd == "drive" and args.idle_s < MIN_IDLE_S:
+        ap.error(f"--idle-s must be at least {MIN_IDLE_S:.0f} (AGENTS.md)")
     if args.cmd == "drive":
         drive(args)
     else:

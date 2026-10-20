@@ -494,12 +494,12 @@ def test_forced_schedule_compares_only_emitted_positions():
     assert got == dict(on=[[3, 63]], off=[], **{"pass": False})
 
 
-# ------------------------------------------------------------------ P400: the deployed KV codec (TurboQuant)
+# ------------------------------------------------------------------ P400: the KV codecs (registry TurboQuant; served affine, P405)
 TQ4 = dict(kv_bits=4, kv_quant_scheme="turboquant", quantized_kv_start=0)
 AFFINE4 = dict(
     kv_bits=4, kv_quant_scheme="uniform", quantized_kv_start=0
 )  # what the server builds today (P405)
-DEPLOYED_KV = {PICKS[0]: {}, PICKS[1]: TQ4}
+DEPLOYED_KV = {PICKS[0]: {}, PICKS[1]: TQ4}  # the registry's intent
 KV_CASES = [
     (PICKS[0], {}, "KVCache"),
     (PICKS[1], TQ4, "TurboQuantKVCache"),
