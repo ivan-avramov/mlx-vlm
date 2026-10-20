@@ -51,7 +51,12 @@ def _warm(n=N, seed=5):
 
 
 def _kv_leaf(caches):
-    return next(c for c in iter_leaf_caches(caches) if type(c).__name__ == "KVCache")
+    """The first full-attention KV leaf — a native ``KVCache`` or a ``TurboQuantKVCache`` (P400)."""
+    return next(
+        c
+        for c in iter_leaf_caches(caches)
+        if type(c).__name__ in ("KVCache", "TurboQuantKVCache")
+    )
 
 
 def _recurrent_leaf(caches):
@@ -240,11 +245,15 @@ def _quantized(pick):
     return _QUANTIZED[pick]
 
 
-def _e1c(pick, seed=5, n=12):
-    """ON with recording, then the OFF replay forced along ON's tokens, hashing at ON's offsets."""
+def _e1c(pick, seed=5, n=12, kv=None):
+    """ON with recording, then the OFF replay forced along ON's tokens, hashing at ON's offsets (``kv``: the
+    KV-cache codec kwargs, e.g. the pick's deployed TurboQuant; P400)."""
+    kv = kv or {}
     lm, drafter = _quantized(pick)
     model, params = fake_model(lm), deployed_sampling(pick)
-    plain, _ = turn(model, PROMPT, PromptCacheState(), n=n, seed=seed, params=params)
+    plain, _ = turn(
+        model, PROMPT, PromptCacheState(), n=n, seed=seed, params=params, **kv
+    )
     plain = list(plain)
     scripted(
         drafter, lambda p: plain[p] if p < len(plain) else None, high=True, vocab=64
@@ -258,6 +267,7 @@ def _e1c(pick, seed=5, n=12):
             n=n,
             seed=seed,
             params=params,
+            **kv,
         )
     assert list(emitted) == plain and on.draft_rounds > 0
     offsets = [on.prompt_end["offset"]] + [c["offset"] for c in on.commits]
@@ -482,3 +492,77 @@ def test_forced_schedule_compares_only_emitted_positions():
     assert not fs([(3, 63)], [(3, 62)], 5)["pass"]
     got = fs([(3, 63)], [], 5)
     assert got == dict(on=[[3, 63]], off=[], **{"pass": False})
+
+
+# ------------------------------------------------------------------ P400: the deployed KV codec (TurboQuant)
+TQ4 = dict(kv_bits=4, kv_quant_scheme="turboquant", quantized_kv_start=0)
+DEPLOYED_KV = {PICKS[0]: {}, PICKS[1]: TQ4}
+
+
+@metal
+@pytest.mark.parametrize(
+    "n", [14, 17]
+)  # (n - 1) % 3 == 1: the terminal round has one token of budget (width 2)
+@pytest.mark.parametrize("pick", PICKS)
+def test_quantized_e1c_on_the_deployed_kv_codec(pick, n):
+    kv = DEPLOYED_KV[pick]
+    lm, model, params, on, emitted, offsets = _e1c(pick, n=n, kv=kv)
+    leaf_kinds = {type(c).__name__ for c in iter_leaf_caches(on._cache or [])}
+    with observe.Recorder(
+        mode="off", force_tokens=emitted, hash_offsets=offsets, lm=lm, probe_token=PROBE
+    ) as off:
+        turn(
+            model,
+            PROMPT,
+            PromptCacheState(),
+            n=len(emitted),
+            seed=5,
+            params=params,
+            **kv,
+        )
+        off_kinds = {type(c).__name__ for c in iter_leaf_caches(off._cache or [])}
+    want = "TurboQuantKVCache" if kv else "KVCache"
+    assert want in leaf_kinds | off_kinds, (leaf_kinds, off_kinds)
+    forced = compare.forced_positions(on, emitted, finish_reason="length")
+    rows = compare.compare_streams(
+        on.rows, off.rows, len(emitted), params, exclude=forced
+    )
+    assert rows["pass"] and rows["raw_equal"] == len(emitted) - len(forced), rows
+    assert compare.forced_schedule(on.forced, off.forced, len(emitted))["pass"]
+    states = observe.compare_states(on, off)
+    assert states["pass"] and states["compared"] == len(offsets), states
+
+
+@metal
+def test_quantized_e1c_detects_a_turboquant_packed_state_change():
+    """The state check sees a changed TurboQuant norm in an OLD prefix position (the corruption positive, on TQ)."""
+    kv = DEPLOYED_KV[PICKS[1]]
+    lm, model, params, on, emitted, offsets = _e1c(PICKS[1], kv=kv)
+    target = offsets[len(offsets) // 2]
+
+    def corrupt(caches, offset):
+        if offset == target:
+            leaf = _kv_leaf(caches)
+            assert type(leaf).__name__ == "TurboQuantKVCache", type(leaf).__name__
+            norms = leaf.keys[0]
+            norms[..., 0:1] = norms[..., 0:1] * 2.0
+
+    with observe.Recorder(
+        mode="off",
+        force_tokens=emitted,
+        hash_offsets=offsets,
+        lm=lm,
+        probe_token=PROBE,
+        before_hash=corrupt,
+    ) as off:
+        turn(
+            model,
+            PROMPT,
+            PromptCacheState(),
+            n=len(emitted),
+            seed=5,
+            params=params,
+            **kv,
+        )
+    states = observe.compare_states(on, off)
+    assert not states["pass"] and target in states["mismatched_offsets"]
