@@ -1025,3 +1025,21 @@ def test_an_affine_quantized_kv_leaf_gets_its_own_positive():
     got = worker.kv_positive_targets([affine])
     assert [kind for kind, _ in got] == ["quantized_scale"], got
     assert got[0][1] is affine.keys[1]
+
+
+def test_the_worker_script_imports_under_isolated_mode(tmp_path):
+    """Smoke 12: the orchestrator launches ``python -I worker.py job.json`` — neither the script's directory nor
+    PYTHONPATH is on sys.path until ``main`` inserts the job's dev dir, so a module-level sibling import kills the
+    worker before it reads its job. Here the job file is absent: the worker must get as far as reading it.
+    """
+    import subprocess
+
+    script = Path(worker.__file__).resolve()
+    out = subprocess.run(
+        [sys.executable, "-I", str(script), str(tmp_path / "absent.json")],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert "ModuleNotFoundError" not in out.stderr, out.stderr[-2000:]
+    assert "FileNotFoundError" in out.stderr, out.stderr[-2000:]
