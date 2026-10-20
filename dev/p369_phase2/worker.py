@@ -25,9 +25,11 @@ FILLER = "alpha beta gamma delta epsilon zeta eta theta iota kappa".split()
 NUDGES = list("abcdefghijklmnopqrstuvwxyz0123456789")
 
 
-class DryRun(BaseException):
-    """Raised inside the endpoint's tokenization to measure a prompt without generating (a BaseException,
-    so no generic ``except Exception`` handler on the way out can swallow it)."""
+class DryRun(Exception):
+    """Raised inside the endpoint's tokenization to stop a measuring request before generation. A plain
+    ``Exception`` (smoke 2): a ``BaseException`` unwinds through the app's ``http`` middleware task group as a
+    ``BaseExceptionGroup`` and stops the TestClient portal. The ids travel on the side (``prompt_ids``), so
+    an endpoint handler that turns the error into a response loses nothing."""
 
     def __init__(self, tokens):
         super().__init__(tokens)
@@ -474,30 +476,44 @@ def prompt_tokens(client, messages, base_payload):
 
 
 def prompt_ids(client, messages, base_payload):
-    """The endpoint's own templated prompt token ids for ``messages`` (no generation)."""
+    """The endpoint's own templated prompt token ids for ``messages`` (no generation): the production
+    tokenization is hooked to record the ids, then stop the request (``DryRun``) before it is submitted.
+    """
     from mlx_vlm.server import generation
 
     real = generation.ResponseGenerator._preprocess_request
+    seen = []
 
     def measuring(rg, *args, **kwargs):
         raw = real(rg, *args, **kwargs)
         ids = _ids_list(raw["input_ids"])
         if len(ids) != generation._count_prompt_tokens(raw):
             raise RuntimeError("templated ids disagree with the production count")
+        seen.append(ids)
         raise DryRun(ids)
 
     generation.ResponseGenerator._preprocess_request = measuring
+    response = None
     try:
-        client.post(
+        response = client.post(
             "/v1/chat/completions",
             headers={"X-MLX-VLM-Chat-Id": f"p369-size-{uuid.uuid4().hex}"},
             json=routed(dict(base_payload, messages=messages, max_tokens=1)),
         )
-    except DryRun as stop:
-        return stop.tokens
+    except DryRun:
+        pass
     finally:
         generation.ResponseGenerator._preprocess_request = real
-    raise RuntimeError("dry run reached generation")
+    if not seen:
+        raise RuntimeError(
+            "dry run did not reach tokenization: "
+            f"{getattr(response, 'status_code', None)} {getattr(response, 'text', '')[:300]}"
+        )
+    if response is not None and response.status_code == 200:
+        raise RuntimeError("dry run reached generation")
+    if any(ids != seen[0] for ids in seen):
+        raise RuntimeError("the dry run tokenized the prompt differently twice")
+    return seen[0]
 
 
 def size_prompt(count, target, *, prefix, suffix):
