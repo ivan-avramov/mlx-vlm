@@ -681,6 +681,44 @@ def kv_positive_targets(leaves):
     return targets
 
 
+def in_support_perturbation(latest, params, exclude=()):
+    """Smoke 12b: ``(position, record)`` — a change to one sampled row GUARANTEED to change its canonical
+    (post-transform) distribution: the latest non-excluded position whose retained support has >= 2 tokens gets +0.5
+    on its top logit (a retained probability moves); if every support is a single token, the latest position's best
+    out-of-support token is raised to the top logit (the support boundary moves). Verified, else it raises.
+    """
+    import mlx.core as mx
+    import numpy as np
+    from p369_phase2 import compare
+
+    candidates = sorted((p for p in latest if p not in set(exclude)), reverse=True)
+    if not candidates:
+        raise RuntimeError("no comparable position for the in-support positive")
+    multi = [
+        p
+        for p in candidates
+        if int((compare.canonical(latest[p], params) > 0).sum()) >= 2
+    ]
+    position = multi[0] if multi else candidates[0]
+    record = latest[position]
+    canon = compare.canonical(record, params)
+    row = compare.from_record(record)
+    top = int(np.argmax(canon))
+    if multi:
+        bumped = mx.where(mx.arange(row.size) == top, row + 0.5, row)
+    else:
+        raw = np.array(row.astype(mx.float32))
+        outside = np.where(canon == 0, raw, -np.inf)
+        j = int(np.argmax(outside))
+        bumped = mx.where(mx.arange(row.size) == j, row[top], row)
+    perturbed = compare.as_record(bumped.astype(row.dtype))
+    if np.array_equal(compare.canonical(perturbed, params), canon):
+        raise RuntimeError(
+            f"in-support perturbation at {position} left the distribution unchanged"
+        )
+    return position, perturbed
+
+
 def smoke_positives(on, off, n, params, exclude=()):
     """Q32 on live data: the unmodified ON / OFF data pass, and each injected change is detected (rows at the
     ``exclude``d forced positions are not compared, P398)."""
@@ -709,22 +747,19 @@ def smoke_positives(on, off, n, params, exclude=()):
         exclude=exclude,
     )
     fired["raw_ulp"] = raw["raw_only_differences"] == [position] and raw["pass"]
-    # in support: the comparator must fail exactly there.
-    row = compare.from_record(record)
-    top = int(np.argmax(canon))
-    import mlx.core as mx
-
-    bumped = mx.where(mx.arange(row.size) == top, row + 0.5, row).astype(row.dtype)
+    # in support: the comparator must fail exactly there (smoke 12b: a perturbation guaranteed to change the
+    # canonical distribution, at the latest multi-token support or else at a moved support boundary).
+    at, perturbed = in_support_perturbation(latest, params, exclude=exclude)
     bad = compare.compare_streams(
         rows_on,
-        _replace_last(rows_off, position, compare.as_record(bumped)),
+        _replace_last(rows_off, at, perturbed),
         n,
         params,
         exclude=exclude,
     )
     fired["in_support"] = (not bad["pass"]) and [
         m["position"] for m in bad["mismatches"]
-    ] == [position]
+    ] == [at]
     # live cache components (the final OFF cache): each change must move the full-state hash.
     from mlx_vlm.speculative.cache_state import iter_leaf_caches
 
