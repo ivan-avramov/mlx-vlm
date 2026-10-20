@@ -43,11 +43,12 @@ DEPLOYED_KV = {PICKS[0]: {}, PICKS[1]: TQ4}  # native16 / TurboQuant 4-bit
 
 @pytest.fixture
 def observed(monkeypatch):
-    """Verifier block widths, and the query length of every TurboQuant attention call made INSIDE the verifier."""
+    """Verifier block widths, and the query length of every TurboQuant attention call made INSIDE the verifier —
+    through any of its entry points (``decode_attention`` for L == 1; ``prefill_attention`` / ``quantized_attention``
+    for L > 1)."""
     rec = SimpleNamespace(widths=[], tq_lengths=[])
     depth = [0]
     real_attention = sv.Qwen3_5BatchInvariantForward._attention
-    real_quantized = tq._TurboQuantAttentionMixin.quantized_attention
 
     def attention(self, attn, x, *args, **kwargs):
         rec.widths.append(int(x.shape[1]))
@@ -57,13 +58,18 @@ def observed(monkeypatch):
         finally:
             depth[0] -= 1
 
-    def quantized(self, queries, *args, **kwargs):
-        if depth[0]:
-            rec.tq_lengths.append(int(queries.shape[2]))
-        return real_quantized(self, queries, *args, **kwargs)
+    def recording(real):
+        def wrapped(self, queries, *args, **kwargs):
+            if depth[0]:
+                rec.tq_lengths.append(int(queries.shape[2]))
+            return real(self, queries, *args, **kwargs)
+
+        return wrapped
 
     monkeypatch.setattr(sv.Qwen3_5BatchInvariantForward, "_attention", attention)
-    monkeypatch.setattr(tq._TurboQuantAttentionMixin, "quantized_attention", quantized)
+    for name in ("decode_attention", "prefill_attention", "quantized_attention"):
+        real = getattr(tq._TurboQuantAttentionMixin, name)
+        monkeypatch.setattr(tq._TurboQuantAttentionMixin, name, recording(real))
     return rec
 
 

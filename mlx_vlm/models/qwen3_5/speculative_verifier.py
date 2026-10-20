@@ -124,23 +124,11 @@ class Qwen3_5BatchInvariantForward:
                 mask=mask,
             )
 
-        if output is None and length == 2:
-            if isinstance(mask, str) and mask == "causal":
-                key_length = kv_sequence_length(keys)
-                prefix_length = key_length - length
-                mask = (
-                    mx.arange(key_length)[None, None, None, :]
-                    < (prefix_length + mx.arange(length) + 1)[None, None, :, None]
-                )
-            output = scaled_dot_product_attention(
-                queries,
-                keys,
-                values,
-                cache=cache,
-                scale=attention.scale,
-                mask=mask,
-            )
-        elif output is None and length > 1:
+        # Fork (P400): upstream served a length-2 block with ONE batched masked SDPA call. On a TurboQuant cache that
+        # is quantized_attention(L = 2) — the multi-query path, not bit-identical to plain decoding's singleton call
+        # under TF32 (this box's default numerics) — so every length > 1 block takes the per-query loop below, the
+        # same singleton call per query plain decoding makes (as the Gemma4 / Nemotron-H verifiers already do).
+        if output is None and length > 1:
             prefix_length = kv_sequence_length(keys) - length
             output = mx.concatenate(
                 [
