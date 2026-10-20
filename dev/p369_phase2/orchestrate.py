@@ -28,7 +28,7 @@ try:
 except ImportError:  # run as a script: this directory is sys.path[0]
     import kvmanifest
 
-PRODUCTION = "3395cef3"  # P400 + P401 (C188) + P405 F1 / F2 (C189); was da27f0ef, before it 4e6d0e03
+PRODUCTION = "7207179b"  # P400 + P401 (C188) + P405 F1 / F2 + K6 (C189 / C192); was 3395cef3, da27f0ef, 4e6d0e03
 PICKS = {
     "Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed": dict(
         kv="native16", verify_policy="joint_v1"
