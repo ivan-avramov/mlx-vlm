@@ -224,6 +224,9 @@ class Recorder:
         self.before_hash = before_hash
         self.rows = []
         self.commits = []
+        self.cuts = (
+            []
+        )  # code round 1 M7: one per emission decision — base, verifier rows, emitted
         self.states = {}
         self.prompt_end = None
         self.draft_rounds = 0
@@ -262,6 +265,7 @@ class Recorder:
         if any(position < base for position, _ in block):
             raise RuntimeError(f"a block row precedes its base position {base}")
         self.rows[start:] = [r for r in block if r[0] < base + n_emit]
+        self.cuts.append(dict(base=base, rows=len(block), n_emit=int(n_emit)))
         self._block = None
 
     # -- patches

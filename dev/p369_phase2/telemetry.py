@@ -107,6 +107,9 @@ class KernelTelemetry:
             []
         )  # v13 V15: one per drafter MoE-block invocation in draft scope
         self._routed_stack = []
+        self._helper_depth = (
+            0  # code round 1 M5: a fused helper's own bank calls are not counted twice
+        )
         self._draft_stack = []
         self._draft_depth = 0
         self.calls = []
@@ -280,48 +283,62 @@ class KernelTelemetry:
         return "verify" if self._scope_depth else "other"
 
     def _routed_note(self, module, indices, projections=None):
-        """One routed-bank projection call (or a fused helper standing for ``projections``) on ``module``."""
+        """One routed-bank projection call — or a fused helper standing for ``projections`` of the container
+        ``module`` — attributed to EACH underlying bank (its own family; code round 1 M5) and to the enclosing
+        invocation frame (code round 1 M6: a verify-scope routed call outside a frame is a problem).
+        """
         import numpy as np
 
-        name = self._names.get(id(module), "?")
-        projs = projections or (name.rsplit(".", 1)[-1],)
+        if projections is None:
+            name = self._names.get(id(module), "?")
+            banks = [(name.rsplit(".", 1)[-1], name, module)]
+        else:
+            base = self._names.get(id(module), "?")
+            banks = [
+                (p, f"{base}.{p}", getattr(module, p, module)) for p in projections
+            ]
         tokens = int(indices.size // indices.shape[-1]) if indices is not None else 0
         experts = (
             sorted({int(e) for e in np.array(indices).reshape(-1)})
             if indices is not None
             else []
         )
-        bank = name.rsplit(".", 1)[0] if projections is None else name
-        if self._routed_stack:
-            frame = self._routed_stack[-1]
-            frame["projections"].extend(projs)
+        frame = self._routed_stack[-1] if self._routed_stack else None
+        if frame is not None:
+            frame["projections"].extend(p for p, _, _ in banks)
             frame["experts"].update(experts)
-        family = (
-            "routed_gather_quantized"
-            if type(module).__name__.startswith("Quantized")
-            else "routed_gather"
-        )
         if not self._probe_depth:
-            for proj in projs:
+            for _, bank_name, bank in banks:
+                family = (
+                    "routed_gather_quantized"
+                    if type(bank).__name__.startswith("Quantized")
+                    else "routed_gather"
+                )
                 self.attributions.append(
                     dict(
                         entry="routed",
                         family=family,
                         width=tokens,
-                        module=f"{bank}.{proj}" if projections else name,
+                        module=bank_name,
                         kind="routed",
                         scope=self._scope_name(),
+                        frame=frame["id"] if frame is not None else None,
                     )
                 )
         if self._draft_stack:
-            self._draft_stack[-1]["parts"].extend(f"switch_mlp.{p}" for p in projs)
+            self._draft_stack[-1]["parts"].extend(
+                f"switch_mlp.{p}" for p, _, _ in banks
+            )
             self._draft_stack[-1]["experts"].update(experts)
 
     def _routed_bank(self, real):
         telemetry = self
 
         def wrapped(module, x, indices, *args, **kwargs):
-            telemetry._routed_note(module, indices)
+            if (
+                not telemetry._helper_depth
+            ):  # inside a fused helper: the helper records it once
+                telemetry._routed_note(module, indices)
             return real(module, x, indices, *args, **kwargs)
 
         return wrapped
@@ -330,7 +347,11 @@ class KernelTelemetry:
         telemetry = self
 
         def wrapped(module, x, indices, *args, **kwargs):
-            out = real(module, x, indices, *args, **kwargs)
+            telemetry._helper_depth += 1
+            try:
+                out = real(module, x, indices, *args, **kwargs)
+            finally:
+                telemetry._helper_depth -= 1
             if out is not None:
                 telemetry._routed_note(module, indices, projections)
             return out
@@ -344,6 +365,7 @@ class KernelTelemetry:
         def wrapped(*args, **kwargs):
             x = args[positional_indices - 1]
             frame = dict(
+                id=len(telemetry.routed_frames) + len(telemetry._routed_stack),
                 scope=telemetry._scope_name(),
                 width=int(x.shape[0] * x.shape[1]) if x.ndim == 3 else int(x.shape[0]),
                 projections=[],
@@ -661,11 +683,25 @@ def verdict(telemetry, manifest):
                 )
         elif a["family"] not in allowed | WIDTH1_OK:
             problems.append(f"unexpected width-1 family in {a}")
-    for (
-        frame
-    ) in (
-        telemetry.routed_frames
-    ):  # v13 V3: each verify-scope invocation runs every bank exactly once
+    routed_on_path = [
+        m
+        for m, info in manifest.items()
+        if info.get("kind") == "routed" and _on_path(m, info)
+    ]
+    verify_frames = [f for f in telemetry.routed_frames if f["scope"] == "verify"]
+    if (
+        routed_on_path and not verify_frames
+    ):  # code round 1 M6: the invocation observer must have run
+        problems.append(
+            "routed banks on the path but no verify-scope routed invocation observed"
+        )
+    for a in verify:
+        if a.get("kind") == "routed" and a.get("frame") is None:
+            problems.append(
+                f"verify-scope routed call outside an invocation frame: {a}"
+            )
+    # v13 V3: each verify-scope invocation runs every bank exactly once
+    for frame in telemetry.routed_frames:
         if frame["scope"] == "verify" and sorted(frame["projections"]) != sorted(
             ROUTED_PROJ
         ):

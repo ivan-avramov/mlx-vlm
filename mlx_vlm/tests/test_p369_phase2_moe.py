@@ -420,3 +420,282 @@ def test_v3d_a_moe_verify_block_equals_sequential_singletons(
                 )
                 compared += 1
     assert compared > 0
+
+
+# ------------------------------------------------------------------ P369 v13 code round 1 M4–M8 (Metal; run after the GPU campaign)
+METAL = pytest.mark.skipif(
+    not mx.metal.is_available(), reason="the served kernels are Metal"
+)
+
+
+@METAL
+def test_m4_the_split_artifact_itself_binds_and_runs_a_draft_verify_round(tmp_path):
+    """M4: the split → strict-load result is bound to a MoE target and executed (not a freshly constructed drafter),
+    with its certified shape asserted."""
+    written, drafter, kind = _split_and_load(tmp_path, "qwen3_5_moe_text")
+    assert drafter.config.block_size == 3  # depth 1 + the splitter's block_size_extra 2
+    mlp = drafter.layers[0].mlp
+    assert (mlp.num_experts, mlp.top_k) == (EXPERTS, TOP_K)
+    assert all(
+        hasattr(mlp.switch_mlp, p) for p in ("gate_proj", "up_proj", "down_proj")
+    )
+    lm = tiny_moe_target()
+    off, _ = turn(
+        fake_model(lm), PROMPT, PromptCacheState(), n=12, seed=5, params=PARAMS
+    )
+    tel, rec, on = _observed_turn(lm, drafter)
+    assert on == list(off) and rec.draft_rounds > 0
+    assert telemetry.draft_verdict(tel, drafter)["pass"]
+
+
+@METAL
+def test_m5_a_fused_helper_records_each_bank_exactly_once():
+    """M5: SwitchGLU's exact fused path (1 < L <= DECODE_BLOCK_SIZE) — its helpers call the (wrapped) banks; each bank
+    is attributed once per invocation, with the bank's own family."""
+    import mlx.nn as nn
+
+    from mlx_vlm.models import switch_layers
+
+    mx.random.seed(4)
+    glu = switch_layers.SwitchGLU(64, 64, EXPERTS)
+    nn.quantize(glu, group_size=64, bits=4)
+    mx.eval(glu.parameters())
+    lm = tiny_moe_target()
+    tel = telemetry.KernelTelemetry(lm)
+    tel._names[id(glu)] = "probe.switch_mlp"
+    for p in ("gate_proj", "up_proj", "down_proj"):
+        tel._names[id(getattr(glu, p))] = f"probe.switch_mlp.{p}"
+    x = mx.random.normal((1, 2, 64))
+    indices = mx.array([[[0, 1], [2, 3]]], dtype=mx.int32)
+    with tel:
+        mx.eval(glu(x, indices))
+    (frame,) = tel.routed_frames
+    assert sorted(frame["projections"]) == ["down_proj", "gate_proj", "up_proj"], frame
+    fams = {a["module"]: a["family"] for a in tel.attributions if a["kind"] == "routed"}
+    assert set(fams.values()) == {"routed_gather_quantized"}, fams
+
+
+@METAL
+def test_m6_an_absent_invocation_hook_fails_the_verdict(monkeypatch):
+    """M6: the bank hooks still run but the per-invocation observer is gone — never a pass."""
+    from mlx_vlm.models.qwen3_5 import speculative_verifier as sv
+
+    real = sv.Qwen3_5BatchInvariantForward._switch_glu
+    lm = tiny_moe_target()
+    drafter = tiny_moe_drafter(lm)
+    tel, _, _ = _observed_turn(
+        lm,
+        drafter,
+        sabotage=lambda mp: mp.setattr(
+            sv.Qwen3_5BatchInvariantForward, "_switch_glu", real
+        ),
+        monkeypatch=monkeypatch,
+    )
+    v = telemetry.verdict(tel, telemetry.manifest_from_model(lm))
+    assert not v["pass"] and any(
+        "frame" in p or "invocation" in p for p in v["problems"]
+    ), v["problems"]
+
+
+@METAL
+def test_m7_cuts_full_and_partial_and_every_commit_probe_is_neutral():
+    """M7: concrete emission-cut categories (a fully accepted block and a partial one) and a neutral probe at every
+    commit, on the MoE stack."""
+    from test_mtp_exactness import scripted
+
+    lm = tiny_moe_target()
+    plain, _ = turn(
+        fake_model(lm), PROMPT, PromptCacheState(), n=16, seed=5, params=PARAMS
+    )
+    plain = list(plain)
+    drafter = scripted(  # follows the plain path except every 5th position: full accepts and rejections
+        tiny_moe_drafter(lm),
+        lambda p: (
+            (plain[p] if p % 5 else (plain[p] + 1) % 64) if p < len(plain) else None
+        ),
+        high=True,
+        vocab=64,
+    )
+    with observe.Recorder(mode="on", lm=lm, probe_token=5) as rec:
+        out, _ = turn(
+            fake_model(lm),
+            PROMPT,
+            PromptCacheState(),
+            drafter=drafter,
+            n=16,
+            seed=5,
+            params=PARAMS,
+        )
+    assert list(out) == plain
+    assert any(
+        c["n_emit"] == c["rows"] for c in rec.cuts
+    ), rec.cuts  # a fully accepted block (+ bonus)
+    assert any(
+        0 < c["n_emit"] < c["rows"] for c in rec.cuts
+    ), rec.cuts  # a rejection mid-block
+    assert rec.commits and all(
+        c["probe"] is not None and c["neutral"] for c in rec.commits
+    )
+
+
+@METAL
+@pytest.mark.parametrize("part", ["router", "shared"])
+def test_m7_omitting_the_router_or_the_shared_expert_inside_an_observed_block_fails(
+    monkeypatch, part
+):
+    """M7: the MoE-block observer stays; only one part runs unobserved (a plain function with the same math)."""
+    lm = tiny_moe_target()
+    drafter = tiny_moe_drafter(lm)
+    mlp = drafter.layers[0].mlp
+    if part == "router":
+        weight = mlp.gate.weight
+        monkeypatch.setattr(mlp, "gate", lambda x: x @ weight.T)
+    else:
+        real = mlp.shared_expert
+        monkeypatch.setattr(
+            mlp,
+            "shared_expert",
+            lambda x: real.down_proj(
+                nn_silu(real.gate_proj.weight, x) * (x @ real.up_proj.weight.T)
+            ),
+        )
+    tel, _, _ = _observed_turn(lm, drafter)
+    d = telemetry.draft_verdict(tel, drafter)
+    assert (
+        not d["pass"] and d["invocations"]
+    ), d  # the block WAS observed; a part was missing
+
+
+def nn_silu(weight, x):
+    import mlx.nn as nn
+
+    return nn.silu(x @ weight.T)
+
+
+def tiny_moe_target_g64(seed=0):
+    """A g64-capable tiny MoE target (every routed bank's input dims are multiples of 64) — M8."""
+    import mlx.nn as nn
+
+    mx.random.seed(seed)
+    text = dict(
+        tiny_moe_text(),
+        hidden_size=64,
+        moe_intermediate_size=64,
+        shared_expert_intermediate_size=64,
+        num_hidden_layers=LAYERS,
+        full_attention_interval=2,
+    )
+    cfg = MoeTextConfig.from_dict(text)
+    vision = MoeVisionConfig(
+        model_type="qwen3_5_moe",
+        depth=1,
+        hidden_size=8,
+        intermediate_size=16,
+        out_hidden_size=64,
+        num_heads=1,
+        in_channels=3,
+        patch_size=4,
+        temporal_patch_size=2,
+        spatial_merge_size=1,
+        num_position_embeddings=4,
+    )
+    lm = MoeLanguageModel(
+        cfg,
+        config=MoeModelConfig(
+            text_config=cfg, vision_config=vision, model_type="qwen3_5_moe"
+        ),
+    )
+    lm.model.norm.weight = lm.model.norm.weight * 12.0
+    nn.quantize(lm, group_size=64, bits=4)
+    mx.eval(lm.parameters())
+    return lm
+
+
+def _capture_routed(monkeypatch):
+    from mlx_vlm.models import switch_layers
+    from mlx_vlm.models.qwen3_5 import speculative_verifier as sv
+
+    seen = dict(block=[], plain=[], block_out=[], plain_out=[])
+    real_glu = sv.Qwen3_5BatchInvariantForward._switch_glu
+    real_switch = switch_layers.SwitchGLU.__call__
+
+    def glu(self, switch_mlp, x, indices):
+        out = real_glu(self, switch_mlp, x, indices)
+        seen["block"].append(indices)
+        seen["block_out"].append(out)
+        return out
+
+    def switch(self, x, indices, *a, **k):
+        out = real_switch(self, x, indices, *a, **k)
+        seen["plain"].append(indices)
+        seen["plain_out"].append(out)
+        return out
+
+    monkeypatch.setattr(sv.Qwen3_5BatchInvariantForward, "_switch_glu", glu)
+    monkeypatch.setattr(switch_layers.SwitchGLU, "__call__", switch)
+    return seen
+
+
+@METAL
+@pytest.mark.parametrize("width", [2, 3])
+def test_m8_a_g64_int4_moe_verify_block_equals_sequential_singletons(
+    monkeypatch, width
+):
+    """M8: Ornith's certified bank format (every routed bank int4 / g64); routed outputs, experts, logits and every cache
+    leaf (count, type, offset, keys, arrays — both directions) bitwise."""
+    from mlx_vlm.speculative.cache_state import iter_leaf_caches
+
+    lm = tiny_moe_target_g64()
+    banks = [m for n, m in lm.named_modules() if ".switch_mlp." in n]
+    assert banks and all(
+        type(b).__name__ == "QuantizedSwitchLinear"
+        and (b.bits, b.group_size) == (4, 64)
+        for b in banks
+    )
+    block_cache, plain_cache = _moe_prefilled(lm), _moe_prefilled(lm)
+    seen = _capture_routed(monkeypatch)
+    tokens = mx.array([[5, 9, 13][:width]], dtype=mx.int32)
+    verify = lm(tokens, cache=block_cache, speculative_verify=True)
+    rows = [
+        lm(tokens[:, i : i + 1], cache=plain_cache).logits[:, -1, :]
+        for i in range(width)
+    ]
+    mx.eval(verify.logits, rows, *seen.values())
+    for i in range(width):
+        assert mx.array_equal(verify.logits[:, i, :], rows[i]).item(), f"logits row {i}"
+    assert len(seen["block"]) == LAYERS and len(seen["plain"]) == LAYERS * width
+    for k in range(LAYERS):
+        for j in range(width):
+            p = j * LAYERS + k
+            got_idx, want_idx = (
+                seen["block"][k][0, j],
+                seen["plain"][p].reshape(-1, TOP_K)[0],
+            )
+            order_got, order_want = mx.argsort(got_idx), mx.argsort(want_idx)
+            assert mx.array_equal(got_idx[order_got], want_idx[order_want]).item(), (
+                k,
+                j,
+            )
+            got_out = seen["block_out"][k][0, j][order_got]
+            want_out = seen["plain_out"][p].reshape(
+                -1, TOP_K, seen["plain_out"][p].shape[-1]
+            )[0][order_want]
+            assert mx.array_equal(
+                got_out, want_out
+            ).item(), f"layer {k} token {j} routed output"
+    a_leaves, b_leaves = list(iter_leaf_caches(block_cache)), list(
+        iter_leaf_caches(plain_cache)
+    )
+    assert len(a_leaves) == len(b_leaves)
+    for a, b in zip(a_leaves, b_leaves, strict=True):
+        assert type(a) is type(b) and getattr(a, "offset", None) == getattr(
+            b, "offset", None
+        )
+        fa, fb = tree_flatten(a.state), tree_flatten(b.state)
+        assert [k for k, _ in fa] == [k for k, _ in fb]
+        for (key, x), (_, y) in zip(fa, fb, strict=True):
+            if isinstance(x, mx.array):
+                assert x.shape == y.shape and mx.array_equal(x, y).item(), (
+                    type(a).__name__,
+                    key,
+                )
