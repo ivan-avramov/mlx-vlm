@@ -658,8 +658,14 @@ def kv_positive_targets(leaves):
         keys = getattr(leaf, "keys", None)
         if keys is None:
             continue
+        from mlx_vlm.models.cache import QuantizedKVCache
+
         if tq is not None and isinstance(leaf, tq._TurboQuantAttentionMixin):
             targets.append(("tq_norm", keys[0]))
+        elif isinstance(
+            leaf, QuantizedKVCache
+        ):  # affine (packed, scales, biases); smoke 9 / P405
+            targets.append(("quantized_scale", keys[1]))
         elif isinstance(keys, mx.array):
             targets.append(("old_prefix_k", keys))
     return targets

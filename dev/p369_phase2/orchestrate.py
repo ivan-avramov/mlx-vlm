@@ -773,6 +773,23 @@ def e7b_sessions_checked(pick, e7b):
     return e7b["sessions"]
 
 
+def kv_positive_kind(census, where):
+    """Smoke 9 / P405: the KV positive the live leaves require, from the E1c entry's leaf census (never the registry
+    label — the server may build a different codec than the registry names)."""
+    if not isinstance(census, dict) or not census:
+        raise MalformedEvidence(f"malformed evidence: {where}.leaf_census = {census!r}")
+    names = list(census)
+    if any(n.endswith("TurboQuantKVCache") for n in names):
+        return "tq_norm"
+    if any(n.endswith("QuantizedKVCache") for n in names):
+        return "quantized_scale"
+    if any(n.endswith("KVCache") for n in names):
+        return "old_prefix_k"
+    raise MalformedEvidence(
+        f"malformed evidence: {where}.leaf_census has no KV leaf: {census!r}"
+    )
+
+
 def smoke_gate(picks):
     """Every live positive fired (TurboQuant's required where TurboQuant KV is served), every E1c cell
     passed, E2 passed, exactly the first reconstructed C84 item's E7b session ran and reported (its
@@ -800,7 +817,7 @@ def smoke_gate(picks):
                 baseline = exact_bool(sp.get("baseline_pass"), f"{where}.baseline_pass")
                 seen = {k for k, ok in fired.items() if exact_bool(ok, f"{where}.{k}")}
                 need = {"raw_ulp", "in_support", "recurrent", "probe_logit"}
-                need.add("tq_norm" if PICKS[pick]["kv"] == "tq4" else "old_prefix_k")
+                need.add(kv_positive_kind(v.get("leaf_census"), f"{pick} {name}"))
                 if not baseline or not need <= seen:
                     problems.append(f"{pick}: smoke positives {sp}")
         e2 = record.get("e2")
@@ -1924,6 +1941,9 @@ class Campaign:
                 kernels=on["verdict"],
                 smoke_positives=on.get("smoke_positives"),
                 forced_positions=on.get("forced_positions"),  # P398: not compared
+                leaf_census=on.get(
+                    "leaf_census"
+                ),  # smoke 9: what the hash / positives saw
                 attempts=attempts[name],
                 rejected=[a for a in attempts[name] if not a["valid"]],
             )
