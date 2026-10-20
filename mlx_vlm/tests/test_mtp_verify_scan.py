@@ -1793,13 +1793,20 @@ def expected_interim(fixture):
 
 
 def live_registry_state(text):
-    """``"mtp_on"`` (the fixture verbatim), ``"c177_interim"`` (exactly the expected interim), else None."""
-    fixture = _fixture_verbatim()
-    if text == fixture:
+    """P369 v13 V10 (the shared 16-state generator): ``"mtp_on"`` (the fixture verbatim), ``"c177_interim"``
+    (exactly the C177 interim), ``"off:<entries>"`` for any other of the 16 per-entry ON / OFF states, else None.
+    """
+    sys.path.insert(0, str(REPO / "dev"))
+    from p369_phase2 import registry_states as rs
+
+    off = rs.classify(text, _fixture_verbatim())
+    if off is None:
+        return None
+    if not off:
         return "mtp_on"
-    if text == expected_interim(fixture):
+    if off == set(INTERIM_LINES):
         return "c177_interim"
-    return None
+    return "off:" + "+".join(sorted(off))
 
 
 def live_registry():
@@ -1826,7 +1833,7 @@ def live_registry():
     state = live_registry_state(path.read_bytes().decode("utf-8", errors="replace"))
     if state is None:
         pytest.fail(
-            f"the live registry {path} is neither the pinned fixture nor the C177 interim; "
+            f"the live registry {path} is not one of the 16 accepted states (P369 v13); "
             "refresh stack_registry_golden.yaml (see its header)"
         )
     return path, state
@@ -1946,7 +1953,7 @@ def test_p387_live_registry_resolution(monkeypatch, tmp_path):
 @pytest.mark.requires_stack_registry
 def test_p387_the_live_registry_is_the_fixture_or_the_c177_interim():
     path, state = live_registry()
-    assert state in ("mtp_on", "c177_interim"), (path, state)
+    assert state is not None, (path, state)  # one of the 16 states (P369 v13 V10)
 
 
 def test_golden_the_shipped_first_pick_passes_every_load_time_refusal(

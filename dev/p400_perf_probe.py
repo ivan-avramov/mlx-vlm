@@ -175,6 +175,15 @@ def tree_problems(trees, refs, attest):
     return problems
 
 
+def _fixture():
+    """The pinned golden registry of THIS tree (P369 v13 V5): the overlays come from the 16-state generator."""
+    from p369_phase2 import registry_states
+
+    return registry_states.fixture_text(
+        Path(__file__).resolve().parents[1] / "mlx_vlm" / "tests" / "fixtures"
+    )
+
+
 def codec_overlay(text, pick, scheme):
     """The registry with exactly ``pick``'s ``kv_quant_scheme:`` line set to ``scheme`` (comment kept); refuses
     anything else."""
@@ -492,7 +501,7 @@ def drive(args):
     picks = args.pick or list(orchestrate.PICKS)
     argvs = {}
     for pick in picks:
-        text, _ = orchestrate.overlay_registry(registry, pick)
+        text, _ = orchestrate.overlay_registry(registry, pick, _fixture())
         overlay = out / f"overlay-{pick}.yaml"
         overlay.write_text(text)
         argvs[pick] = orchestrate.worker_argv(stack, overlay, pick) + [
@@ -568,9 +577,10 @@ def drive_codec(args):
     argvs = {}
     for pick in picks:
         for arm, scheme in CODEC_ARMS.items():
-            text, _ = orchestrate.overlay_registry(
-                codec_overlay(registry, pick, scheme), pick
-            )
+            on, _ = orchestrate.overlay_registry(registry, pick, _fixture())
+            text = codec_overlay(
+                on, pick, scheme
+            )  # the MTP-ON registry, then the arm's codec
             overlay = out / f"overlay-{pick}-{arm}.yaml"
             overlay.write_text(text)
             argvs[pick, arm] = orchestrate.worker_argv(stack, overlay, pick)

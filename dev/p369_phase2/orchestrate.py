@@ -24,9 +24,10 @@ from contextlib import contextmanager
 from pathlib import Path
 
 try:
-    from p369_phase2 import kvmanifest
+    from p369_phase2 import kvmanifest, registry_states
 except ImportError:  # run as a script: this directory is sys.path[0]
     import kvmanifest
+    import registry_states
 
 PRODUCTION = "7207179b"  # P400 + P401 (C188) + P405 F1 / F2 + K6 (C189 / C192); was 3395cef3, da27f0ef, 4e6d0e03
 PICKS = {
@@ -79,56 +80,15 @@ REFUSED_SCRIPT_DIRS = ("benchmark", "mlx_vlm")
 PORTS = (8000, 8091)
 MIN_FREE_GB = 20
 MONITOR_S = 300
-C177_MARK = "# P369 INTERIM (C177"
 
 
 # ------------------------------------------------------------------ pure parts (tested)
-def overlay_registry(text, pick):
-    """Restore exactly the C177 lines of ``pick``'s block: its commented ``draft_kind: mtp`` (marked), the
-    commented ``draft_model`` on the next line, and (Fable) the marked ``mtp_verify_scan: joint_v1``.
-    Returns ``(new_text, restored_lines)``; refuses anything else."""
-    lines = text.split("\n")
-    start = next(
-        (
-            i
-            for i, line in enumerate(lines)
-            if re.match(rf"^\s*- name: {re.escape(pick)}\s*$", line)
-        ),
-        None,
-    )
-    if start is None:
-        raise ValueError(f"{pick}: no registry block")
-    end = next(
-        (
-            i
-            for i in range(start + 1, len(lines))
-            if re.match(r"^\s*- name: ", lines[i])
-        ),
-        len(lines),
-    )
-    restored = []
-    for i in range(start, end):
-        m = re.match(r"^(\s*)# (draft_kind: mtp)\s+" + re.escape(C177_MARK), lines[i])
-        if m:
-            nxt = re.match(r"^(\s*)# (draft_model: \S+)", lines[i + 1])
-            if nxt is None:
-                raise ValueError(
-                    f"{pick}: marked draft_kind without an adjacent draft_model"
-                )
-            lines[i] = m.group(1) + m.group(2)
-            lines[i + 1] = nxt.group(1) + nxt.group(2)
-            restored += [lines[i].strip(), lines[i + 1].strip()]
-            continue
-        m = re.match(
-            r"^(\s*)# (mtp_verify_scan: joint_v1)\s+" + re.escape(C177_MARK), lines[i]
-        )
-        if m:
-            lines[i] = m.group(1) + m.group(2)
-            restored.append(lines[i].strip())
-    want = 3 if PICKS[pick]["verify_policy"] == "joint_v1" else 2
-    if len(restored) != want:
-        raise ValueError(f"{pick}: restored {restored}, expected {want} C177 lines")
-    return "\n".join(lines), restored
+def overlay_registry(text, pick, fixture):
+    """P369 v13 V5 / V10: ``pick`` MTP-ON in ``text`` via the ONE byte-state generator — ``text`` must be one of the
+    16 accepted states of the pinned ``fixture`` (else ValueError); the other entries keep their state and the pick's
+    block equals the fixture's. Returns ``(new_text, restored fixture lines)`` (none when already ON).
+    """
+    return registry_states.overlay_on(text, fixture, pick)
 
 
 def worker_env(base):
@@ -1828,8 +1788,18 @@ class Campaign:
             picks={},
         )
         self.stack_bench = manifest["stack_bench"]
+        # P369 v13 V5: the live registry must be one of the 16 byte states of the pinned fixture (refused otherwise)
+        fixture = registry_states.fixture_text(
+            self.fork / "mlx_vlm" / "tests" / "fixtures"
+        )
+        off = registry_states.classify(self.registry, fixture)
+        if off is None:
+            raise Refused(
+                "refused: the live registry is not one of the 16 accepted byte states"
+            )
+        manifest["registry_off"] = sorted(off)
         for pick in self.picks:
-            text, restored = overlay_registry(self.registry, pick)
+            text, restored = overlay_registry(self.registry, pick, fixture)
             overlay = self.out / f"overlay-{pick}.yaml"
             overlay.write_text(text)
             on = worker_argv(self.stack, overlay, pick)
