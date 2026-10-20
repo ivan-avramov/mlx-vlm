@@ -626,27 +626,6 @@ def test_run_with_censoring_never_absorbs_other_failures():
 
 
 # ------------------------------------------------------------------ code round 1 H5 H6 H7 H10
-@pytest.mark.parametrize(
-    ("identical", "control", "engaged", "want"),
-    [
-        (True, True, True, "PASS"),
-        (False, True, True, "FAIL"),
-        (True, False, True, "INFORMATIVE_ONLY"),
-        (False, False, True, "INFORMATIVE_ONLY"),
-        (True, True, False, "INCOMPLETE"),
-        (True, None, True, "PASS"),  # the smoke: no reload control
-        (False, None, True, "FAIL"),
-    ],
-)
-def test_e2_verdict(identical, control, engaged, want):
-    assert (
-        orchestrate.e2_verdict(
-            all_identical=identical, control_identical=control, engaged=engaged
-        )
-        == want
-    )
-
-
 def _e7_entry(rounds, events=(), n=40, finish="stop", verdict=True, sha="d"):
     return dict(
         verdict={"pass": verdict},
@@ -1432,34 +1411,6 @@ def test_e1c_refuses_non_boolean_c1_and_c2_evidence(tmp_path):
                 camp.e1c(FABLE, {1024: "x"}, smoke=True)
 
 
-def _e2_camp(tmp_path, kernel=True):
-    camp = object.__new__(orchestrate.Campaign)
-    camp.out, camp.digests = tmp_path, {}
-    camp.job = lambda pick, name, mode, arm, requests: name
-    camp.run = lambda name: None
-    camp.c84_payloads = lambda pick, items, greedy, limit=None: [dict(name="a")]
-    for name in ("e2-off-0", "e2-on-1"):
-        d = tmp_path / FABLE / name
-        d.mkdir(parents=True)
-        entry = dict(
-            turns=[dict(final=dict(token_ids=[1, 2]), mtp_rounds=3, prompt={})],
-            telemetry=dict(speculative_argmax_from_hidden=4),
-            verdict={"pass": kernel},
-        )
-        (d / "req-0.json").write_text(json.dumps(entry))
-    return camp
-
-
-def test_e2_refuses_a_non_boolean_kernel_verdict(tmp_path):
-    assert (
-        _e2_camp(tmp_path / "good").e2(FABLE, [], {}, smoke=True)["verdict"] == "PASS"
-    )
-    for k, value in enumerate(BAD):
-        camp = _e2_camp(tmp_path / f"bad-{k}", kernel=value)
-        with pytest.raises(orchestrate.MalformedEvidence, match="verdict"):
-            camp.e2(FABLE, [], {}, smoke=True)
-
-
 def _e7b_report(**changes):
     session = dict(
         name="math500/1",
@@ -1628,3 +1579,137 @@ def test_main_refuses_a_malformed_smoke_summary_before_any_preflight(
         AssertionError, match="reached preflight"
     ):  # a valid one gets past
         orchestrate.main(argv)
+
+
+# ------------------------------------------------------------------ C185 (plan v8 §3 E2): the same-instance triple
+def _turn(tokens, *, rounds=3, argmax=4, sha="d", finish="length"):
+    return dict(
+        final=dict(token_ids=list(tokens), finish_reason=finish),
+        mtp_rounds=rounds,
+        prompt=dict(sha256=sha),
+        telemetry=dict(speculative_argmax_from_hidden=argmax),
+    )
+
+
+def _pair(on=(1, 2), off1=(1, 2), off2=(1, 2), *, kernel=True, **on_kw):
+    return dict(
+        turns=[_turn(on, **on_kw)],
+        off=[_turn(off1, rounds=0, argmax=0), _turn(off2, rounds=0, argmax=0)],
+        verdict={"pass": kernel},
+    )
+
+
+def _cross(tokens=(1, 2)):
+    return dict(turns=[_turn(tokens, rounds=0, argmax=0)])
+
+
+@pytest.mark.parametrize(
+    ("c1", "engaged", "identical", "want"),
+    [
+        (True, True, True, "PASS"),
+        (True, True, False, "FAIL"),
+        (True, False, True, "INCOMPLETE"),
+        (True, False, False, "INCOMPLETE"),
+        (False, True, True, "ABORT"),
+        (False, False, False, "ABORT"),
+    ],
+)
+def test_e2_verdict_same_instance_precedence(c1, engaged, identical, want):
+    got = orchestrate.e2_verdict(
+        c1_identical=c1, engaged=engaged, all_identical=identical
+    )
+    assert got == want
+
+
+def test_e2_verdict_refuses_non_boolean_flags():
+    for key in ("c1_identical", "engaged", "all_identical"):
+        flags = dict(c1_identical=True, engaged=True, all_identical=True)
+        for value in BAD:
+            with pytest.raises(orchestrate.MalformedEvidence, match=key):
+                orchestrate.e2_verdict(**{**flags, key: value})
+
+
+def test_e2_summary_decides_on_the_same_instance_pair_only():
+    got = orchestrate.e2_summary({"a": _pair()}, {"a": _cross()}, digests={"a": "d"})
+    assert got["verdict"] == "PASS" and got["identity"] == {"a": True}
+    assert got["c1_identical"] is True and got["cross_load"]["summary"] == "identical"
+    # a cross-load difference is reported and never changes the verdict (C185, like C2)
+    far = orchestrate.e2_summary(
+        {"a": _pair()}, {"a": _cross((1, 3))}, digests={"a": "d"}
+    )
+    assert far["verdict"] == "PASS"
+    assert far["cross_load"] == dict(per_request={"a": False}, summary="unestablished")
+    # ON vs OFF1 decides
+    fail = orchestrate.e2_summary(
+        {"a": _pair(on=(1, 3))}, {"a": _cross()}, digests={"a": "d"}
+    )
+    assert fail["verdict"] == "FAIL" and fail["identity"] == {"a": False}
+    # OFF1 vs OFF2 (tokens or finish) differing is ABORT, whatever ON did
+    for pair in (_pair(off2=(1, 3)), _pair(on=(1, 3), off2=(1, 3))):
+        got = orchestrate.e2_summary({"a": pair}, {"a": _cross()}, digests={"a": "d"})
+        assert got["verdict"] == "ABORT" and got["c1_identical"] is False, got
+    finish = _pair()
+    finish["off"][1]["final"]["finish_reason"] = "stop"
+    got = orchestrate.e2_summary({"a": finish}, {"a": _cross()}, digests={"a": "d"})
+    assert got["verdict"] == "ABORT"
+
+
+def test_e2_summary_needs_engagement_and_equal_digests():
+    for pair, why in (
+        (_pair(rounds=0), "no MTP rounds"),
+        (_pair(argmax=0), "no argmax readout"),
+        (_pair(kernel=False), "kernel verdict"),
+        (_pair(sha="x"), "digest"),
+    ):
+        got = orchestrate.e2_summary({"a": pair}, {"a": _cross()}, digests={"a": "d"})
+        assert got["verdict"] == "INCOMPLETE", why
+    # the three trajectories share one templated prompt (straddles have no reconstruction digest)
+    split = _pair()
+    split["off"][0]["prompt"]["sha256"] = "y"
+    got = orchestrate.e2_summary({"T1024": split}, {"T1024": _cross()}, digests={})
+    assert got["verdict"] == "INCOMPLETE" and got["prompt_digest_problems"]
+    # the cross-load arm's prompt is bound to the reconstruction too
+    cross = _cross()
+    cross["turns"][0]["prompt"]["sha256"] = "x"
+    got = orchestrate.e2_summary({"a": _pair()}, {"a": cross}, digests={"a": "d"})
+    assert got["prompt_digest_problems"] and got["verdict"] == "INCOMPLETE"
+
+
+def test_e2_summary_refuses_malformed_evidence():
+    for value in BAD:
+        with pytest.raises(orchestrate.MalformedEvidence, match="verdict"):
+            orchestrate.e2_summary(
+                {"a": _pair(kernel=value)}, {"a": _cross()}, digests={"a": "d"}
+            )
+    two = _pair()
+    two["off"] = two["off"][:1]
+    with pytest.raises(orchestrate.MalformedEvidence, match="off"):
+        orchestrate.e2_summary({"a": two}, {"a": _cross()}, digests={"a": "d"})
+    with pytest.raises(orchestrate.MalformedEvidence, match="cross"):
+        orchestrate.e2_summary({"a": _pair()}, {}, digests={"a": "d"})
+
+
+def _e2_pair_camp(tmp_path, pair, cross):
+    camp = object.__new__(orchestrate.Campaign)
+    camp.out, camp.digests, camp.jobs = tmp_path, {FABLE: {"a": "d"}}, []
+    camp.job = lambda pick, name, mode, arm, requests: (name, mode, arm, requests)
+    camp.run = lambda job: camp.jobs.append(job)
+    camp.c84_payloads = lambda pick, items, greedy, limit=None: [
+        dict(name="a", timeout_s=10)
+    ]
+    for name, entry in (("e2-pair", pair), ("e2-off", cross)):
+        d = tmp_path / FABLE / name
+        d.mkdir(parents=True)
+        (d / "req-0.json").write_text(json.dumps(entry))
+    return camp
+
+
+def test_e2_runs_the_triple_in_the_on_worker_and_one_cross_load_off_arm(tmp_path):
+    camp = _e2_pair_camp(tmp_path, _pair(), _cross())
+    got = camp.e2(FABLE, [], {}, smoke=True)
+    assert got["verdict"] == "PASS", got
+    (n1, m1, a1, r1), (n2, m2, a2, r2) = camp.jobs
+    assert (n1, m1, a1) == ("e2-pair", "e2_pair", "on")
+    assert (n2, m2, a2) == ("e2-off", "e2", "off")
+    # ON + OFF1 + OFF2 in one request's budget; the cross-load arm runs it once
+    assert r1[0]["timeout_s"] == 3 * r2[0]["timeout_s"]

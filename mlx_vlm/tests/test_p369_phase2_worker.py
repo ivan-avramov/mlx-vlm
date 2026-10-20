@@ -570,3 +570,30 @@ def test_check_snapshots_rehashes_the_loaded_files(tmp_path):
     (snap / "model.safetensors").write_bytes(b"mutated, same revision")
     with pytest.raises(RuntimeError, match="model.safetensors"):
         worker.check_snapshots(argv, want, lambda repo: snap)
+
+
+# ------------------------------------------------------------------ C185 (plan v8 §3 E2): the same-instance triple
+def _greedy(cached=0, rounds=0, verify=0):
+    return dict(
+        final=dict(token_ids=[1, 2], cached_tokens=cached),
+        mtp_rounds=rounds,
+        verify_scope_calls=verify,
+    )
+
+
+def test_e2_detached_problems():
+    on, offs = _greedy(rounds=3, verify=5), [_greedy(), _greedy()]
+    assert worker.e2_detached_problems(on, offs, [[], []]) == []
+    cases = [
+        (_greedy(cached=7, rounds=3), offs, [[], []], "ON reused"),
+        (on, [_greedy(cached=1), _greedy()], [[], []], "OFF1 reused"),
+        (on, [_greedy(), _greedy(cached=None)], [[], []], "OFF2 reused"),
+        (on, [_greedy(rounds=2), _greedy()], [[], []], "OFF1 ran 2 MTP rounds"),
+        (on, [_greedy(), _greedy(verify=1)], [[], []], "OFF2 ran 1 verify-scope"),
+        (on, offs, [[], ["draft kwargs returned ['x']"]], "OFF2 guard"),
+    ]
+    for on_, offs_, guards, why in cases:
+        got = worker.e2_detached_problems(on_, offs_, guards)
+        assert any(why in p for p in got), (why, got)
+    with pytest.raises(ValueError, match="two detached replays"):
+        worker.e2_detached_problems(on, offs[:1], [[]])
