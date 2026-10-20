@@ -911,7 +911,7 @@ def smoke_authorization_problems(summary, projection_ruling=None):
     code = summary.get("exit_code")
     ruled = None
     if projection_ruling is not None:
-        ruled = PROJECTION_RULINGS.get(projection_ruling)
+        ruled = (PROJECTION_RULINGS.get(projection_ruling) or {}).get("pick")
         if ruled is None:
             return problems + [f"unknown projection ruling {projection_ruling!r}"]
         if list(summary.get("picks") or {}) != [ruled]:
@@ -929,6 +929,12 @@ def smoke_authorization_problems(summary, projection_ruling=None):
         fits = exact_bool(gate.get("fits"), "smoke_gate.fits")
         if not (passed and (fits or ruled)):
             problems.append(f"the smoke gate did not pass / fit: {gate}")
+        if (
+            ruled and fits
+        ):  # code round 2 K8: the ruling lifts `fits` only when it is false
+            problems.append(
+                f"ruling {projection_ruling} covers a smoke that does not fit; this one fits"
+            )
         again = smoke_gate(summary.get("picks") or {})
         if again != gate:
             problems.append(
@@ -1634,7 +1640,27 @@ SHORT_PROMPT = "Explain, step by step, why the sum of two odd integers is even."
 ESTIMATE_LIMIT_S = 3.5 * 3600
 # C193 (operator 2026-10-20): recorded rulings that lift ONLY the smoke gate's `fits` for one pick's full run (its
 # total-wall watchdog stays the cap); the P369 v13 phase-based projection replaces this in the v13 build.
-PROJECTION_RULINGS = {"C193": "Qwen3.8-27B-mlx-uniform-4bit"}
+PROJECTION_RULINGS = (
+    {  # code round 2 K8: the ruling carries its authorized wall cap (P369 v13 V17)
+        "C193": dict(pick="Qwen3.8-27B-mlx-uniform-4bit", wall_limit_s=20400),
+    }
+)
+
+
+def ruling_wall_limit(ruling, wall_limit_s):
+    """The full run's wall limit under a projection ruling: the ruling's cap, or a tighter explicit one; a looser
+    explicit limit refuses. Without a ruling, C184's default (no campaign hard stop) stands.
+    """
+    if ruling is None:
+        return wall_limit_s
+    cap = PROJECTION_RULINGS[ruling]["wall_limit_s"]
+    if wall_limit_s is None:
+        return cap
+    if wall_limit_s > cap:
+        raise SystemExit(
+            f"--wall-limit-s {wall_limit_s} exceeds ruling {ruling}'s cap {cap}"
+        )
+    return wall_limit_s
 
 
 def campaign_deadline(wall_limit_s, *, now):
@@ -2386,6 +2412,7 @@ def main(argv=None):
         problems = smoke_authorization_problems(  # code round 6 H36; C193
             smoke, projection_ruling=args.projection_ruling
         )
+        args.wall_limit_s = ruling_wall_limit(args.projection_ruling, args.wall_limit_s)
         if problems:
             raise SystemExit(f"full: the smoke summary does not authorize: {problems}")
     checks = preflight(args, out.parent)

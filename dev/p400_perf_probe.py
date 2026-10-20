@@ -49,6 +49,9 @@ CODEC_SCHEDULES = dict(
     ),  # 255 × 1024 + 64 < the 262,144 cap
 )
 CODEC_METRICS = ("tps", "prefill_tps", "decode_peak", "prefill_peak")
+CODEC_PICKS = (
+    "Qwen3.8-27B-mlx-uniform-4bit",
+)  # code round 2 K9: quantized-KV picks only (Fable is native)
 
 
 # ------------------------------------------------------------------ pure parts (tested)
@@ -208,6 +211,34 @@ def codec_overlay(text, pick, scheme):
     return "\n".join(lines)
 
 
+def codec_arm_problems(argv_a, argv_b):
+    """Code round 2 K9: arm A must resolve to affine and arm B to TurboQuant, with the same bits."""
+    from p369_phase2 import kvmanifest
+
+    a, b = kvmanifest.kv_from_argv(argv_a), kvmanifest.kv_from_argv(argv_b)
+    problems = []
+    if a["kv_bits"] is None or b["kv_bits"] is None:
+        problems.append(f"native KV arm (kv_bits A {a['kv_bits']} / B {b['kv_bits']})")
+    if (a["kv_quant_scheme"], b["kv_quant_scheme"]) != ("uniform", "turboquant"):
+        problems.append(
+            f"arms resolve to {a['kv_quant_scheme']} / {b['kv_quant_scheme']}"
+        )
+    if a["kv_bits"] != b["kv_bits"]:
+        problems.append(f"arms differ in bits {a['kv_bits']} / {b['kv_bits']}")
+    return problems
+
+
+def leg_cache_problems(observed, template, argv):
+    """Code round 2 K7: the LIVE target cache of a measured request matches, layer by layer, what its argv implies."""
+    from p369_phase2 import kvmanifest
+
+    if observed is None:
+        return ["no live target cache captured"]
+    return kvmanifest.manifest_problems(
+        observed, template, kvmanifest.kv_from_argv(argv)
+    )
+
+
 def codec_request_problems(probe, finish_reason, tokens):
     """A codec request decodes exactly the schedule's ``tokens`` to the length cap with finite positive prefill and
     decode rates and peaks (no width-2 requirement: the deployed tuple's own blocks)."""
@@ -336,6 +367,21 @@ def leg(job_path):
         gen_module = sys.modules["mlx_vlm.generate"]
         real_stream = gen_module.stream_generate
         probe = {}
+        from mlx_vlm.generate import dispatch
+        from p369_phase2 import kvmanifest
+
+        real_step, captured = dispatch.generate_step, {}
+
+        def capturing_step(
+            *a, **k
+        ):  # code round 2 K7: the live target cache of the request
+            captured["cache"] = k.get("prompt_cache")
+            yield from real_step(*a, **k)
+
+        dispatch.generate_step = capturing_step
+        template = kvmanifest.manifest(
+            server.runtime.response_generator.model.language_model.make_cache()
+        )
 
         def stream(*a, **k):
             first, last = True, None
@@ -369,6 +415,7 @@ def leg(job_path):
         for i in range(warmup + measured):
             probe.clear()
             widths.clear()
+            captured.clear()
             chat = f"p400-perf-{uuid.uuid4().hex}"
             r = client.post(
                 "/v1/chat/completions",
@@ -378,6 +425,11 @@ def leg(job_path):
             )
             if r.status_code != 200:
                 raise RuntimeError(f"request {i}: {r.status_code} {r.text[:300]}")
+            cache = captured.get("cache")
+            live = None if cache is None else kvmanifest.manifest(cache)
+            cache_problems = leg_cache_problems(live, template, job["argv"])
+            if cache_problems:
+                raise RuntimeError(f"request {i}: live cache {cache_problems}")
             worker.release_session(chat)
             finish = r.json()["choices"][0].get("finish_reason")
             problems = (
@@ -391,6 +443,7 @@ def leg(job_path):
                 dict(
                     probe,
                     finish_reason=finish,
+                    live_cache_kinds=sorted({m["kind"] for m in live}),
                     widths=sorted(set(widths)),
                     warmup=i < warmup,
                 )
@@ -506,7 +559,7 @@ def drive_codec(args):
     attest = attest_tree(tree)
     if attest["head"] != ref or not attest["clean"]:
         raise SystemExit(f"tree {tree}: {attest}, wanted clean at {ref}")
-    picks = args.pick or list(orchestrate.PICKS)
+    picks = args.pick or list(CODEC_PICKS)
     argvs = {}
     for pick in picks:
         for arm, scheme in CODEC_ARMS.items():
@@ -516,6 +569,9 @@ def drive_codec(args):
             overlay = out / f"overlay-{pick}-{arm}.yaml"
             overlay.write_text(text)
             argvs[pick, arm] = orchestrate.worker_argv(stack, overlay, pick)
+        problems = codec_arm_problems(argvs[pick, "A"], argvs[pick, "B"])
+        if problems:
+            raise SystemExit(f"{pick}: codec arms {problems}")
     report = dict(
         mode="codec",
         arms=CODEC_ARMS,
