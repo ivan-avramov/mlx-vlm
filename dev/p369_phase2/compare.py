@@ -105,6 +105,14 @@ def forced_positions(recorder, tokens, *, finish_reason):
     return missing
 
 
+def forced_schedule(on_forced, off_forced, n):
+    """C185 round 4 E8: ON's thinking-budget forcing schedule equals plain decoding's at every emitted
+    position (below ``n``; a pop past the output emits nothing)."""
+    a = [[int(p), int(tok)] for p, tok in on_forced if int(p) < n]
+    b = [[int(p), int(tok)] for p, tok in off_forced if int(p) < n]
+    return dict(on=a, off=b, **{"pass": a == b})
+
+
 def compare_streams(on_records, off_records, n, params, *, exclude=()):
     """Compare the emitted-position rows ``0..n-1`` of the ON and OFF streams, except the ``exclude``d
     positions (P398: the forced emissions, which production samples from no row)."""

@@ -224,9 +224,9 @@ class Recorder:
         self.states = {}
         self.prompt_end = None
         self.draft_rounds = 0
-        self.forced = (
-            []
-        )  # P398 / round 3 E6: (intended position, token) of each forced pop (ON)
+        # P398 / round 3 E6 / round 4 E8: (intended position, token) of each forced pop — ON: the MTP
+        # loop's; OFF: plain decoding's, recorded and consumed but never applied (the replay follows ON)
+        self.forced = []
         self._block = (
             None  # (rows index, base position) of the verifier block being walked
         )
@@ -330,13 +330,25 @@ class Recorder:
 
         from mlx_vlm.utils import ThinkingBudgetCriteria
 
-        call, driven = ThinkingBudgetCriteria.__call__, {}
+        call, pop = (
+            ThinkingBudgetCriteria.__call__,
+            ThinkingBudgetCriteria.pop_forced_token_id,
+        )
+        driven = {}
 
         def counting_call(
             criteria, token_id
         ):  # the real criteria sees every emitted token
             driven[id(criteria)] = driven.get(id(criteria), 0) + 1
             return call(criteria, token_id)
+
+        def observed_pop(
+            criteria,
+        ):  # round 4 E8 (OFF): plain's schedule, observed, never applied
+            token = pop(criteria)
+            if token is not None:
+                recorder.forced.append((driven.get(id(criteria), 0), int(token)))
+            return None
 
         def recording_pop_forced(criteria):
             token = pop_forced(criteria)
@@ -364,13 +376,15 @@ class Recorder:
             ar._PositionedTargetSampler, "sample_target", recording_sample_target
         )
         self._patch(dispatch, "generate_step", capturing_generate_step)
+        self._patch(ThinkingBudgetCriteria, "__call__", counting_call)
         if self.mode == "on":
             self._patch(mtp._MTPVerifyResult, "commit", recording_commit)
             self._patch(mtp, "_mtp_commit_pending_token", recording_pending)
             self._patch(mtp, "_mtp_acceptance_walk", recording_walk)
             self._patch(mtp, "_mtp_plain_emission", recording_emission)
             self._patch(mtp, "_mtp_pop_forced", recording_pop_forced)
-            self._patch(ThinkingBudgetCriteria, "__call__", counting_call)
+        else:
+            self._patch(ThinkingBudgetCriteria, "pop_forced_token_id", observed_pop)
         return self
 
     def __exit__(self, *exc):

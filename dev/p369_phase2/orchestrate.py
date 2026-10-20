@@ -560,6 +560,8 @@ def e2_summary(pair, cross, *, digests):
         bad("requests", pair)
     if not isinstance(cross, dict) or not cross:  # round 3 E1
         bad("cross-load requests", cross)
+    if set(cross) != set(pair):  # round 4 E9: every cross-load result has its triple
+        bad("cross-load request names", sorted(set(cross) ^ set(pair)))
 
     def first_turn(where, entry):  # round 2 E1: an entry with a non-empty turn list
         turns = entry.get("turns") if isinstance(entry, dict) else None
@@ -910,12 +912,15 @@ def e1c_verdict(on_entry, off_entry, *, threshold, verify_policy):
         return exact_bool(value, f"comparator {key}.pass")
 
     rows, states = verdict_of(off_entry, "rows"), verdict_of(off_entry, "states")
+    forced = verdict_of(off_entry, "forced")  # round 4 E8
     kernels = verdict_of(on_entry, "verdict")
     neutrality, evidence = [], []
     if not rows:
         neutrality.append("rows")
     if not states:
         neutrality.append("states")
+    if not forced:
+        neutrality.append("forced schedule")
     if not kernels:
         evidence.append("kernels")
     if not on_entry.get("draft_rounds"):
@@ -1902,6 +1907,9 @@ class Campaign:
             )
             c2_rows = exact_bool(c2["rows"].get("pass"), f"{name}.c2.rows.pass")
             c2_states = exact_bool(c2["states"].get("pass"), f"{name}.c2.states.pass")
+            c2_forced = exact_bool(
+                (c2.get("forced") or {}).get("pass"), f"{name}.c2.forced.pass"
+            )
             if not c1_ok:
                 v["pass_"] = False
                 v["problems"].append(f"C1: {on['c1']['acceptance']['problems']}")
@@ -1909,7 +1917,7 @@ class Campaign:
                 pair=on["pair"],
                 c1=dict(identical=c1_ok, **on["c1"]),
                 c2=dict(
-                    identical=c2_rows and c2_states,
+                    identical=c2_rows and c2_states and c2_forced,
                     rows=c2["rows"],
                     states=c2["states"],
                 ),

@@ -833,6 +833,8 @@ def c1_acceptance(on_part, off_parts, c1, *, retired, expected_offsets, replay_o
         problems.append("C1 rows differ")
     if not c1["states"]["pass"]:
         problems.append("C1 states differ")
+    if not c1["forced"]["pass"]:  # round 4 E8
+        problems.append("C1 forced schedules differ")
     return dict(problems=problems, **{"pass": not problems})
 
 
@@ -1148,10 +1150,16 @@ def run_job(job, out_dir, result):
                 )
                 entry["off_final"] = off1_part["final"]
                 entry["pair"] = compare_pair(on, off1, n, params, exclude=forced)
+                # round 4 E8: ON's forcing schedule vs plain decoding's on the same instance
+                entry["pair"]["forced"] = compare.forced_schedule(
+                    on.forced, off1.forced, n
+                )
+                entry["off1_forced"] = [list(f) for f in off1.forced]
                 c1_ref = snapshot_holder(
                     [off1.states[o] for o in sorted(off1.states)], rows=off1.rows
                 )
                 c1 = compare_pair(c1_ref, off2, n, params)
+                c1["forced"] = compare.forced_schedule(off1.forced, off2.forced, n)
                 entry["c1"] = dict(
                     c1,
                     acceptance=c1_acceptance(
@@ -1186,6 +1194,9 @@ def run_job(job, out_dir, result):
                     load_snapshots(spec["on_snaps"]), rows=load_rows(spec["on_rows"])
                 )
                 entry.update(compare_pair(ref, rec, len(tokens), params))
+                entry["forced"] = compare.forced_schedule(  # C2 includes the schedule
+                    ref_meta["off1_forced"], rec.forced, len(tokens)
+                )
                 if spec.get("smoke_positives"):
                     entry["smoke_positives"] = smoke_positives(
                         ref, rec, len(tokens), params

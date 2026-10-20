@@ -1832,7 +1832,9 @@ def test_e1c_keeps_the_neutrality_of_an_attempt_rejected_for_validity(tmp_path):
     retry.mkdir()
     (retry / "req-0.json").write_text(json.dumps(entry))  # the valid, passing retry
     rejected = dict(entry, straddle=False)
-    rejected["pair"] = dict(rows={"pass": False}, states={"pass": False})
+    rejected["pair"] = dict(
+        rows={"pass": False}, states={"pass": False}, forced={"pass": True}
+    )
     first.write_text(json.dumps(rejected))
     got = camp.e1c(FABLE, {1024: "x"}, smoke=True)
     cell = got["T1024"]
@@ -1858,7 +1860,9 @@ def test_e1c_cells_invalid_on_every_seed_keep_their_attempts_evidence(
     for k in range(len(orchestrate.SEEDS)):
         attempt = dict(entry)
         if k == 2:
-            attempt["pair"] = dict(rows={"pass": neutral}, states={"pass": True})
+            attempt["pair"] = dict(
+                rows={"pass": neutral}, states={"pass": True}, forced={"pass": True}
+            )
             attempt["c1"] = dict(acceptance={"pass": c1, "problems": []})
         d = tmp_path / FABLE / f"e1c-pair-a{k}"
         d.mkdir(exist_ok=True)
