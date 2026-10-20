@@ -813,10 +813,19 @@ def leaf_manifest_problems(pick, name, cell, kv):
         raise MalformedEvidence(f"malformed evidence: {pick}.kv = {kv!r}")
     try:
         found = kvmanifest.manifest_problems(lm["observed"], lm["template"], kv)
-    except (
-        ValueError
-    ) as exc:  # a codec the manifest does not model: refused, never guessed
+    except ValueError as exc:  # a codec the manifest does not model: refused
         found = [str(exc)]
+    dm = cell.get("drafter_manifest")  # code round 1 K3
+    if not (
+        isinstance(dm, dict)
+        and isinstance(dm.get("observed"), list)
+        and isinstance(dm.get("template"), list)
+        and dm["template"]
+    ):
+        raise MalformedEvidence(
+            f"malformed evidence: {where}.drafter_manifest = {dm!r}"
+        )
+    found += kvmanifest.drafter_problems(dm["observed"], dm["template"])
     return [f"{where}: leaf manifest {p}" for p in found]
 
 
@@ -1986,6 +1995,7 @@ class Campaign:
                     "leaf_census"
                 ),  # smoke 9: what the hash / positives saw
                 leaf_manifest=on.get("leaf_manifest"),  # P405 F3
+                drafter_manifest=on.get("drafter_manifest"),  # P405 code round 1 K3
                 attempts=attempts[name],
                 rejected=[a for a in attempts[name] if not a["valid"]],
             )

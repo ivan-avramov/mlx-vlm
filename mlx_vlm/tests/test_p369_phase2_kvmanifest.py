@@ -151,10 +151,16 @@ def test_the_manifest_is_ordered_by_layer_path_with_codec_details():
         key_bits=4.0,
         value_bits=4.0,
         mode="mse",
+        batch=False,
     )
     affine = kvmanifest.manifest([PreallocQuantizedKVCache(group_size=64, bits=4)])[0]
     assert affine == dict(
-        path="0", kind="affine", cls="PreallocQuantizedKVCache", bits=4, group_size=64
+        path="0",
+        kind="affine",
+        cls="PreallocQuantizedKVCache",
+        bits=4,
+        group_size=64,
+        batch=False,
     )
 
 

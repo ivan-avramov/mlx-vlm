@@ -2008,6 +2008,7 @@ def test_the_smoke_gate_wants_the_kv_positive_of_the_leaf_actually_served(
                 pass_=True,
                 leaf_census=census,
                 leaf_manifest=_smoke_e1c()["T65536"]["leaf_manifest"],
+                drafter_manifest=_smoke_e1c()["T65536"]["drafter_manifest"],
                 smoke_positives=dict(baseline_pass=True, fired=fired),
             ),
         }
@@ -2023,6 +2024,7 @@ def test_the_smoke_gate_wants_the_kv_positive_of_the_leaf_actually_served(
                     pass_=True,
                     leaf_census=census,
                     leaf_manifest=_smoke_e1c()["T65536"]["leaf_manifest"],
+                    drafter_manifest=_smoke_e1c()["T65536"]["drafter_manifest"],
                     smoke_positives=dict(baseline_pass=True, fired=wrong),
                 ),
             }

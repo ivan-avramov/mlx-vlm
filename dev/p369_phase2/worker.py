@@ -1147,6 +1147,15 @@ def run_job(job, out_dir, result):
                     observed=kvmanifest.manifest(on._cache or []),
                     template=kvmanifest.manifest(lm.make_cache()),
                 )
+                drafter = (
+                    rg.draft_model
+                )  # K3: the drafter's own cache, against its own template
+                entry["drafter_manifest"] = dict(
+                    observed=kvmanifest.manifest(
+                        getattr(drafter, "_cache", None) or []
+                    ),
+                    template=kvmanifest.manifest(drafter.make_cache()),
+                )
                 metrics = server.runtime.metrics
                 replays = []
                 wait_idle(rg, metrics)

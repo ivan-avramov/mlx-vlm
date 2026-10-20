@@ -71,27 +71,36 @@ def kv_problems(served, expected):
 
 # ------------------------------------------------------------------ the per-layer manifest
 def _kind(leaf):
-    """``tq`` / ``affine`` / ``native`` for a KV leaf, else the class name (linear-attention state and the like)."""
-    for cls in type(leaf).__mro__:
-        if cls.__name__ == "_TurboQuantAttentionMixin":
-            return "tq"
+    """``tq`` / ``affine`` / ``native`` for a KV leaf (the continuous-batching variants included, code round 1 K1),
+    else the class name (linear-attention state and the like)."""
     names = {cls.__name__ for cls in type(leaf).__mro__}
-    if "QuantizedKVCache" in names:
+    if "_TurboQuantAttentionMixin" in names:
+        return "tq"
+    if names & {"QuantizedKVCache", "BatchQuantizedKVCache"}:
         return "affine"
-    if "KVCache" in names:
+    if names & {"KVCache", "BatchKVCache"}:
         return "native"
     return type(leaf).__name__
 
 
 def _record(path, leaf):
     kind = _kind(leaf)
-    out = dict(path=path, kind=kind, cls=type(leaf).__name__)
+    out = dict(
+        path=path,
+        kind=kind,
+        cls=type(leaf).__name__,
+        batch=type(leaf).__name__.startswith(
+            "Batch"
+        ),  # K1: not the cached-session path F3 models
+    )
     if kind == "tq":
         out.update(
             bits=float(leaf.bits),
             key_bits=float(leaf.key_bits),
             value_bits=float(leaf.value_bits),
-            mode=leaf._kv_quant_mode,
+            mode=getattr(
+                leaf, "_kv_quant_mode", None
+            ),  # the batch class has none: a mismatch, never a crash
         )
     elif kind == "affine":
         out.update(bits=int(leaf.bits), group_size=int(leaf.group_size))
@@ -190,12 +199,31 @@ def manifest_problems(observed, template, kv):
         problems.append(f"layers {missing} missing from the live cache")
     if extra:
         problems.append(f"layers {extra} not in the model's cache template")
+    batch = [o["path"] for o in observed if o.get("batch")]
+    if batch:
+        problems.append(
+            f"layers {batch} are continuous-batching caches (not the cached-session path the manifest models)"
+        )
     for path, want in expected.items():
         got = seen.get(path)
         if got is None:
             continue
-        got = {k: v for k, v in got.items() if k != "cls"}
-        want = {k: v for k, v in want.items() if k != "cls"}
-        if got != want:
+        if _comparable(got) != _comparable(want):
             problems.append(f"layer {path}: served {got}, expected {want}")
+    return problems
+
+
+def _comparable(record):
+    """Class names and the batch flag are not compared (the pre-allocating variants are the served path's own; batch
+    leaves are refused on their own); kind, widths, mode and group size are."""
+    return {k: v for k, v in record.items() if k not in ("cls", "batch")}
+
+
+def drafter_problems(observed, template):
+    """Code round 1 K3: the MTP drafter's cache is never quantized — its leaves are exactly its template's."""
+    want = [(t["path"], t["kind"]) for t in template]
+    got = [(o["path"], o["kind"]) for o in observed]
+    problems = [] if got == want else [f"drafter cache {got}, template {want}"]
+    if any(o.get("batch") for o in observed):
+        problems.append("drafter cache holds continuous-batching leaves")
     return problems
