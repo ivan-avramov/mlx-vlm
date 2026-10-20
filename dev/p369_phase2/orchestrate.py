@@ -23,7 +23,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-PRODUCTION = "4e6d0e03"
+PRODUCTION = "da27f0ef"  # P400 + P401 (C188); was 4e6d0e03 (the P369 production fixes)
 PICKS = {
     "Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed": dict(
         kv="native16", verify_policy="joint_v1"
