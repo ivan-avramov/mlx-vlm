@@ -176,6 +176,65 @@ def served_state():
     )
 
 
+def _quantized_shapes(module):
+    """``[(bits, group_size)]`` of every quantized leaf (QuantizedLinear / QuantizedSwitchLinear / embedding)."""
+    return sorted(
+        {
+            (int(m.bits), int(m.group_size))
+            for m in module.modules()
+            if hasattr(m, "bits") and hasattr(m, "group_size")
+        }
+    )
+
+
+def drafter_identity(drafter, *, quantized=_quantized_shapes):
+    """P369 v13 V11: what the LOADED drafter is (not its config file): type, layer classes and depth, dims, MoE
+    shape, quantization, and what it is bound to."""
+    tc = drafter.config.text_config
+    experts = getattr(tc, "num_experts", None)
+    return dict(
+        model_type=getattr(drafter.config, "model_type", None),
+        text_type=getattr(tc, "model_type", None),
+        layer=sorted({type(layer).__name__ for layer in drafter.layers}),
+        depth=len(drafter.layers),
+        hidden=int(tc.hidden_size),
+        vocab=int(tc.vocab_size),
+        experts=(int(experts), int(tc.num_experts_per_tok)) if experts else None,
+        quant=[list(q) for q in quantized(drafter)],
+        embed=id(drafter._input_embed),
+        head_bound=drafter._lm_head_fn is not None,
+    )
+
+
+def target_identity(lm):
+    args = getattr(lm, "args", None) or getattr(lm, "config")
+    return dict(
+        hidden=int(args.hidden_size),
+        vocab=int(args.vocab_size),
+        embed=id(lm.model.embed_tokens),
+    )
+
+
+def drafter_problems(identity, target, expect):
+    """The loaded drafter matches the certified shape (``expect``) and is bound to THIS target."""
+    want = dict(
+        model_type="qwen3_5_mtp",
+        layer=[expect["layer"]],
+        depth=expect["depth"],
+        experts=expect["experts"],
+        quant=[list(q) for q in expect["quant"]],
+        hidden=target["hidden"],
+        vocab=target["vocab"],
+        embed=target["embed"],
+        head_bound=True,
+    )
+    return [
+        f"drafter {k} {identity.get(k)!r} != {v!r}"
+        for k, v in want.items()
+        if identity.get(k) != v
+    ]
+
+
 def assert_served(state, expect):
     from p369_phase2 import kvmanifest  # function-level: `python -I` (smoke 12)
 
@@ -1102,6 +1161,13 @@ def run_job(job, out_dir, result):
 
         rg = server.runtime.response_generator
         lm = rg.model.language_model
+        shape = job["expect"].get("drafter_shape")
+        if shape:  # P369 v13 V11: the LOADED drafter, not its config file
+            ident = drafter_identity(rg.draft_model)
+            result["drafter_identity"] = dict(ident, embed=None)
+            problems = drafter_problems(ident, target_identity(lm), shape)
+            if problems:
+                raise RuntimeError("served drafter mismatch: " + "; ".join(problems))
         policy = getattr(rg, "mtp_verify_policy", None)
         manifest = telemetry.manifest_from_model(lm)
         result["manifest"] = manifest

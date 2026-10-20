@@ -30,17 +30,26 @@ except ImportError:  # run as a script: this directory is sys.path[0]
     import registry_states
 
 PRODUCTION = "7207179b"  # P400 + P401 (C188) + P405 F1 / F2 + K6 (C189 / C192); was 3395cef3, da27f0ef, 4e6d0e03
+_DENSE = dict(layer="Qwen3_5DecoderLayer", depth=1, experts=None, quant=[(4, 64)])
 PICKS = {  # P369 v13 §3.1: every MTP-certified registry entry; one entry per campaign (V9)
     "Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed": dict(
-        kv="native16", verify_policy="joint_v1"
+        kv="native16", verify_policy="joint_v1", drafter=_DENSE
     ),
-    "Qwen3.8-27B-mlx-uniform-4bit": dict(kv="tq4", verify_policy=None),
+    "Qwen3.8-27B-mlx-uniform-4bit": dict(kv="tq4", verify_policy=None, drafter=_DENSE),
     # no C84 bundles of their own: E2 / E7 use the reviewed borrowed panel of the uniform pick's items (V4)
     "Qwen3.6-27B-Opus-Distill-OptiQ-4bit": dict(
-        kv="tq4", verify_policy=None, items_from="Qwen3.8-27B-mlx-uniform-4bit"
+        kv="tq4",
+        verify_policy=None,
+        items_from="Qwen3.8-27B-mlx-uniform-4bit",
+        drafter=_DENSE,
     ),
     "Ornith-1.0-35B-mlx-uniform-4bit": dict(
-        kv="native16", verify_policy=None, items_from="Qwen3.8-27B-mlx-uniform-4bit"
+        kv="native16",
+        verify_policy=None,
+        items_from="Qwen3.8-27B-mlx-uniform-4bit",
+        drafter=dict(  # the transplanted MoE head (M27): routed experts, never dense layers (V12 / V14)
+            layer="Qwen3_5MoeDecoderLayer", depth=1, experts=(256, 8), quant=[(4, 64)]
+        ),
     ),
 }
 THRESHOLDS = (1024, 8192, 32768, 65536)
@@ -1934,6 +1943,7 @@ class Campaign:
             verify_policy=PICKS[pick]["verify_policy"] if arm == "on" else None,
             revisions=revisions,  # code round 2 H9: what the worker must actually load
             kv=kvmanifest.kv_from_argv(self.arms[pick][arm]),  # P405 F3
+            drafter_shape=PICKS[pick]["drafter"] if arm == "on" else None,  # v13 V11
         )
         timeout = sum(int(r["timeout_s"]) for r in requests) + 900
         return dict(

@@ -1107,21 +1107,22 @@ def _drafter(
     d = types.SimpleNamespace(
         config=types.SimpleNamespace(model_type="qwen3_5_mtp", text_config=tc),
         layers=[layer_cls() for _ in range(depth)],
-        _input_embed="E",
+        _input_embed=EMBED,
         _lm_head_fn=len,
         quantized=[quant],
     )
     return d
 
 
-TARGET = dict(hidden=5120, vocab=248320, embed="E")
+EMBED = object()
+TARGET = dict(hidden=5120, vocab=248320, embed=id(EMBED))
 DENSE = dict(layer="Qwen3_5DecoderLayer", depth=1, experts=None, quant=[(4, 64)])
 MOE = dict(layer="Qwen3_5MoeDecoderLayer", depth=1, experts=(256, 8), quant=[(4, 64)])
 
 
 def _identity(d):
     return worker.drafter_identity(
-        d, embed="E", quantized=lambda m: [(q.bits, q.group_size) for q in m.quantized]
+        d, quantized=lambda m: [(q.bits, q.group_size) for q in m.quantized]
     )
 
 
@@ -1150,7 +1151,7 @@ def test_a_loaded_moe_drafter_must_build_moe_layers():
         (dict(hidden=4096), TARGET),
         (dict(bits=8), TARGET),
         ({}, dict(TARGET, vocab=1)),
-        ({}, dict(TARGET, embed="other")),  # not bound to the target's embeddings
+        ({}, dict(TARGET, embed=id(object()))),  # not bound to the target's embeddings
     ],
 )
 def test_the_loaded_drafter_must_match_the_certified_shape(change, target):
