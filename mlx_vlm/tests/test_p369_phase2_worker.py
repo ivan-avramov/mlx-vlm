@@ -1084,3 +1084,74 @@ def test_the_in_support_perturbation_moves_the_boundary_when_every_support_is_on
     latest = {0: _logit_record(PEAKED), 1: _logit_record(PEAKED)}
     position, perturbed = worker.in_support_perturbation(latest, SAMPLING, exclude=())
     assert position == 1 and _changes(latest[1], perturbed)
+
+
+# ------------------------------------------------------------------ P369 v13 V11: the LOADED drafter's architecture
+def _drafter(
+    text_type="qwen3_5_text",
+    layer="Qwen3_5DecoderLayer",
+    depth=1,
+    hidden=5120,
+    experts=None,
+    bits=4,
+):
+    tc = types.SimpleNamespace(
+        model_type=text_type,
+        hidden_size=hidden,
+        vocab_size=248320,
+        num_experts=experts and experts[0],
+        num_experts_per_tok=experts and experts[1],
+    )
+    quant = types.SimpleNamespace(bits=bits, group_size=64)
+    layer_cls = type(layer, (), {})
+    d = types.SimpleNamespace(
+        config=types.SimpleNamespace(model_type="qwen3_5_mtp", text_config=tc),
+        layers=[layer_cls() for _ in range(depth)],
+        _input_embed="E",
+        _lm_head_fn=len,
+        quantized=[quant],
+    )
+    return d
+
+
+TARGET = dict(hidden=5120, vocab=248320, embed="E")
+DENSE = dict(layer="Qwen3_5DecoderLayer", depth=1, experts=None, quant=[(4, 64)])
+MOE = dict(layer="Qwen3_5MoeDecoderLayer", depth=1, experts=(256, 8), quant=[(4, 64)])
+
+
+def _identity(d):
+    return worker.drafter_identity(
+        d, embed="E", quantized=lambda m: [(q.bits, q.group_size) for q in m.quantized]
+    )
+
+
+def test_a_loaded_dense_drafter_matching_its_target_passes():
+    assert worker.drafter_problems(_identity(_drafter()), TARGET, DENSE) == []
+
+
+def test_a_loaded_moe_drafter_must_build_moe_layers():
+    """V12 / V14: a nested `qwen3_next` text type would build DENSE layers holding expert weights."""
+    moe = _drafter(
+        "qwen3_5_moe_text", "Qwen3_5MoeDecoderLayer", hidden=2048, experts=(256, 8)
+    )
+    assert worker.drafter_problems(_identity(moe), dict(TARGET, hidden=2048), MOE) == []
+    dense_built = _drafter(
+        "qwen3_next", "Qwen3_5DecoderLayer", hidden=2048, experts=(256, 8)
+    )
+    assert worker.drafter_problems(
+        _identity(dense_built), dict(TARGET, hidden=2048), MOE
+    )
+
+
+@pytest.mark.parametrize(
+    ("change", "target"),
+    [
+        (dict(depth=2), TARGET),
+        (dict(hidden=4096), TARGET),
+        (dict(bits=8), TARGET),
+        ({}, dict(TARGET, vocab=1)),
+        ({}, dict(TARGET, embed="other")),  # not bound to the target's embeddings
+    ],
+)
+def test_the_loaded_drafter_must_match_the_certified_shape(change, target):
+    assert worker.drafter_problems(_identity(_drafter(**change)), target, DENSE)
