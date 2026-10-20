@@ -1007,7 +1007,7 @@ def compare_pair(ref, recorder, n, params, exclude=()):
 
 def run_job(job, out_dir, result):
     global ROUTED_MODEL
-    from p369_phase2 import telemetry
+    from p369_phase2 import compare, telemetry  # function-level: every branch uses them
 
     ROUTED_MODEL = argv_model(job["argv"])
 
@@ -1091,8 +1091,6 @@ def run_job(job, out_dir, result):
                     ([on.prompt_end] if on.prompt_end else []) + on.commits,
                 )
                 tokens, n = part["final"]["token_ids"], len(part["final"]["token_ids"])
-                from p369_phase2 import compare
-
                 # P398: the forced emissions have no sampled ON row; proven, then excluded from the rows
                 forced = compare.forced_positions(
                     on, tokens, finish_reason=part["final"]["finish_reason"]
