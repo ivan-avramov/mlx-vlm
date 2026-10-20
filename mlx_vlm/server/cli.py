@@ -26,6 +26,8 @@ from .request_normalization import (  # Fork: chat compaction switch (v0.7.6 syn
     CHAT_COMPACTION_ENV,
     chat_compaction_enabled,
 )
+from .runtime import runtime  # Fork (P405)
+from .runtime_config import RuntimeConfig  # Fork (P405)
 from .session_manager import (  # Fork: session manager is fork
     _env_choice,
     _env_float,
@@ -846,6 +848,11 @@ def main():
             else "disabled"
         ),
     )
+
+    # Fork (P405): `runtime.config` was built from the environment when the server package was
+    # imported, before the writes above, so its import-time defaults won (`kv_quant_scheme="uniform"`
+    # over --kv-quant-scheme). Rebuild it, and its /v1/settings replace restore point, from the final env.
+    runtime.config = RuntimeConfig.from_env()
 
     logger.debug("Command-line arguments: %s", args)
     logger.info("Starting MLX VLM Server")
