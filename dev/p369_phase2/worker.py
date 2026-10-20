@@ -21,11 +21,6 @@ import uuid
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
-try:
-    from p369_phase2 import kvmanifest
-except ImportError:  # run as a script: this directory is sys.path[0]
-    import kvmanifest
-
 FILLER = "alpha beta gamma delta epsilon zeta eta theta iota kappa".split()
 NUDGES = list("abcdefghijklmnopqrstuvwxyz0123456789")
 
@@ -164,6 +159,7 @@ def boot(argv):
 
 def served_state():
     import mlx_vlm.server as server
+    from p369_phase2 import kvmanifest  # function-level: `python -I` (smoke 12)
     from mlx_vlm.server import session_manager
 
     rg = server.runtime.response_generator
@@ -181,6 +177,8 @@ def served_state():
 
 
 def assert_served(state, expect):
+    from p369_phase2 import kvmanifest  # function-level: `python -I` (smoke 12)
+
     problems = []
     if state["drafter_loaded"] != expect["drafter"]:
         problems.append(
@@ -1048,7 +1046,11 @@ def compare_pair(ref, recorder, n, params, exclude=()):
 
 def run_job(job, out_dir, result):
     global ROUTED_MODEL
-    from p369_phase2 import compare, telemetry  # function-level: every branch uses them
+    from p369_phase2 import (  # function-level: every branch uses them (`python -I`)
+        compare,
+        kvmanifest,
+        telemetry,
+    )
 
     ROUTED_MODEL = argv_model(job["argv"])
 
