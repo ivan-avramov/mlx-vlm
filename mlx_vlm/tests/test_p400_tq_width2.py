@@ -7,6 +7,10 @@ singleton calls. Every case asserts the cache codec it ran on and the verifier w
 KV cannot pass. Metal only (the exact verifier kernels).
 """
 
+import os
+import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -33,6 +37,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 TQ4 = dict(kv_bits=4, kv_quant_scheme="turboquant", quantized_kv_start=0)
+PRODUCTION_NUMERICS = os.environ.get("MLX_VLM_TEST_TF32") == "1"  # conftest (P403)
 DEPLOYED_KV = {PICKS[0]: {}, PICKS[1]: TQ4}  # native16 / TurboQuant 4-bit
 
 
@@ -201,3 +206,34 @@ def test_a_width_2_verify_block_equals_two_singleton_calls(pick, observed):
                     assert x.shape == y.shape and mx.array_equal(x, y).item(), key
                     compared += 1
     assert compared > 0
+
+
+# --------------------------------------------------------------------------- P403: production numerics (TF32 on)
+def test_these_checks_hold_under_production_numerics():
+    """The suite runs with TF32 OFF (conftest); this box serves with it ON (MLX's default), and P400 shows only then
+    (TurboQuant's multi-query attention path runs TF32 matmuls the singleton decode path does not). Rerun this module and
+    the TurboQuant E1c cases in a fresh interpreter under production numerics."""
+    if PRODUCTION_NUMERICS:
+        assert os.environ["MLX_ENABLE_TF32"] == "1"
+        pytest.skip("this IS the production-numerics run")
+    here = Path(__file__).resolve()
+    observe = here.with_name("test_p369_phase2_observe.py")
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            str(here),
+            f"{observe}::test_quantized_e1c_on_the_deployed_kv_codec",
+            f"{observe}::test_quantized_e1c_detects_a_turboquant_packed_state_change",
+        ],
+        cwd=str(here.parent),
+        env=dict(os.environ, MLX_VLM_TEST_TF32="1"),
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    assert out.returncode == 0, out.stdout[-4000:] + out.stderr[-2000:]

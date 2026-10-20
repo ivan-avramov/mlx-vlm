@@ -29,6 +29,11 @@ import pathlib  # Fork: needed by the collection config below; upstream imports 
 # looser than the float32 references these tests compare against. Set rather than
 # setdefault, so an inherited MLX_ENABLE_TF32=1 doesn't leak into the test run.
 os.environ["MLX_ENABLE_TF32"] = "0"
+# Fork (P403): the box's PRODUCTION numerics have TF32 on (MLX's default here); a test that must hold under them
+# (P400: TurboQuant x width-2 verify is exact only with TF32 off) reruns itself in a fresh interpreter with
+# MLX_VLM_TEST_TF32=1, the only way to reach that setting from the suite.
+if os.environ.get("MLX_VLM_TEST_TF32") == "1":
+    os.environ["MLX_ENABLE_TF32"] = "1"
 
 
 def pytest_sessionfinish(session, exitstatus):
