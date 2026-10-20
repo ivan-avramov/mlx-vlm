@@ -1765,10 +1765,22 @@ class LanguageModel(nn.Module):
 
         if position_ids is not None and cache_offsets is None:
             seq_length = inputs.shape[-1]
+            # Fork (P401): a buffer shorter than the chunk, or a full-prompt buffer that does not cover the
+            # chunk at the cache offset (suffix-local positions from an unprimed warm prefill), would run RoPE
+            # on short / empty positions; refuse instead. Equal length = already block-local: used as given.
+            if position_ids.shape[-1] < seq_length:
+                raise ValueError(
+                    f"position_ids length {position_ids.shape[-1]} < chunk {seq_length}"
+                )
             if position_ids.shape[-1] > seq_length:
                 position_ids = position_ids[
                     ..., cache_offset : cache_offset + seq_length
                 ]
+                if position_ids.shape[-1] != seq_length:  # Fork (P401)
+                    raise ValueError(
+                        f"position_ids do not cover the chunk at cache offset {cache_offset}"
+                        " (unprimed warm prefill?)"
+                    )
 
         if (
             mask is None
