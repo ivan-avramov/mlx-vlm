@@ -2187,7 +2187,9 @@ def test_without_a_ruling_an_over_budget_smoke_does_not_authorize():
 
 def test_the_c193_ruling_authorizes_only_its_pick_and_only_the_projection():
     sap = orchestrate.smoke_authorization_problems
-    assert orchestrate.PROJECTION_RULINGS == {"C193": UNIFORM}
+    assert orchestrate.PROJECTION_RULINGS == {
+        "C193": dict(pick=UNIFORM, wall_limit_s=20400)
+    }
     assert sap(_over_budget_summary(), projection_ruling="C193") == []
     assert sap(
         _over_budget_summary(pick=FABLE), projection_ruling="C193"
@@ -2209,3 +2211,27 @@ def test_the_c193_ruling_authorizes_only_its_pick_and_only_the_projection():
     assert sap(
         exit_one, projection_ruling="C193"
     )  # a harness error is not an over-budget smoke
+
+
+def test_the_c193_ruling_never_covers_a_smoke_that_fits():
+    """P405 code round 2 K8: the ruling lifts `fits` only when `fits` is actually false."""
+    fitting = _over_budget_summary()
+    for record in fitting["picks"].values():
+        record["wall_s"] = 60
+    fitting["smoke_gate"] = orchestrate.smoke_gate(fitting["picks"])
+    assert fitting["smoke_gate"]["fits"]
+    assert orchestrate.smoke_authorization_problems(fitting, projection_ruling="C193")
+
+
+def test_the_c193_ruling_brings_its_wall_cap():
+    """K8 + P369 v13 V17: the ruled full run gets the ruling's authorized wall cap (nominal 13,140 s + one 7,200 s
+    tail reserve); a looser or absent explicit limit is replaced / refused, never infinity.
+    """
+    wl = orchestrate.ruling_wall_limit
+    assert wl(None, None) is None  # no ruling: C184's default stands
+    assert wl("C193", None) == 20400
+    assert wl("C193", 18000) == 18000  # a tighter operator limit stands
+    import pytest
+
+    with pytest.raises(SystemExit, match="20400"):
+        wl("C193", 30000)

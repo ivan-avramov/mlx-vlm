@@ -300,3 +300,56 @@ def test_codec_stats_are_descriptive_per_arm_and_schedule():
     assert (
         stats["long"]["A"]["n"] == 4 and "verdict" not in stats["long"]
     )  # descriptive: no bound, no verdict
+
+
+# ------------------------------------------------------------------ P405 code round 2 K7 / K9
+TQ = [
+    "--model",
+    "m",
+    "--kv-bits",
+    "4",
+    "--kv-quant-scheme",
+    "turboquant",
+    "--quantized-kv-start",
+    "0",
+]
+AFFINE = [
+    "--model",
+    "m",
+    "--kv-bits",
+    "4",
+    "--kv-quant-scheme",
+    "uniform",
+    "--quantized-kv-start",
+    "0",
+]
+
+
+def _layers(kinds):
+    return [dict(path=str(i), kind=k, cls=k, batch=False) for i, k in enumerate(kinds)]
+
+
+def test_every_request_checks_the_live_cache_against_its_arms_argv():
+    """K7: configuration can say TurboQuant while the cache is affine (P405 itself); the leg checks the LIVE cache."""
+    template = _layers(["ArraysCache", "native", "ArraysCache", "native"])
+    affine = [
+        dict(t, kind="affine", bits=4, group_size=64) if t["kind"] == "native" else t
+        for t in template
+    ]
+    assert probe.leg_cache_problems(affine, template, AFFINE) == []
+    assert probe.leg_cache_problems(
+        affine, template, TQ
+    )  # the arms disagree with their live leaves
+    assert probe.leg_cache_problems(None, template, TQ) == [
+        "no live target cache captured"
+    ]
+
+
+def test_codec_mode_defaults_to_quantized_picks_and_refuses_native_arms():
+    """K9: Fable is native KV — changing only the scheme cannot make affine / TurboQuant arms."""
+    assert probe.CODEC_PICKS == ("Qwen3.8-27B-mlx-uniform-4bit",)
+    assert probe.codec_arm_problems(AFFINE, TQ) == []
+    native = ["--model", "m", "--kv-bits", "0", "--kv-quant-scheme", "turboquant"]
+    assert probe.codec_arm_problems(native, native)
+    assert probe.codec_arm_problems(TQ, TQ)  # both arms TurboQuant
+    assert probe.codec_arm_problems(AFFINE, AFFINE)
