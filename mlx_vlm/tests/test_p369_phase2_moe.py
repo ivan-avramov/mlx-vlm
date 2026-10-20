@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 
 import mlx.core as mx
+import pytest
 from mlx.utils import tree_flatten
 
 from mlx_vlm.models.qwen3_5_moe.config import TextConfig as MoeTextConfig
@@ -334,3 +335,88 @@ def test_v3e_an_absent_routed_hook_fails_the_verdict(monkeypatch):
     tel, _, _ = _observed_turn(lm, drafter, sabotage=unhook, monkeypatch=monkeypatch)
     assert not telemetry.verdict(tel, telemetry.manifest_from_model(lm))["pass"]
     assert not telemetry.draft_verdict(tel, drafter)["pass"]
+
+
+# ------------------------------------------------------------------ V3 (d): the MoE analogue of P400, measured
+def _moe_prefilled(lm, prompt=PROMPT):
+    cache = lm.make_cache()
+    lm(mx.array([prompt], dtype=mx.int32), cache=cache)
+    mx.eval([c.state for c in cache])
+    return cache
+
+
+def _capture_experts(monkeypatch):
+    """Per-call selected experts: the verifier's ``_switch_glu`` (block) and the plain MoE block's routing (singletons)."""
+    from mlx_vlm.models import switch_layers
+    from mlx_vlm.models.qwen3_5 import speculative_verifier as sv
+
+    seen = dict(block=[], plain=[])
+    real_glu = sv.Qwen3_5BatchInvariantForward._switch_glu
+    real_switch = switch_layers.SwitchGLU.__call__
+
+    def glu(self, switch_mlp, x, indices):
+        seen["block"].append(indices)
+        return real_glu(self, switch_mlp, x, indices)
+
+    def switch(self, x, indices, *a, **k):
+        seen["plain"].append(indices)
+        return real_switch(self, x, indices, *a, **k)
+
+    monkeypatch.setattr(sv.Qwen3_5BatchInvariantForward, "_switch_glu", glu)
+    monkeypatch.setattr(switch_layers.SwitchGLU, "__call__", switch)
+    return seen
+
+
+@pytest.mark.skipif(
+    not mx.metal.is_available(), reason="the served verifier kernels are Metal"
+)
+@pytest.mark.parametrize("width", [2, 3])
+@pytest.mark.parametrize("quantized", [False, True], ids=["dense", "int4"])
+def test_v3d_a_moe_verify_block_equals_sequential_singletons(
+    monkeypatch, width, quantized
+):
+    """One width-``width`` ``speculative_verify`` call vs ``width`` plain singleton calls on an INDEPENDENT, identically
+    prefilled cache, on the MoE stack (routed banks dispatched for the whole block at once — the MoE analogue of P400):
+    logits rows, every full-attention KV and recurrent state, and each layer's selected experts, bitwise.
+    """
+    import mlx.nn as nn
+
+    lm = tiny_moe_target()
+    if quantized:  # the served Ornith banks are QuantizedSwitchLinear (int4)
+        nn.quantize(lm, group_size=32, bits=4)
+        mx.eval(lm.parameters())
+        assert any(
+            type(m).__name__ == "QuantizedSwitchLinear" for _, m in lm.named_modules()
+        )
+    block_cache, plain_cache = _moe_prefilled(lm), _moe_prefilled(lm)
+    seen = _capture_experts(monkeypatch)
+    tokens = mx.array([[5, 9, 13][:width]], dtype=mx.int32)
+    verify = lm(tokens, cache=block_cache, speculative_verify=True)
+    rows = [
+        lm(tokens[:, i : i + 1], cache=plain_cache).logits[:, -1, :]
+        for i in range(width)
+    ]
+    mx.eval(verify.logits, rows, seen["block"], seen["plain"])
+    for i in range(width):
+        assert mx.array_equal(verify.logits[:, i, :], rows[i]).item(), f"logits row {i}"
+    # experts: block call k covers tokens 0..width-1 of layer k; singleton j of layer k is plain call j * LAYERS + k
+    assert len(seen["block"]) == LAYERS and len(seen["plain"]) == LAYERS * width
+    for k, block_idx in enumerate(seen["block"]):
+        for j in range(width):
+            plain_idx = seen["plain"][j * LAYERS + k]
+            got = mx.sort(block_idx[0, j], axis=-1)
+            want = mx.sort(plain_idx.reshape(-1, plain_idx.shape[-1])[0], axis=-1)
+            assert mx.array_equal(got, want).item(), f"layer {k} token {j} experts"
+    from mlx_vlm.speculative.cache_state import iter_leaf_caches
+
+    compared = 0
+    for a, b in zip(iter_leaf_caches(block_cache), iter_leaf_caches(plain_cache)):
+        fa, fb = tree_flatten(a.state), tree_flatten(b.state)
+        for (key, x), (_, y) in zip(fa, fb):
+            if isinstance(x, mx.array):
+                assert x.shape == y.shape and mx.array_equal(x, y).item(), (
+                    type(a).__name__,
+                    key,
+                )
+                compared += 1
+    assert compared > 0

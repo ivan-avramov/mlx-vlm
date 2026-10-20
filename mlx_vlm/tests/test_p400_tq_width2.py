@@ -258,6 +258,7 @@ QUANTIZED_EXACTNESS = (  # the deployed kernel path (bf16 affine-quantized); den
     "test_p369_phase2_observe.py::test_quantized_e1c_detects_an_in_support_change_of_one_verifier_row",
     "test_p369_phase2_observe.py::test_quantized_e1c_on_the_deployed_kv_codec",
     "test_p369_phase2_observe.py::test_quantized_e1c_detects_a_turboquant_packed_state_change",
+    "test_p369_phase2_moe.py::test_v3d_a_moe_verify_block_equals_sequential_singletons",  # P369 v13 V3 (d)
 )
 
 
