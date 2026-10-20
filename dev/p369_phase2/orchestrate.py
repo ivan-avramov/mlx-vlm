@@ -489,6 +489,39 @@ def e2_verdict(*, c1_identical, engaged, all_identical):
     return "PASS" if identical else "FAIL"
 
 
+def _exact_int(value):
+    return type(value) is int
+
+
+def is_sha256(value):
+    return (
+        type(value) is str
+        and len(value) == 64
+        and all(c in "0123456789abcdef" for c in value)
+    )
+
+
+def e2_turn_checked(where, turn, *, readout=False):
+    """C185 review round 1 E1: a turn's evidence is typed — token ids ``list[int]``, a ``str`` finish reason,
+    exact-int MTP rounds (and, for an ON turn, the argmax readout count) — else RAISES.
+    """
+    final = turn.get("final") if isinstance(turn, dict) else None
+    ids = final.get("token_ids") if isinstance(final, dict) else None
+    ok = (
+        type(ids) is list
+        and all(_exact_int(t) for t in ids)
+        and type(final.get("finish_reason")) is str
+        and _exact_int(turn.get("mtp_rounds"))
+    )
+    if ok and readout:
+        ok = _exact_int(
+            (turn.get("telemetry") or {}).get("speculative_argmax_from_hidden")
+        )
+    if not ok:
+        raise MalformedEvidence(f"malformed evidence: E2 {where} turn = {turn!r}")
+    return turn
+
+
 def e2_summary(pair, cross, *, digests):
     """C185: E2 from the same-instance triples (``pair``: name -> the ``e2_pair`` entry, ``turns[0]`` = ON,
     ``off`` = [OFF1, OFF2]) and the cross-load OFF arm (``cross``: name -> the ``e2`` entry). The verdict is
@@ -510,6 +543,9 @@ def e2_summary(pair, cross, *, digests):
         if n not in cross:
             bad(f"{n} cross-load entry", None)
         on, (off1, off2), far = entry["turns"][0], offs, cross[n]["turns"][0]
+        e2_turn_checked(f"{n} ON", on, readout=True)
+        for label, turn in (("OFF1", off1), ("OFF2", off2), ("cross-load", far)):
+            e2_turn_checked(f"{n} {label}", turn)
         kernel = exact_bool(
             (entry.get("verdict") or {}).get("pass"), f"E2 {n}.verdict.pass"
         )
@@ -525,7 +561,11 @@ def e2_summary(pair, cross, *, digests):
             and on["mtp_rounds"] > 0
         )
         shas = [(t.get("prompt") or {}).get("sha256") for t in (on, off1, off2, far)]
-        if len(set(shas)) != 1:
+        if not all(
+            is_sha256(x) for x in shas
+        ):  # round 1 E2: None == None binds nothing
+            problems.append(f"{n}: a trajectory lacks a valid prompt digest: {shas}")
+        elif len(set(shas)) != 1:
             problems.append(f"{n}: the trajectories' prompt digests differ: {shas}")
     problems += prompt_digest_problems(digests, pair)
     problems += prompt_digest_problems(digests, cross)

@@ -835,6 +835,60 @@ def greedy_turn(client, capture, tel, payload, key, timeout):
     )
 
 
+def instance_identity(rg):
+    """The loaded target and its verify-policy object, held by reference (C185 review round 1 E3)."""
+    return rg.model, getattr(rg, "mtp_verify_policy", None)
+
+
+def same_instance(rg, ident):
+    """Re-reads the LIVE target and verify policy: both are still the very objects of ``ident``."""
+    model, policy = ident
+    return rg.model is model and getattr(rg, "mtp_verify_policy", None) is policy
+
+
+def e2_pair_entry(rg, metrics, client, capture, lm, manifest, spec, timeout):
+    """C185 (plan v8 §3 E2): greedy ON, then OFF1 / OFF2 with the drafter detached on the SAME loaded target;
+    each trajectory on a fresh chat id, the worker idle and its session released before the next starts
+    (Q35 / Q38 pattern); the instance re-checked live (round 1 E3); the triple's cleanliness enforced.
+    """
+    from p369_phase2 import telemetry
+
+    ident = instance_identity(rg)
+    payload = spec["payload"]
+    tel = telemetry.KernelTelemetry(lm)
+    on = greedy_turn(client, capture, tel, payload, spec["name"], timeout)
+    entry = dict(
+        turns=[on], telemetry=on["telemetry"], verdict=telemetry.verdict(tel, manifest)
+    )
+    wait_idle(rg, metrics)
+    release_session(on["chat_id"])
+    offs, guards = [], []
+    with drafter_detached(rg):
+        for k in (1, 2):
+            with DetachedGuard() as guard:
+                off = greedy_turn(
+                    client,
+                    capture,
+                    telemetry.KernelTelemetry(lm),
+                    payload,
+                    f"{spec['name']}#OFF{k}",
+                    timeout,
+                )
+                wait_idle(rg, metrics)
+            release_session(off["chat_id"])
+            offs.append(off)
+            guards.append(list(guard.problems))
+            if not same_instance(rg, ident):
+                raise RuntimeError(
+                    "the target / verify policy changed during the E2 triple"
+                )
+    entry["off"] = offs
+    problems = e2_detached_problems(on, offs, guards)
+    if problems:
+        raise RuntimeError(f"E2 same-instance triple: {problems}")
+    return entry
+
+
 def snapshot_holder(snaps, rows=None):
     """A comparison reference from saved snapshots: ``prompt_end`` (if recorded) and the rest as commits."""
     from types import SimpleNamespace
@@ -1080,43 +1134,19 @@ def run_job(job, out_dir, result):
                     )
                 wait_idle(rg, server.runtime.metrics)
                 release_trajectory(rec, part["chat_id"])
-            elif job["mode"] == "e2_pair":
-                # C185: greedy ON, then OFF1 / OFF2 with the drafter detached on the SAME loaded target; each
-                # trajectory on a fresh chat id, its session released before the next starts (Q35 / Q38 pattern)
-                metrics = server.runtime.metrics
-                same = dict(model=id(rg.model), policy=id(policy))
-                payload = spec["payload"]
-                tel = telemetry.KernelTelemetry(lm)
-                on = greedy_turn(client, capture, tel, payload, spec["name"], timeout)
-                entry["turns"] = [on]
-                entry["telemetry"] = on["telemetry"]
-                entry["verdict"] = telemetry.verdict(tel, manifest)
-                wait_idle(rg, metrics)
-                release_session(on["chat_id"])
-                offs, guards = [], []
-                with drafter_detached(rg):
-                    for k in (1, 2):
-                        with DetachedGuard() as guard:
-                            off = greedy_turn(
-                                client,
-                                capture,
-                                telemetry.KernelTelemetry(lm),
-                                payload,
-                                f"{spec['name']}#OFF{k}",
-                                timeout,
-                            )
-                            wait_idle(rg, metrics)
-                        release_session(off["chat_id"])
-                        offs.append(off)
-                        guards.append(list(guard.problems))
-                if dict(model=id(rg.model), policy=id(policy)) != same:
-                    raise RuntimeError(
-                        "the target / verify policy changed during the E2 triple"
+            elif job["mode"] == "e2_pair":  # C185: the same-instance triple
+                entry.update(
+                    e2_pair_entry(
+                        rg,
+                        server.runtime.metrics,
+                        client,
+                        capture,
+                        lm,
+                        manifest,
+                        spec,
+                        timeout,
                     )
-                entry["off"] = offs
-                problems = e2_detached_problems(on, offs, guards)
-                if problems:
-                    raise RuntimeError(f"E2 same-instance triple: {problems}")
+                )
             elif job["mode"] in ("e2", "e7a", "e7b"):
                 from p369_phase2 import classes
 
