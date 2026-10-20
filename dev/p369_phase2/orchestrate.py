@@ -474,15 +474,81 @@ def pick_outcome(verdicts):
     return dict(e1c=e1c, run_e2_e7=e1c == "PASS", cross_load=cross)
 
 
-def e2_verdict(*, all_identical, control_identical, engaged):
-    """Code round 1 H10 (plan §3 E2): INCOMPLETE without engagement on every ON request (verifier rounds,
-    argmax readout, kernel verdict); INFORMATIVE_ONLY when the OFF reload control differs; else PASS iff
-    every request is identical. ``control_identical`` None = no control (the smoke)."""
+def e2_verdict(*, c1_identical, engaged, all_identical):
+    """C185 (plan v8 §3 E2) precedence per pick: the within-instance control OFF1 vs OFF2 differing ABORTs
+    (the instrument cannot decide; never an MTP finding); an ON request not engaged (argmax readout, kernel
+    verdict, MTP rounds) or a prompt digest problem is INCOMPLETE; else PASS iff ON equals OFF1 on every
+    request, FAIL otherwise. Every flag is an exact boolean (code round 6 H34)."""
+    c1 = exact_bool(c1_identical, "e2_verdict.c1_identical")
+    engaged = exact_bool(engaged, "e2_verdict.engaged")
+    identical = exact_bool(all_identical, "e2_verdict.all_identical")
+    if not c1:
+        return "ABORT"
     if not engaged:
         return "INCOMPLETE"
-    if control_identical is False:
-        return "INFORMATIVE_ONLY"
-    return "PASS" if all_identical else "FAIL"
+    return "PASS" if identical else "FAIL"
+
+
+def e2_summary(pair, cross, *, digests):
+    """C185: E2 from the same-instance triples (``pair``: name -> the ``e2_pair`` entry, ``turns[0]`` = ON,
+    ``off`` = [OFF1, OFF2]) and the cross-load OFF arm (``cross``: name -> the ``e2`` entry). The verdict is
+    ON vs OFF1 under the C1-E2 control; ``cross_load`` (OFF arm vs OFF1) is reported and never decides. The
+    four trajectories of a request share one templated prompt; C84 items are bound to the reconstruction.
+    """
+
+    def bad(what, value):
+        raise MalformedEvidence(f"malformed evidence: E2 {what} = {value!r}")
+
+    if not isinstance(pair, dict) or not pair:
+        bad("requests", pair)
+    tokens = lambda turn: turn["final"]["token_ids"]  # noqa: E731
+    identity, c1, cross_per, engaged, problems = {}, {}, {}, {}, []
+    for n, entry in pair.items():
+        offs = entry.get("off")
+        if not isinstance(offs, list) or len(offs) != 2:
+            bad(f"{n}.off", offs)
+        if n not in cross:
+            bad(f"{n} cross-load entry", None)
+        on, (off1, off2), far = entry["turns"][0], offs, cross[n]["turns"][0]
+        kernel = exact_bool(
+            (entry.get("verdict") or {}).get("pass"), f"E2 {n}.verdict.pass"
+        )
+        c1[n] = (
+            tokens(off1) == tokens(off2)
+            and off1["final"]["finish_reason"] == off2["final"]["finish_reason"]
+        )
+        identity[n] = tokens(on) == tokens(off1)
+        cross_per[n] = tokens(far) == tokens(off1)
+        engaged[n] = (
+            on["telemetry"]["speculative_argmax_from_hidden"] > 0
+            and kernel
+            and on["mtp_rounds"] > 0
+        )
+        shas = [(t.get("prompt") or {}).get("sha256") for t in (on, off1, off2, far)]
+        if len(set(shas)) != 1:
+            problems.append(f"{n}: the trajectories' prompt digests differ: {shas}")
+    problems += prompt_digest_problems(digests, pair)
+    problems += prompt_digest_problems(digests, cross)
+    all_identical = all(identity.values())
+    c1_identical = all(c1.values())
+    argmax_ok = all(engaged.values())
+    return dict(
+        identity=identity,
+        all_identical=all_identical,
+        c1=c1,
+        c1_identical=c1_identical,
+        cross_load=dict(
+            per_request=cross_per,
+            summary="identical" if all(cross_per.values()) else "unestablished",
+        ),
+        argmax_and_kernels=argmax_ok,
+        prompt_digest_problems=problems,
+        verdict=e2_verdict(
+            c1_identical=c1_identical,
+            engaged=argmax_ok and not problems,
+            all_identical=all_identical,
+        ),
+    )
 
 
 E7_CLASSES = ("M4a", "M4b", "M4b_first", "M3")
@@ -1808,6 +1874,9 @@ class Campaign:
         }
 
     def e2(self, pick, items, prompts, *, smoke):
+        """C185 (plan v8 §3 E2): the same-instance triple (ON, OFF1, OFF2) per request in the ON worker
+        (``e2_pair``, one request budget for the three), then the cross-load OFF arm once.
+        """
         reqs = self.c84_payloads(pick, items, greedy=True, limit=2 if smoke else None)
         straddles = (
             []
@@ -1827,59 +1896,22 @@ class Campaign:
                 for t, text in prompts.items()
             ]
         )
-        arms = [("off", reqs + straddles), ("on", reqs + straddles)] + (
-            [] if smoke else [("off", reqs)]
-        )
-        results = []
-        for k, (arm, requests) in enumerate(arms):
-            name = f"e2-{arm}-{k}"
-            self.run(self.job(pick, name, "e2", arm, requests))
-            results.append(
-                {
-                    r["name"]: json.loads(
-                        (self.out / pick / name / f"req-{i}.json").read_text()
-                    )
-                    for i, r in enumerate(requests)
-                }
-            )
-        off, on = results[0], results[1]
-        control = results[2] if len(results) > 2 else None
-        tokens = lambda e: e["turns"][0]["final"]["token_ids"]  # noqa: E731
-        identity = {n: tokens(on[n]) == tokens(off[n]) for n in off}
-        control_ok = (
-            None
-            if control is None
-            else all(tokens(control[n]) == tokens(off[n]) for n in control)
-        )
-        kernels = {  # code round 6 H34
-            n: exact_bool(
-                (on[n].get("verdict") or {}).get("pass"), f"E2 {n}.verdict.pass"
-            )
-            for n in on
-        }
-        argmax_ok = all(
-            on[n]["telemetry"]["speculative_argmax_from_hidden"] > 0
-            and kernels[n]
-            and on[n]["turns"][0]["mtp_rounds"] > 0
-            for n in on
-        )
-        digest_problems = [
-            p
-            for arm in results
-            for p in prompt_digest_problems(self.digests.get(pick, {}), arm)
-        ]
-        all_identical = all(identity.values())
-        return dict(
-            identity=identity,
-            all_identical=all_identical,
-            control_identical=control_ok,
-            argmax_and_kernels=argmax_ok,
-            prompt_digest_problems=digest_problems,
-            verdict=e2_verdict(
-                all_identical=all_identical,
-                control_identical=control_ok,
-                engaged=argmax_ok and not digest_problems,
-            ),
+        requests = reqs + straddles
+        triples = [dict(r, timeout_s=3 * r["timeout_s"]) for r in requests]
+        loaded = {}
+        for name, mode, arm, batch in (
+            ("e2-pair", "e2_pair", "on", triples),
+            ("e2-off", "e2", "off", requests),
+        ):
+            self.run(self.job(pick, name, mode, arm, batch))
+            loaded[name] = {
+                r["name"]: json.loads(
+                    (self.out / pick / name / f"req-{i}.json").read_text()
+                )
+                for i, r in enumerate(batch)
+            }
+        return e2_summary(
+            loaded["e2-pair"], loaded["e2-off"], digests=self.digests.get(pick, {})
         )
 
     def batch_runner(self, pick, base, mode, arm):

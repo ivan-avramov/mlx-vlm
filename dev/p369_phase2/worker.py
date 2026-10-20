@@ -791,6 +791,50 @@ def c1_acceptance(on_part, off_parts, c1, *, retired, expected_offsets, replay_o
     return dict(problems=problems, **{"pass": not problems})
 
 
+def e2_detached_problems(on, offs, guards):
+    """C185 (plan v8 §3 E2): the same-instance triple is clean — every trajectory (ON, OFF1, OFF2) reused
+    exactly 0 cached tokens, and each detached replay ran no MTP round, no verify-scope projection call and
+    tripped no ``DetachedGuard`` check. Any problem is a harness error."""
+    if len(offs) != 2 or len(guards) != 2:
+        raise ValueError("an E2 triple has exactly two detached replays")
+    problems = []
+    for label, part in (("ON", on), ("OFF1", offs[0]), ("OFF2", offs[1])):
+        cached = part["final"].get("cached_tokens")
+        if type(cached) is not int or cached != 0:
+            problems.append(f"{label} reused {cached!r} cached tokens")
+    for k, (part, guard) in enumerate(zip(offs, guards), 1):
+        if part["mtp_rounds"]:
+            problems.append(f"OFF{k} ran {part['mtp_rounds']} MTP rounds")
+        if part["verify_scope_calls"]:
+            problems.append(
+                f"OFF{k} ran {part['verify_scope_calls']} verify-scope calls"
+            )
+        if guard:
+            problems.append(f"OFF{k} guard: {guard}")
+    return problems
+
+
+def greedy_turn(client, capture, tel, payload, key, timeout):
+    """C185: one request on a fresh chat id under the MTP round observer and the kernel telemetry ``tel``."""
+    from p369_phase2 import classes
+
+    observer = classes.Observer()
+    observer.begin_request(key)
+    with observer, tel:
+        got = post(client, payload, f"p369-{uuid.uuid4().hex}", capture, timeout)
+    events = observer.end_request(
+        got["final"]["generation_tokens"] or len(got["final"]["token_ids"]),
+        got["final"]["finish_reason"],
+    )
+    return dict(
+        got,
+        events=events,
+        mtp_rounds=len(observer.requests[-1]["rounds"]),
+        telemetry=tel.summary(),
+        verify_scope_calls=sum(1 for c in tel.calls if c.get("scope") == "verify"),
+    )
+
+
 def snapshot_holder(snaps, rows=None):
     """A comparison reference from saved snapshots: ``prompt_end`` (if recorded) and the rest as commits."""
     from types import SimpleNamespace
@@ -1036,6 +1080,43 @@ def run_job(job, out_dir, result):
                     )
                 wait_idle(rg, server.runtime.metrics)
                 release_trajectory(rec, part["chat_id"])
+            elif job["mode"] == "e2_pair":
+                # C185: greedy ON, then OFF1 / OFF2 with the drafter detached on the SAME loaded target; each
+                # trajectory on a fresh chat id, its session released before the next starts (Q35 / Q38 pattern)
+                metrics = server.runtime.metrics
+                same = dict(model=id(rg.model), policy=id(policy))
+                payload = spec["payload"]
+                tel = telemetry.KernelTelemetry(lm)
+                on = greedy_turn(client, capture, tel, payload, spec["name"], timeout)
+                entry["turns"] = [on]
+                entry["telemetry"] = on["telemetry"]
+                entry["verdict"] = telemetry.verdict(tel, manifest)
+                wait_idle(rg, metrics)
+                release_session(on["chat_id"])
+                offs, guards = [], []
+                with drafter_detached(rg):
+                    for k in (1, 2):
+                        with DetachedGuard() as guard:
+                            off = greedy_turn(
+                                client,
+                                capture,
+                                telemetry.KernelTelemetry(lm),
+                                payload,
+                                f"{spec['name']}#OFF{k}",
+                                timeout,
+                            )
+                            wait_idle(rg, metrics)
+                        release_session(off["chat_id"])
+                        offs.append(off)
+                        guards.append(list(guard.problems))
+                if dict(model=id(rg.model), policy=id(policy)) != same:
+                    raise RuntimeError(
+                        "the target / verify policy changed during the E2 triple"
+                    )
+                entry["off"] = offs
+                problems = e2_detached_problems(on, offs, guards)
+                if problems:
+                    raise RuntimeError(f"E2 same-instance triple: {problems}")
             elif job["mode"] in ("e2", "e7a", "e7b"):
                 from p369_phase2 import classes
 
@@ -1108,7 +1189,7 @@ def run_job(job, out_dir, result):
                 raise ValueError(f"unknown mode {job['mode']}")
             finish_request(out_dir, index, entry, spec["name"], cleanup)
             result["requests"].append(
-                {k: entry[k] for k in entry if k not in ("response", "turns")}
+                {k: entry[k] for k in entry if k not in ("response", "turns", "off")}
             )
 
 

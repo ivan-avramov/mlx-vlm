@@ -770,11 +770,7 @@ def test_overall_status_and_exit_code():
         passing,
         picks=dict(
             passing["picks"],
-            **{
-                UNIFORM: dict(
-                    outcome=dict(e1c="PASS"), e2=dict(verdict="INFORMATIVE_ONLY")
-                )
-            },
+            **{UNIFORM: dict(outcome=dict(e1c="PASS"), e2=dict(verdict="ABORT"))},
         ),
     )
     assert orchestrate.overall_status(informative) == ("NOT_PASS", 2)
