@@ -84,20 +84,23 @@ def _margin(p):
 
 
 def forced_positions(recorder, tokens, *, finish_reason):
-    """P398: the ON positions without a sampled row are EXACTLY the forced emissions — ON's tokens there are
-    the forced tokens in order; one forced pop may stay unemitted only when the request ended at its length
-    budget. Anything else is an instrument error (RAISES)."""
+    """P398 / C185 round 3 E6: the ON positions without a sampled row are EXACTLY the forced emissions —
+    every forced pop's intended position below ``len(tokens)`` is row-less and carries the forced token, and
+    the only pop allowed beyond the output sits exactly at ``len(tokens)`` under a length finish. Anything
+    else is an instrument error (RAISES)."""
     _, missing = latest_rows(recorder.rows, len(tokens))
-    forced = list(recorder.forced)
-    extra = len(forced) - len(missing)
+    forced = [(int(p), int(t)) for p, t in recorder.forced]
+    inside = [(p, t) for p, t in forced if p < len(tokens)]
+    beyond = [p for p, _ in forced if p >= len(tokens)]
     if (
-        [int(tokens[p]) for p in missing] != forced[: len(missing)]
-        or extra not in (0, 1)
-        or (extra == 1 and finish_reason != "length")
+        [p for p, _ in inside] != missing
+        or any(int(tokens[p]) != t for p, t in inside)
+        or beyond not in ([], [len(tokens)])
+        or (beyond and finish_reason != "length")
     ):
         raise RuntimeError(
             f"forced emissions {forced} do not account for the ON positions without a row "
-            f"{missing} (finish {finish_reason})"
+            f"{missing} (finish {finish_reason}, {len(tokens)} tokens)"
         )
     return missing
 

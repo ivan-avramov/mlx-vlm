@@ -224,7 +224,9 @@ class Recorder:
         self.states = {}
         self.prompt_end = None
         self.draft_rounds = 0
-        self.forced = []  # P398: thinking-budget forced tokens popped (ON)
+        self.forced = (
+            []
+        )  # P398 / round 3 E6: (intended position, token) of each forced pop (ON)
         self._block = (
             None  # (rows index, base position) of the verifier block being walked
         )
@@ -326,10 +328,20 @@ class Recorder:
             recorder._cut_block(out[0])
             return out
 
+        from mlx_vlm.utils import ThinkingBudgetCriteria
+
+        call, driven = ThinkingBudgetCriteria.__call__, {}
+
+        def counting_call(
+            criteria, token_id
+        ):  # the real criteria sees every emitted token
+            driven[id(criteria)] = driven.get(id(criteria), 0) + 1
+            return call(criteria, token_id)
+
         def recording_pop_forced(criteria):
             token = pop_forced(criteria)
-            if token is not None:
-                recorder.forced.append(int(token))
+            if token is not None:  # it replaces the token after those emitted so far
+                recorder.forced.append((driven.get(id(criteria), 0), int(token)))
             return token
 
         def recording_commit(verify, model, caches, accepted, block_size):
@@ -358,6 +370,7 @@ class Recorder:
             self._patch(mtp, "_mtp_acceptance_walk", recording_walk)
             self._patch(mtp, "_mtp_plain_emission", recording_emission)
             self._patch(mtp, "_mtp_pop_forced", recording_pop_forced)
+            self._patch(ThinkingBudgetCriteria, "__call__", counting_call)
         return self
 
     def __exit__(self, *exc):

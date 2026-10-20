@@ -558,6 +558,8 @@ def e2_summary(pair, cross, *, digests):
 
     if not isinstance(pair, dict) or not pair:
         bad("requests", pair)
+    if not isinstance(cross, dict) or not cross:  # round 3 E1
+        bad("cross-load requests", cross)
 
     def first_turn(where, entry):  # round 2 E1: an entry with a non-empty turn list
         turns = entry.get("turns") if isinstance(entry, dict) else None
@@ -1868,11 +1870,6 @@ class Campaign:
                 else:
                     still.append((t, text))
             pending = still
-        if pending:
-            raise RuntimeError(  # P399: with every attempt's same-instance evidence
-                f"{pick}: E1c cells invalid after {len(SEEDS)} seeds: "
-                f"{[t for t, _ in pending]}; attempts {attempts}"
-            )
         names = list(accepted)
         requests = []
         for k, name in enumerate(names):
@@ -1887,7 +1884,8 @@ class Campaign:
                     smoke_positives=False,
                 )
             )
-        self.run(self.job(pick, "e1c-c2", "e1c_off", "off", requests))
+        if requests:
+            self.run(self.job(pick, "e1c-c2", "e1c_off", "off", requests))
         verdicts = {}
         for i, name in enumerate(names):
             cell = accepted[name]
@@ -1922,6 +1920,24 @@ class Campaign:
                 rejected=[a for a in attempts[name] if not a["valid"]],
             )
             verdicts[name] = v
+        for (
+            t,
+            _,
+        ) in pending:  # round 3 E7: invalid on every seed — the attempts still decide
+            name = f"T{t}" if t else "short"
+            rejected = list(attempts[name])
+            verdicts[name] = dict(
+                pass_=False,
+                neutral=True,
+                evidence_ok=False,
+                problems=[f"invalid on all {len(SEEDS)} seeds"],
+                neutrality_problems=[],
+                evidence_problems=[f"invalid on all {len(SEEDS)} seeds"],
+                c1=dict(identical=True),
+                c2=dict(identical=False),
+                attempts=rejected,
+                rejected=rejected,
+            )
         return verdicts
 
     def c84_payloads(self, pick, items, *, greedy, limit=None):
