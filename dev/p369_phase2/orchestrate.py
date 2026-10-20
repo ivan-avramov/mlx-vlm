@@ -1009,10 +1009,10 @@ def _stop(proc, grace_s, tracker=None):
         _signal_each(_owned_live(proc, tracker, tracker.scan()), signal.SIGTERM)
         until = time.monotonic() + grace_s
         while time.monotonic() < until:
-            if (
-                proc.returncode is not None
-                or tracker.root_state(tracker.scan(deadline=until)) != "alive"
-            ):
+            # P396: the scan keeps PS_MARGIN_S past the grace end (as reap's do) — bounded by ``until`` alone,
+            # the last one ran ps with the few ms left and a TERM-ignoring worker became a harness error
+            table = tracker.scan(deadline=until + PS_MARGIN_S)
+            if proc.returncode is not None or tracker.root_state(table) != "alive":
                 break
             time.sleep(0.05)
     except RuntimeError:
