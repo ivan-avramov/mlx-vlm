@@ -43,3 +43,91 @@ def test_verdict_applies_both_pre_registered_bounds():
     short = probe.arm_stats(_legs([10.0] * 10, [10.0] * 10, 1000, 1000))
     short["B"]["n"] = 9
     assert probe.verdict(short)["status"] == "INCOMPLETE"
+
+
+# ------------------------------------------------------------------ code round 2 C3–C6
+def test_every_request_must_decode_the_full_256_tokens_to_the_length_cap():
+    """C3: an early EOS makes a shorter, cheaper request; it must never enter the statistic."""
+    good = dict(tps=10.0, tokens=probe.DECODE_TOKENS, decode_peak=1)
+    assert probe.request_problems(good, "length", [1, 2]) == []
+    assert probe.request_problems(dict(good, tokens=200), "length", [2])
+    assert probe.request_problems(good, "stop", [2])
+    assert probe.request_problems(dict(good, tps=0.0), "length", [2])
+    assert probe.request_problems({}, "length", [2])
+    assert probe.request_problems(good, "length", [1])  # no width-2 verify block
+
+
+def test_the_arms_are_two_distinct_clean_trees_at_the_expected_commits():
+    """C4: an arm is bound to a commit and a clean tree, not a directory path."""
+    trees = dict(A="/w/old", B="/w/new")
+    refs = dict(A="a" * 40, B="b" * 40)
+    att = {
+        "/w/old": dict(head="a" * 40, clean=True),
+        "/w/new": dict(head="b" * 40, clean=True),
+    }
+    assert probe.tree_problems(trees, refs, att) == []
+    assert probe.tree_problems(
+        dict(A="/w/old", B="/w/old"), refs, att
+    )  # identical arms
+    assert probe.tree_problems(trees, dict(refs, B="a" * 40), att)  # identical commits
+    assert probe.tree_problems(
+        trees, dict(refs, B="c" * 40), att
+    )  # not the expected commit
+    dirty = dict(att, **{"/w/new": dict(head="b" * 40, clean=False)})
+    assert probe.tree_problems(trees, refs, dirty)
+
+
+def test_every_leg_after_the_first_is_idle_first_across_picks():
+    """C5: the ≥ 10 min idle precedes every globally consecutive leg, including a pick's first."""
+    plan = probe.leg_schedule(["p", "q"])
+    assert [(s["pick"], s["k"], s["arm"]) for s in plan] == [
+        (pick, k, arm) for pick in ("p", "q") for k, arm in enumerate(probe.ORDER)
+    ]
+    assert [s["idle_before"] for s in plan] == [False] + [True] * 7
+
+
+def test_the_idle_time_cannot_be_shortened_below_ten_minutes(capsys):
+    import pytest
+
+    argv = ["drive", "--stack-root", ".", "--old-tree", "a", "--new-tree", "b"]
+    argv += ["--old-ref", "x", "--new-ref", "y", "--out", "o", "--python", "p"]
+    with pytest.raises(SystemExit):
+        probe.main(argv + ["--idle-s", "599"])
+    assert "at least 600" in capsys.readouterr().err
+
+
+class _RG:
+    def __init__(self, bits, scheme):
+        self.kv_bits, self.kv_quant_scheme = bits, scheme
+
+
+def test_the_leg_asserts_the_served_tuple_and_kv_codec_its_argv_asks_for():
+    """C6 (+ P405): the leg proves the deployed MTP tuple (drafter, verify policy) and the KV codec its argv names."""
+    calls = []
+
+    class Worker:
+        @staticmethod
+        def served_state():
+            return dict(state=1)
+
+        @staticmethod
+        def assert_served(state, expect):
+            calls.append((state, expect))
+
+    pick = "Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed"
+    argv = ["--model", "m", "--kv-bits", "4", "--kv-quant-scheme", "turboquant"]
+    got = probe.served_check(Worker, _RG(4.0, "turboquant"), argv, pick)
+    assert calls == [(dict(state=1), dict(drafter=True, verify_policy="joint_v1"))]
+    assert got == dict(state=1, kv=dict(bits=4.0, scheme="turboquant"))
+    import pytest
+
+    with pytest.raises(
+        RuntimeError, match="KV"
+    ):  # the P405 shape: the CLI asked TurboQuant, affine served
+        probe.served_check(Worker, _RG(4.0, "uniform"), argv, pick)
+    with pytest.raises(RuntimeError, match="KV"):
+        probe.served_check(Worker, _RG(None, "uniform"), argv, pick)
+    native = ["--model", "m", "--kv-bits", "0", "--kv-quant-scheme", "turboquant"]
+    assert probe.served_check(Worker, _RG(None, "turboquant"), native, pick)[
+        "kv"
+    ] == dict(bits=None, scheme=None)

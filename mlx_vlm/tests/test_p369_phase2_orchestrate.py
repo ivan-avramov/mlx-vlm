@@ -1285,7 +1285,7 @@ def test_the_smoke_gate_needs_e7b_to_have_run_not_to_be_continuous():
     record = dict(
         reconstruction={"math500/1": {}},
         outcome=dict(e1c="PASS"),
-        e1c={},
+        e1c=_smoke_e1c(),
         e2=dict(verdict="PASS"),
         wall_s=60,
     )
@@ -1426,11 +1426,30 @@ def _e7b_report(**changes):
     return dict(sessions=[session], status=status)
 
 
+NATIVE_CENSUS = {"ArraysCache": 48, "PreallocKVCache": 16}
+SMOKE_FIRED = {
+    k: True
+    for k in ("raw_ulp", "in_support", "recurrent", "probe_logit", "old_prefix_k")
+}
+
+
+def _smoke_e1c():
+    """The scheduled smoke E1c cells: the positive block rides exactly the T65536 cell (code round 2 C2)."""
+    return {
+        "T1024": dict(pass_=True),
+        "T65536": dict(
+            pass_=True,
+            leaf_census=dict(NATIVE_CENSUS),
+            smoke_positives=dict(baseline_pass=True, fired=dict(SMOKE_FIRED)),
+        ),
+    }
+
+
 def _smoke_record(**changes):
     record = dict(
         reconstruction={"math500/1": {}, "math500/2": {}},
         outcome=dict(e1c="PASS"),
-        e1c={"T1024": dict(pass_=True)},
+        e1c=_smoke_e1c(),
         e2=dict(verdict="PASS"),
         e7b=_e7b_report(),
         wall_s=60,
@@ -1489,11 +1508,14 @@ def test_the_smoke_gate_refuses_a_malformed_e7b_report(e7b):
         _smoke_record(e1c={"T1024": dict(pass_="true")}),
         _smoke_record(wall_s="60"),
         _smoke_record(
-            e1c={
-                "T1024": dict(
-                    pass_=True, smoke_positives=dict(baseline_pass="true", fired={})
-                )
-            }
+            e1c=dict(
+                _smoke_e1c(),
+                T65536=dict(
+                    pass_=True,
+                    leaf_census=dict(NATIVE_CENSUS),
+                    smoke_positives=dict(baseline_pass="true", fired={}),
+                ),
+            )
         ),
     ],
 )
@@ -1939,11 +1961,12 @@ def test_the_smoke_gate_wants_the_kv_positive_of_the_leaf_actually_served(
     }
     record = _smoke_record(
         e1c={
+            "T1024": dict(pass_=True),
             "T65536": dict(
                 pass_=True,
                 leaf_census=census,
                 smoke_positives=dict(baseline_pass=True, fired=fired),
-            )
+            ),
         }
     )
     for pick in (FABLE, UNIFORM):
@@ -1952,11 +1975,12 @@ def test_the_smoke_gate_wants_the_kv_positive_of_the_leaf_actually_served(
         del wrong[kv_kind]
         bad = _smoke_record(
             e1c={
+                "T1024": dict(pass_=True),
                 "T65536": dict(
                     pass_=True,
                     leaf_census=census,
                     smoke_positives=dict(baseline_pass=True, fired=wrong),
-                )
+                ),
             }
         )
         assert not orchestrate.smoke_gate({pick: bad})["pass_"], (pick, census)
@@ -1965,10 +1989,47 @@ def test_the_smoke_gate_wants_the_kv_positive_of_the_leaf_actually_served(
 def test_the_smoke_gate_refuses_a_positive_without_a_leaf_census():
     record = _smoke_record(
         e1c={
+            "T1024": dict(pass_=True),
             "T65536": dict(
                 pass_=True, smoke_positives=dict(baseline_pass=True, fired={})
-            )
+            ),
         }
     )
     with pytest.raises(orchestrate.MalformedEvidence, match="leaf_census"):
         orchestrate.smoke_gate({UNIFORM: record})
+
+
+# ------------------------------------------------------------------ code round 2 C2: the positive block is required
+def _without(cells, name, key=None):
+    cells = {k: dict(v) for k, v in cells.items()}
+    if key is None:
+        del cells[name]
+    else:
+        del cells[name][key]
+    return cells
+
+
+@pytest.mark.parametrize(
+    "e1c",
+    [
+        _without(_smoke_e1c(), "T65536", "smoke_positives"),  # the whole block dropped
+        _without(_smoke_e1c(), "T65536"),  # the scheduled cell dropped
+        _without(_smoke_e1c(), "T1024"),
+        dict(  # the block on an unscheduled cell
+            _without(_smoke_e1c(), "T65536", "smoke_positives"),
+            T1024=dict(_smoke_e1c()["T65536"]),
+        ),
+        {},
+    ],
+)
+def test_the_smoke_gate_requires_the_scheduled_positive_block(e1c):
+    """C2: a worker / reporting regression that drops the positives (or their cell) must not authorize a full run."""
+    got = orchestrate.smoke_gate({FABLE: _smoke_record(e1c=e1c)})
+    assert not got["pass_"], e1c
+    assert any(
+        "E1c smoke cells" in p or "smoke positives" in p for p in got["problems"]
+    )
+
+
+def test_the_smoke_schedule_is_the_gate_s_schedule():
+    assert orchestrate.SMOKE_THRESHOLDS == (1024, 65536)
