@@ -715,8 +715,12 @@ class _Client:
 
     def post(self, path, headers, json, timeout=None):
         self.bodies.append(json)
-        if self.dry_run is not None:
-            raise worker.DryRun(self.dry_run)
+        if (
+            self.dry_run is not None
+        ):  # the endpoint tokenizes through the (hooked) production call
+            from mlx_vlm.server import generation
+
+            generation.ResponseGenerator._preprocess_request(None, "prompt")
         cap = self.capture
         cap.backend, cap.final = "cached_session", dict(token_ids=[1])
         cap.prompt = dict(tokens=3, sha256="d" * 64, ids=[1, 2, 3])
@@ -734,6 +738,13 @@ def test_requests_carry_the_workers_model_as_the_router_rewrites_it(monkeypatch)
     client = _Client(capture)
     worker.post(client, payload, "chat", capture, 10.0)
     assert client.bodies[-1]["model"] == HF_PATH
+    from mlx_vlm.server import generation
+
+    monkeypatch.setattr(
+        generation.ResponseGenerator,
+        "_preprocess_request",
+        lambda rg, *a, **k: dict(input_ids=np.array([[4, 5]])),
+    )
     dry = _Client(dry_run=[4, 5])
     assert worker.prompt_ids(dry, [dict(role="user", content="x")], payload) == [4, 5]
     assert dry.bodies[-1]["model"] == HF_PATH
@@ -748,3 +759,79 @@ def test_routing_needs_the_workers_model(monkeypatch):
     )
     with pytest.raises(ValueError, match="--model"):
         worker.argv_model(["--host", "h"])
+
+
+# ------------------------------------------------------------------ smoke 2 (live boot): the dry run through the app's middleware
+def _middleware_app(behaviour):
+    """The shape that broke smoke 2: an ``@app.middleware("http")`` (Starlette ``BaseHTTPMiddleware``, an
+    anyio task group) around an endpoint that tokenizes through ``_preprocess_request``.
+    """
+    from fastapi import FastAPI
+    from fastapi.responses import JSONResponse
+
+    from mlx_vlm.server import generation
+
+    app = FastAPI()
+
+    @app.middleware("http")
+    async def passthrough(request, call_next):
+        return await call_next(request)
+
+    @app.post("/v1/chat/completions")
+    def endpoint(body: dict):
+        if body.get("messages") is None:
+            return {"ok": True}
+        if behaviour == "skip":
+            return {"choices": []}
+        if behaviour == "propagate":
+            generation.ResponseGenerator._preprocess_request(None, "prompt")
+        try:
+            generation.ResponseGenerator._preprocess_request(None, "prompt")
+        except Exception as exc:  # an endpoint handler turning errors into responses
+            if behaviour == "convert":
+                return JSONResponse({"error": str(exc)}, status_code=500)
+        return {"choices": []}  # "generate": the dry run did not stop the request
+
+    return app
+
+
+@pytest.mark.parametrize("behaviour", ["propagate", "convert"])
+def test_a_dry_run_survives_the_apps_http_middleware(monkeypatch, behaviour):
+    from fastapi.testclient import TestClient
+
+    from mlx_vlm.server import generation
+
+    monkeypatch.setattr(worker, "ROUTED_MODEL", HF_PATH)
+    monkeypatch.setattr(
+        generation.ResponseGenerator,
+        "_preprocess_request",
+        lambda rg, *a, **k: dict(input_ids=np.array([[4, 5, 6]])),
+    )
+    msgs = [dict(role="user", content="x")]
+    with TestClient(_middleware_app(behaviour)) as client:
+        assert worker.prompt_ids(client, msgs, dict(model="m")) == [4, 5, 6]
+        assert worker.prompt_ids(client, msgs, dict(model="m")) == [4, 5, 6]
+        # the app (and the TestClient portal) still serve requests afterwards
+        assert client.post("/v1/chat/completions", json={}).json() == {"ok": True}
+
+
+@pytest.mark.parametrize(
+    ("behaviour", "why"),
+    [("skip", "did not reach tokenization"), ("generate", "reached generation")],
+)
+def test_a_dry_run_that_misses_tokenization_or_reaches_generation_refuses(
+    monkeypatch, behaviour, why
+):
+    from fastapi.testclient import TestClient
+
+    from mlx_vlm.server import generation
+
+    monkeypatch.setattr(worker, "ROUTED_MODEL", HF_PATH)
+    monkeypatch.setattr(
+        generation.ResponseGenerator,
+        "_preprocess_request",
+        lambda rg, *a, **k: dict(input_ids=np.array([[4, 5, 6]])),
+    )
+    with TestClient(_middleware_app(behaviour)) as client:
+        with pytest.raises(RuntimeError, match=why):
+            worker.prompt_ids(client, [dict(role="user", content="x")], dict(model="m"))
