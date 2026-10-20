@@ -2448,3 +2448,28 @@ def test_the_smoke_gate_uses_the_phase_projection_and_needs_the_step_timings():
     del record["step_s"]
     with pytest.raises(orchestrate.MalformedEvidence, match="step_s"):
         orchestrate.smoke_gate({FABLE: record})
+
+
+# ------------------------------------------------------------------ P369 v13 V15: the drafter's MoE path gates Ornith's smoke
+def _ornith_record(draft_kernels):
+    cells = _smoke_e1c()
+    if draft_kernels is not ...:
+        cells["T65536"] = dict(cells["T65536"], draft_kernels=draft_kernels)
+    return _smoke_record(e1c=cells)
+
+
+def test_a_moe_drafter_entrys_smoke_needs_a_passing_draft_path_inventory():
+    ok = dict(moe=True, problems=[], invocations=[{}], **{"pass": True})
+    assert orchestrate.smoke_gate({ORNITH: _ornith_record(ok)})["pass_"]
+    bad = dict(ok, problems=["drafter MoE block ran ['gate']"], **{"pass": False})
+    gate = orchestrate.smoke_gate({ORNITH: _ornith_record(bad)})
+    assert not gate["pass_"] and any("draft" in p for p in gate["problems"])
+    with pytest.raises(orchestrate.MalformedEvidence, match="draft_kernels"):
+        orchestrate.smoke_gate({ORNITH: _ornith_record(...)})  # absent
+
+
+def test_a_dense_drafter_entry_does_not_need_the_draft_path_inventory():
+    assert orchestrate.smoke_gate({UNIFORM: _ornith_record(...)})["pass_"]  # unchanged for dense
+    assert orchestrate.needs_draft_inventory(
+        ORNITH
+    ) and not orchestrate.needs_draft_inventory(UNIFORM)
