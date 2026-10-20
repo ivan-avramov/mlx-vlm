@@ -1,5 +1,6 @@
 """P400 §5.3: the performance probe's pre-registered statistic and bounds (fork-only, CPU)."""
 
+import json
 import sys
 from pathlib import Path
 
@@ -353,3 +354,14 @@ def test_codec_mode_defaults_to_quantized_picks_and_refuses_native_arms():
     assert probe.codec_arm_problems(native, native)
     assert probe.codec_arm_problems(TQ, TQ)  # both arms TurboQuant
     assert probe.codec_arm_problems(AFFINE, AFFINE)
+
+
+def test_the_live_cache_manifest_is_kept_verbatim_per_request():
+    """P405 code round 3 K10: the report carries each request's full validated manifest (paths, kinds, widths,
+    group size, mode), not only the kinds — materially different manifests must not record identically.
+    """
+    live = _layers(["ArraysCache", "native"])
+    rep = probe.request_record(dict(tps=1.0), "length", [2], live, warmup=False)
+    assert (
+        rep["live_cache"] == live and json.loads(json.dumps(rep))["live_cache"] == live
+    )

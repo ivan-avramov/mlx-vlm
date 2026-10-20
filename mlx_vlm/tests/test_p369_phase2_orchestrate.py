@@ -4,6 +4,7 @@ Fork-only file. The orchestrator runs under the STACK venv (mlx-serve, psutil); 
 tested here without either.
 """
 
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -2187,9 +2188,7 @@ def test_without_a_ruling_an_over_budget_smoke_does_not_authorize():
 
 def test_the_c193_ruling_authorizes_only_its_pick_and_only_the_projection():
     sap = orchestrate.smoke_authorization_problems
-    assert orchestrate.PROJECTION_RULINGS == {
-        "C193": dict(pick=UNIFORM, wall_limit_s=20400)
-    }
+    assert orchestrate.PROJECTION_RULINGS == {"C193": dict(pick=UNIFORM)}
     assert sap(_over_budget_summary(), projection_ruling="C193") == []
     assert sap(
         _over_budget_summary(pick=FABLE), projection_ruling="C193"
@@ -2223,15 +2222,16 @@ def test_the_c193_ruling_never_covers_a_smoke_that_fits():
     assert orchestrate.smoke_authorization_problems(fitting, projection_ruling="C193")
 
 
-def test_the_c193_ruling_brings_its_wall_cap():
-    """K8 + P369 v13 V17: the ruled full run gets the ruling's authorized wall cap (nominal 13,140 s + one 7,200 s
-    tail reserve); a looser or absent explicit limit is replaced / refused, never infinity.
-    """
-    wl = orchestrate.ruling_wall_limit
-    assert wl(None, None) is None  # no ruling: C184's default stands
-    assert wl("C193", None) == 20400
-    assert wl("C193", 18000) == 18000  # a tighter operator limit stands
-    import pytest
+def test_a_ruled_full_run_keeps_c184_no_hard_stop():
+    """C194 (operator: "no hard stop"): a projection ruling brings NO campaign wall cap — C184 stands; only the
+    per-request watchdogs stop a run (v13 V17's cap withdrawn)."""
+    assert not hasattr(orchestrate, "ruling_wall_limit")
+    assert orchestrate.campaign_deadline(None, now=0.0) == float("inf")
 
-    with pytest.raises(SystemExit, match="20400"):
-        wl("C193", 30000)
+
+@pytest.mark.parametrize("raw", ["nan", "inf", "-inf", "0", "-5"])
+def test_an_explicit_wall_limit_must_be_finite_and_positive(raw):
+    """P405 code round 3 K11: `--wall-limit-s nan` made `now >= deadline` never true — a silent no-op stop."""
+    with pytest.raises(argparse.ArgumentTypeError):
+        orchestrate.positive_seconds(raw)
+    assert orchestrate.positive_seconds("3600") == 3600.0
