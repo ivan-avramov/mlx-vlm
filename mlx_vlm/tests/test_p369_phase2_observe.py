@@ -437,3 +437,48 @@ def test_compare_streams_excludes_only_the_given_positions():
     # an excluded position never hides a missing row elsewhere
     rep = compare.compare_streams(rows[:2], off, 4, PARAMS, exclude=[2])
     assert not rep["pass"] and rep["missing_on"] == [3]
+
+
+# ------------------------------------------------------------------ round 4 E8: plain decoding's forced schedule
+def _replay(emitted, budget, n=12):
+    """The OFF recorder replaying ON's tokens under a plain criteria with thinking budget ``budget``."""
+    _, model, _, prompt, tokenizer = _budget_setup()
+    kw = dict(tokenizer=tokenizer(), thinking_budget=budget, enable_thinking=True)
+    with observe.Recorder(mode="off", force_tokens=emitted) as off:
+        replayed, _ = turn(model, prompt, PromptCacheState(), n=n, seed=5, **kw)
+    return off, list(replayed)
+
+
+@pytest.mark.parametrize("budget", [2, 5])
+def test_the_off_recorder_observes_plain_forcing_without_letting_it_override(budget):
+    """C185 round 4 E8: a forced replay must expose where PLAIN decoding would force: its pops are recorded
+    (position, token) and consumed but never applied, so the replay stays on ON's tokens while a schedule
+    difference (ON forcing where plain would not) becomes visible instead of hiding behind the replay.
+    """
+    on, emitted = _budget_on(budget)
+    for other in (
+        budget - 1,
+        budget + 1,
+    ):  # plain would force elsewhere: its pops never override
+        assert _replay(emitted, other)[1] == emitted, other
+    same, replayed = _replay(emitted, budget)
+    assert replayed == emitted
+    assert compare.forced_schedule(on.forced, same.forced, len(emitted))["pass"]
+    for other in (budget - 1, budget + 1):  # plain would force elsewhere
+        off, replayed = _replay(emitted, other)
+        assert replayed == emitted  # the plain pops never override the replay
+        got = compare.forced_schedule(on.forced, off.forced, len(emitted))
+        assert not got["pass"], (budget, other, got)
+
+
+def test_forced_schedule_compares_only_emitted_positions():
+    fs = compare.forced_schedule
+    assert fs([(3, 63), (4, 62)], [(3, 63), (4, 62)], 5)["pass"]
+    assert fs([(3, 63), (5, 62)], [(3, 63)], 5)[
+        "pass"
+    ]  # a pop past the output emits nothing
+    assert not fs([(3, 63), (4, 62)], [(3, 63)], 5)["pass"]
+    assert not fs([(3, 63)], [(2, 63)], 5)["pass"]
+    assert not fs([(3, 63)], [(3, 62)], 5)["pass"]
+    got = fs([(3, 63)], [], 5)
+    assert got == dict(on=[[3, 63]], off=[], **{"pass": False})

@@ -356,9 +356,13 @@ def _entries(**changes):
             timings=dict(verify_blocks_straddle=3, verify_fallback_reasons={})
         ),
     )
-    off = dict(rows=dict(**{"pass": True}), states=dict(**{"pass": True}))
+    off = dict(
+        rows=dict(**{"pass": True}),
+        states=dict(**{"pass": True}),
+        forced=dict(**{"pass": True}),
+    )
     for key, value in changes.items():
-        (off if key in ("rows", "states") else on)[key] = value
+        (off if key in ("rows", "states", "forced") else on)[key] = value
     return on, off
 
 
@@ -1386,10 +1390,10 @@ def _e1c_camp(tmp_path, *, acceptance=True, c2_rows=True, c2_states=True):
         response=dict(
             timings=dict(verify_blocks_straddle=1, verify_fallback_reasons={})
         ),
-        pair=dict(rows={"pass": True}, states={"pass": True}),
+        pair=dict(rows={"pass": True}, states={"pass": True}, forced={"pass": True}),
         c1=dict(acceptance={"pass": acceptance, "problems": []}),
     )
-    c2 = dict(rows={"pass": c2_rows}, states={"pass": c2_states})
+    c2 = dict(rows={"pass": c2_rows}, states={"pass": c2_states}, forced={"pass": True})
     for name, entry in (("e1c-pair-a0", on), ("e1c-c2", c2)):
         d = tmp_path / FABLE / name
         d.mkdir(parents=True)
@@ -1869,3 +1873,43 @@ def test_e2_summary_refuses_a_malformed_cross_load_container():
     for cross in ("a", None, [], {}):
         with pytest.raises(orchestrate.MalformedEvidence, match="malformed evidence"):
             orchestrate.e2_summary({"a": _pair()}, cross, digests={"a": D64})
+
+
+# ------------------------------------------------------------------ round 4 E8 E9
+def test_a_forced_schedule_difference_is_non_neutrality():
+    on, off = _entries(forced=dict(**{"pass": False}))
+    got = orchestrate.e1c_verdict(on, off, threshold=8192, verify_policy=None)
+    assert (
+        not got["pass_"] and not got["neutral"] and "forced schedule" in got["problems"]
+    )
+    assert (
+        orchestrate.pick_outcome(
+            {
+                "a": dict(
+                    _v(), **{k: got[k] for k in ("pass_", "neutral", "evidence_ok")}
+                )
+            }
+        )["e1c"]
+        == "FAIL"
+    )
+    for bad in (None, dict(**{"pass": "false"})):
+        on, off = _entries(forced=bad)
+        with pytest.raises(orchestrate.MalformedEvidence, match="forced"):
+            orchestrate.e1c_verdict(on, off, threshold=8192, verify_policy=None)
+
+
+def test_c2_needs_an_identical_forced_schedule_too(tmp_path):
+    camp = _e1c_camp(tmp_path)
+    c2 = tmp_path / FABLE / "e1c-c2" / "req-0.json"
+    entry = json.loads(c2.read_text())
+    entry["forced"] = {"pass": False}
+    c2.write_text(json.dumps(entry))
+    got = camp.e1c(FABLE, {1024: "x"}, smoke=True)
+    assert got["T1024"]["c2"]["identical"] is False
+
+
+def test_e2_summary_refuses_extra_cross_load_requests():
+    with pytest.raises(orchestrate.MalformedEvidence, match="cross-load"):
+        orchestrate.e2_summary(
+            {"a": _pair()}, {"a": _cross(), "b": _cross()}, digests={"a": D64}
+        )

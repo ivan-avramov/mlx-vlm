@@ -304,7 +304,7 @@ EXPECTED = [8, 11, 13]
 
 
 def test_c1_acceptance():
-    ok = dict(rows={"pass": True}, states={"pass": True})
+    ok = dict(rows={"pass": True}, states={"pass": True}, forced={"pass": True})
     on, offs = _part([1, 2, 3]), [_part([1, 2, 3]), _part([1, 2, 3])]
     full = [EXPECTED, EXPECTED]
     assert worker.c1_acceptance(
@@ -322,6 +322,8 @@ def test_c1_acceptance():
         ),
         (on, [_part([1, 2, 3], cached=4), _part([1, 2, 3])], ok, True, full, "reused"),
         (on, offs, dict(ok, states={"pass": False}), True, full, "states"),
+        # round 4 E8: OFF1 and OFF2 plain forcing schedules differ — within-instance instability
+        (on, offs, dict(ok, forced={"pass": False}), True, full, "C1 forced schedules"),
         (on, offs, ok, False, full, "not retired"),
         # code round 1 H4: both replays missing the same ON offset is a C1 failure (ABORT), not an E1c FAIL
         (on, offs, ok, True, [[8, 13], [8, 13]], "OFF1 offsets"),
