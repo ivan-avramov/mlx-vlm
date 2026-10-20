@@ -1391,7 +1391,7 @@ def test_e7b_session_refuses_non_boolean_verdict_or_continuity():
 def test_overall_status_refuses_a_non_boolean_smoke_gate():
     for key in ("pass_", "fits"):
         for value in BAD:
-            gate = dict(pass_=True, fits=True, **{key: value})
+            gate = {**dict(pass_=True, fits=True), key: value}
             with pytest.raises(orchestrate.MalformedEvidence, match=key):
                 orchestrate.overall_status(dict(phase="smoke", smoke_gate=gate))
 
@@ -1470,7 +1470,8 @@ def _e7b_report(**changes):
         mtp_rounds=[3, 2, 2],
     )
     session.update(changes)
-    return dict(sessions=[session], status=orchestrate.e7b_status([session]))
+    status = "OBSERVED" if session["censored"] is False else "INCOMPLETE"
+    return dict(sessions=[session], status=status)
 
 
 def _smoke_record(**changes):

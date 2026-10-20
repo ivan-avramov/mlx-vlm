@@ -433,6 +433,17 @@ def straddle_target(threshold):
     return threshold - 64
 
 
+class MalformedEvidence(RuntimeError):
+    """Code round 6 H34 (C186): evidence not of its exact type — a harness defect, never an MTP outcome."""
+
+
+def exact_bool(value, what):
+    """Code round 6 H34: an evidence flag is exactly ``True`` or ``False``; anything else RAISES."""
+    if type(value) is not bool:
+        raise MalformedEvidence(f"malformed evidence: {what} = {value!r}")
+    return value
+
+
 def pick_outcome(verdicts):
     """Q37 precedence per pick (code round 2 H15): any C1 failure / incompleteness ABORTs (no E1c verdict,
     no bound); else an ESTABLISHED same-instance row / state difference FAILs (that pick's E1c finished for
@@ -440,8 +451,18 @@ def pick_outcome(verdicts):
     INCOMPLETE — never reported as non-neutrality; else PASS. The cross-load / configuration comparison (C2)
     never decides E1c: ``identical`` or ``unestablished``.
     """
-    values = list(verdicts.values())
-    if any(not v["c1"]["identical"] for v in values):
+
+    def flag(name, v, path):
+        node = v
+        for key in path.split("."):
+            node = node.get(key) if isinstance(node, dict) else None
+        return exact_bool(node, f"{name}.{path}")
+
+    keys = ("c1.identical", "neutral", "evidence_ok", "pass_", "c2.identical")
+    values = [  # code round 6 H34: every cell's flags validated before any decides
+        {key: flag(name, v, key) for key in keys} for name, v in verdicts.items()
+    ]
+    if any(not v["c1.identical"] for v in values):
         e1c = "ABORT"
     elif any(not v["neutral"] for v in values):
         e1c = "FAIL"
@@ -449,9 +470,7 @@ def pick_outcome(verdicts):
         e1c = "INCOMPLETE"
     else:
         e1c = "PASS"
-    cross = (
-        "identical" if all(v["c2"]["identical"] for v in values) else "unestablished"
-    )
+    cross = "identical" if all(v["c2.identical"] for v in values) else "unestablished"
     return dict(e1c=e1c, run_e2_e7=e1c == "PASS", cross_load=cross)
 
 
@@ -483,6 +502,9 @@ def e7a_stats(done, censored, *, digests=None):
     Clopper–Pearson 95 % interval; ``status`` OBSERVED iff n >= 1, else INCOMPLETE."""
     engaged, not_engaged, invalid = {}, [], []
     for name, entry in done.items():
+        kernel_ok = exact_bool(  # code round 6 H34
+            (entry.get("verdict") or {}).get("pass"), f"{name}.verdict.pass"
+        )
         turn = entry["turns"][0]
         first = _first_terminal(turn)
         if turn.get("mtp_rounds", 0) <= 0 and not first:
@@ -491,7 +513,7 @@ def e7a_stats(done, censored, *, digests=None):
         digest_bad = digests is not None and (turn.get("prompt") or {}).get(
             "sha256"
         ) != digests.get(name)
-        kernel_bad = not first and not (entry.get("verdict") or {}).get("pass")
+        kernel_bad = not first and not kernel_ok
         if digest_bad or kernel_bad:
             invalid.append(name)
             continue
@@ -519,10 +541,20 @@ def e7b_session(name, entry, *, digest):
     and every follow-up turn is continuous (``worker.turn_continuity``, code round 1 H7); else censored with
     the first reason. Events are reported per session, never pooled with E7a."""
     turns = entry["turns"]
+    kernel_ok = exact_bool(  # code round 6 H34
+        (entry.get("verdict") or {}).get("pass"), f"{name}.verdict.pass"
+    )
+    follow_ups = []  # the worker writes a continuity record for every e7b turn > 0
+    for k, turn in enumerate(turns[1:], 1):
+        record = turn.get("continuity")
+        what = f"{name} turn {k} continuity"
+        if not isinstance(record, dict):
+            raise MalformedEvidence(f"malformed evidence: {what} = {record!r}")
+        follow_ups.append((exact_bool(record.get("continuity"), what), record))
     reasons = []
     if (turns[0].get("prompt") or {}).get("sha256") != digest:
         reasons.append("the first prompt's digest differs from the reconstruction")
-    if not (entry.get("verdict") or {}).get("pass"):
+    if not kernel_ok:
         reasons.append("the kernel verdict failed")
     reasons += [
         f"turn {t} ran no MTP rounds"
@@ -530,15 +562,13 @@ def e7b_session(name, entry, *, digest):
         if turn.get("mtp_rounds", 0) <= 0 and not _first_terminal(turn)
     ]
     reasons += [
-        (t["continuity"] or {}).get("reason") or "no continuity record"
-        for t in turns[1:]
-        if not (t.get("continuity") or {}).get("continuity")
+        record.get("reason") or "no continuity reason"
+        for ok, record in follow_ups
+        if not ok
     ]
     return dict(
         name=name,
-        continuity=all(
-            (t.get("continuity") or {}).get("continuity") for t in turns[1:]
-        ),
+        continuity=all(ok for ok, _ in follow_ups),
         censored=bool(reasons),
         reason=reasons[0] if reasons else None,
         events=[ev["cls"] for t in turns for ev in t["events"]],
@@ -547,7 +577,147 @@ def e7b_session(name, entry, *, digest):
 
 
 def e7b_status(sessions):
-    return "OBSERVED" if any(not s["censored"] for s in sessions) else "INCOMPLETE"
+    return (
+        "OBSERVED"
+        if any(not exact_bool(s["censored"], "e7b.censored") for s in sessions)
+        else "INCOMPLETE"
+    )
+
+
+E7B_TIMEOUT_KEYS = {"name", "censored", "reason"}
+E7B_SESSION_KEYS = {"name", "continuity", "censored", "reason", "events", "mtp_rounds"}
+
+
+def e7b_sessions_checked(pick, e7b):
+    """Code round 6 H38: an E7b report is a list of sessions, each EXACTLY a timeout censor
+    ``{name, censored: True, reason: "timeout"}`` or an ``e7b_session`` record with typed fields (the
+    censored flag agreeing with the reason), and its status re-derived by ``e7b_status``; else RAISES.
+    """
+
+    def bad(what, value):
+        raise MalformedEvidence(f"malformed evidence: {pick} e7b {what} = {value!r}")
+
+    if not isinstance(e7b, dict) or not isinstance(e7b.get("sessions"), list):
+        bad("report", e7b)
+    for s in e7b["sessions"]:
+        keys = set(s) if isinstance(s, dict) else None
+        if keys == E7B_TIMEOUT_KEYS:
+            ok = (
+                type(s["name"]) is str
+                and s["censored"] is True
+                and s["reason"] == "timeout"
+            )
+        elif keys == E7B_SESSION_KEYS:
+            ok = (
+                type(s["name"]) is str
+                and type(s["continuity"]) is bool
+                and type(s["censored"]) is bool
+                and (s["reason"] is None or type(s["reason"]) is str)
+                and s["censored"] is (s["reason"] is not None)
+                and type(s["events"]) is list
+                and all(type(e) is str for e in s["events"])
+                and type(s["mtp_rounds"]) is list
+                and all(type(r) is int for r in s["mtp_rounds"])
+            )
+        else:
+            ok = False
+        if not ok:
+            bad("session", s)
+    if e7b.get("status") != e7b_status(e7b["sessions"]):
+        bad("status", e7b.get("status"))
+    return e7b["sessions"]
+
+
+def smoke_gate(picks):
+    """Every live positive fired (TurboQuant's required where TurboQuant KV is served), every E1c cell
+    passed, E2 passed, exactly the first reconstructed C84 item's E7b session ran and reported (its
+    continuity is descriptive; code round 6 H38), and the projected full run fits ESTIMATE_LIMIT_S. Pure
+    (code round 6 H36): ``main`` recomputes it from a loaded smoke summary; malformed evidence RAISES.
+    """
+    problems, e7b_status_of = [], {}
+    projected = 0
+    if not picks:
+        problems.append("no pick ran")
+    for pick, record in picks.items():
+        if record["outcome"]["e1c"] != "PASS":
+            problems.append(f"{pick}: E1c {record['outcome']}")
+        for name, v in (record.get("e1c") or {}).items():
+            if not exact_bool(v.get("pass_"), f"{pick} {name}.pass_"):
+                problems.append(f"{pick} {name}: {v.get('problems')}")
+            sp = v.get("smoke_positives")
+            if sp is not None:
+                where = f"{pick} {name}.smoke_positives"
+                fired = sp.get("fired")
+                if not isinstance(fired, dict):
+                    raise MalformedEvidence(
+                        f"malformed evidence: {where}.fired = {fired!r}"
+                    )
+                baseline = exact_bool(sp.get("baseline_pass"), f"{where}.baseline_pass")
+                seen = {k for k, ok in fired.items() if exact_bool(ok, f"{where}.{k}")}
+                need = {"raw_ulp", "in_support", "recurrent", "probe_logit"}
+                need.add("tq_norm" if PICKS[pick]["kv"] == "tq4" else "old_prefix_k")
+                if not baseline or not need <= seen:
+                    problems.append(f"{pick}: smoke positives {sp}")
+        e2 = record.get("e2")
+        if e2 is None or e2.get("verdict") != "PASS":
+            problems.append(f"{pick}: E2 smoke {e2}")
+        e7b = record.get("e7b")
+        if e7b is None:
+            problems.append(f"{pick}: E7b smoke session did not run")
+        else:
+            names = [s["name"] for s in e7b_sessions_checked(pick, e7b)]
+            expected = next(iter(record.get("reconstruction") or {}), None)
+            if expected is None or names != [expected]:
+                problems.append(
+                    f"{pick}: E7b smoke ran {names}, expected exactly [{expected!r}]"
+                )
+            e7b_status_of[pick] = e7b["status"]
+        wall = record.get("wall_s")
+        if type(wall) not in (int, float):
+            raise MalformedEvidence(f"malformed evidence: {pick}.wall_s = {wall!r}")
+        projected += wall * 6  # the full run is ≈ 6× the smoke per pick (plan §4)
+    return dict(
+        problems=problems,
+        projected_full_s=projected,
+        fits=projected <= ESTIMATE_LIMIT_S,
+        pass_=not problems,
+        e7b=e7b_status_of,
+    )
+
+
+def smoke_authorization_problems(summary):
+    """Code round 6 H36: a full run is authorized only by a smoke summary (as loaded from its JSON) whose
+    phase is smoke, status ``SMOKE_PASS`` with exit code 0, whose stored gate holds exact ``True`` for
+    ``pass_`` and ``fits``, and which equals the gate recomputed from the summary's own evidence.
+    """
+    if not isinstance(summary, dict):
+        return ["the smoke summary is not an object"]
+    problems = []
+    if summary.get("phase") != "smoke":
+        problems.append(f"phase {summary.get('phase')!r} is not smoke")
+    code = summary.get("exit_code")
+    if summary.get("status") != "SMOKE_PASS" or type(code) is not int or code != 0:
+        problems.append(f"status {summary.get('status')!r} / exit code {code!r}")
+    gate = summary.get("smoke_gate")
+    if not isinstance(gate, dict):
+        return problems + ["the smoke summary carries no smoke gate"]
+    try:
+        passed = exact_bool(gate.get("pass_"), "smoke_gate.pass_")
+        fits = exact_bool(gate.get("fits"), "smoke_gate.fits")
+        if not (passed and fits):
+            problems.append(f"the smoke gate did not pass / fit: {gate}")
+        again = smoke_gate(summary.get("picks") or {})
+        if again != gate:
+            problems.append(
+                f"the stored smoke gate {gate} != its recomputation {again}"
+            )
+    except MalformedEvidence as exc:
+        problems.append(str(exc))
+    except (KeyError, TypeError, AttributeError) as exc:
+        problems.append(
+            f"malformed evidence: the smoke summary ({type(exc).__name__}: {exc})"
+        )
+    return problems
 
 
 def prompt_digest_problems(want, entries):
@@ -571,7 +741,9 @@ def overall_status(summary):
     errors record ``HARNESS_ERROR`` and exit 1."""
     if summary.get("phase") == "smoke":
         gate = summary.get("smoke_gate") or {}
-        ok = bool(gate.get("pass_") and gate.get("fits"))
+        passed = exact_bool(gate.get("pass_"), "smoke_gate.pass_")  # code round 6 H34
+        fits = exact_bool(gate.get("fits"), "smoke_gate.fits")
+        ok = passed and fits
         return ("SMOKE_PASS", 0) if ok else ("SMOKE_NOT_PASS", 2)
     picks = summary.get("picks") or {}
     ok = bool(picks) and all(
@@ -592,9 +764,7 @@ def e1c_verdict(on_entry, off_entry, *, threshold, verify_policy):
 
     def verdict_of(entry, key):
         value = (entry.get(key) or {}).get("pass") if isinstance(entry, dict) else None
-        if type(value) is not bool:
-            raise RuntimeError(f"malformed comparator evidence: {key}.pass = {value!r}")
-        return value
+        return exact_bool(value, f"comparator {key}.pass")
 
     rows, states = verdict_of(off_entry, "rows"), verdict_of(off_entry, "states")
     kernels = verdict_of(on_entry, "verdict")
@@ -620,7 +790,7 @@ def e1c_verdict(on_entry, off_entry, *, threshold, verify_policy):
                 evidence.append(
                     f"fallback reasons {timings['verify_fallback_reasons']}"
                 )
-        elif not on_entry.get("straddle"):
+        elif not exact_bool(on_entry.get("straddle"), "straddle"):  # code round 6 H34
             evidence.append("no observed per-query straddle")
     return dict(
         pass_=not (neutrality or evidence),
@@ -1529,7 +1699,10 @@ class Campaign:
                     dict(seed=seed, path=str(path))
                 )
                 n = len(entry["final"]["token_ids"])
-                valid = t is None or (entry.get("straddle") and n >= 65)
+                valid = t is None or (
+                    exact_bool(entry.get("straddle"), f"{req['name']}.straddle")
+                    and n >= 65
+                )
                 if valid:
                     accepted[req["name"]] = dict(
                         threshold=t, req=req, dir=path.parent, index=i
@@ -1567,7 +1740,11 @@ class Campaign:
                 threshold=cell["threshold"],
                 verify_policy=PICKS[pick]["verify_policy"],
             )
-            c1_ok = bool(on["c1"]["acceptance"]["pass"])
+            c1_ok = exact_bool(  # code round 6 H34
+                on["c1"]["acceptance"].get("pass"), f"{name}.c1.acceptance.pass"
+            )
+            c2_rows = exact_bool(c2["rows"].get("pass"), f"{name}.c2.rows.pass")
+            c2_states = exact_bool(c2["states"].get("pass"), f"{name}.c2.states.pass")
             if not c1_ok:
                 v["pass_"] = False
                 v["problems"].append(f"C1: {on['c1']['acceptance']['problems']}")
@@ -1575,7 +1752,7 @@ class Campaign:
                 pair=on["pair"],
                 c1=dict(identical=c1_ok, **on["c1"]),
                 c2=dict(
-                    identical=bool(c2["rows"]["pass"] and c2["states"]["pass"]),
+                    identical=c2_rows and c2_states,
                     rows=c2["rows"],
                     states=c2["states"],
                 ),
@@ -1674,9 +1851,15 @@ class Campaign:
             if control is None
             else all(tokens(control[n]) == tokens(off[n]) for n in control)
         )
+        kernels = {  # code round 6 H34
+            n: exact_bool(
+                (on[n].get("verdict") or {}).get("pass"), f"E2 {n}.verdict.pass"
+            )
+            for n in on
+        }
         argmax_ok = all(
             on[n]["telemetry"]["speculative_argmax_from_hidden"] > 0
-            and on[n]["verdict"]["pass"]
+            and kernels[n]
             and on[n]["turns"][0]["mtp_rounds"] > 0
             for n in on
         )
@@ -1879,50 +2062,7 @@ class Campaign:
         return self.summary
 
     def smoke_gate(self):
-        """Every live positive fired (TurboQuant's required where TurboQuant KV is served), every E1c cell
-        passed, E2 passed, the E7b session ran and reported (its continuity is descriptive), and the projected
-        full run fits ESTIMATE_LIMIT_S."""
-        problems, e7b_status = [], {}
-        projected = 0
-        for pick, record in self.summary["picks"].items():
-            if record["outcome"]["e1c"] != "PASS":
-                problems.append(f"{pick}: E1c {record['outcome']}")
-            for name, v in record.get("e1c", {}).items():
-                if not v["pass_"]:
-                    problems.append(f"{pick} {name}: {v['problems']}")
-                sp = v.get("smoke_positives")
-                if sp is not None:
-                    fired = sp["fired"]
-                    need = {"raw_ulp", "in_support", "recurrent", "probe_logit"}
-                    need.add(
-                        "tq_norm" if PICKS[pick]["kv"] == "tq4" else "old_prefix_k"
-                    )
-                    if not sp["baseline_pass"] or not need <= {
-                        k for k, ok in fired.items() if ok
-                    }:
-                        problems.append(f"{pick}: smoke positives {sp}")
-            e2 = record.get("e2")
-            if e2 is None or e2.get("verdict") != "PASS":
-                problems.append(f"{pick}: E2 smoke {e2}")
-            e7b = record.get("e7b") or {}
-            if not e7b.get("sessions") or e7b.get("status") not in (
-                "OBSERVED",
-                "INCOMPLETE",
-            ):  # ran and reported; continuity itself is descriptive (P394 (2) refined)
-                problems.append(
-                    f"{pick}: E7b smoke session did not run / report: {e7b}"
-                )
-            e7b_status[pick] = e7b.get("status")
-            projected += (
-                record["wall_s"] * 6
-            )  # the full run is ≈ 6× the smoke per pick (plan §4)
-        return dict(
-            problems=problems,
-            projected_full_s=projected,
-            fits=projected <= ESTIMATE_LIMIT_S,
-            pass_=not problems,
-            e7b=e7b_status,
-        )
+        return smoke_gate(self.summary["picks"])
 
     def write_summary(self):
         tmp = self.out / ".summary.json.tmp"
@@ -1998,9 +2138,10 @@ def main(argv=None):
     if args.phase == "full":
         if not args.smoke_summary:
             raise SystemExit("full: --smoke-summary of a passed smoke is required")
-        gate = json.loads(Path(args.smoke_summary).read_text()).get("smoke_gate") or {}
-        if not (gate.get("pass_") and gate.get("fits")):
-            raise SystemExit(f"full: the smoke gate did not pass / fit: {gate}")
+        smoke = json.loads(Path(args.smoke_summary).read_text())
+        problems = smoke_authorization_problems(smoke)  # code round 6 H36
+        if problems:
+            raise SystemExit(f"full: the smoke summary does not authorize: {problems}")
     checks = preflight(args, out.parent)
     print(json.dumps(dict(preflight=checks), indent=1))
     if args.plan_only:
