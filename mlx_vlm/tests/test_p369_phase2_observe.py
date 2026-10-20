@@ -382,13 +382,13 @@ def test_on_rows_stop_at_each_blocks_emission_cut_and_forced_tokens_are_recorded
         trip,
         missing,
     )  # no stale row survives
-    assert rec.forced[:2] == [NEWLINE, CLOSE], rec.forced
-    # exactly the forced emissions have no ON row, in order
-    assert [emitted[p] for p in missing] == rec.forced[: len(missing)], (
-        missing,
-        rec.forced,
-    )
-    assert len(rec.forced) - len(missing) in (0, 1)
+    assert [t for _, t in rec.forced[:2]] == [NEWLINE, CLOSE], rec.forced
+    # round 3 E6: each forced pop carries its intended position; the emitted ones are exactly the row-less
+    # positions, an unemitted one sits exactly at the end
+    inside = [(p, t) for p, t in rec.forced if p < len(emitted)]
+    assert [p for p, _ in inside] == missing, (missing, rec.forced)
+    assert all(emitted[p] == t for p, t in inside)
+    assert [p for p, _ in rec.forced if p >= len(emitted)] in ([], [len(emitted)])
     got = compare.forced_positions(rec, emitted, finish_reason="length")
     assert got == missing
 
@@ -396,27 +396,28 @@ def test_on_rows_stop_at_each_blocks_emission_cut_and_forced_tokens_are_recorded
 def test_forced_positions_refuse_inconsistent_bookkeeping():
     rec = type("R", (), {})()
     rec.rows = [(0, None), (1, None), (3, None)]
-    rec.forced = [63]
-    assert compare.forced_positions(rec, [5, 6, 63, 7], finish_reason="stop") == [2]
-    for forced, tokens, finish in (
+    tokens = [5, 6, 63, 7]
+    rec.forced = [(2, 63)]
+    assert compare.forced_positions(rec, tokens, finish_reason="stop") == [2]
+    rec.forced = [
+        (2, 63),
+        (4, 62),
+    ]  # the next forced token was popped but the length budget ended first
+    assert compare.forced_positions(rec, tokens, finish_reason="length") == [2]
+    for forced, finish in (
+        ([(2, 62)], "stop"),  # the row-less position's token is not the forced one
+        ([], "stop"),  # a row-less position with no forced emission
+        ([(2, 63), (4, 62)], "stop"),  # an unemitted pop needs a length finish
+        ([(2, 63), (4, 62), (5, 61)], "length"),
         (
-            [62],
-            [5, 6, 63, 7],
-            "stop",
-        ),  # the missing position's token is not the forced one
-        ([], [5, 6, 63, 7], "stop"),  # a missing row with no forced emission
-        (
-            [63, 62],
-            [5, 6, 63, 7],
-            "stop",
-        ),  # an unemitted forced pop needs a length finish
-        ([63, 62, 61], [5, 6, 63, 7], "length"),
+            [(2, 63), (3, 7)],
+            "length",
+        ),  # round 3 E6: an EMITTED forced position kept a (stale) row
+        ([(1, 6)], "stop"),  # a forced position that is not row-less
     ):
         rec.forced = forced
         with pytest.raises(RuntimeError, match="forced"):
             compare.forced_positions(rec, tokens, finish_reason=finish)
-    rec.forced = [63, 62]
-    assert compare.forced_positions(rec, [5, 6, 63, 7], finish_reason="length") == [2]
 
 
 def test_compare_streams_excludes_only_the_given_positions():

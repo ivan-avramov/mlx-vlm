@@ -1835,3 +1835,37 @@ def test_e1c_keeps_the_neutrality_of_an_attempt_rejected_for_validity(tmp_path):
     assert cell["pass_"], cell  # the accepted retry itself conforms...
     assert [a["neutral"] for a in cell["rejected"]] == [False], cell["rejected"]
     assert orchestrate.pick_outcome(got)["e1c"] == "FAIL"  # ...but the pick does not
+
+
+# ------------------------------------------------------------------ C185 review round 3 E7 E1
+@pytest.mark.parametrize(
+    ("neutral", "c1", "want"),
+    [(True, True, "INCOMPLETE"), (False, True, "FAIL"), (True, False, "ABORT")],
+)
+def test_e1c_cells_invalid_on_every_seed_keep_their_attempts_evidence(
+    tmp_path, neutral, c1, want
+):
+    """Round 3 E7: when every pre-registered seed is invalid the cell is not a harness error — its attempts
+    still decide (any C1 failure ABORTs, any neutrality failure FAILs, else INCOMPLETE).
+    """
+    camp = _e1c_camp(tmp_path)
+    entry = json.loads((tmp_path / FABLE / "e1c-pair-a0" / "req-0.json").read_text())
+    entry["straddle"] = False
+    for k in range(len(orchestrate.SEEDS)):
+        attempt = dict(entry)
+        if k == 2:
+            attempt["pair"] = dict(rows={"pass": neutral}, states={"pass": True})
+            attempt["c1"] = dict(acceptance={"pass": c1, "problems": []})
+        d = tmp_path / FABLE / f"e1c-pair-a{k}"
+        d.mkdir(exist_ok=True)
+        (d / "req-0.json").write_text(json.dumps(attempt))
+    got = camp.e1c(FABLE, {1024: "x"}, smoke=True)
+    assert got["T1024"]["pass_"] is False
+    assert len(got["T1024"]["rejected"]) == len(orchestrate.SEEDS)
+    assert orchestrate.pick_outcome(got)["e1c"] == want
+
+
+def test_e2_summary_refuses_a_malformed_cross_load_container():
+    for cross in ("a", None, [], {}):
+        with pytest.raises(orchestrate.MalformedEvidence, match="malformed evidence"):
+            orchestrate.e2_summary({"a": _pair()}, cross, digests={"a": D64})
