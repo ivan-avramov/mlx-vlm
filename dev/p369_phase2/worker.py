@@ -340,6 +340,26 @@ def release_session(chat_id):
     entry["state"].clear()
 
 
+ROUTED_MODEL = (
+    None  # the worker's --model (hf_path), set by run_job from the worker argv
+)
+
+
+def argv_model(argv):
+    if "--model" not in argv:
+        raise ValueError(f"no --model in the worker argv {argv}")
+    return argv[argv.index("--model") + 1]
+
+
+def routed(payload):
+    """mlx-serve's router rewrites ``body["model"] = model_cfg.hf_path`` before forwarding (``router.py``);
+    the harness drives the worker directly, so every request body gets the same rewrite (smoke 1: the
+    registry name made the worker unload its preloaded target)."""
+    if ROUTED_MODEL is None:
+        raise RuntimeError("no routed model: run_job sets it from the worker argv")
+    return dict(payload, model=ROUTED_MODEL)
+
+
 def post(client, payload, chat_id, capture, timeout_s):
     capture.reset()
     before = capture.completed
@@ -347,7 +367,7 @@ def post(client, payload, chat_id, capture, timeout_s):
     r = client.post(
         "/v1/chat/completions",
         headers={"X-MLX-VLM-Chat-Id": chat_id},
-        json=payload,
+        json=routed(payload),
         timeout=timeout_s,
     )
     elapsed = time.monotonic() - started
@@ -471,7 +491,7 @@ def prompt_ids(client, messages, base_payload):
         client.post(
             "/v1/chat/completions",
             headers={"X-MLX-VLM-Chat-Id": f"p369-size-{uuid.uuid4().hex}"},
-            json=dict(base_payload, messages=messages, max_tokens=1),
+            json=routed(dict(base_payload, messages=messages, max_tokens=1)),
         )
     except DryRun as stop:
         return stop.tokens
@@ -956,7 +976,10 @@ def compare_pair(ref, recorder, n, params):
 
 
 def run_job(job, out_dir, result):
+    global ROUTED_MODEL
     from p369_phase2 import telemetry
+
+    ROUTED_MODEL = argv_model(job["argv"])
 
     client = boot(job["argv"])
     with client, ExitStack() as stack:
