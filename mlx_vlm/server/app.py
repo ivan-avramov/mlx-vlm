@@ -434,10 +434,8 @@ async def lifespan(app):
     if model_path:
         logger.info("Pre-loading language model: %s", model_path)
         get_cached_model(model_path, adapter_path, model_kind="text_generation")
-        kv_bits = os.environ.get("KV_BITS")
-        kv_scheme = os.environ.get("KV_QUANT_SCHEME", "uniform")
-        if kv_bits:
-            logger.info("KV cache quantization: bits=%s scheme=%s", kv_bits, kv_scheme)
+        # Fork (P405): upstream logged KV_BITS / KV_QUANT_SCHEME from the env here, which printed
+        # scheme=turboquant while affine KV was served; get_cached_model logs the resolved codec.
         logger.info("Language model ready, continuous batching enabled.")
 
     preload_models = (
@@ -947,6 +945,21 @@ def get_cached_model(
         else get_quantized_kv_start()
     )
     kv_quant_scheme = cfg.kv_quant_scheme or get_kv_quant_scheme()
+    # Fork (P405): the codec as resolved here, from exactly what the generator receives.
+    logger.info(
+        "KV cache resolved: kv_bits=%r kv_key_bits=%r kv_value_bits=%r kv_key_scheme=%r "
+        "kv_value_scheme=%r kv_quant_scheme=%r kv_group_size=%r quantized_kv_start=%r "
+        "TQ_KV_QUANT_MODE=%r",
+        kv_bits,
+        kv_key_bits,
+        kv_value_bits,
+        kv_key_scheme,
+        kv_value_scheme,
+        kv_quant_scheme,
+        kv_group_size,
+        quantized_kv_start,
+        os.environ.get("TQ_KV_QUANT_MODE"),
+    )
 
     # APC: build a shared block pool if opted in via env var. The namespace
     # fingerprints the adapter and the whole KV-quantization config, so two runs
