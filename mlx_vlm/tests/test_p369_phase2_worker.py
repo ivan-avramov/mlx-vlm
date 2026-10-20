@@ -701,3 +701,50 @@ def test_e2_pair_entry_raises_on_a_speculative_replay(triple):
     state["off_rounds"] = 2
     with pytest.raises(RuntimeError, match="OFF1 ran 2 MTP rounds"):
         run()
+
+
+# ------------------------------------------------------------------ smoke 1 (live boot): requests are routed like mlx-serve's
+HF_PATH = "caslca/Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed"
+
+
+class _Client:
+    """Records each request body; plays one completed cached request for ``post``."""
+
+    def __init__(self, capture=None, dry_run=None):
+        self.bodies, self.capture, self.dry_run = [], capture, dry_run
+
+    def post(self, path, headers, json, timeout=None):
+        self.bodies.append(json)
+        if self.dry_run is not None:
+            raise worker.DryRun(self.dry_run)
+        cap = self.capture
+        cap.backend, cap.final = "cached_session", dict(token_ids=[1])
+        cap.prompt = dict(tokens=3, sha256="d" * 64, ids=[1, 2, 3])
+        cap.completed += 1
+        return types.SimpleNamespace(status_code=200, json=lambda: {}, text="")
+
+
+def test_requests_carry_the_workers_model_as_the_router_rewrites_it(monkeypatch):
+    # mlx-serve's router sets body["model"] = model_cfg.hf_path; a registry name reaching the worker made it
+    # unload the preloaded target and try to load a repo that does not exist (smoke 1)
+    monkeypatch.setattr(worker, "ROUTED_MODEL", HF_PATH)
+    payload = dict(model="Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed", stream=False)
+    assert worker.routed(payload) == dict(payload, model=HF_PATH)
+    capture = worker.Capture()
+    client = _Client(capture)
+    worker.post(client, payload, "chat", capture, 10.0)
+    assert client.bodies[-1]["model"] == HF_PATH
+    dry = _Client(dry_run=[4, 5])
+    assert worker.prompt_ids(dry, [dict(role="user", content="x")], payload) == [4, 5]
+    assert dry.bodies[-1]["model"] == HF_PATH
+
+
+def test_routing_needs_the_workers_model(monkeypatch):
+    monkeypatch.setattr(worker, "ROUTED_MODEL", None)
+    with pytest.raises(RuntimeError, match="routed model"):
+        worker.routed(dict(model="m"))
+    assert (
+        worker.argv_model(["--host", "h", "--model", HF_PATH, "--port", "1"]) == HF_PATH
+    )
+    with pytest.raises(ValueError, match="--model"):
+        worker.argv_model(["--host", "h"])
