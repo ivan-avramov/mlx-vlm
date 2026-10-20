@@ -8,6 +8,7 @@ drafter holding expert weights (it must be rewritten to the MoE type or fail).
 """
 
 import json
+from contextlib import nullcontext
 from pathlib import Path
 
 import mlx.core as mx
@@ -297,17 +298,20 @@ def _observed_turn(lm, drafter, *, sabotage=None, monkeypatch=None, n=12):
     tel = telemetry.KernelTelemetry(lm, drafter=drafter)
     keys = observe.KeyLengths()  # the verifier block boundaries
     with tel, keys, observe.Recorder(mode="on", lm=lm, probe_token=5) as rec:
-        if sabotage:
-            sabotage(monkeypatch)
-        out, _ = turn(
-            fake_model(lm),
-            PROMPT,
-            PromptCacheState(),
-            drafter=drafter,
-            n=n,
-            seed=5,
-            params=PARAMS,
-        )
+        # code round 2 N2: the sabotage lives in its own patch context, undone BEFORE the telemetry restores its
+        # wrappers (``monkeypatch`` itself never records a telemetry wrapper as an original)
+        with monkeypatch.context() if sabotage else nullcontext() as mp:
+            if sabotage:
+                sabotage(mp)
+            out, _ = turn(
+                fake_model(lm),
+                PROMPT,
+                PromptCacheState(),
+                drafter=drafter,
+                n=n,
+                seed=5,
+                params=PARAMS,
+            )
     rec.blocks = keys.blocks
     return tel, rec, list(out)
 

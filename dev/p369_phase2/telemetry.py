@@ -117,10 +117,11 @@ class KernelTelemetry:
         self.attributions = []
         self.readouts = collections.Counter()
         self._names = {id(m): name for name, m in lm.named_modules()}
-        if drafter is not None:
-            self._names.update(
-                {id(m): f"drafter.{name}" for name, m in drafter.named_modules()}
-            )
+        if (
+            drafter is not None
+        ):  # P413: a bound drafter's references to target modules keep the target's names
+            for name, m in drafter.named_modules():
+                self._names.setdefault(id(m), f"drafter.{name}")
         self._frames = []
         self._probe_depth = 0
         self._scope_depth = 0
@@ -306,6 +307,7 @@ class KernelTelemetry:
         frame = self._routed_stack[-1] if self._routed_stack else None
         if frame is not None:
             frame["projections"].extend(p for p, _, _ in banks)
+            frame["modules"].extend(n for _, n, _ in banks)  # code round 2 N3
             frame["experts"].update(experts)
         if not self._probe_depth:
             for _, bank_name, bank in banks:
@@ -352,7 +354,9 @@ class KernelTelemetry:
                 out = real(module, x, indices, *args, **kwargs)
             finally:
                 telemetry._helper_depth -= 1
-            if out is not None:
+            if (
+                out is not None and not telemetry._helper_depth
+            ):  # code round 2 M5: a helper nested in a helper is the outer one's
                 telemetry._routed_note(module, indices, projections)
             return out
 
@@ -368,7 +372,10 @@ class KernelTelemetry:
                 id=len(telemetry.routed_frames) + len(telemetry._routed_stack),
                 scope=telemetry._scope_name(),
                 width=int(x.shape[0] * x.shape[1]) if x.ndim == 3 else int(x.shape[0]),
+                # code round 2 N3: the container whose banks this invocation must run (the argument before x)
+                owner=telemetry._names.get(id(args[positional_indices - 2]), "?"),
                 projections=[],
+                modules=[],
                 experts=set(),
             )
             telemetry._routed_stack.append(frame)
@@ -700,12 +707,17 @@ def verdict(telemetry, manifest):
             problems.append(
                 f"verify-scope routed call outside an invocation frame: {a}"
             )
-    # v13 V3: each verify-scope invocation runs every bank exactly once
+    # v13 V3: each verify-scope invocation runs every bank exactly once — code round 2 N3: its OWN container's banks
     for frame in telemetry.routed_frames:
-        if frame["scope"] == "verify" and sorted(frame["projections"]) != sorted(
-            ROUTED_PROJ
-        ):
+        if frame["scope"] != "verify":
+            continue
+        if sorted(frame["projections"]) != sorted(ROUTED_PROJ):
             problems.append(f"routed invocation ran {frame['projections']}: {frame}")
+        owned = sorted(f"{frame['owner']}.{p}" for p in ROUTED_PROJ)
+        if frame["owner"] == "?" or sorted(frame["modules"]) != owned:
+            problems.append(
+                f"routed invocation of owner {frame['owner']} ran banks {sorted(frame['modules'])}: {frame}"
+            )
     on_path = sorted(m for m, info in manifest.items() if _on_path(m, info))
     missing = [m for m in on_path if m not in observed]
     if missing:

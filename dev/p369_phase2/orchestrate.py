@@ -24,10 +24,11 @@ from contextlib import contextmanager
 from pathlib import Path
 
 try:
-    from p369_phase2 import kvmanifest, registry_states
+    from p369_phase2 import kvmanifest, registry_states, telemetry
 except ImportError:  # run as a script: this directory is sys.path[0]
     import kvmanifest
     import registry_states
+    import telemetry  # code round 2 M2: stdlib-only at import
 
 PRODUCTION = "7207179b"  # P400 + P401 (C188) + P405 F1 / F2 + K6 (C189 / C192); was 3395cef3, da27f0ef, 4e6d0e03
 _DENSE = dict(
@@ -120,9 +121,9 @@ def read_registry(path):
 
 def draft_inventory_problems(pick, name, dk):
     """Code round 1 M2: the drafter MoE-path inventory itself — MoE, at least one invocation, each running every
-    part exactly once, with selected experts — never only its pass flag."""
-    from p369_phase2 import telemetry
-
+    part exactly once, with selected experts — never only its pass flag. Code round 2 M2: each invocation names a
+    ``drafter.`` block and a non-empty list of unique integer expert ids within the entry's expert count.
+    """
     where = f"{pick} {name}.draft_kernels"
     if not isinstance(dk, dict) or not isinstance(dk.get("invocations"), list):
         raise MalformedEvidence(f"malformed evidence: {where} = {dk!r}")
@@ -134,12 +135,24 @@ def draft_inventory_problems(pick, name, dk):
     if not dk["invocations"]:
         problems.append(f"{pick} {name}: no drafter MoE-block invocation")
     want = sorted(telemetry.DRAFT_MOE_PARTS)
+    n_experts = PICKS[pick]["drafter"]["experts"][0]
     for inv in dk["invocations"]:
         if not isinstance(inv, dict) or inv.get("parts") != want:
             problems.append(f"{pick} {name}: drafter MoE invocation parts {inv!r}")
-        elif not inv.get("selected_experts"):
+            continue
+        block, experts = inv.get("block"), inv.get("selected_experts")
+        if not (
+            isinstance(block, str) and block.startswith("drafter.") and len(block) > 8
+        ):
+            problems.append(f"{pick} {name}: drafter MoE invocation block {block!r}")
+        if not (
+            isinstance(experts, list)
+            and experts
+            and all(type(e) is int and 0 <= e < n_experts for e in experts)
+            and len(set(experts)) == len(experts)
+        ):
             problems.append(
-                f"{pick} {name}: drafter MoE invocation without selected experts"
+                f"{pick} {name}: drafter MoE invocation selected experts {experts!r}"
             )
     return problems
 

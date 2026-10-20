@@ -1222,7 +1222,12 @@ def test_the_head_identity_names_a_tied_embedding_method():
             return x
 
     e = Embed()
-    assert worker._callable_identity(e.as_linear) == ["method", id(e), "as_linear"]
+    assert worker._callable_identity(e.as_linear) == [
+        "method",
+        id(e),
+        "as_linear",
+        id(Embed.as_linear),
+    ]
     assert worker._callable_identity(HEAD) == ["module", id(HEAD)]
 
 

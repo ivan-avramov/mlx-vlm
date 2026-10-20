@@ -188,11 +188,18 @@ def _quantized_shapes(module):
 
 
 def _callable_identity(fn):
-    """A head callable by what it IS: a module (``["module", id]``) or a bound method (``["method", id(owner), name]``)."""
+    """A head callable by what it IS: a module (``["module", id]``) or a bound method (``["method", id(owner), name,
+    id(function)]`` — code round 2 M3: a same-named method of another function is not the head).
+    """
     owner = getattr(fn, "__self__", None)
     if owner is None or callable(getattr(fn, "parameters", None)):
         return ["module", id(fn)]
-    return ["method", id(owner), fn.__name__]
+    return [
+        "method",
+        id(owner),
+        fn.__name__,
+        id(getattr(fn, "__func__", fn)),
+    ]  # a builtin has no __func__
 
 
 def _bank_shapes(drafter):
@@ -253,9 +260,18 @@ def target_identity(model):
         head=(
             ["module", id(head)]
             if head is not None
-            else ["method", id(embed), "as_linear"]
+            else ["method", id(embed), "as_linear", id(type(embed).as_linear)]
         ),
     )
+
+
+def check_loaded_drafter(model, drafter, shape, *, requested_block=None):
+    """Code round 2 M3: a drafter as loaded is unbound (``reset`` binds it at each request's start); bind it to the
+    served target — exactly what ``reset`` does — then compare its identity with the certified ``shape``.
+    """
+    drafter.bind(model)
+    ident = drafter_identity(drafter, requested_block=requested_block)
+    return ident, drafter_problems(ident, target_identity(model), shape)
 
 
 def drafter_problems(identity, target, expect):
@@ -265,7 +281,9 @@ def drafter_problems(identity, target, expect):
         text_type=expect["text_type"],
         layer=[expect["layer"]],
         depth=expect["depth"],
-        experts=expect["experts"],
+        experts=(
+            tuple(expect["experts"]) if expect["experts"] else None
+        ),  # P412: JSON lists
         quant=[list(q) for q in expect["quant"]],
         block_size=expect["block_size"],
         effective_block=expect["block_size"],
@@ -1222,12 +1240,13 @@ def run_job(job, out_dir, result):
         lm = rg.model.language_model
         shape = job["expect"].get("drafter_shape")
         if shape:  # P369 v13 V11: the LOADED drafter, not its config file
-            ident = drafter_identity(
+            ident, problems = check_loaded_drafter(
+                rg.model,
                 rg.draft_model,
+                shape,
                 requested_block=os.environ.get("MLX_VLM_DRAFT_BLOCK_SIZE") or None,
             )
             result["drafter_identity"] = dict(ident, embed=None, head=None)
-            problems = drafter_problems(ident, target_identity(rg.model), shape)
             if problems:
                 raise RuntimeError("served drafter mismatch: " + "; ".join(problems))
         policy = getattr(rg, "mtp_verify_policy", None)
