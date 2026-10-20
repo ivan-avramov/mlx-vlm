@@ -356,8 +356,10 @@ def _snap(cache):
     return out
 
 
-def _trace(model, lazy, prime=0, ids=None, pixel=None, **gen_kwargs):
-    """Raw logits and cache (arrays + offsets) after every language-model call."""
+def _trace(model, lazy, prime=0, ids=None, pixel=None, primed=True, **gen_kwargs):
+    """Raw logits and cache (arrays + offsets) after every language-model call. A warm suffix
+    (``prime``) gets ABSOLUTE full-prompt positions primed exactly as every production warm prefill does
+    (``dispatch._prime_cached_prefix_rope_state``; P401) unless ``primed=False``."""
     runner = model if lazy else _without_lazy(model)
     cache = model.language_model.make_cache()
     logits, snaps = [], []
@@ -377,6 +379,13 @@ def _trace(model, lazy, prime=0, ids=None, pixel=None, **gen_kwargs):
             for y, _ in _gen(_without_lazy(model), prompt[:prime], cache, max_tokens=0):
                 pass
             del logits[:], snaps[:]
+        if prime and primed:
+            from mlx_vlm.generate import dispatch
+
+            gen_kwargs = dict(gen_kwargs)
+            assert dispatch._prime_cached_prefix_rope_state(
+                model, mx.array([prompt]), None, gen_kwargs
+            )
         for _ in _gen(
             runner, prompt[prime:], cache, max_tokens=1, pixel=pixel, **gen_kwargs
         ):
@@ -492,3 +501,77 @@ class TestF6AgainstEager:
         assert max(eager_lengths) == len(ids)
         assert max(spy.lengths) == len(ids)  # whole prompt embedded: eager merge
         _same(eager, lazy)
+
+
+# ----------------------------------------------------------------- P401: positions sliced at the cache offset
+def _model_positions(model, run):
+    """The ``position_ids`` every inner-model call receives (after LanguageModel's slicing)."""
+    inner = type(model.language_model.model)
+    real, seen = inner.__call__, []
+
+    def spy(self, *args, **kwargs):
+        pid = kwargs.get("position_ids")
+        seen.append(None if pid is None else mx.array(pid).tolist())
+        return real(self, *args, **kwargs)
+
+    inner.__call__ = spy
+    try:
+        run()
+    finally:
+        inner.__call__ = real
+    return [p for p in seen if p is not None]
+
+
+class TestP401PositionSlice:
+    def test_a_primed_warm_suffix_prefill_gets_absolute_positions(self):
+        model = _tiny_model()
+        got = _model_positions(model, lambda: _trace(model, False, prime=6))
+        # priming (0..5), the warm suffix chunks at offsets 6 / 10 / 12, then the lookahead decode at 13
+        assert got == [
+            [[0, 1, 2, 3]],
+            [[4]],
+            [[5]],
+            [[6, 7, 8, 9]],
+            [[10, 11]],
+            [[12]],
+            [[13]],
+        ], got
+
+    def test_an_unprimed_warm_suffix_call_raises(self):
+        """Suffix-local positions sliced at the absolute cache offset give short / empty arrays; RoPE then
+        read uninitialized memory (P401, allocator-timing dependent). It must fail loudly instead.
+        """
+        model = _tiny_model()
+        with pytest.raises(ValueError, match="position_ids"):
+            _trace(model, False, prime=6, primed=False)
+
+    def _warm(self, model, n=6):
+        cache = model.language_model.make_cache()
+        for _ in _gen(_without_lazy(model), PROMPT[:n], cache, max_tokens=0):
+            pass
+        return cache
+
+    def test_block_local_positions_on_a_warm_cache_are_used_as_given(self):
+        # equal length (e.g. Qwen4 speculative verify's [B, L] block-local positions): not sliced, not refused
+        model = _tiny_model()
+        cache, lm = self._warm(model), model.language_model
+        ids = mx.array([PROMPT[6:9]])
+        pos = mx.array([[6, 7, 8]])
+        got = _model_positions(model, lambda: lm(ids, cache=cache, position_ids=pos))
+        assert got == [[[6, 7, 8]]]
+
+    def test_a_full_prompt_3d_mrope_buffer_is_sliced_at_the_cache_offset(self):
+        model = _tiny_model()
+        cache, lm = self._warm(model), model.language_model
+        full = mx.broadcast_to(
+            mx.arange(len(PROMPT))[None, None, :], (3, 1, len(PROMPT))
+        )
+        ids = mx.array([PROMPT[6:10]])
+        got = _model_positions(model, lambda: lm(ids, cache=cache, position_ids=full))
+        assert got == [[[[6, 7, 8, 9]]] * 3]
+
+    def test_a_too_short_position_buffer_is_refused(self):
+        model = _tiny_model()
+        cache, lm = self._warm(model), model.language_model
+        with pytest.raises(ValueError, match="position_ids"):
+            lm(mx.array([PROMPT[6:10]]), cache=cache, position_ids=mx.array([[6, 7]]))
