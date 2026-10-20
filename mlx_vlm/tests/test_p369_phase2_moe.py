@@ -513,6 +513,12 @@ def test_m7_cuts_full_and_partial_and_every_commit_probe_is_neutral(served):
     assert rec.commits and all(
         c["probe"] is not None and c["neutral"] for c in rec.commits
     )
+    # code round 2 M7: the prompt-end snapshot exists, carries a probe and is neutral; every emitted token after the
+    # prefill's first is accounted for by exactly one emission cut
+    end = rec.prompt_end
+    assert end is not None and end["kind"] == "prompt_end", end
+    assert end["probe"] is not None and end["neutral"] is True, end
+    assert 1 + sum(c["n_emit"] for c in rec.cuts) == len(plain), rec.cuts
 
 
 @METAL
@@ -638,3 +644,179 @@ def test_v3d_m8_a_served_moe_verify_block_equals_sequential_singletons(
                     type(a).__name__,
                     key,
                 )
+
+
+# ------------------------------------------------------------------ P369 v13 code round 2 M3 / M5 / N2 / N3 / N4
+SERVED_DRAFTER_SHAPE = dict(
+    layer="Qwen3_5MoeDecoderLayer",
+    depth=1,
+    experts=(EXPERTS, TOP_K),
+    quant=[(4, 64)],
+    text_type="qwen3_5_moe_text",
+    block_size=3,
+    banks=("QuantizedSwitchLinear", 4, 64),
+)
+
+
+def test_m3r2_a_freshly_loaded_drafter_passes_the_startup_gate():
+    """Code round 2 M3 / P412: a drafter as loaded is UNBOUND (``reset`` binds it at the first request); the worker's
+    startup gate binds it to the served target before reading its identity, and the certified shape arrives as JSON.
+    """
+    from p369_phase2 import worker
+
+    lm = served_moe_target()
+    drafter = served_moe_drafter(lm)
+    assert drafter._input_embed is None and drafter._lm_head_fn is None  # as loaded
+    shape = json.loads(json.dumps(SERVED_DRAFTER_SHAPE))
+    ident, problems = worker.check_loaded_drafter(lm, drafter, shape)
+    assert problems == [], problems
+    assert ident["embed"] == id(lm.model.embed_tokens)
+    other = served_moe_target(seed=3)
+    assert worker.drafter_problems(ident, worker.target_identity(other), shape)
+
+
+def test_m5r2_a_nested_successful_helper_is_attributed_once():
+    """Code round 2 M5: ``exact_quantized_moe_hc_expand`` calls the (wrapped) ``exact_quantized_selected_linear``; the
+    outer successful helper alone records its bank."""
+    tel = telemetry.KernelTelemetry(tiny_moe_target())
+
+    class Bank:
+        pass
+
+    bank = Bank()
+    tel._names[id(bank)] = "probe.switch_mlp.down_proj"
+    inner = tel._routed_helper(lambda module, x, indices: "inner", None)
+    outer = tel._routed_helper(
+        lambda module, x, indices: inner(module, x, indices), None
+    )
+    assert outer(bank, None, mx.array([[[0, 1]]], dtype=mx.int32)) == "inner"
+    routed = [a for a in tel.attributions if a["kind"] == "routed"]
+    assert [a["module"] for a in routed] == ["probe.switch_mlp.down_proj"], routed
+
+
+@METAL
+def test_m5r2_the_fused_affine_gate_up_branch_attributes_each_bank_once(monkeypatch):
+    """Code round 2 M5: width 512 so ``exact_affine_switch_gate_up`` TAKES its fused branch (asserted), and the exact
+    per-bank attribution — each of gate / up / down once, each with the quantized bank family.
+    """
+    import collections
+
+    import mlx.nn as nn
+
+    from mlx_vlm.models import fast_ops, switch_layers
+
+    mx.random.seed(4)
+    glu = switch_layers.SwitchGLU(512, 512, EXPERTS)
+    glu.set_dtype(mx.bfloat16)
+    nn.quantize(glu, group_size=64, bits=4, mode="affine")
+    glu.eval()  # the exact fused path is inference-only (``not self.training``)
+    mx.eval(glu.parameters())
+    real, took = fast_ops.exact_affine_switch_gate_up, []
+
+    def spy(*args, **kwargs):
+        out = real(*args, **kwargs)
+        took.append(out is not None)
+        return out
+
+    monkeypatch.setattr(
+        fast_ops, "exact_affine_switch_gate_up", spy
+    )  # before the telemetry: it wraps the spy
+    tel = telemetry.KernelTelemetry(tiny_moe_target())
+    tel._names[id(glu)] = "probe.switch_mlp"
+    for p in ("gate_proj", "up_proj", "down_proj"):
+        tel._names[id(getattr(glu, p))] = f"probe.switch_mlp.{p}"
+    x = mx.random.normal((1, 2, 512)).astype(mx.bfloat16)
+    indices = mx.array([[[0, 1], [2, 3]]], dtype=mx.int32)
+    with tel:
+        mx.eval(glu(x, indices))
+    assert took == [True]
+    routed = collections.Counter(
+        (a["module"], a["family"]) for a in tel.attributions if a["kind"] == "routed"
+    )
+    assert routed == collections.Counter(
+        {
+            (f"probe.switch_mlp.{p}", "routed_gather_quantized"): 1
+            for p in ("gate_proj", "up_proj", "down_proj")
+        }
+    ), routed
+
+
+@METAL
+def test_n2_a_sabotaged_turn_leaves_no_telemetry_wrapper_behind(served):
+    """Code round 2 N2: a sabotage applied inside the telemetry context is undone before the telemetry restores its
+    own patches — pytest's later undo must not reinstall a stale telemetry wrapper."""
+    from mlx_vlm.models import switch_layers
+
+    classes = (switch_layers.SwitchLinear, switch_layers.QuantizedSwitchLinear)
+    real = {c: c.__call__ for c in classes}
+    lm, drafter = served
+
+    def unhook(mp):
+        for cls, fn in real.items():
+            mp.setattr(cls, "__call__", fn)
+
+    mp = pytest.MonkeyPatch()
+    _observed_turn(lm, drafter, sabotage=unhook, monkeypatch=mp, n=4)
+    mp.undo()  # what pytest's teardown does
+    assert all(cls.__call__ is real[cls] for cls in classes)
+
+
+@METAL
+def test_n3_a_routed_invocation_running_another_layers_bank_fails(served):
+    """Code round 2 N3: swapping the gate banks of the two layers keeps every projection name in every frame and every
+    bank observed globally — the verdict must still refuse a frame running a bank its container does not own.
+    """
+    lm, drafter = served
+    s0, s1 = (layer.mlp.switch_mlp for layer in lm.model.layers)
+
+    def swap(mp):
+        g0, g1 = s0.gate_proj, s1.gate_proj
+        mp.setattr(s0, "gate_proj", g1)
+        mp.setattr(s1, "gate_proj", g0)
+
+    with pytest.MonkeyPatch.context() as mp:
+        tel, _, _ = _observed_turn(lm, drafter, sabotage=swap, monkeypatch=mp)
+    v = _verdict(tel, lm)
+    assert not v["pass"] and any("owner" in p for p in v["problems"]), v["problems"]
+
+
+def test_n4_the_served_fixture_quantizes_every_eligible_linear():
+    """Code round 2 N4: the served-shape fixtures hold no dense linear / embedding / routed bank — every one affine
+    int4 / g64 with bf16 scales and biases."""
+    import mlx.nn as nn
+
+    from mlx_vlm.models import switch_layers
+
+    lm = served_moe_target()
+    for root in (lm, served_moe_drafter(lm)):
+        modules = list(root.named_modules())
+        dense = [
+            n
+            for n, m in modules
+            if isinstance(m, (nn.Linear, nn.Embedding))
+            or type(m) is switch_layers.SwitchLinear
+        ]
+        assert not dense, dense
+        quantized = [(n, m) for n, m in modules if hasattr(m, "bits")]
+        assert quantized
+        for n, m in quantized:
+            assert (m.bits, m.group_size, m.mode) == (4, 64, "affine"), n
+            assert m.scales.dtype == mx.bfloat16 and m.biases.dtype == mx.bfloat16, n
+
+
+def test_p413_a_bound_drafter_never_renames_the_targets_modules():
+    """P413: a BOUND drafter holds the target's embedding (and head) as attributes; the telemetry's module names stay
+    the target's own (``drafter._input_embed`` / ``drafter._lm_head_fn`` would be unknown to the target manifest).
+    """
+    lm = served_moe_target()
+    drafter = served_moe_drafter(lm).bind(lm)
+    tel = telemetry.KernelTelemetry(lm, drafter=drafter)
+    targets = {id(m): n for n, m in lm.named_modules()}
+    assert all(tel._names[i] == n for i, n in targets.items())
+    assert tel._names[id(lm.model.embed_tokens)] == "model.embed_tokens"
+    own = {
+        id(m)
+        for n, m in drafter.named_modules()
+        if not n.startswith(("_input_embed", "_lm_head_fn"))
+    }
+    assert all(tel._names[i].startswith("drafter.") for i in own - set(targets))

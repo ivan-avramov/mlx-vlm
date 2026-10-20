@@ -2548,3 +2548,103 @@ def test_m10_phase_timings_must_be_finite_and_non_negative(bad):
     record = _smoke_record(step_s=dict(prep=5, e1c=bad, e2=5, e7b=10))
     with pytest.raises(orchestrate.MalformedEvidence, match="step_s"):
         orchestrate.smoke_gate({FABLE: record})
+
+
+# ------------------------------------------------------------------ P369 v13 code round 2 M1 / M2
+def test_m1r2_prepare_itself_hands_the_classifier_the_registry_bytes(
+    tmp_path, monkeypatch
+):
+    """Code round 2 M1: ``Campaign.prepare`` (not only the helper) reads the live registry as bytes — a CRLF registry
+    reaches the 16-state classifier with its CR bytes, and is refused there."""
+    stack = tmp_path / "stack"
+    stack.mkdir()
+    (stack / "main_models.yaml").write_bytes(
+        ALL_OFF.replace("\n", "\r\n").encode("utf-8")
+    )
+    args = argparse.Namespace(
+        stack_root=str(stack),
+        fork_root=str(DEV.parent),
+        out=str(tmp_path / "run"),
+        pick=[UNIFORM],
+        phase="smoke",
+        wall_limit_s=None,
+        reviewed_head=None,
+        smoke_summary=None,
+    )
+    for name, value in dict(
+        stack_bench_problems=lambda *a, **k: [],
+        stack_bench_state=lambda *a, **k: {},
+        fork_versions=lambda *a, **k: {},
+    ).items():
+        monkeypatch.setattr(orchestrate, name, value)
+    seen, real = [], rs.classify
+
+    class Stop(Exception):
+        pass
+
+    def spy(
+        text, fixture
+    ):  # stop at the classifier: what prepare() handed it is the claim
+        seen.append(text)
+        raise Stop
+
+    monkeypatch.setattr(orchestrate.registry_states, "classify", spy)
+    with pytest.raises(Stop):
+        orchestrate.Campaign(args).prepare()
+    assert len(seen) == 1 and "\r\n" in seen[0]  # the CR bytes reached it
+    assert real(seen[0], FIXTURE_TEXT) is None  # ... and are refused there
+
+
+def test_m2r2_the_draft_inventory_check_runs_in_direct_script_mode():
+    """Code round 2 M2: the orchestrator runs as a script (``dev/p369_phase2`` is ``sys.path[0]``, no package);
+    the smoke gate's draft-inventory check must work there."""
+    import subprocess
+
+    code = (
+        "import json, sys; sys.path.insert(0, sys.argv[1]); import orchestrate; "
+        "print(json.dumps(orchestrate.draft_inventory_problems(sys.argv[2], 'smoke', json.loads(sys.argv[3]))))"
+    )
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            code,
+            str(DEV / "p369_phase2"),
+            ORNITH,
+            json.dumps(_inventory()),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == []
+
+
+@pytest.mark.parametrize(
+    ("kind", "invocation"),
+    [
+        ("forged", dict(selected_experts="forged")),
+        ("bools", dict(selected_experts=[True])),
+        ("floats", dict(selected_experts=[1.0])),
+        ("negative", dict(selected_experts=[-1])),
+        ("out_of_range", dict(selected_experts=[256])),
+        ("duplicates", dict(selected_experts=[3, 3])),
+        ("no_block", dict(block=None)),
+        ("empty_block", dict(block="")),
+        ("target_block", dict(block="model.layers.0.mlp")),
+    ],
+)
+def test_m2r2_each_draft_invocation_is_well_formed(kind, invocation):
+    """Code round 2 M2: a non-empty ``drafter.`` block and a non-empty list of unique in-range integer expert ids
+    (``PICKS``' expert count), never any truthy value."""
+    good = _inventory()["invocations"][0]
+    inv = {k: v for k, v in dict(good, **invocation).items() if v is not None}
+    try:
+        gate = orchestrate.smoke_gate(
+            {ORNITH: _ornith_record(_inventory(invocations=[inv]))}
+        )
+    except orchestrate.MalformedEvidence:
+        return
+    assert not gate["pass_"], (kind, gate)

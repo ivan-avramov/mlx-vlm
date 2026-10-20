@@ -1224,3 +1224,37 @@ def test_the_head_identity_names_a_tied_embedding_method():
     e = Embed()
     assert worker._callable_identity(e.as_linear) == ["method", id(e), "as_linear"]
     assert worker._callable_identity(HEAD) == ["module", id(HEAD)]
+
+
+# ------------------------------------------------------------------ P369 v13 code round 2 M3 / P412
+def test_p412_a_json_round_tripped_shape_still_matches():
+    """P412: the job reaches the worker as JSON, so the certified shape's tuples arrive as lists; a matching loaded
+    MoE drafter must still pass (and a mismatching one still fail)."""
+    moe = _drafter(
+        "qwen3_5_moe_text", "Qwen3_5MoeDecoderLayer", hidden=2048, experts=(256, 8)
+    )
+    tgt = dict(TARGET, hidden=2048)
+    shape = json.loads(json.dumps(MOE))
+    assert worker.drafter_problems(_identity(moe), tgt, shape) == []
+    assert worker.drafter_problems(_identity(moe), tgt, dict(shape, experts=[256, 4]))
+
+
+def test_m3r2_a_same_named_method_of_another_function_is_not_the_head():
+    """Code round 2 M3: a bound method is identified by its owner AND its function, not its name."""
+
+    class Embed:
+        def as_linear(self, x):
+            return x
+
+    embed = Embed()
+
+    def as_linear(self, x):  # same name, different function
+        return x
+
+    forged = types.MethodType(as_linear, embed)
+    assert worker._callable_identity(embed.as_linear) != worker._callable_identity(
+        forged
+    )
+    assert worker._callable_identity(embed.as_linear) == worker._callable_identity(
+        embed.as_linear
+    )
