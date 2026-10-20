@@ -2253,3 +2253,58 @@ def test_a_borrowed_entry_refuses_until_its_reviewed_panel_exists(tmp_path):
     assert (
         orchestrate.borrowed_panel(UNIFORM, tmp_path / "absent.json") is None
     )  # own C84 bundles
+
+
+# ------------------------------------------------------------------ P369 v13 V6 / V11: pinned target / drafter files
+def test_snapshot_files_cover_every_loaded_file_recursively(tmp_path):
+    for rel in (
+        "config.json",
+        "model.safetensors",
+        "chat_template.jinja",
+        "optiq/mtp.safetensors",
+        "tokenizer.model",
+        "README.md",
+        ".gitattributes",
+        "evaluation/M44.json",
+    ):
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_text(rel)
+    got = orchestrate.snapshot_files(tmp_path)
+    assert sorted(got) == [
+        "chat_template.jinja",
+        "config.json",
+        "model.safetensors",
+        "optiq/mtp.safetensors",
+        "tokenizer.model",
+    ]
+
+
+def _rec(rev="r1", **files):
+    return dict(hf_path="caslca/x", revision=rev, files=files or {"a.json": "1" * 64})
+
+
+def test_pins_refuse_any_revision_or_file_difference():
+    pins = {UNIFORM: dict(target=_rec(), drafter=_rec("d1"))}
+    pp = orchestrate.pins_problems
+    assert pp(pins, UNIFORM, _rec(), _rec("d1")) == []
+    assert pp(pins, UNIFORM, _rec("r2"), _rec("d1"))  # another revision
+    assert pp(pins, UNIFORM, _rec(**{"a.json": "2" * 64}), _rec("d1"))  # another blob
+    assert pp(
+        pins, UNIFORM, _rec(**{"a.json": "1" * 64, "b.json": "3" * 64}), _rec("d1")
+    )  # an extra file
+    assert pp(pins, UNIFORM, _rec(), dict(_rec("d1"), files={}))  # a missing file
+    assert pp(pins, FABLE, _rec(), _rec("d1"))  # an entry without pins
+
+
+def test_the_reviewed_pins_cover_all_four_entries_and_match_the_registry():
+    import yaml
+
+    pins = orchestrate.load_pins()
+    entries = {e["name"]: e for e in yaml.safe_load(FIXTURE_TEXT)["models"]}
+    assert set(pins) == set(orchestrate.PICKS)
+    for pick, pin in pins.items():
+        assert pin["target"]["hf_path"] == entries[pick]["hf_path"], pick
+        assert pin["drafter"]["hf_path"] == entries[pick]["draft_model"], pick
+        for role in ("target", "drafter"):
+            assert len(pin[role]["revision"]) == 40 and pin[role]["files"], (pick, role)
+            assert all(len(sha) == 64 for sha in pin[role]["files"].values())
