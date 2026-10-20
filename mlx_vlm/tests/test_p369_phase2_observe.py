@@ -336,3 +336,103 @@ def test_recorder_uninstalls_everything():
         mtp._MTPVerifyResult.commit,
         mtp._mtp_commit_pending_token,
     )
+
+
+# ------------------------------------------------------------------ smoke 3 (P398): rows after an emission cut
+def _budget_setup():
+    from test_mtp_thinking_budget import THINKING_PROMPT, ThinkingTokenizer
+
+    lm = hybrid_lm(logit_scale=4.0)
+    model = fake_model(lm)
+    free, _ = turn(model, THINKING_PROMPT, PromptCacheState(), n=16)
+    return lm, model, list(free), THINKING_PROMPT, ThinkingTokenizer
+
+
+def _budget_on(budget, n=12):
+    """MTP-ON with a full-accept drafter proposing the UNBUDGETED path, so a block runs across the trip."""
+    lm, model, free, prompt, tokenizer = _budget_setup()
+    drafter = mtp_drafter(lm)
+    scripted(drafter, lambda p: free[p] if p < len(free) else None, high=True, vocab=64)
+    kw = dict(tokenizer=tokenizer(), thinking_budget=budget, enable_thinking=True)
+    with observe.Recorder(mode="on") as rec:
+        emitted, _ = turn(
+            model, prompt, PromptCacheState(), drafter=drafter, n=n, seed=5, **kw
+        )
+    plain, _ = turn(model, prompt, PromptCacheState(), n=n, seed=5, **kw)
+    assert list(emitted) == list(plain)  # production: MTP emits plain's sequence
+    return rec, list(emitted)
+
+
+@pytest.mark.parametrize("budget", range(0, 8))
+def test_on_rows_stop_at_each_blocks_emission_cut_and_forced_tokens_are_recorded(
+    budget,
+):
+    """A thinking-budget trip cuts a verified block; its rows past the cut are conditioned on drafts that
+    were replaced (unreachable history) and forced tokens are emitted with no sampler call — so the ON
+    recorder must keep only each block's first n_emit rows and list the forced tokens (smoke 3: a stale
+    row at the forced ``</think>`` position read as an E1c row mismatch with TV 1)."""
+    from test_mtp_thinking_budget import CLOSE, NEWLINE
+
+    rec, emitted = _budget_on(budget)
+    rows, missing = compare.latest_rows(rec.rows, len(emitted))
+    trip = next(
+        i for i in range(len(emitted) - 1) if emitted[i : i + 2] == [NEWLINE, CLOSE]
+    )
+    assert trip in missing and trip + 1 in missing, (
+        trip,
+        missing,
+    )  # no stale row survives
+    assert rec.forced[:2] == [NEWLINE, CLOSE], rec.forced
+    # exactly the forced emissions have no ON row, in order
+    assert [emitted[p] for p in missing] == rec.forced[: len(missing)], (
+        missing,
+        rec.forced,
+    )
+    assert len(rec.forced) - len(missing) in (0, 1)
+    got = compare.forced_positions(rec, emitted, finish_reason="length")
+    assert got == missing
+
+
+def test_forced_positions_refuse_inconsistent_bookkeeping():
+    rec = type("R", (), {})()
+    rec.rows = [(0, None), (1, None), (3, None)]
+    rec.forced = [63]
+    assert compare.forced_positions(rec, [5, 6, 63, 7], finish_reason="stop") == [2]
+    for forced, tokens, finish in (
+        (
+            [62],
+            [5, 6, 63, 7],
+            "stop",
+        ),  # the missing position's token is not the forced one
+        ([], [5, 6, 63, 7], "stop"),  # a missing row with no forced emission
+        (
+            [63, 62],
+            [5, 6, 63, 7],
+            "stop",
+        ),  # an unemitted forced pop needs a length finish
+        ([63, 62, 61], [5, 6, 63, 7], "length"),
+    ):
+        rec.forced = forced
+        with pytest.raises(RuntimeError, match="forced"):
+            compare.forced_positions(rec, tokens, finish_reason=finish)
+    rec.forced = [63, 62]
+    assert compare.forced_positions(rec, [5, 6, 63, 7], finish_reason="length") == [2]
+
+
+def test_compare_streams_excludes_only_the_given_positions():
+    def row(hot):
+        return compare.as_record(
+            mx.array([4.0 if j == hot else 0.0 for j in range(32)])
+        )
+
+    rows = [(i, row(i)) for i in range(4)]
+    off = list(rows)
+    off[2] = (2, row(9))
+    assert not compare.compare_streams(rows, off, 4, PARAMS)["pass"]
+    rep = compare.compare_streams(
+        [r for r in rows if r[0] != 2], off, 4, PARAMS, exclude=[2]
+    )
+    assert rep["pass"] and rep["excluded"] == [2] and rep["compared"] == 3, rep
+    # an excluded position never hides a missing row elsewhere
+    rep = compare.compare_streams(rows[:2], off, 4, PARAMS, exclude=[2])
+    assert not rep["pass"] and rep["missing_on"] == [3]
