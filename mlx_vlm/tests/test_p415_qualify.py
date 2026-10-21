@@ -1170,3 +1170,17 @@ def test_r3_f1_an_unreadable_power_log_is_a_problem_not_no_outage():
     assert qualify.power_log_problems(1, "")
     assert qualify.power_log_problems(0, "garbage without power-source lines\n")
     assert qualify.power_log_problems(0, PMSET) == []
+
+
+# ------------------------------------------------------------------ R7 smoke 1 (P394: smoke-found, no review round)
+def test_smoke1_the_generation_seed_is_read_from_the_sampler_generate_step_receives():
+    """R7 smoke 1: on the cached path the seed reaches ``generate_step`` inside its sampler
+    (``_PositionedTargetSampler(seed=args.seed)``); ``stream_generate`` consumes the ``seed`` keyword itself.
+    """
+    from types import SimpleNamespace
+
+    from p369_phase2 import worker
+
+    assert worker.generation_seed(dict(sampler=SimpleNamespace(seed=7))) == 7
+    assert worker.generation_seed(dict(sampler=SimpleNamespace(seed=None), seed=7)) == 7
+    assert worker.generation_seed(dict(sampler=object())) is None
