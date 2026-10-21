@@ -509,7 +509,15 @@ def test_t7_the_run_exits_nonzero_unless_every_entry_completed():
 
 
 # ------------------------------------------------------------------ T7 / T11: the driver's lifecycle (orchestrator mocked)
-def _drive(tmp_path, monkeypatch, run_job, names=(FABLE, STATIC)):
+def _drive(
+    tmp_path,
+    monkeypatch,
+    run_job,
+    names=(FABLE, STATIC),
+    keep_refs=False,
+    console=None,
+    release=None,
+):
     import argparse
 
     from p369_phase2 import orchestrate
@@ -518,7 +526,7 @@ def _drive(tmp_path, monkeypatch, run_job, names=(FABLE, STATIC)):
     blocks = {FABLE: FABLE_ENTRY, STATIC: STATIC_ENTRY}
     for name, value in dict(
         acquire_lock=lambda lock: 3,
-        release_lock=lambda fd: None,
+        release_lock=release or (lambda fd: None),
         lock_path=lambda env: tmp_path / ".lock",
         preflight=lambda args, out: dict(problems=[]),
         read_registry=lambda p: registry,
@@ -535,7 +543,8 @@ def _drive(tmp_path, monkeypatch, run_job, names=(FABLE, STATIC)):
 
     monkeypatch.setattr(registry_states, "fixture_text", lambda d: "fx")
     monkeypatch.setattr(registry_states, "classify", lambda text, fx: set())
-    monkeypatch.setattr(qualify, "load_references", lambda p, **k: {})
+    if not keep_refs:
+        monkeypatch.setattr(qualify, "load_references", lambda p, **k: {})
     monkeypatch.setattr(qualify, "_resolve_ref", lambda path, ref: "a" * 40)
     monkeypatch.setattr(
         qualify,
@@ -547,13 +556,17 @@ def _drive(tmp_path, monkeypatch, run_job, names=(FABLE, STATIC)):
     monkeypatch.setattr(
         qualify,
         "console_script_info",
-        lambda stack: dict(
-            shebang=str(Path(stack) / ".venv" / "bin" / "python"),
-            entry="mlx_vlm.server:main",
-            stack_mlx_vlm="x",
+        console
+        or (
+            lambda stack: dict(
+                shebang=str(Path(stack) / ".venv" / "bin" / "python"),
+                entry="mlx_vlm.server:main",
+                stack_mlx_vlm="x",
+            )
         ),
     )
     monkeypatch.setattr(qualify, "_last_tick_age", lambda p: 1.0)
+    monkeypatch.setattr(qualify, "_pmset_log", lambda: "")  # hermetic: never the box's own power log
     monkeypatch.setattr(qualify, "interference", lambda o: dict(ok=True, why=None))
     monkeypatch.setattr(qualify, "binding_problems", lambda *a: [])
     monkeypatch.setattr(qualify, "_git_head", lambda p: "h")
@@ -893,3 +906,204 @@ def test_d6_d13_an_interruption_after_the_job_never_leaves_completed(
         _drive(tmp_path, monkeypatch, _good, names=(FABLE,))
     report = json.loads((tmp_path / "run" / "report.json").read_text())
     assert report["entries"][FABLE]["status"] == "NOT_RUN"
+
+
+# ------------------------------------------------------------------ P415 code round 2 (D5 D10 D11 D12 D13 E1 E2)
+def _good_snapshots(job, *a, **k):
+    """``check_snapshots``' REAL return shape: ``{flag: revision}`` (code round 2 E1)."""
+    out = _good(job)
+    out["snapshots"] = {"--model": "rev-model"}
+    return out
+
+
+def test_e1_a_completed_entry_with_a_reference_uses_the_real_snapshot_shape(
+    tmp_path, monkeypatch
+):
+    refs = {
+        FABLE: dict(
+            peak_gb=37.97,
+            source="x",
+            source_path="docs/x.md",
+            source_blob="0" * 40,
+            fingerprint={},
+        )
+    }
+    monkeypatch.setattr(qualify, "load_references", lambda p, **k: refs)
+    code, report = _drive(
+        tmp_path, monkeypatch, _good_snapshots, names=(FABLE,), keep_refs=True
+    )
+    assert code == 0, report["entries"][FABLE]
+    ref = report["entries"][FABLE]["reference"]
+    assert ref["comparable"] is False and "snapshot" in ref["differs"]
+
+
+def test_e2_the_qualification_boot_limit_is_600_s(tmp_path, monkeypatch):
+    from p369_phase2 import orchestrate
+
+    seen = []
+
+    def run_job(job, *a, **k):
+        seen.append(orchestrate.BOOT_TIMEOUT_S)
+        return _good(job)
+
+    _drive(tmp_path, monkeypatch, run_job, names=(FABLE,))
+    assert seen == [600] and orchestrate.BOOT_TIMEOUT_S == 900  # restored after the run
+
+
+def test_d5_a_console_script_changed_during_the_run_invalidates(tmp_path, monkeypatch):
+    calls = []
+
+    def info(stack):
+        calls.append(1)
+        return dict(
+            shebang=str(Path(stack) / ".venv" / "bin" / "python"),
+            entry="mlx_vlm.server:main" if len(calls) == 1 else "mlx_lm.server:main",
+            stack_mlx_vlm="x",
+        )
+
+    code, report = _drive(tmp_path, monkeypatch, _good, names=(FABLE,), console=info)
+    assert code == 1 and report["entries"][FABLE]["status"] != "COMPLETED"
+
+
+def test_d10_the_summary_must_be_a_real_campaign_artifact(tmp_path):
+    root = tmp_path / "p369" / "phase2"
+    run = root / "20261020-x-full-qwen36"
+    run.mkdir(parents=True)
+    s = _summary()
+    (run / "summary.json").write_text(json.dumps(s))
+    (run / "manifest.json").write_text(
+        json.dumps(dict(fork_head="f" * 40, production="7207179b"))
+    )
+    ok = dict(is_commit=lambda c: True, contains_reviewed=lambda c: True)
+    assert (
+        qualify.summary_artifact_problems(run / "summary.json", s, root=root, **ok)
+        == []
+    )
+    outside = tmp_path / "elsewhere.json"
+    outside.write_text(json.dumps(s))
+    assert qualify.summary_artifact_problems(outside, s, root=root, **ok)
+    assert qualify.summary_artifact_problems(
+        run / "summary.json",
+        s,
+        root=root,
+        is_commit=lambda c: False,
+        contains_reviewed=lambda c: True,
+    )
+    assert qualify.summary_artifact_problems(
+        run / "summary.json",
+        s,
+        root=root,
+        is_commit=lambda c: True,
+        contains_reviewed=lambda c: False,
+    )
+    (run / "manifest.json").write_text(json.dumps(dict(fork_head="e" * 40)))
+    assert qualify.summary_artifact_problems(run / "summary.json", s, root=root, **ok)
+
+
+def test_d11_the_blob_must_belong_to_the_named_path_and_the_fingerprint_names_weights_and_harness():
+    refs = {
+        FABLE: dict(
+            peak_gb=1.0,
+            source="x",
+            source_path="docs/x.md",
+            source_blob="0" * 40,
+            fingerprint={},
+        )
+    }
+    seen = []
+    qualify.load_references(
+        Path(__file__), table=refs, blob_exists=lambda b, p: seen.append((b, p)) or True
+    )
+    assert seen == [("0" * 40, "docs/x.md")]
+    with pytest.raises(ValueError, match="source_path"):
+        qualify.load_references(
+            Path(__file__),
+            table={FABLE: dict(refs[FABLE], source_path=None)},
+            blob_exists=lambda b, p: True,
+        )
+    rec = dict(
+        _record(),
+        snapshots={"--model": "r1"},
+        weights={"--model": "w" * 64},
+        harness="a" * 40,
+    )
+    fp = qualify.fingerprint_of(rec, qualify.expected_config(FABLE_ENTRY))
+    assert (
+        fp["snapshot"] == {"--model": "r1"}
+        and fp["weights"] == {"--model": "w" * 64}
+        and fp["harness"] == "a" * 40
+    )
+
+
+def test_d12_a_monitor_tick_older_than_one_period_plus_slack_is_stale():
+    assert qualify.monitor_problems(alive=True, last_tick_age_s=599)
+    assert qualify.monitor_problems(alive=True, last_tick_age_s=300) == []
+
+
+def test_d13_the_lock_is_released_even_when_the_cleanup_itself_fails(
+    tmp_path, monkeypatch
+):
+    released = []
+    monkeypatch.setattr(
+        qualify, "_atomic", lambda path, obj: (_ for _ in ()).throw(OSError("disk"))
+    )
+    with pytest.raises(OSError):
+        _drive(
+            tmp_path,
+            monkeypatch,
+            _good,
+            names=(FABLE,),
+            release=lambda fd: released.append(fd),
+        )
+    assert released == [3]
+
+
+# ------------------------------------------------------------------ P418: power-source changes inside an entry (pmset log)
+PMSET = """2026-10-20 16:37:24 -0700 Assertions          \tSummary- [System: PrevIdle] Using Batt(Charge: 100)
+2026-10-20 16:37:30 -0700 Assertions          \tSummary- [System: PrevIdle] Using AC(Charge: 100)
+2026-10-20 18:50:22 -0700 Assertions          \tSummary- [System: PrevIdle] Using Batt(Charge: 80)
+2026-10-20 18:51:53 -0700 Assertions          \tSummary- [System: PrevIdle] Using AC(Charge: 78)
+"""
+
+
+def _ts(text):
+    import datetime
+
+    return datetime.datetime.strptime(text, "%Y-%m-%d %H:%M:%S %z").timestamp()
+
+
+def test_p418_a_battery_interval_inside_the_entry_window_is_found():
+    got = qualify.battery_intervals(
+        PMSET, _ts("2026-10-20 18:40:00 -0700"), _ts("2026-10-20 19:00:00 -0700")
+    )
+    assert got == [("2026-10-20 18:50:22 -0700", "2026-10-20 18:51:53 -0700")]
+    assert (
+        qualify.battery_intervals(
+            PMSET, _ts("2026-10-20 16:38:00 -0700"), _ts("2026-10-20 18:00:00 -0700")
+        )
+        == []
+    )
+
+
+def test_p418_an_entry_that_starts_on_battery_or_never_returns_is_caught():
+    tail = (
+        PMSET
+        + "2026-10-20 19:10:00 -0700 Assertions \tSummary- [System: X] Using Batt(Charge: 70)\n"
+    )
+    got = qualify.battery_intervals(
+        tail, _ts("2026-10-20 19:15:00 -0700"), _ts("2026-10-20 19:20:00 -0700")
+    )
+    assert got == [("2026-10-20 19:10:00 -0700", None)]
+
+
+def test_p418_a_battery_interval_makes_the_entry_invalid():
+    assert (
+        qualify.entry_status(
+            pre=dict(ok=True),
+            post=dict(ok=True),
+            error=None,
+            problems=[],
+            power_events=[("a", "b")],
+        )["status"]
+        == "INVALID"
+    )
