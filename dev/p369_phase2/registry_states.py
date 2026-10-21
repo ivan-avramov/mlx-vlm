@@ -1,7 +1,7 @@
 """P369 v13 (V5 / V10): the ONE byte-state generator for the stack registry (pure; no MLX import).
 
-The pinned golden fixture (`mlx_vlm/tests/fixtures/stack_registry_golden.yaml`, the last MTP-ON registry, stack `7021bdbb`)
-is the reference. Each MTP-certified entry's MTP-OFF form is an ATOMIC raw-byte substitution of its block: the C177 lines
+The pinned golden fixture (`mlx_vlm/tests/fixtures/stack_registry_golden.yaml`, the shipped-when-ON registry: stack `59d7802f`
+with every substitution below reversed, P422) is the reference. Each MTP-certified entry's MTP-OFF form is an ATOMIC raw-byte substitution of its block: the C177 lines
 for the two Qwen3.8-27B picks, the P406 / C191 lines for `Ornith-1.0-35B-mlx-uniform-4bit` and
 `Qwen3.6-27B-Opus-Distill-OptiQ-4bit`. The accepted live registries are exactly the 2**4 = 16 combinations; `classify`
 returns the set of OFF entries or None, `overlay_on` turns one entry ON whatever the others are. `Campaign.prepare`, the
@@ -14,7 +14,7 @@ from pathlib import Path
 
 FIXTURE_NAME = "stack_registry_golden.yaml"
 FIXTURE_MARKER = "# ---- BEGIN VERBATIM main_models.yaml ----\n"
-FIXTURE_SHA256 = "1d07c9dd0ebf5058b526e1d78fee2a88f8e92976323ddf0e8d5503dcaa18253d"
+FIXTURE_SHA256 = "96067c3d019375a19f28bd9546f45da9907da62ea75c2f8649deffd81b6ebfdb"
 _C177 = (
     "  # P369 INTERIM (C177 2026-10-17): MTP OFF on the daily driver until the MTP EOS/budget fixes ship and are "
     "re-certified"
