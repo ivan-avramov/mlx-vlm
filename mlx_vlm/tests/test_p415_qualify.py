@@ -1184,3 +1184,23 @@ def test_smoke1_the_generation_seed_is_read_from_the_sampler_generate_step_recei
     assert worker.generation_seed(dict(sampler=SimpleNamespace(seed=7))) == 7
     assert worker.generation_seed(dict(sampler=SimpleNamespace(seed=None), seed=7)) == 7
     assert worker.generation_seed(dict(sampler=object())) is None
+
+
+def test_smoke2_only_the_requests_own_generate_step_call_is_recorded():
+    """R7 smoke 2: session retention (fork M48 ``_prefill_canonical_suffix``) runs a SECOND, prompt-only
+    ``generate_step`` after the request (no seed, temperature 0); it must not overwrite the request's seed / cache.
+    """
+    from types import SimpleNamespace
+
+    from p369_phase2 import worker
+
+    rec, state = {}, {}
+    request_cache, retention_cache = object(), object()
+    worker.note_generate_step(
+        rec, state, dict(prompt_cache=request_cache, sampler=SimpleNamespace(seed=7))
+    )
+    worker.note_generate_step(
+        rec, state, dict(prompt_cache=retention_cache, max_tokens=0, temperature=0.0)
+    )
+    assert rec["generate_seed"] == 7 and state["cache"] is request_cache
+    assert rec["generate_calls"] == 2
