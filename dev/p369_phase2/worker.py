@@ -187,6 +187,28 @@ def _quantized_shapes(module):
     )
 
 
+BIND_CHILDREN = (
+    "_input_embed",
+    "_lm_head_fn",
+)  # a bound drafter's references to the TARGET's modules
+
+
+def _drafter_quantized_shapes(drafter):
+    """P417: ``_quantized_shapes`` over the drafter's OWN modules — never the target embedding / head it is bound to."""
+    own = [
+        m
+        for name, m in drafter.named_modules()
+        if not name.split(".", 1)[0] in BIND_CHILDREN
+    ]
+    return sorted(
+        {
+            (int(m.bits), int(m.group_size))
+            for m in own
+            if hasattr(m, "bits") and hasattr(m, "group_size")
+        }
+    )
+
+
 def _callable_identity(fn):
     """A head callable by what it IS: a module (``["module", id]``) or a bound method (``["method", id(owner), name,
     id(function)]`` — code round 2 M3: a same-named method of another function is not the head).
@@ -221,7 +243,9 @@ def _bank_shapes(drafter):
     return sorted(list(b) for b in out)
 
 
-def drafter_identity(drafter, *, requested_block=None, quantized=_quantized_shapes):
+def drafter_identity(
+    drafter, *, requested_block=None, quantized=_drafter_quantized_shapes
+):
     """P369 v13 V11: what the LOADED drafter is (not its config file): type, layer classes and depth, dims, MoE
     shape, quantization, and what it is bound to."""
     tc = drafter.config.text_config
