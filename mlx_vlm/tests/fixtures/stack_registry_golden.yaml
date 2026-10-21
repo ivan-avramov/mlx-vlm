@@ -1,10 +1,13 @@
-# PINNED COPY of the stack's main_models.yaml at stack 7021bdbb — the LAST MTP-ON registry (the last commit
-# changing it before C177 78a730fe; byte-identical to 78a730fe^ = 98a14f2e), i.e. the shipped-when-ON tuple the P369 tests
-# certify (P387). Everything after the BEGIN marker is a VERBATIM copy; its sha256 is recorded in the golden
-# test. The ordinary suite reads ONLY this file; the opt-in live check (MLX_REQUIRE_STACK_REGISTRY=1) accepts
-# a live registry that equals it or equals its C177 interim (test_mtp_verify_scan.INTERIM_LINES). REFRESH
-# when the shipped-when-ON registry changes: copy it below the marker, update the recorded sha, the source
-# commit above and INTERIM_LINES, and re-check the first-pick expectations.
+# PINNED COPY of the stack's main_models.yaml in its shipped-when-ON form (P422): stack 59d7802f (C202 — all four
+# MTP-certified entries OFF) with every dev/p369_phase2/registry_states.py ENTRY_OFF substitution reversed, i.e. all
+# four entries MTP-ON — the shipped-when-ON tuple the P369 tests certify (P387). It parses identically to the previous
+# fixture (stack 7021bdbb, the last real MTP-ON registry): the difference is comments only (two C202 PROVISIONAL blocks).
+# Everything after the BEGIN marker is VERBATIM; its sha256 is pinned in registry_states.FIXTURE_SHA256 and
+# test_mtp_verify_scan.FIXTURE_SHA256. The ordinary suite reads ONLY this file; the opt-in live check
+# (MLX_REQUIRE_STACK_REGISTRY=1) accepts exactly the 16 per-entry ON / OFF states (registry_states.classify). REFRESH on
+# any stack registry edit outside those 16 states (comments included): reverse the OFF substitutions of the live file,
+# check it parses as intended, copy it below the marker, update both pinned shas and the source commit above and in
+# test_mtp_verify_scan.FIXTURE_SOURCE, and re-check the first-pick expectations.
 # ---- BEGIN VERBATIM main_models.yaml ----
 # APPROVED C57 2026-09-09: PROVISIONAL B order (model, tune, predictor):
 # 1 Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed @t0.5 medium, certified MTP (C61/M36 2026-09-10).
@@ -219,6 +222,9 @@ models:
     # vscode/zed, which carry no sampling). Applied only when a request omits the field.
     # Coding op-temp 0.3. presence_penalty 0.0 lets suffix engage. See docs FU-2.
     generation_defaults:
+      # PROVISIONAL (C189 / C202 2026-10-21): from the P405 fork bump (mlx-vlm 2e66d89d) this entry is SERVED with TurboQuant
+      #   4-bit KV; its certifications since 2026-08-23 describe AFFINE 4-bit KV (P405) — provisional until the P405 R6 matched
+      #   affine-vs-TurboQuant quality re-certification. R7 2026-10-21: 256K capacity MTP-ON 30.16 GB (candidate production 7207179b).
       temperature: 0.3
       top_p: 0.95
       top_k: 20
@@ -367,6 +373,9 @@ models:
     draft_kind: mtp
     draft_model: caslca/Qwen3.8-27B-mlx-uniform-4bit-mtp-drafter  # UPLOADED 2026-08-26 (public; card still says PROBE-ONLY — needs the certified update)
     generation_defaults:
+      # PROVISIONAL (C189 / C202 2026-10-21): from the P405 fork bump (mlx-vlm 2e66d89d) this entry is SERVED with TurboQuant
+      #   4-bit KV; its certifications since 2026-08-23 describe AFFINE 4-bit KV (P405) — provisional until the P405 R6 matched
+      #   affine-vs-TurboQuant quality re-certification. R7 2026-10-21: 256K capacity MTP-ON 28.27 GB (candidate production 7207179b).
       # CERTIFIED C84 runtime 2026-09-14: 522671c4/b632280; tool/vision smoke PASS; 20 paired outputs unchanged.
       # Bounded integration scope; measured timing costs and broader-quality limits: docs/stack-certification-2026-09-14.md.
       # CERTIFIED M40 2026-09-13: predictor-ON certified on EVERY axis backing the B and C picks (C71 rule) — Math500 99 % both
