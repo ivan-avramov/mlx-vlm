@@ -509,9 +509,14 @@ def _drive(tmp_path, monkeypatch, run_job, names=(FABLE, STATIC)):
     monkeypatch.setattr(qualify, "interference", lambda o: dict(ok=True, why=None))
     monkeypatch.setattr(qualify, "binding_problems", lambda *a: [])
     monkeypatch.setattr(qualify, "_git_head", lambda p: "h")
-    monkeypatch.setattr(
-        qualify, "full_command", lambda stack, path, name: (_cmd(blocks[name]), "m")
-    )
+
+    def full_command(
+        stack, path, name
+    ):  # the shipping command, under the run's own stack venv
+        cmd = _cmd(blocks[name])
+        return [str(Path(stack) / ".venv" / "bin" / "mlx_vlm.server"), *cmd[1:]], "m"
+
+    monkeypatch.setattr(qualify, "full_command", full_command)
     monkeypatch.setattr(
         "yaml.safe_load", lambda text: dict(models=list(blocks.values()))
     )

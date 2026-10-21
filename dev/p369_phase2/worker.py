@@ -441,6 +441,8 @@ class Capture:
                     ],
                     finish_reason=getattr(last, "finish_reason", None),
                     generation_tokens=getattr(last, "generation_tokens", None),
+                    prompt_tps=getattr(last, "prompt_tps", None),  # P415
+                    generation_tps=getattr(last, "generation_tps", None),  # P415
                     prompt_tokens=getattr(last, "prompt_tokens", None),
                     cached_tokens=getattr(last, "cached_tokens", None),
                 )
@@ -1270,6 +1272,249 @@ def compare_pair(ref, recorder, n, params, exclude=()):
     )
 
 
+def record_memory_limits():
+    """P415 (plan v4 Q2): the memory / cache limits the CLI sets, recorded from its own ``mx.set_*`` calls, plus the
+    inputs of mlx-serve's limit rule (physical memory, the recommended working set)."""
+    import mlx.core as mx
+
+    out = dict(set_memory_limit=[], set_cache_limit=[])
+    for name in ("set_memory_limit", "set_cache_limit"):
+        real = getattr(mx, name)
+
+        def recording(value, *a, _real=real, _name=name, **k):
+            out[_name].append(int(value))
+            return _real(value, *a, **k)
+
+        setattr(mx, name, recording)
+    try:
+        out["phys"] = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (ValueError, AttributeError, OSError):
+        out["phys"] = None
+    out["rec_wss"] = (
+        int(mx.device_info().get("max_recommended_working_set_size", 0)) or None
+    )
+    return out
+
+
+def _leaf_capacity(leaf):
+    """The allocated sequence length of a KV leaf: the largest dim 2 of its 4-D backing arrays (None if it has none)."""
+    import mlx.core as mx
+
+    dims = []
+
+    def walk(value):
+        if isinstance(value, mx.array):
+            if value.ndim == 4:
+                dims.append(int(value.shape[2]))
+        elif isinstance(value, (list, tuple)):
+            for v in value:
+                walk(v)
+        elif isinstance(value, dict):
+            for v in value.values():
+                walk(v)
+
+    for value in vars(leaf).values():
+        walk(value)
+    return max(dims) if dims else None
+
+
+def _find_key(obj, key):
+    if isinstance(obj, dict):
+        if key in obj:
+            return obj[key]
+        for v in obj.values():
+            got = _find_key(v, key)
+            if got is not None:
+                return got
+    elif isinstance(obj, list):
+        for v in obj:
+            got = _find_key(v, key)
+            if got is not None:
+                return got
+    return None
+
+
+def qualify_request(client, capture, rg, spec, memory):
+    """P415 (plan v5): ONE request at the largest accepted prompt with the registry's own settings (only the seed set),
+    observed where production consumes each setting: the resolved arguments, the ids actually prefilled, the prefill
+    chunk sequence, the prefill / decode boundary (Q11), the retire shrink, the lazy-embedding path, the fused attention
+    counter and every KV leaf's allocated capacity at the boundary."""
+    import mlx.core as mx
+    from mlx_vlm.generate import dispatch
+    from mlx_vlm.models import cache as cache_mod
+    from mlx_vlm.server import generation
+    from mlx_vlm.speculative.cache_state import iter_leaf_caches
+
+    base = dict(model=spec["model"], stream=False)
+    count = lambda text: prompt_tokens(  # noqa: E731
+        client, [dict(role="user", content=text)], base
+    )
+    text, tokens = size_prompt(
+        count, spec["target"], prefix=spec["prefix"], suffix=spec["suffix"]
+    )
+    if text is None:
+        raise RuntimeError(f"could not size the prompt to {spec['target']} ({tokens})")
+    messages = [dict(role="user", content=text)]
+    sized = prompt_ids(client, messages, base)
+    rec = dict(
+        prompt=dict(sized=dict(tokens=len(sized), sha256=token_digest(sized))),
+        chunks=[],
+        prompt_step_tokens=None,
+        boundary_seen=False,
+        peaks=dict(prefill=None, decode=None, retire=None),
+        lazy_calls=0,
+        shrink_calls=0,
+        memory=memory,
+    )
+    state = dict(phase="prefill", cache=None)
+    patched = []
+
+    def patch(owner, name, value):
+        patched.append((owner, name, getattr(owner, name)))
+        setattr(owner, name, value)
+
+    def boundary():  # Q11: after the prompt step, before the first decode step
+        if state["phase"] != "prefill":
+            return
+        mx.synchronize()
+        rec["peaks"]["prefill"] = int(mx.get_peak_memory())
+        rec["capacities"] = [
+            dict(leaf=f"leaf.{i}", cls=type(c).__name__, capacity=_leaf_capacity(c))
+            for i, c in enumerate(iter_leaf_caches(state["cache"] or []))
+        ]
+        mx.reset_peak_memory()
+        state["phase"] = "decode"
+        rec["boundary_seen"] = True
+
+    budget = generation._apply_generation_budget
+
+    def recording_budget(args, prompt_tokens_):
+        budget(args, prompt_tokens_)
+        rec["resolved"] = {
+            k: getattr(args, k, None)
+            for k in (
+                *spec["generation_defaults"],
+                "max_tokens",
+                "thinking_budget",
+                "seed",
+            )
+        }
+
+    prepare = dispatch._prepare_generation_inputs
+
+    def recording_prepare(*a, **k):
+        out = prepare(*a, **k)
+        ids = _ids_list(out[0])
+        rec["prompt"]["prepared"] = dict(tokens=len(ids), sha256=token_digest(ids))
+        return out
+
+    step = dispatch.generate_step
+
+    def recording_step(*a, **k):
+        state["cache"] = k.get("prompt_cache")
+        rec["generate_seed"] = k.get("seed")
+        yield from step(*a, **k)
+
+    lm_cls = type(rg.model.language_model)
+    lm_call = lm_cls.__call__
+
+    def recording_lm(self, *a, **k):
+        if state["phase"] == "prefill":
+            if "n_to_process" in k:
+                rec["chunks"].append(int(k["n_to_process"]))
+            elif rec["prompt_step_tokens"] is None:
+                x = a[0] if a else k.get("inputs")
+                rec["prompt_step_tokens"] = int(x.shape[-1]) if x is not None else None
+            else:
+                boundary()
+        return lm_call(self, *a, **k)
+
+    lazy_owner = type(rg.model)
+    lazy = getattr(lazy_owner, "get_lazy_text_embeddings", None)
+
+    def recording_lazy(self, *a, **k):
+        out = lazy(self, *a, **k)
+        if out is not None:
+            rec["lazy_calls"] += 1
+        return out
+
+    shrinkers = [
+        cls
+        for cls in (cache_mod.PreallocKVCache, cache_mod.PreallocQuantizedKVCache)
+        if "shrink_to_offset" in vars(cls)
+    ]
+
+    def recording_shrink(real):
+        def wrapped(self, *a, **k):
+            if (
+                state["phase"] == "decode"
+            ):  # the retire phase starts at the first shrink
+                mx.synchronize()
+                rec["peaks"]["decode"] = int(mx.get_peak_memory())
+                mx.reset_peak_memory()
+                state["phase"] = "retire"
+            rec["shrink_calls"] += 1
+            return real(self, *a, **k)
+
+        return wrapped
+
+    try:
+        patch(generation, "_apply_generation_budget", recording_budget)
+        patch(dispatch, "_prepare_generation_inputs", recording_prepare)
+        patch(dispatch, "generate_step", recording_step)
+        patch(lm_cls, "__call__", recording_lm)
+        if lazy is not None:
+            patch(lazy_owner, "get_lazy_text_embeddings", recording_lazy)
+        for cls in shrinkers:
+            patch(
+                cls, "shrink_to_offset", recording_shrink(vars(cls)["shrink_to_offset"])
+            )
+        drafter = getattr(rg, "draft_model", None)
+        if drafter is not None:  # an MTP round's first work is the drafter's
+            draft = type(drafter).draft_block
+
+            def recording_draft(self, *a, **k):
+                boundary()
+                return draft(self, *a, **k)
+
+            patch(type(drafter), "draft_block", recording_draft)
+        mx.synchronize()
+        mx.reset_peak_memory()
+        got = post(
+            client,
+            dict(base, messages=messages, seed=spec["seed"]),
+            f"p415-{uuid.uuid4().hex}",
+            capture,
+            spec["timeout_s"],
+        )
+        mx.synchronize()
+        end = int(mx.get_peak_memory())
+        if state["phase"] == "retire":
+            rec["peaks"]["retire"] = end
+        elif state["phase"] == "decode":
+            rec["peaks"]["decode"] = end
+    finally:
+        while patched:
+            owner, name, value = patched.pop()
+            setattr(owner, name, value)
+    release_session(got["chat_id"])
+    final = got["final"]
+    rec["prompt"]["preprocessed"] = dict(got["prompt"])
+    rec.update(
+        cached_tokens=final.get("cached_tokens"),
+        backend=capture.backend,
+        finish_reason=final.get("finish_reason"),
+        generation_tokens=final.get("generation_tokens"),
+        rates=dict(
+            prefill_tps=final.get("prompt_tps"), decode_tps=final.get("generation_tps")
+        ),
+        sdpa_forced=_find_key(got["response"], "sdpa_forced"),
+        server_defaults=generation.get_server_generation_defaults(),
+        wall_s=got["wall_s"],
+    )
+    return rec
+
+
 def run_job(job, out_dir, result):
     global ROUTED_MODEL
     from p369_phase2 import (  # function-level: every branch uses them (`python -I`)
@@ -1280,6 +1525,9 @@ def run_job(job, out_dir, result):
 
     ROUTED_MODEL = argv_model(job["argv"])
 
+    memory = (
+        record_memory_limits() if job["mode"] == "qualify" else None
+    )  # P415: before the CLI sets them
     client = boot(job["argv"])
     with client, ExitStack() as stack:
         state = served_state()
@@ -1347,6 +1595,15 @@ def run_job(job, out_dir, result):
                 result["requests"].append(
                     dict(name=spec["name"], tokens=len(ids), sha256=token_digest(ids))
                 )
+            return
+        if job["mode"] == "qualify":  # P415 (plan v5): one maximal request, as shipped
+            spec = job["requests"][0]
+            write_progress(
+                out_dir, index=0, name=spec["name"], deadline_s=spec["timeout_s"]
+            )
+            record = qualify_request(client, capture, rg, spec, memory)
+            record["drafter_live_checks"] = result.get("drafter_live_checks")
+            result["requests"].append(dict(name=spec["name"], qualify=record))
             return
         probe = dict(probe_token=int(job["probe_token"]))
         params = job["params"]
