@@ -590,3 +590,246 @@ def test_t11_an_interruption_marks_the_rest_not_run(tmp_path, monkeypatch):
         _drive(tmp_path, monkeypatch, run_job)
     report = json.loads((tmp_path / "run" / "report.json").read_text())
     assert {e["status"] for e in report["entries"].values()} == {"NOT_RUN"}
+
+
+# ------------------------------------------------------------------ P415 code round 1 (D1–D13)
+UNIFORM_ENTRY = dict(
+    STATIC_ENTRY,
+    name=UNIFORM,
+    hf_path=f"caslca/{UNIFORM}",
+    draft_kind="mtp",
+    draft_model="/d/u",
+)
+
+
+def test_d1_an_omitted_verify_scan_is_the_default_policy_object_none():
+    """D1: production represents the default per-query scan as NO policy object (``served_state`` → None)."""
+    assert qualify.expected_config(UNIFORM_ENTRY)["verify_policy"] is None
+    assert qualify.expected_config(FABLE_ENTRY)["verify_policy"] == "joint_v1"
+
+
+def test_d2_the_record_producer_and_the_check_agree_on_memory_fields():
+    """D2: the check needs only what ``record_memory_limits`` records (no invented field)."""
+    from types import SimpleNamespace
+
+    from p369_phase2 import worker
+
+    calls = []
+    fake = SimpleNamespace(
+        set_memory_limit=lambda v: calls.append(("m", v)),
+        set_cache_limit=lambda v: calls.append(("c", v)),
+        device_info=lambda: dict(max_recommended_working_set_size=110 * 10**9),
+    )
+    mem, undo = worker.record_memory_limits(mx=fake)
+    fake.set_memory_limit(5)
+    undo()
+    assert mem["set_memory_limit"] == [5] and calls == [("m", 5)]
+    assert set(mem) == {"set_memory_limit", "set_cache_limit", "phys", "rec_wss"}
+    rec = _record()
+    rec["memory"] = dict(
+        set_memory_limit=[int(min(0.85 * 128e9, 110e9))],
+        set_cache_limit=[
+            qualify.expected_cache_limit(
+                FABLE_ENTRY_EXPECTED_HEADS, qualify.expected_config(FABLE_ENTRY)
+            )
+        ],
+        phys=128e9,
+        rec_wss=110e9,
+        heads=FABLE_ENTRY_EXPECTED_HEADS,
+    )
+    assert qualify.request_problems(rec, qualify.expected_config(FABLE_ENTRY)) == []
+
+
+FABLE_ENTRY_EXPECTED_HEADS = 24
+
+
+def _manifest(kinds):
+    return [
+        dict(path=str(i), kind=k, cls="X", batch=False) for i, k in enumerate(kinds)
+    ]
+
+
+def test_d3_the_measured_cache_must_be_the_exact_leaf_layout_with_exact_capacity():
+    want = qualify.expected_config(STATIC_ENTRY)  # TurboQuant 4-bit
+    template = _manifest(["ArraysCache", "native", "ArraysCache", "native", "native"])
+    good = [
+        dict(path="0", kind="ArraysCache", cls="ArraysCache", batch=False),
+        dict(
+            path="1",
+            kind="tq",
+            cls="TurboQuantKVCache",
+            batch=False,
+            bits=4.0,
+            key_bits=4.0,
+            value_bits=4.0,
+            mode="mse",
+        ),
+        dict(path="2", kind="ArraysCache", cls="ArraysCache", batch=False),
+        dict(
+            path="3",
+            kind="tq",
+            cls="TurboQuantKVCache",
+            batch=False,
+            bits=4.0,
+            key_bits=4.0,
+            value_bits=4.0,
+            mode="mse",
+        ),
+        dict(path="4", kind="native", cls="PreallocKVCache", batch=False),
+    ]
+    caps = {"1": 262144, "3": 262144, "4": 262144, "0": None, "2": None}
+    rec = _record(
+        sdpa_forced=0,
+        lazy_calls=0,
+        shrink_calls=0,
+        drafter_live_checks=None,
+        peaks=dict(prefill=30e9, decode=30.2e9, retire=None),
+        manifest=good,
+        template=template,
+        capacities_by_path=caps,
+    )
+    rec["memory"] = dict(
+        rec["memory"],
+        heads=24,
+        set_cache_limit=[qualify.expected_cache_limit(24, want)],
+    )
+    assert qualify.request_problems(rec, want) == []
+    affine = [dict(g) for g in good]
+    affine[1] = dict(
+        path="1",
+        kind="affine",
+        cls="QuantizedKVCache",
+        batch=False,
+        bits=4,
+        group_size=64,
+    )
+    assert any(
+        "layer 1" in p
+        for p in qualify.request_problems(dict(rec, manifest=affine), want)
+    )
+    assert any(
+        "capacity" in p
+        for p in qualify.request_problems(
+            dict(rec, capacities_by_path=dict(caps, **{"3": 262400})), want
+        )
+    )
+
+
+def test_d4_the_console_script_entry_point_is_the_booted_main():
+    good = dict(
+        shebang="/s/.venv/bin/python",
+        entry="mlx_vlm.server:main",
+        delegates_to_cli_main=True,
+    )
+    assert qualify.entry_point_problems(good, Path("/s/.venv/bin")) == []
+    for bad in (
+        dict(good, shebang="/other/python"),
+        dict(good, entry="mlx_lm.server:main"),
+        dict(good, delegates_to_cli_main=False),
+    ):
+        assert qualify.entry_point_problems(bad, Path("/s/.venv/bin")), bad
+
+
+def test_d5_the_fork_must_be_at_the_reviewed_head_and_the_stack_unchanged():
+    base = dict(fork_head="a" * 40, fork_clean=True, stack_head="s" * 40)
+    assert qualify.guard_problems(base, base, reviewed="a" * 40) == []
+    assert qualify.guard_problems(base, base, reviewed="b" * 40)
+    assert qualify.guard_problems(
+        base, dict(base, stack_head="t" * 40), reviewed="a" * 40
+    )
+    assert qualify.guard_problems(base, dict(base, fork_clean=False), reviewed="a" * 40)
+
+
+def test_d8_the_default_run_is_all_seven_and_needs_the_qwen36_evidence():
+    assert len(qualify.default_entries()) == 7 and QWEN36 in qualify.default_entries()
+
+
+def test_d9_the_auto_cache_limit_is_mlx_vlms_derivation():
+    want = qualify.expected_config(FABLE_ENTRY)
+    gb = -(-24 * 512 * 262144 * 2 // 10**9) + 2  # ceil + 2 GB margin
+    assert qualify.expected_cache_limit(24, want) == int(gb * 2**30)
+    rec = _record()
+    rec["memory"] = dict(rec["memory"], heads=24, set_cache_limit=[int(gb * 2**30) + 1])
+    assert any("cache limit" in p for p in qualify.request_problems(rec, want))
+
+
+def _summary(**changes):
+    s = dict(
+        phase="full",
+        status="PASS",
+        binding=dict(production="7207179b", fork_head="f" * 40, reviewed_head="f" * 40),
+        manifest=dict(production="7207179b", fork_head="f" * 40),
+        picks={QWEN36: dict(outcome=dict(e1c="PASS"), e2=dict(verdict="PASS"))},
+    )
+    s.update(changes)
+    return s
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        dict(
+            binding=dict(
+                production="4e6d0e03", fork_head="f" * 40, reviewed_head="f" * 40
+            )
+        ),
+        dict(
+            binding=dict(production="7207179b", fork_head="f" * 40, reviewed_head=None)
+        ),
+        dict(manifest=dict(production="4e6d0e03", fork_head="f" * 40)),
+        dict(picks={UNIFORM: dict(outcome=dict(e1c="PASS"), e2=dict(verdict="PASS"))}),
+    ],
+)
+def test_d10_the_qwen36_gate_checks_the_summarys_provenance(tmp_path, change):
+    good = tmp_path / "good.json"
+    good.write_text(json.dumps(_summary()))
+    assert qualify.entry_problems([QWEN36], p369_summary=good) == []
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps(_summary(**change)))
+    assert qualify.entry_problems([QWEN36], p369_summary=bad)
+
+
+def test_d11_references_need_an_existing_source_blob_and_the_fingerprint_carries_weights():
+    p = Path(__file__)
+    refs = {FABLE: dict(peak_gb=1.0, source="x", source_blob="0" * 40, fingerprint={})}
+    with pytest.raises(ValueError, match="blob"):
+        qualify.load_references(p, table=refs, blob_exists=lambda b: False)
+    assert qualify.load_references(p, table=refs, blob_exists=lambda b: True)
+    fp = qualify.fingerprint_of(
+        dict(
+            _record(),
+            snapshots={"--model": dict(revision="r1")},
+            versions={"mlx": "0.32.3"},
+        ),
+        qualify.expected_config(FABLE_ENTRY),
+    )
+    assert fp["snapshot"] == {"--model": "r1"} and fp["mlx"] == "0.32.3"
+
+
+def test_d12_a_dead_or_stale_monitor_blocks_completed():
+    assert qualify.monitor_problems(alive=True, last_tick_age_s=100) == []
+    assert qualify.monitor_problems(alive=False, last_tick_age_s=100)
+    assert qualify.monitor_problems(alive=True, last_tick_age_s=900)
+    assert (
+        qualify.entry_status(
+            pre=dict(ok=True),
+            post=dict(ok=True),
+            error=None,
+            problems=[],
+            monitor=["dead"],
+        )["status"]
+        == "INVALID"
+    )
+
+
+def test_d6_d13_an_interruption_after_the_job_never_leaves_completed(
+    tmp_path, monkeypatch
+):
+    """D6: the entry stays RUNNING until its evidence is final — an interruption while finalizing leaves NOT_RUN."""
+    monkeypatch.setattr(
+        qualify, "capacity_gb", lambda peaks: (_ for _ in ()).throw(SystemExit(143))
+    )
+    with pytest.raises(SystemExit):
+        _drive(tmp_path, monkeypatch, _good, names=(FABLE,))
+    report = json.loads((tmp_path / "run" / "report.json").read_text())
+    assert report["entries"][FABLE]["status"] == "NOT_RUN"
