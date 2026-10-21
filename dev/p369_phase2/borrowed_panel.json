@@ -1,0 +1,317 @@
+{
+ "source_pick": "Qwen3.8-27B-mlx-uniform-4bit",
+ "bundles": {
+  "benchmark/results/Qwen3.8-27B-mlx-uniform-4bit/cjudge.c84bundle-after-tq4-20260914.jsonl": "53a0886c581d77fd417f325526ab3dd7b71d4906f7e73e3fa539ad9b6e4007ba",
+  "benchmark/results/Qwen3.8-27B-mlx-uniform-4bit/humanevalplus.c84bundle-after-tq4-20260914.jsonl": "601396c60c22a8817969411c524624d52b0913d23e2ed4136d5c73b4f6a8dd89",
+  "benchmark/results/Qwen3.8-27B-mlx-uniform-4bit/math500.c84bundle-after-tq4-20260914.jsonl": "0c65a7466ce4a7e6fc8f3d29b36fc9e2b28ec4be50a2c78d07986b151caa45cc",
+  "benchmark/results/Qwen3.8-27B-mlx-uniform-4bit/mbppplus.c84bundle-after-tq4-20260914.jsonl": "e6ee706655bf6fef74d945edc140d6bfd1e550a11111ae2b9d0a7cc61ed05c78"
+ },
+ "items": [
+  {
+   "name": "math500/test/prealgebra/1907.json",
+   "seed": 644353993,
+   "item_sha256": "5186f774e1c98f958c986cd2d179e27dc2af7fd503c76c6509457cd786fa3c56",
+   "corpus_sha256": "f92e8630a86469ec7a1e0ed85c7bae01d7f361d6247e52cf8fabf6e15eb71cc5",
+   "messages_sha256": "04233f321222c411f43567c1510db3dc9900f48366442e5cf0a4c5d1f13539db"
+  },
+  {
+   "name": "math500/test/prealgebra/1834.json",
+   "seed": 862028940,
+   "item_sha256": "c66384f6299cb5b890ecf81d5d687e740ea7c415e8de374673f68892f586c9c5",
+   "corpus_sha256": "f92e8630a86469ec7a1e0ed85c7bae01d7f361d6247e52cf8fabf6e15eb71cc5",
+   "messages_sha256": "09ee2151fe83415d853f4ff3d748cc6028f98b6f64c58302b48bd7dc727ed012"
+  },
+  {
+   "name": "math500/test/intermediate_algebra/102.json",
+   "seed": 1541782138,
+   "item_sha256": "7989728dbdf1ded09f6835fce388178fb1e7af87dada416e01b8d57f15d80682",
+   "corpus_sha256": "f92e8630a86469ec7a1e0ed85c7bae01d7f361d6247e52cf8fabf6e15eb71cc5",
+   "messages_sha256": "ae8c2b0769e0e5ae94946120735fcd6ab29a9d7f84f2927c09a4b425755b8a13"
+  },
+  {
+   "name": "math500/test/prealgebra/914.json",
+   "seed": 1589729479,
+   "item_sha256": "d5db7a5c76cfcb5579a52ccfb2de3a65225e6784eee3c6bab3e0261cafb75304",
+   "corpus_sha256": "f92e8630a86469ec7a1e0ed85c7bae01d7f361d6247e52cf8fabf6e15eb71cc5",
+   "messages_sha256": "fc1bb84f18a4ff31e4dc045d5208b85c98bce02dcf494844ccdaab463aa6fc02"
+  },
+  {
+   "name": "math500/test/algebra/2593.json",
+   "seed": 205090261,
+   "item_sha256": "16c0602fcd66c6ab4a5ca0d5ca7bf8f3a161e681822ae0d43b4ab6545595cae4",
+   "corpus_sha256": "f92e8630a86469ec7a1e0ed85c7bae01d7f361d6247e52cf8fabf6e15eb71cc5",
+   "messages_sha256": "0c676ba836f9600f056fd4654b6f844c90375249a8e5d5b83f8cee64d0a51c55"
+  },
+  {
+   "name": "humanevalplus/HumanEval/61",
+   "seed": 1851549111,
+   "item_sha256": "b0735fa8e821729787a703083c91ee93edbbd2fc88168d1d45567c9ab5daf9c1",
+   "corpus_sha256": "d5c8bb127f032e239263ae91bfac2e1091bf5b240700ee46e5e681deab812f85",
+   "messages_sha256": "36f7db8eecc6e648028ff642cf43473bec25240298a1c693cd920dedae2fb368"
+  },
+  {
+   "name": "humanevalplus/HumanEval/143",
+   "seed": 415683729,
+   "item_sha256": "3795d72db927fbe82cdaeb3c7bfa5e831694ab083281982272c56150d3511a71",
+   "corpus_sha256": "d5c8bb127f032e239263ae91bfac2e1091bf5b240700ee46e5e681deab812f85",
+   "messages_sha256": "d0ebda8d280fc993e7f61db3b254cd7f132656479188223cfe15733b2211c35b"
+  },
+  {
+   "name": "humanevalplus/HumanEval/125",
+   "seed": 273010434,
+   "item_sha256": "ecf3cd5fe5b55e7448c4f509af74aed8a749e0c9891ec4244bf82d26115c3f5f",
+   "corpus_sha256": "d5c8bb127f032e239263ae91bfac2e1091bf5b240700ee46e5e681deab812f85",
+   "messages_sha256": "70e907d91681b6e2f7a1fb56354a4dec02e13d2ab72cc2013aa4364575caec64"
+  },
+  {
+   "name": "humanevalplus/HumanEval/64",
+   "seed": 412454081,
+   "item_sha256": "59d61970e1b18e55a16792e6122eea9095347403ffa7e3f18d22d24d44fc5f0f",
+   "corpus_sha256": "d5c8bb127f032e239263ae91bfac2e1091bf5b240700ee46e5e681deab812f85",
+   "messages_sha256": "08799be12e1f91a3b30dd3024da33f4cf52c4851c6ab45a8215e703aa73cfa9a"
+  },
+  {
+   "name": "humanevalplus/HumanEval/77",
+   "seed": 1014391932,
+   "item_sha256": "e4207d391b3fe8be0b21d79d525caa49223fc73b37a8125b8282a783f128f18b",
+   "corpus_sha256": "d5c8bb127f032e239263ae91bfac2e1091bf5b240700ee46e5e681deab812f85",
+   "messages_sha256": "9d62a8f9f6229840865c3728980f037ca1ec3a2076664c81761e922e9b498624"
+  },
+  {
+   "name": "mbppplus/Mbpp/770",
+   "seed": 1178696540,
+   "item_sha256": "6ea9f1e0588ecafcd8b6e5a1814ff151108bcb8cf718cd084b4084354655e951",
+   "corpus_sha256": "e0068c66c99dee90a431bb3a3e9553767e7e9552668360971b951c5fbd8668c5",
+   "messages_sha256": "0fc4e73539e1afafa16f40e48ac4d713adc6eb6172bb1e81571c7ec89182f56a"
+  },
+  {
+   "name": "mbppplus/Mbpp/71",
+   "seed": 1764370578,
+   "item_sha256": "790a617fd960996c0ef795ef34a858ba8896b8563becf602c5a48ebb819c1d12",
+   "corpus_sha256": "e0068c66c99dee90a431bb3a3e9553767e7e9552668360971b951c5fbd8668c5",
+   "messages_sha256": "442d04babc56a8981e577dc6ee4ba9c7b8b0cf6f8c9f776ba4fed8c07362194e"
+  },
+  {
+   "name": "mbppplus/Mbpp/285",
+   "seed": 2075325773,
+   "item_sha256": "60b22a9afb50bb2e59fc48acc46c2e890da02efbd10dc7700a626c0b1c2d4ef2",
+   "corpus_sha256": "e0068c66c99dee90a431bb3a3e9553767e7e9552668360971b951c5fbd8668c5",
+   "messages_sha256": "8697f392498e69ce049414254249b63bffe8284ac7fdda03714af3c093159c3c"
+  },
+  {
+   "name": "mbppplus/Mbpp/240",
+   "seed": 802746355,
+   "item_sha256": "e3710bb9e63e67d9ef1ca333351c82ed1d55298ec648bfb5a48f371e0243bb78",
+   "corpus_sha256": "e0068c66c99dee90a431bb3a3e9553767e7e9552668360971b951c5fbd8668c5",
+   "messages_sha256": "48613d5448229dd55a05fce2e1b130dad45362b821aeca10852e6d558f32af93"
+  },
+  {
+   "name": "mbppplus/Mbpp/638",
+   "seed": 2104175422,
+   "item_sha256": "384fdec2639e4f33bbc8e70ee91fb2c3012653a9d80a293b889559582186b97a",
+   "corpus_sha256": "e0068c66c99dee90a431bb3a3e9553767e7e9552668360971b951c5fbd8668c5",
+   "messages_sha256": "cd051bbe7266c628ac89282e8a03e7944df359db9defe6787a44eb8467a5376b"
+  },
+  {
+   "name": "cjudge/pub-4c960b9ee8744a98997f7bfde177d2d7",
+   "seed": 544168142,
+   "item_sha256": "c0d618d7adcc85bf051282c2c70beb7585057deb8b32028635328f9fe545a021",
+   "corpus_sha256": "fe8634c3899d25f9f370311bec9043642499812a9b3ef5a98ccbfe61873354d6",
+   "messages_sha256": "a162f6250b549a0a3e4fb2c938bab814dd4473ea0cef3fc68d456c438f57d54f"
+  },
+  {
+   "name": "cjudge/pub-e7e76d4bcf0342308ca6153634000a4a",
+   "seed": 2141834053,
+   "item_sha256": "b3b45cec4fd09b5b5c89f5a87c528c3c572c9b4b87ee65ef0e76b5ad8d749bcc",
+   "corpus_sha256": "fe8634c3899d25f9f370311bec9043642499812a9b3ef5a98ccbfe61873354d6",
+   "messages_sha256": "b6434054687aed097e6978378c5789e23fee0dc3c0483672eb0fd38654fb1538"
+  },
+  {
+   "name": "cjudge/pub-ef1fe5ad746d4d8db235204f7421260d",
+   "seed": 2134662700,
+   "item_sha256": "ebe7f701f94178c22814e265c4f563b777414a987e89a43b57968b6e2eb1af0d",
+   "corpus_sha256": "fe8634c3899d25f9f370311bec9043642499812a9b3ef5a98ccbfe61873354d6",
+   "messages_sha256": "59ba7628e18082d6e03e0d4b85d9ea327b18ad03ef499fa5c3eb977e041f826c"
+  },
+  {
+   "name": "cjudge/dom-15",
+   "seed": 474410510,
+   "item_sha256": "fbad0732e1c776b04dde0ac3c7547feac56dbbc2585423478fd4d49d18e33e20",
+   "corpus_sha256": "fe8634c3899d25f9f370311bec9043642499812a9b3ef5a98ccbfe61873354d6",
+   "messages_sha256": "ba3fc82d05938c4c309e1bb2165865ddbd2b9dee39bda63a9b08faf4fdb5cb34"
+  },
+  {
+   "name": "cjudge/dom-09",
+   "seed": 1807676434,
+   "item_sha256": "ef1d51e26a5decb3f2c8134b858323ea970ed690d1ea892bb98d2a6a4ecdd7f3",
+   "corpus_sha256": "fe8634c3899d25f9f370311bec9043642499812a9b3ef5a98ccbfe61873354d6",
+   "messages_sha256": "b155d1f031cd476927a9f733bd191dfc9ce7ecde72cf507e561d69a67ade47dd"
+  }
+ ],
+ "entries": {
+  "Qwen3.6-27B-Opus-Distill-OptiQ-4bit": {
+   "math500/test/prealgebra/1907.json": {
+    "tokens": 55,
+    "sha256": "4da731958d187505b42f3ab54c911b16eae9d4a3b18a69510edd285d87a22308"
+   },
+   "math500/test/prealgebra/1834.json": {
+    "tokens": 38,
+    "sha256": "67eb6468691d51a5cfcba27d38d854020d9071a7a02f8fa1a7a7b3917b3c371b"
+   },
+   "math500/test/intermediate_algebra/102.json": {
+    "tokens": 93,
+    "sha256": "3d66bb41bc3c40af3f093242aa720c7f6d4472ded6f2618974c3e6b4745635e1"
+   },
+   "math500/test/prealgebra/914.json": {
+    "tokens": 201,
+    "sha256": "d1d1d60356ba4f1cf9042c42a761d25ead57c4af9cf1970bc174ad659e1f9b11"
+   },
+   "math500/test/algebra/2593.json": {
+    "tokens": 55,
+    "sha256": "ab97bf548a65bfbb46000a788817c2f6f3ebe5963b631cbaed328b06d888e5af"
+   },
+   "humanevalplus/HumanEval/61": {
+    "tokens": 127,
+    "sha256": "b285c5e2a751603c4107a198b67e050ad5063d6eac85b9d50972534bb05f0b53"
+   },
+   "humanevalplus/HumanEval/143": {
+    "tokens": 192,
+    "sha256": "e01df5dfb8c4d11148ce1785ff35b8acc941a26cb42acbd421adfeedf1cf80c2"
+   },
+   "humanevalplus/HumanEval/125": {
+    "tokens": 174,
+    "sha256": "de1401690b77467bfe199a6be0060a4033336fdcad36b2def1a3a0a7059f18e3"
+   },
+   "humanevalplus/HumanEval/64": {
+    "tokens": 164,
+    "sha256": "3354fe02d5863eb023c70e5af5d2b7d872aeda99f6fc7089ce633db446b56226"
+   },
+   "humanevalplus/HumanEval/77": {
+    "tokens": 147,
+    "sha256": "56fbfcf8d07183b206c30c7f767b0b48928efcb979b71d6555d61ab25f7fdc22"
+   },
+   "mbppplus/Mbpp/770": {
+    "tokens": 69,
+    "sha256": "52b29fdcab0cc25f8aae373c17045920646fb89a46553e3db84e8c7408b14883"
+   },
+   "mbppplus/Mbpp/71": {
+    "tokens": 92,
+    "sha256": "b50b94fdb74b000ba2da03d90bcc40a7f9bc591422bc78b01fc3793fb5acd98f"
+   },
+   "mbppplus/Mbpp/285": {
+    "tokens": 75,
+    "sha256": "2c3f5612d42afe74e8c85778d0cc61d84993b57ccfcdc5170bedf20d66ff3b20"
+   },
+   "mbppplus/Mbpp/240": {
+    "tokens": 125,
+    "sha256": "e1ae84c94fb69540606156813beb151476a95a37acab0a0b62769e15c2bb9c00"
+   },
+   "mbppplus/Mbpp/638": {
+    "tokens": 82,
+    "sha256": "9fdc1bc5c138bb10c6a2e9f33c1fde37cceee09d4143fb6b9b8e44a89ff2528d"
+   },
+   "cjudge/pub-4c960b9ee8744a98997f7bfde177d2d7": {
+    "tokens": 39,
+    "sha256": "ee59072b53b6b967587ad4735cef34d90d6e694df57db5baf0442bc228aef372"
+   },
+   "cjudge/pub-e7e76d4bcf0342308ca6153634000a4a": {
+    "tokens": 65,
+    "sha256": "8d8b2f685bb04c5e070475e8b935b997e47c7088ad7562ba426b9723469c6e6a"
+   },
+   "cjudge/pub-ef1fe5ad746d4d8db235204f7421260d": {
+    "tokens": 88,
+    "sha256": "0ec12c0f99cd222d94cd8482ed5d7ea6ae2117f918b6873137ea492a332db2a4"
+   },
+   "cjudge/dom-15": {
+    "tokens": 60,
+    "sha256": "43b9d2d099f881775c70b14293de6bc23b96c92b74d8b6dd373349d6f1b4ae0a"
+   },
+   "cjudge/dom-09": {
+    "tokens": 64,
+    "sha256": "485ff85d48d36a02b38ae0ad3293a7a1bde8aef211c7ea0be516ca19cba1bb3d"
+   }
+  },
+  "Ornith-1.0-35B-mlx-uniform-4bit": {
+   "math500/test/prealgebra/1907.json": {
+    "tokens": 55,
+    "sha256": "4da731958d187505b42f3ab54c911b16eae9d4a3b18a69510edd285d87a22308"
+   },
+   "math500/test/prealgebra/1834.json": {
+    "tokens": 38,
+    "sha256": "67eb6468691d51a5cfcba27d38d854020d9071a7a02f8fa1a7a7b3917b3c371b"
+   },
+   "math500/test/intermediate_algebra/102.json": {
+    "tokens": 93,
+    "sha256": "3d66bb41bc3c40af3f093242aa720c7f6d4472ded6f2618974c3e6b4745635e1"
+   },
+   "math500/test/prealgebra/914.json": {
+    "tokens": 201,
+    "sha256": "d1d1d60356ba4f1cf9042c42a761d25ead57c4af9cf1970bc174ad659e1f9b11"
+   },
+   "math500/test/algebra/2593.json": {
+    "tokens": 55,
+    "sha256": "ab97bf548a65bfbb46000a788817c2f6f3ebe5963b631cbaed328b06d888e5af"
+   },
+   "humanevalplus/HumanEval/61": {
+    "tokens": 127,
+    "sha256": "b285c5e2a751603c4107a198b67e050ad5063d6eac85b9d50972534bb05f0b53"
+   },
+   "humanevalplus/HumanEval/143": {
+    "tokens": 192,
+    "sha256": "e01df5dfb8c4d11148ce1785ff35b8acc941a26cb42acbd421adfeedf1cf80c2"
+   },
+   "humanevalplus/HumanEval/125": {
+    "tokens": 174,
+    "sha256": "de1401690b77467bfe199a6be0060a4033336fdcad36b2def1a3a0a7059f18e3"
+   },
+   "humanevalplus/HumanEval/64": {
+    "tokens": 164,
+    "sha256": "3354fe02d5863eb023c70e5af5d2b7d872aeda99f6fc7089ce633db446b56226"
+   },
+   "humanevalplus/HumanEval/77": {
+    "tokens": 147,
+    "sha256": "56fbfcf8d07183b206c30c7f767b0b48928efcb979b71d6555d61ab25f7fdc22"
+   },
+   "mbppplus/Mbpp/770": {
+    "tokens": 69,
+    "sha256": "52b29fdcab0cc25f8aae373c17045920646fb89a46553e3db84e8c7408b14883"
+   },
+   "mbppplus/Mbpp/71": {
+    "tokens": 92,
+    "sha256": "b50b94fdb74b000ba2da03d90bcc40a7f9bc591422bc78b01fc3793fb5acd98f"
+   },
+   "mbppplus/Mbpp/285": {
+    "tokens": 75,
+    "sha256": "2c3f5612d42afe74e8c85778d0cc61d84993b57ccfcdc5170bedf20d66ff3b20"
+   },
+   "mbppplus/Mbpp/240": {
+    "tokens": 125,
+    "sha256": "e1ae84c94fb69540606156813beb151476a95a37acab0a0b62769e15c2bb9c00"
+   },
+   "mbppplus/Mbpp/638": {
+    "tokens": 82,
+    "sha256": "9fdc1bc5c138bb10c6a2e9f33c1fde37cceee09d4143fb6b9b8e44a89ff2528d"
+   },
+   "cjudge/pub-4c960b9ee8744a98997f7bfde177d2d7": {
+    "tokens": 39,
+    "sha256": "ee59072b53b6b967587ad4735cef34d90d6e694df57db5baf0442bc228aef372"
+   },
+   "cjudge/pub-e7e76d4bcf0342308ca6153634000a4a": {
+    "tokens": 65,
+    "sha256": "8d8b2f685bb04c5e070475e8b935b997e47c7088ad7562ba426b9723469c6e6a"
+   },
+   "cjudge/pub-ef1fe5ad746d4d8db235204f7421260d": {
+    "tokens": 88,
+    "sha256": "0ec12c0f99cd222d94cd8482ed5d7ea6ae2117f918b6873137ea492a332db2a4"
+   },
+   "cjudge/dom-15": {
+    "tokens": 60,
+    "sha256": "43b9d2d099f881775c70b14293de6bc23b96c92b74d8b6dd373349d6f1b4ae0a"
+   },
+   "cjudge/dom-09": {
+    "tokens": 64,
+    "sha256": "485ff85d48d36a02b38ae0ad3293a7a1bde8aef211c7ea0be516ca19cba1bb3d"
+   }
+  }
+ }
+}
