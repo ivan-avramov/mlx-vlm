@@ -454,9 +454,30 @@ def guard_problems(start, now, *, reviewed):
     return problems
 
 
-def monitor_problems(*, alive, last_tick_age_s, period_s=300):
-    """Code round 1 D12: the 5-minute monitor is alive and ticked within two periods."""
-    problems = []
+class MonitorHealth:
+    """Code round 3 D12: wraps a monitor's ``tick`` in place — every tick is counted and every failure recorded
+    (sticky), then re-raised; a failed tick can never be hidden by a later successful one.
+    """
+
+    def __init__(self, monitor):
+        self.ticks, self.errors = 0, []
+        real = monitor.tick
+
+        def tick(*a, **k):
+            try:
+                out = real(*a, **k)
+            except Exception as exc:
+                self.errors.append(f"{type(exc).__name__}: {exc}")
+                raise
+            self.ticks += 1
+            return out
+
+        monitor.tick = tick
+
+
+def monitor_problems(*, alive, last_tick_age_s, period_s=300, errors=()):
+    """Code round 1–3 D12: the 5-minute monitor is alive, ticked within one period (+ 60 s), and no tick failed."""
+    problems = [f"a monitor tick failed: {e}" for e in errors]
     if not alive:
         problems.append("the monitor thread is dead")
     if last_tick_age_s is None or last_tick_age_s > period_s + 60:  # round 2 D12
@@ -560,6 +581,17 @@ def battery_intervals(log_text, start, end):
     if opened is not None and opened[0] <= end:
         out.append((opened[1], None))
     return out
+
+
+def power_log_problems(returncode, log_text):
+    """Code round 3 F1: the power log must have been read and must carry power-source history."""
+    import re
+
+    if returncode != 0:
+        return [f"pmset -g log failed (rc {returncode})"]
+    if not re.search(r"Using (AC|Batt)\b", log_text or ""):
+        return ["pmset -g log has no power-source history"]
+    return []
 
 
 def idle_before(names):
@@ -849,6 +881,7 @@ def _drive_locked(
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, on_signal)
         monitor = orchestrate.Monitor(out / "monitor.log", estimate_s=len(names) * 1200)
+        health = MonitorHealth(monitor)  # code round 3 D12: before the thread starts
         monitor.__enter__()
         for i, name in enumerate(names):
             if i:
@@ -913,10 +946,16 @@ def _drive_locked(
                 ) as exc:  # recorded per entry; the run continues (plan v2 Q5)
                     error = f"{type(exc).__name__}: {exc}"
                 after = interference(orchestrate)
-            events = battery_intervals(_pmset_log(), window_start, time.time())  # P418
+            rc, log_text = _pmset_log()
+            events = battery_intervals(log_text, window_start, time.time())  # P418
+            events += [
+                ("power log", p) for p in power_log_problems(rc, log_text)
+            ]  # code round 3 F1: an unreadable log is never "no outage"
             last = _last_tick_age(out / "monitor.log")
             mon = monitor_problems(
-                alive=monitor._thread.is_alive(), last_tick_age_s=last
+                alive=monitor._thread.is_alive(),
+                last_tick_age_s=last,
+                errors=health.errors,
             )
             # code round 1 D6: every piece of evidence is final BEFORE the terminal status is written
             final = dict(problems=problems[:50], before=before, after=after, record=rec)
@@ -950,9 +989,14 @@ def _drive_locked(
             _atomic(out / "report.json", report)
         report["end"] = _tree_state(fork, stack)
         report["end_problems"] = guard_problems(start, report["end"], reviewed=reviewed)
-        if console_script_info(stack) != console:  # code round 2 D5
+        try:  # code round 3 D5: an unreadable script at exit is a problem, never an escape
+            if console_script_info(stack) != console:  # code round 2 D5
+                report["end_problems"].append(
+                    "the stack console script changed during the run"
+                )
+        except Exception as exc:
             report["end_problems"].append(
-                "the stack console script changed during the run"
+                f"the stack console script is unreadable at exit: {type(exc).__name__}: {exc}"
             )
         if report["end_problems"]:
             for state in report["entries"].values():
@@ -1031,7 +1075,8 @@ def _resolve_ref(path, ref):
 def _pmset_log():
     import subprocess
 
-    return subprocess.run(["pmset", "-g", "log"], capture_output=True, text=True).stdout
+    got = subprocess.run(["pmset", "-g", "log"], capture_output=True, text=True)
+    return got.returncode, got.stdout
 
 
 def _last_tick_age(path):
