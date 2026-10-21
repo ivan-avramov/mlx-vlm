@@ -934,3 +934,27 @@ def test_r2_a_fused_helper_resolves_each_bank_by_identity(monkeypatch):
     assert any(
         "model.layers.0.mlp.switch_mlp.gate_proj" in p for p in frame["parts"]
     ), frame
+
+
+# ------------------------------------------------------------------ P417 (smoke 16): a bound drafter's quantization is its own
+def test_p417_a_bound_drafter_never_reports_the_targets_quantization():
+    """P417: a BOUND drafter holds the target's embedding / head as module children; its identity's quantization set
+    must be the drafter's own modules only (an 8-bit target embedding is not the drafter's).
+    """
+    import mlx.nn as nn
+
+    from p369_phase2 import worker
+
+    lm = served_moe_target()
+    emb = lm.model.embed_tokens
+    dense = nn.Embedding(emb.weight.shape[0], 512)
+    lm.model.embed_tokens = nn.QuantizedEmbedding.from_embedding(
+        dense, group_size=64, bits=8
+    )
+    drafter = served_moe_drafter(lm)
+    drafter.bind(lm)
+    assert worker.drafter_identity(drafter)["quant"] == [[4, 64]]
+    _, problems = worker.check_loaded_drafter(
+        lm, served_moe_drafter(lm), json.loads(json.dumps(SERVED_DRAFTER_SHAPE))
+    )
+    assert problems == [], problems
