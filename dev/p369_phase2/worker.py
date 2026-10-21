@@ -1318,6 +1318,14 @@ def _capacities(caches, prefix=""):
     return out
 
 
+def generation_seed(kwargs):
+    """R7 smoke 1: the seed ``generate_step`` samples with — its sampler's (the cached path builds
+    ``_PositionedTargetSampler(seed=args.seed)``; ``stream_generate`` consumes the ``seed`` keyword itself), else the
+    keyword."""
+    seed = getattr(kwargs.get("sampler"), "seed", None)
+    return seed if seed is not None else kwargs.get("seed")
+
+
 def check_server_main():
     """Code round 1 D4: ``mlx_vlm.server.main`` (the console script's entry point) runs ``mlx_vlm.server.cli.main``
     — the function ``boot`` runs in-process."""
@@ -1463,7 +1471,7 @@ def qualify_request(client, capture, rg, spec, memory):
 
     def recording_step(*a, **k):
         state["cache"] = k.get("prompt_cache")
-        rec["generate_seed"] = k.get("seed")
+        rec["generate_seed"] = generation_seed(k)  # R7 smoke 1: the sampler's seed
         yield from step(*a, **k)
 
     lm_cls = type(rg.model.language_model)
