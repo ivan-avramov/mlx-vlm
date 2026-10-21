@@ -9,7 +9,8 @@
    "p405_window": false,
    "prefill_step": 512,
    "method": "mx.get_peak_memory (server_peak_gb)"
-  }
+  },
+  "source_path": "benchmark/results/Qwen3.6-27B-Opus-Distill-OptiQ-4bit/capacity_ladder.jsonl"
  },
  "Qwen3.8-27B-mlx-uniform-4bit": {
   "peak_gb": 37.797,
@@ -22,7 +23,8 @@
    "mtp": "on",
    "mlx": "0.32.2",
    "method": "mx.get_peak_memory (server_peak_gb)"
-  }
+  },
+  "source_path": "benchmark/results/Qwen3.8-27B-mlx-uniform-4bit/capacity_ladder.m43on-20260913.jsonl"
  },
  "Qwen3.8-27B-static-mixed-4bit": {
   "peak_gb": 31.579,
@@ -34,7 +36,8 @@
    "p405_window": false,
    "mtp": "off",
    "method": "mx.get_peak_memory (server_peak_gb)"
-  }
+  },
+  "source_path": "benchmark/results/Qwen3.8-27B-static-mixed-4bit/capacity_ladder.jsonl"
  },
  "Qwen3.8-27B-OptiQ-4.5bpw-mixed": {
   "peak_gb": 33.715,
@@ -46,7 +49,8 @@
    "p405_window": false,
    "mtp": "off",
    "method": "mx.get_peak_memory (server_peak_gb)"
-  }
+  },
+  "source_path": "benchmark/results/Qwen3.8-27B-OptiQ-4.5bpw-mixed/capacity_ladder.jsonl"
  },
  "Qwen3.8-27B-Fable-Distill-mlx-uniform-4bit": null,
  "Qwen3.8-27B-Opus-Distill-v2-mlx-uniform-4bit": null,
@@ -63,6 +67,7 @@
    "lazy_embeddings": true,
    "prealloc": 262144,
    "method": "mx.get_peak_memory (server_peak_gb)"
-  }
+  },
+  "source_path": "docs/campaign-results.md"
  }
 }

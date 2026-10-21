@@ -94,6 +94,30 @@ def entry_problems(names, *, p369_summary):
     return problems
 
 
+def summary_artifact_problems(path, summary, *, root, is_commit, contains_reviewed):
+    """Code round 2 D10: the P369 summary is a real campaign artifact — under the campaign root, beside its own
+    ``manifest.json`` naming the same fork head, and that head a real fork commit containing the reviewed v13 head.
+    """
+    problems = []
+    path = Path(path).resolve()
+    if not path.is_relative_to(Path(root).resolve()):
+        problems.append(f"summary {path} is not under {root}")
+    head = ((summary or {}).get("binding") or {}).get("fork_head")
+    try:
+        manifest = json.loads((path.parent / "manifest.json").read_text())
+    except (OSError, ValueError):
+        manifest = None
+    if not manifest or manifest.get("fork_head") != head:
+        problems.append(
+            "the summary's manifest.json is missing or names another fork head"
+        )
+    if not head or not is_commit(head):
+        problems.append(f"fork head {head!r} is not a fork commit")
+    elif not contains_reviewed(head):
+        problems.append(f"fork head {head} does not contain the reviewed v13 head")
+    return problems
+
+
 def _spelled(kind, value):
     """The flag's value as ``_build_command`` writes it; None = the flag is absent."""
     if kind == "str":
@@ -435,7 +459,7 @@ def monitor_problems(*, alive, last_tick_age_s, period_s=300):
     problems = []
     if not alive:
         problems.append("the monitor thread is dead")
-    if last_tick_age_s is None or last_tick_age_s > 2 * period_s:
+    if last_tick_age_s is None or last_tick_age_s > period_s + 60:  # round 2 D12
         problems.append(f"the monitor's last tick is {last_tick_age_s} s old")
     return problems
 
@@ -457,6 +481,7 @@ FINGERPRINT = (
     "mlx",
     "method",
     "snapshot",
+    "weights",
     "harness",
     "context_cap",
     "memory_limits",
@@ -496,22 +521,61 @@ def load_references(path, *, table=None, blob_exists=None):
             raise ValueError(
                 f"{name}: a reference needs a source and a positive peak_gb"
             )
-        if blob_exists is not None and not blob_exists(ref.get("source_blob")):
+        if not ref.get("source_path"):
+            raise ValueError(f"{name}: a reference needs its source_path")
+        if blob_exists is not None and not blob_exists(
+            ref.get("source_blob"), ref["source_path"]
+        ):  # code round 2 D11: the blob is a version OF that path
             raise ValueError(
-                f"{name}: source blob {ref.get('source_blob')!r} not in the stack repository"
+                f"{name}: blob {ref.get('source_blob')!r} is not a version of {ref['source_path']}"
             )
     return table
+
+
+def battery_intervals(log_text, start, end):
+    """P418: the on-battery intervals (``pmset -g log`` "Using Batt" … "Using AC") overlapping ``[start, end]`` (epoch
+    seconds) — exact, unlike 5-minute ticks or before / after samples; an interval still open at the end has ``None``.
+    """
+    import datetime
+    import re
+
+    events = []
+    for line in log_text.splitlines():
+        m = re.match(
+            r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d [+-]\d{4}) .*Using (AC|Batt)\b", line
+        )
+        if m:
+            at = datetime.datetime.strptime(
+                m.group(1), "%Y-%m-%d %H:%M:%S %z"
+            ).timestamp()
+            events.append((at, m.group(1), m.group(2)))
+    out, opened = [], None
+    for at, text, source in sorted(events):
+        if source == "Batt" and opened is None:
+            opened = (at, text)
+        elif source == "AC" and opened is not None:
+            if opened[0] <= end and at >= start:
+                out.append((opened[1], text))
+            opened = None
+    if opened is not None and opened[0] <= end:
+        out.append((opened[1], None))
+    return out
 
 
 def idle_before(names):
     return [i > 0 for i in range(len(names))]
 
 
-def entry_status(*, pre, post, error, problems, monitor=()):
+def entry_status(*, pre, post, error, problems, monitor=(), power_events=()):
     """C198 (3): interference / power before or after an entry ⇒ INVALID (and a dead / stale monitor, code round 1
     D12); an error or a problem ⇒ FAILED."""
     if monitor:
         return dict(status="INVALID", reason=f"monitor: {'; '.join(monitor)}")
+    if power_events:  # P418: any on-battery interval inside the entry
+        return dict(
+            status="INVALID",
+            reason=f"on battery during the entry: {list(power_events)}",
+        )
     if not pre.get("ok"):
         return dict(status="INVALID", reason=f"before: {pre.get('why')}")
     if post is not None and not post.get("ok"):
@@ -657,10 +721,7 @@ def console_script_info(stack):
 
 
 def drive(args):
-    import signal
-    import subprocess
     import sys
-    import time
 
     import yaml
 
@@ -675,11 +736,60 @@ def drive(args):
     if problems:
         raise SystemExit(f"refused: {problems}")
     reviewed = _resolve_ref(fork, args.reviewed_head)
+    if args.p369_summary and any(ENTRIES[n] == "mtp_on_gated" for n in names):
+        problems = summary_artifact_problems(  # code round 2 D10
+            args.p369_summary,
+            json.loads(Path(args.p369_summary).read_text()),
+            root=Path(os.environ.get("STACK_WORKDIR", "/nonexistent"))
+            / "p369"
+            / "phase2",
+            is_commit=lambda c: _is_commit(fork, c),
+            contains_reviewed=lambda c: _is_ancestor(fork, V13_REVIEWED, c),
+        )
+        if problems:
+            raise SystemExit(f"refused: {problems}")
     out.mkdir(parents=True, exist_ok=False)
     lock = orchestrate.acquire_lock(orchestrate.lock_path(dict(os.environ)))
+    try:  # code round 2 D13: the lock is released whatever the cleanup below does
+        return _drive_locked(
+            args,
+            names,
+            reviewed,
+            stack,
+            fork,
+            out,
+            orchestrate,
+            kvmanifest,
+            registry_states,
+            yaml,
+        )
+    finally:
+        orchestrate.release_lock(lock)
+
+
+def _drive_locked(
+    args,
+    names,
+    reviewed,
+    stack,
+    fork,
+    out,
+    orchestrate,
+    kvmanifest,
+    registry_states,
+    yaml,
+):
+    import signal
+    import subprocess
+    import time
+
     report = dict(entries={n: dict(status="PENDING", arm=ENTRIES[n]) for n in names})
     stop = dict(signal=None)
     monitor = None
+    boot = orchestrate.BOOT_TIMEOUT_S
+    orchestrate.BOOT_TIMEOUT_S = (
+        BOOT_S  # code round 2 E2: the qualification's own boot limit
+    )
     try:  # code round 1 D13: everything after the lock is inside the cleanup scope
         pre = orchestrate.preflight(args, out)
         if pre["problems"]:
@@ -700,15 +810,25 @@ def drive(args):
         if problems:
             raise SystemExit(f"refused: {problems}")
 
-        def blob_exists(blob):
-            return (
-                bool(blob)
-                and subprocess.run(
-                    ["git", "-C", str(stack), "cat-file", "-e", f"{blob}^{{blob}}"],
-                    capture_output=True,
-                ).returncode
-                == 0
+        def blob_exists(blob, source_path):  # code round 2 D11: a version OF that path
+            if not blob:
+                return False
+            log = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(stack),
+                    "log",
+                    "--all",
+                    "--format=%H",
+                    f"--find-object={blob}",
+                    "--",
+                    source_path,
+                ],
+                capture_output=True,
+                text=True,
             )
+            return log.returncode == 0 and bool(log.stdout.strip())
 
         references = load_references(REFERENCES, blob_exists=blob_exists)
         report.update(
@@ -736,6 +856,7 @@ def drive(args):
             state = report["entries"][name]
             state.update(status="RUNNING", started=time.strftime("%Y-%m-%dT%H:%M:%S"))
             _atomic(out / "report.json", report)
+            window_start = time.time()
             before = interference(orchestrate)
             error, problems, after, rec, expected = None, [], None, None, None
             if before["ok"]:
@@ -756,16 +877,11 @@ def drive(args):
                         stack, module_file, registry_sha, orchestrate.sha256_file
                     ) + command_problems(expected, cmd, stack / ".venv" / "bin")
                     if not problems:
+                        job = _job(
+                            name, cmd[1:], expected, fork, out, orchestrate, kvmanifest
+                        )
                         result = orchestrate.run_job(
-                            _job(
-                                name,
-                                cmd[1:],
-                                expected,
-                                fork,
-                                out,
-                                orchestrate,
-                                kvmanifest,
-                            ),
+                            job,
                             fork,
                             orchestrate.worker_env(dict(os.environ)),
                             monitor,
@@ -774,6 +890,8 @@ def drive(args):
                         rec = dict(
                             result["requests"][0]["qualify"],
                             snapshots=result.get("snapshots"),
+                            weights=_weights_digest(job["expect"]["revisions"]),
+                            harness=reviewed,
                             versions=report["versions"],
                         )
                         problems = request_problems(rec, expected)
@@ -784,6 +902,10 @@ def drive(args):
                         problems += binding_problems(
                             stack, module_file, registry_sha, orchestrate.sha256_file
                         )
+                        if console_script_info(stack) != console:  # code round 2 D5
+                            problems.append(
+                                "the stack console script changed during the job"
+                            )
                 except SystemExit:
                     raise
                 except (
@@ -791,6 +913,7 @@ def drive(args):
                 ) as exc:  # recorded per entry; the run continues (plan v2 Q5)
                     error = f"{type(exc).__name__}: {exc}"
                 after = interference(orchestrate)
+            events = battery_intervals(_pmset_log(), window_start, time.time())  # P418
             last = _last_tick_age(out / "monitor.log")
             mon = monitor_problems(
                 alive=monitor._thread.is_alive(), last_tick_age_s=last
@@ -813,14 +936,24 @@ def drive(args):
                 )
             final.update(
                 entry_status(
-                    pre=before, post=after, error=error, problems=problems, monitor=mon
+                    pre=before,
+                    post=after,
+                    error=error,
+                    problems=problems,
+                    monitor=mon,
+                    power_events=events,
                 ),
+                power_events=events,
                 finished=time.strftime("%Y-%m-%dT%H:%M:%S"),
             )
             state.update(final)
             _atomic(out / "report.json", report)
         report["end"] = _tree_state(fork, stack)
         report["end_problems"] = guard_problems(start, report["end"], reviewed=reviewed)
+        if console_script_info(stack) != console:  # code round 2 D5
+            report["end_problems"].append(
+                "the stack console script changed during the run"
+            )
         if report["end_problems"]:
             for state in report["entries"].values():
                 if state["status"] == "COMPLETED":
@@ -838,10 +971,50 @@ def drive(args):
                 )
         report["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S")
         _atomic(out / "report.json", report)
+        orchestrate.BOOT_TIMEOUT_S = boot
         if monitor is not None:
             monitor.__exit__(None, None, None)
-        orchestrate.release_lock(lock)
     return exit_code(report["entries"])
+
+
+V13_REVIEWED = (
+    "3ae8770e"  # C199: the reviewed v13 head every P369 campaign head must contain
+)
+
+
+def _weights_digest(revisions):
+    import hashlib
+
+    return {
+        flag: hashlib.sha256(
+            json.dumps(v["files"], sort_keys=True).encode()
+        ).hexdigest()
+        for flag, v in revisions.items()
+    }
+
+
+def _is_commit(path, ref):
+    import subprocess
+
+    return (
+        subprocess.run(
+            ["git", "-C", str(path), "cat-file", "-e", f"{ref}^{{commit}}"],
+            capture_output=True,
+        ).returncode
+        == 0
+    )
+
+
+def _is_ancestor(path, ancestor, ref):
+    import subprocess
+
+    return (
+        subprocess.run(
+            ["git", "-C", str(path), "merge-base", "--is-ancestor", ancestor, ref],
+            capture_output=True,
+        ).returncode
+        == 0
+    )
 
 
 def _resolve_ref(path, ref):
@@ -853,6 +1026,12 @@ def _resolve_ref(path, ref):
         text=True,
         check=True,
     ).stdout.strip()
+
+
+def _pmset_log():
+    import subprocess
+
+    return subprocess.run(["pmset", "-g", "log"], capture_output=True, text=True).stdout
 
 
 def _last_tick_age(path):
@@ -923,10 +1102,13 @@ def fingerprint_of(rec, expected):
         prefill_step=expected["prefill_step"],
         mlx=(rec.get("versions") or {}).get("mlx"),
         method="mx.get_peak_memory phases (P415)",
-        snapshot={
-            k: v.get("revision") for k, v in (rec.get("snapshots") or {}).items()
-        },  # code round 1 D11
-        harness="p415",
+        snapshot=dict(
+            rec.get("snapshots") or {}
+        ),  # code round 2 E1: check_snapshots' {flag: revision}
+        weights=dict(
+            rec.get("weights") or {}
+        ),  # D11: the worker-verified file hashes, digested per flag
+        harness=rec.get("harness"),  # D11: the reviewed head the run is bound to
         context_cap=expected["cap"],
         memory_limits=dict(
             memory=(rec.get("memory") or {}).get("set_memory_limit"),

@@ -427,6 +427,7 @@ FP = dict(
     mlx="0.32.3",
     method="mx.get_peak_memory",
     snapshot="r1",
+    weights="w1",
     harness="p415",
     context_cap=262144,
     memory_limits="0.85",
@@ -459,7 +460,10 @@ def test_t13_an_absent_reference_field_is_a_difference():
 def test_t6_the_reference_table_loads_and_refuses_bad_rows(tmp_path):
     good = {
         FABLE: dict(
-            peak_gb=37.97, source="docs/campaign-results.md:294", fingerprint=FP
+            peak_gb=37.97,
+            source="docs/campaign-results.md:294",
+            source_path="docs/campaign-results.md",
+            fingerprint=FP,
         ),
         "Qwen3.8-27B-Opus-Distill-v2-mlx-uniform-4bit": None,  # none recorded
     }
@@ -566,7 +570,9 @@ def _drive(
         ),
     )
     monkeypatch.setattr(qualify, "_last_tick_age", lambda p: 1.0)
-    monkeypatch.setattr(qualify, "_pmset_log", lambda: "")  # hermetic: never the box's own power log
+    monkeypatch.setattr(
+        qualify, "_pmset_log", lambda: ""
+    )  # hermetic: never the box's own power log
     monkeypatch.setattr(qualify, "interference", lambda o: dict(ok=True, why=None))
     monkeypatch.setattr(qualify, "binding_problems", lambda *a: [])
     monkeypatch.setattr(qualify, "_git_head", lambda p: "h")
@@ -864,14 +870,22 @@ def test_d10_the_qwen36_gate_checks_the_summarys_provenance(tmp_path, change):
 
 def test_d11_references_need_an_existing_source_blob_and_the_fingerprint_carries_weights():
     p = Path(__file__)
-    refs = {FABLE: dict(peak_gb=1.0, source="x", source_blob="0" * 40, fingerprint={})}
+    refs = {
+        FABLE: dict(
+            peak_gb=1.0,
+            source="x",
+            source_path="docs/x.md",
+            source_blob="0" * 40,
+            fingerprint={},
+        )
+    }
     with pytest.raises(ValueError, match="blob"):
-        qualify.load_references(p, table=refs, blob_exists=lambda b: False)
-    assert qualify.load_references(p, table=refs, blob_exists=lambda b: True)
+        qualify.load_references(p, table=refs, blob_exists=lambda b, path: False)
+    assert qualify.load_references(p, table=refs, blob_exists=lambda b, path: True)
     fp = qualify.fingerprint_of(
         dict(
             _record(),
-            snapshots={"--model": dict(revision="r1")},
+            snapshots={"--model": "r1"},  # check_snapshots' real shape (round 2 E1)
             versions={"mlx": "0.32.3"},
         ),
         qualify.expected_config(FABLE_ENTRY),
