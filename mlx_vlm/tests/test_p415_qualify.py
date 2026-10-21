@@ -571,8 +571,8 @@ def _drive(
     )
     monkeypatch.setattr(qualify, "_last_tick_age", lambda p: 1.0)
     monkeypatch.setattr(
-        qualify, "_pmset_log", lambda: ""
-    )  # hermetic: never the box's own power log
+        qualify, "_pmset_log", lambda: (0, PMSET)
+    )  # hermetic: a fixed history (no interval in the test window), never the box's own power log
     monkeypatch.setattr(qualify, "interference", lambda o: dict(ok=True, why=None))
     monkeypatch.setattr(qualify, "binding_problems", lambda *a: [])
     monkeypatch.setattr(qualify, "_git_head", lambda p: "h")
@@ -608,6 +608,9 @@ class _NullMonitor:
 
         self._thread = threading.Thread(target=lambda: None)
         self._thread.is_alive = lambda: True
+
+    def tick(self):
+        pass
 
     def __enter__(self):
         return self
@@ -1121,3 +1124,49 @@ def test_p418_a_battery_interval_makes_the_entry_invalid():
         )["status"]
         == "INVALID"
     )
+
+
+# ------------------------------------------------------------------ P415 code round 3 (D5 D12 F1), after the last round
+def test_r3_d5_an_unreadable_console_script_at_exit_invalidates_completed_entries(
+    tmp_path, monkeypatch
+):
+    calls = []
+
+    def info(stack):
+        calls.append(1)
+        if len(calls) > 2:  # start, after the job — then gone at exit
+            raise FileNotFoundError("mlx_vlm.server")
+        return dict(
+            shebang=str(Path(stack) / ".venv" / "bin" / "python"),
+            entry="mlx_vlm.server:main",
+            stack_mlx_vlm="x",
+        )
+
+    code, report = _drive(tmp_path, monkeypatch, _good, names=(FABLE,), console=info)
+    assert code == 1
+    assert report["entries"][FABLE]["status"] == "INVALID"
+    assert any("console script" in p for p in report["end_problems"])
+
+
+def test_r3_d12_a_failed_monitor_tick_is_sticky():
+    from types import SimpleNamespace
+
+    failing = SimpleNamespace(tick=lambda: (_ for _ in ()).throw(OSError("disk")))
+    health = qualify.MonitorHealth(failing)
+    with pytest.raises(OSError):
+        failing.tick()
+    failing_ok = SimpleNamespace(tick=lambda: None)
+    assert health.errors and "disk" in health.errors[0]
+    assert qualify.monitor_problems(alive=True, last_tick_age_s=1, errors=health.errors)
+    ok = qualify.MonitorHealth(failing_ok)
+    failing_ok.tick()
+    assert ok.errors == [] and ok.ticks == 1
+    assert (
+        qualify.monitor_problems(alive=True, last_tick_age_s=1, errors=ok.errors) == []
+    )
+
+
+def test_r3_f1_an_unreadable_power_log_is_a_problem_not_no_outage():
+    assert qualify.power_log_problems(1, "")
+    assert qualify.power_log_problems(0, "garbage without power-source lines\n")
+    assert qualify.power_log_problems(0, PMSET) == []
