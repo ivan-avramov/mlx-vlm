@@ -1204,3 +1204,64 @@ def test_smoke2_only_the_requests_own_generate_step_call_is_recorded():
     )
     assert rec["generate_seed"] == 7 and state["cache"] is request_cache
     assert rec["generate_calls"] == 2
+
+
+# ------------------------------------------------------------------ R7 full run 1: chunk landings (P394-class, harness)
+def test_full1_the_chunk_sequence_lands_on_productions_offsets():
+    """R7 full run 1: the four served (MTP-OFF) entries prefilled 42 + 507 × 512 + 469 — the chunk loop shrinks a chunk
+    to land exactly on a snapshot / retention / checkpoint offset (``_adjust_chunk_for_snapshot_landing``).
+    """
+    got = qualify.chunk_sequence(260096, 512, landings=[42])
+    assert got == [42] + [512] * 507 + [469] and sum(got) == 260095
+    assert qualify.chunk_sequence(260096, 512, landings=[]) == [512] * 507 + [511]
+    assert qualify.chunk_sequence(260096, 512, landings=[512 * 3]) == [512] * 507 + [
+        511
+    ]  # lands without a shrink
+    assert qualify.landing_offsets(
+        dict(
+            snapshot_at_offset=None,
+            retain_at_offset=42,
+            prompt_end_offset=True,
+            checkpoint_lengths=None,
+        ),
+        260096,
+    ) == [42]
+    assert (
+        qualify.landing_offsets(
+            dict(
+                snapshot_at_offset=None,
+                retain_at_offset=42,
+                prompt_end_offset=False,
+                checkpoint_lengths=None,
+            ),
+            260096,
+        )
+        == []
+    )  # retention landing only with a prompt-end capture
+
+
+def test_full1_a_served_record_with_its_landing_passes_and_without_fails():
+    want = qualify.expected_config(STATIC_ENTRY)
+    rec = _record(
+        sdpa_forced=0,
+        lazy_calls=0,
+        shrink_calls=0,
+        drafter_live_checks=None,
+        manifest=_tq_manifest(),
+        chunks=[42] + [512] * 507 + [469],
+        landings=dict(
+            snapshot_at_offset=None,
+            retain_at_offset=42,
+            prompt_end_offset=True,
+            checkpoint_lengths=None,
+        ),
+    )
+    rec["peaks"] = dict(prefill=30e9, decode=30.2e9, retire=None)
+    rec["memory"] = dict(
+        rec["memory"], set_cache_limit=[qualify.expected_cache_limit(24, want)]
+    )
+    assert qualify.request_problems(rec, want) == []
+    rec.pop("landings")
+    assert any(
+        "landing" in p or "chunks" in p for p in qualify.request_problems(rec, want)
+    )
