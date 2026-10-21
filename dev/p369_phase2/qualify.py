@@ -25,6 +25,9 @@ MIN_OUTPUT_TOKENS = (
 )
 THINKING_CLAMP = 0.8  # mlx-vlm server: THINKING_BUDGET_CLAMP_RATIO
 SEED = 7
+PRODUCTION = (
+    "7207179b"  # the production pin every qualification and its P369 evidence run on
+)
 VISION_SERVER = "mlx_vlm.server"  # mlx-serve _MLX_VLM_SERVER: <stack venv>/bin/mlx_vlm.server for type: vision
 NON_SERVING = ("name", "on_demand", "presentation", "display_name", "description")
 # registry key -> (mlx-serve default, flag, how the value is spelled); mlx-serve config.ModelConfig / _build_command
@@ -51,7 +54,6 @@ SERVING = {
 }
 FIXED = {"--host": "127.0.0.1", "--port": None}  # present, value not the registry's
 VALUELESS = ("--lazy-prompt-embeddings",)
-KV_CLASSES = ("PreallocKVCache", "PreallocQuantizedKVCache", "TurboQuantKVCache")
 
 
 class UnknownKey(ValueError):
@@ -59,7 +61,9 @@ class UnknownKey(ValueError):
 
 
 def default_entries():
-    return [e for e, arm in ENTRIES.items() if arm != "mtp_on_gated"]
+    """Code round 1 D8: the full qualification is all seven (Qwen3.6 then needs its P369 evidence); a subset only via
+    ``--entry``."""
+    return list(ENTRIES)
 
 
 def entry_problems(names, *, p369_summary):
@@ -70,12 +74,20 @@ def entry_problems(names, *, p369_summary):
             continue
         summary = json.loads(Path(p369_summary).read_text()) if p369_summary else None
         pick = ((summary or {}).get("picks") or {}).get(name) or {}
+        binding = (summary or {}).get("binding") or {}
+        manifest = (summary or {}).get("manifest") or {}
         passed = (
             summary is not None
             and summary.get("phase") == "full"
             and summary.get("status") == "PASS"
             and (pick.get("outcome") or {}).get("e1c") == "PASS"
             and (pick.get("e2") or {}).get("verdict") == "PASS"
+            # code round 1 D10: the run's own provenance — the production pin and a bound reviewed head
+            and binding.get("production") == PRODUCTION
+            and manifest.get("production") == PRODUCTION
+            and bool(binding.get("reviewed_head"))
+            and binding.get("reviewed_head") == binding.get("fork_head")
+            and list(summary.get("picks") or {}) == [name]
         )
         if not passed:
             problems.append(f"{name}: MTP-ON only after its P369 full-run PASS (C199)")
@@ -130,7 +142,14 @@ def expected_config(entry):
         type=values["type"],
         flags=flags,
         drafter=drafter,
-        verify_policy=(values["mtp_verify_scan"] or "per_query") if drafter else None,
+        # code round 1 D1: production holds NO policy object for the default per-query scan (served_state → None)
+        verify_policy=(
+            values["mtp_verify_scan"]
+            if drafter and values["mtp_verify_scan"] not in ("", "per_query")
+            else None
+        ),
+        kv_quant_mode=values["kv_quant_mode"] or None,
+        quantized_kv_start=int(values["quantized_kv_start"]),
         kv_bits=int(values["kv_bits"]) or None,
         kv_quant_scheme=values["kv_quant_scheme"] or None,
         prefill_step=int(values["prefill_step_size"]),
@@ -260,6 +279,10 @@ def request_problems(rec, expected):
     tokens = rec.get("generation_tokens")
     if not (isinstance(tokens, int) and 0 < tokens <= budget):
         problems.append(f"generated tokens {tokens!r} not in 1..{budget}")
+    if (
+        rec.get("delegates_to_cli_main") is not True
+    ):  # code round 1 D4 (proven in the worker)
+        problems.append("mlx_vlm.server.main does not run mlx_vlm.server.cli.main")
     if rec.get("boundary_seen") is not True:
         problems.append("no prefill / decode boundary observed (Q11)")
     if rec.get("prompt_step_tokens") != 1:
@@ -280,16 +303,28 @@ def request_problems(rec, expected):
     for name in ("prefill_tps", "decode_tps"):
         if not _finite_positive((rec.get("rates") or {}).get(name)):
             problems.append(f"{name} {(rec.get('rates') or {}).get(name)!r}")
-    kv = [c for c in rec.get("capacities") or [] if c.get("cls") in KV_CLASSES]
-    if not kv:
-        problems.append("no preallocated KV leaf capacity observed")
-    for c in kv:
-        if not (
-            isinstance(c.get("capacity"), int) and c["capacity"] >= expected["prealloc"]
-        ):
-            problems.append(
-                f"{c.get('leaf')} capacity {c.get('capacity')} < {expected['prealloc']}"
-            )
+    # code round 1 D3: the measured cache's exact leaf layout (P405 F3) against the REGISTRY-derived codec, and every
+    # KV leaf's allocated capacity exactly the registry's preallocation floor
+    from p369_phase2 import kvmanifest
+
+    observed, template = rec.get("manifest"), rec.get("template")
+    if not observed or not template:
+        problems.append("no leaf manifest / template of the measured cache")
+    else:
+        problems += kvmanifest.manifest_problems(
+            observed, template, expected_kv(expected)
+        )
+        caps = rec.get("capacities_by_path") or {}
+        kv_paths = [
+            o["path"] for o in observed if o.get("kind") in ("tq", "affine", "native")
+        ]
+        if not kv_paths:
+            problems.append("no KV leaf in the measured cache")
+        for path in kv_paths:
+            if caps.get(path) != expected["prealloc"]:
+                problems.append(
+                    f"layer {path} capacity {caps.get(path)} != {expected['prealloc']}"
+                )
     fused = expected["attention_policy"] == "fused_v1"
     forced = rec.get("sdpa_forced") or 0
     if fused != (forced > 0):
@@ -313,8 +348,6 @@ def request_problems(rec, expected):
         )
         if v > 0
     ]
-    if memory.get("memory_limit_frac") != expected["memory_limit_frac"]:
-        problems.append(f"memory limit fraction {memory.get('memory_limit_frac')}")
     want_limit = int(min(limits)) if limits else None
     if want_limit is None or memory.get("set_memory_limit") != [want_limit]:
         problems.append(
@@ -322,16 +355,88 @@ def request_problems(rec, expected):
         )
     caches = memory.get("set_cache_limit") or []
     if expected["cache_limit_gb"] > 0:
-        if caches != [int(expected["cache_limit_gb"] * 2**30)]:
-            problems.append(f"cache limit {caches}")
-    elif len(caches) != 1 or not _finite_positive(caches[0]):
-        problems.append(f"cache limit {caches} (auto-derived, one positive value)")
+        want_cache = int(expected["cache_limit_gb"] * 2**30)
+    else:  # code round 1 D9: mlx-vlm's _derive_cache_limit_gb from the model's heads
+        want_cache = expected_cache_limit(memory.get("heads"), expected)
+    if caches != [want_cache]:
+        problems.append(f"cache limit {caches} != [{want_cache}]")
     checks = rec.get("drafter_live_checks")
     if expected["drafter"]:
         if not checks or any(checks):
             problems.append(f"drafter live checks {checks}")
     elif checks:
         problems.append(f"drafter checks without a drafter {checks}")
+    return problems
+
+
+def expected_kv(expected):
+    """The KV codec the REGISTRY asks for, in ``kvmanifest.kv_from_argv``'s shape (the CLI defaults where unset)."""
+    from p369_phase2 import kvmanifest
+
+    return dict(
+        kv_bits=float(expected["kv_bits"]) if expected["kv_bits"] else None,
+        kv_key_bits=None,
+        kv_value_bits=None,
+        kv_key_scheme=None,
+        kv_value_scheme=None,
+        kv_quant_scheme=expected["kv_quant_scheme"]
+        or kvmanifest.CLI_DEFAULTS["kv_quant_scheme"],
+        kv_group_size=kvmanifest.CLI_DEFAULTS["kv_group_size"],
+        quantized_kv_start=expected["quantized_kv_start"],
+        tq_kv_quant_mode=expected["kv_quant_mode"] or kvmanifest.DEFAULT_TQ_MODE,
+    )
+
+
+def expected_cache_limit(heads, expected):
+    """mlx-vlm ``server/cli.py`` ``_derive_cache_limit_gb``: ceil(heads × prefill step × max KV × 2 B / 1e9) + 2 GB
+    (heads default 32), applied as ``int(gb × 2**30)`` bytes; None without a cap or a step.
+    """
+    if not (expected["cap"] and expected["prefill_step"]):
+        return None
+    gb = (
+        math.ceil((heads or 32) * expected["prefill_step"] * expected["cap"] * 2 / 1e9)
+        + 2.0
+    )
+    return int(gb * 2**30)
+
+
+def entry_point_problems(info, venv_bin):
+    """Code round 1 D4: the shipping console script runs the main the worker boots — its shebang is the stack venv's
+    python, its entry point ``mlx_vlm.server:main``, and that main delegates to ``mlx_vlm.server.cli.main``.
+    """
+    problems = []
+    if info.get("shebang") != str(Path(venv_bin) / "python"):
+        problems.append(f"console script interpreter {info.get('shebang')!r}")
+    if info.get("entry") != "mlx_vlm.server:main":
+        problems.append(f"console script entry point {info.get('entry')!r}")
+    if info.get("delegates_to_cli_main") is not True:
+        problems.append("mlx_vlm.server.main does not run mlx_vlm.server.cli.main")
+    return problems
+
+
+def guard_problems(start, now, *, reviewed):
+    """Code round 1 D5: the fork is clean at the reviewed head and the stack HEAD has not moved."""
+    problems = []
+    if now.get("fork_head") != reviewed:
+        problems.append(
+            f"fork at {now.get('fork_head')}, not the reviewed head {reviewed}"
+        )
+    if not now.get("fork_clean"):
+        problems.append("fork tree not clean")
+    if now.get("stack_head") != start.get("stack_head"):
+        problems.append(
+            f"stack HEAD moved {start.get('stack_head')} -> {now.get('stack_head')}"
+        )
+    return problems
+
+
+def monitor_problems(*, alive, last_tick_age_s, period_s=300):
+    """Code round 1 D12: the 5-minute monitor is alive and ticked within two periods."""
+    problems = []
+    if not alive:
+        problems.append("the monitor thread is dead")
+    if last_tick_age_s is None or last_tick_age_s > 2 * period_s:
+        problems.append(f"the monitor's last tick is {last_tick_age_s} s old")
     return problems
 
 
@@ -377,16 +482,23 @@ def reference_comparison(ref, peak_gb, fingerprint):
     )
 
 
-def load_references(path):
-    table = json.loads(Path(path).read_text())
+def load_references(path, *, table=None, blob_exists=None):
+    """The reviewed reference table; every reference names its source and that source's git blob id, which must exist
+    in the stack repository (code round 1 D11: an immutable locator, not a mutable path).
+    """
+    table = json.loads(Path(path).read_text()) if table is None else table
     for name, ref in table.items():
         if name not in ENTRIES:
             raise ValueError(f"reference for an unknown entry {name!r}")
-        if ref is not None and not (
-            ref.get("source") and _finite_positive(ref.get("peak_gb"))
-        ):
+        if ref is None:
+            continue
+        if not (ref.get("source") and _finite_positive(ref.get("peak_gb"))):
             raise ValueError(
                 f"{name}: a reference needs a source and a positive peak_gb"
+            )
+        if blob_exists is not None and not blob_exists(ref.get("source_blob")):
+            raise ValueError(
+                f"{name}: source blob {ref.get('source_blob')!r} not in the stack repository"
             )
     return table
 
@@ -395,8 +507,11 @@ def idle_before(names):
     return [i > 0 for i in range(len(names))]
 
 
-def entry_status(*, pre, post, error, problems):
-    """C198 (3): interference / power before or after an entry ⇒ INVALID; an error or a problem ⇒ FAILED."""
+def entry_status(*, pre, post, error, problems, monitor=()):
+    """C198 (3): interference / power before or after an entry ⇒ INVALID (and a dead / stale monitor, code round 1
+    D12); an error or a problem ⇒ FAILED."""
+    if monitor:
+        return dict(status="INVALID", reason=f"monitor: {'; '.join(monitor)}")
     if not pre.get("ok"):
         return dict(status="INVALID", reason=f"before: {pre.get('why')}")
     if post is not None and not post.get("ok"):
@@ -504,8 +619,46 @@ def _atomic(path, obj):
     os.replace(tmp, path)
 
 
+def _tree_state(fork, stack):
+    import subprocess
+
+    dirty = subprocess.run(
+        ["git", "-C", str(fork), "status", "--porcelain", "--untracked-files=all"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    return dict(
+        fork_head=_git_head(fork), fork_clean=not dirty, stack_head=_git_head(stack)
+    )
+
+
+def console_script_info(stack):
+    """Code round 1 D4: the stack venv's ``mlx_vlm.server`` console script — its interpreter and entry point (the
+    stack-side mlx-vlm is the pre-bump submodule; its location is recorded, the worker runs the fork tree).
+    """
+    import subprocess
+
+    script = Path(stack) / ".venv" / "bin" / VISION_SERVER
+    shebang = script.read_text().splitlines()[0].removeprefix("#!").strip()
+    code = (
+        "import importlib.metadata as m, json, mlx_vlm\n"
+        "eps = [e.value for e in m.entry_points(group='console_scripts') if e.name == 'mlx_vlm.server']\n"
+        "print(json.dumps(dict(entry=eps[0] if len(eps) == 1 else eps, stack_mlx_vlm=mlx_vlm.__file__)))\n"
+    )
+    out = subprocess.run(
+        [str(Path(stack) / ".venv" / "bin" / "python"), "-c", code],
+        capture_output=True,
+        text=True,
+        check=True,
+        cwd=stack,
+    )
+    return dict(json.loads(out.stdout.strip().splitlines()[-1]), shebang=shebang)
+
+
 def drive(args):
     import signal
+    import subprocess
     import sys
     import time
 
@@ -521,40 +674,62 @@ def drive(args):
     problems = entry_problems(names, p369_summary=args.p369_summary)
     if problems:
         raise SystemExit(f"refused: {problems}")
+    reviewed = _resolve_ref(fork, args.reviewed_head)
     out.mkdir(parents=True, exist_ok=False)
     lock = orchestrate.acquire_lock(orchestrate.lock_path(dict(os.environ)))
-    pre = orchestrate.preflight(args, out)
-    if pre["problems"]:
-        raise SystemExit(f"refused: {pre['problems']}")
-    registry = orchestrate.read_registry(stack / "main_models.yaml")
-    registry_sha = orchestrate.sha256_file(stack / "main_models.yaml")
-    fixture = registry_states.fixture_text(fork / "mlx_vlm" / "tests" / "fixtures")
-    if registry_states.classify(registry, fixture) is None:
-        raise SystemExit(
-            "refused: the live registry is not one of the 16 accepted byte states"
-        )
-    references = load_references(REFERENCES)
-    report = dict(
-        started=time.strftime("%Y-%m-%dT%H:%M:%S"),
-        fork_head=_git_head(fork),
-        stack_head=_git_head(stack),
-        production=orchestrate.PRODUCTION,
-        registry_sha256=registry_sha,
-        versions=orchestrate.fork_versions(fork),
-        entries={n: dict(status="PENDING", arm=ENTRIES[n]) for n in names},
-    )
-    _atomic(out / "report.json", report)
-    monitor = orchestrate.Monitor(out / "monitor.log", estimate_s=len(names) * 1200)
+    report = dict(entries={n: dict(status="PENDING", arm=ENTRIES[n]) for n in names})
     stop = dict(signal=None)
+    monitor = None
+    try:  # code round 1 D13: everything after the lock is inside the cleanup scope
+        pre = orchestrate.preflight(args, out)
+        if pre["problems"]:
+            raise SystemExit(f"refused: {pre['problems']}")
+        start = _tree_state(fork, stack)
+        problems = guard_problems(start, start, reviewed=reviewed)  # D5
+        registry = orchestrate.read_registry(stack / "main_models.yaml")
+        registry_sha = orchestrate.sha256_file(stack / "main_models.yaml")
+        fixture = registry_states.fixture_text(fork / "mlx_vlm" / "tests" / "fixtures")
+        if registry_states.classify(registry, fixture) is None:
+            problems.append(
+                "the live registry is not one of the 16 accepted byte states"
+            )
+        console = console_script_info(stack)
+        problems += entry_point_problems(
+            dict(console, delegates_to_cli_main=True), stack / ".venv" / "bin"
+        )  # the delegation itself is proven inside the worker (``check_server_main``)
+        if problems:
+            raise SystemExit(f"refused: {problems}")
 
-    def on_signal(signum, _frame):
-        stop["signal"] = signum
-        raise SystemExit(128 + signum)
+        def blob_exists(blob):
+            return (
+                bool(blob)
+                and subprocess.run(
+                    ["git", "-C", str(stack), "cat-file", "-e", f"{blob}^{{blob}}"],
+                    capture_output=True,
+                ).returncode
+                == 0
+            )
 
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        signal.signal(sig, on_signal)
-    monitor.__enter__()
-    try:
+        references = load_references(REFERENCES, blob_exists=blob_exists)
+        report.update(
+            started=time.strftime("%Y-%m-%dT%H:%M:%S"),
+            reviewed_head=reviewed,
+            start=start,
+            production=orchestrate.PRODUCTION,
+            registry_sha256=registry_sha,
+            versions=orchestrate.fork_versions(fork),
+            console_script=console,
+        )
+        _atomic(out / "report.json", report)
+
+        def on_signal(signum, _frame):
+            stop["signal"] = signum
+            raise SystemExit(128 + signum)
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(sig, on_signal)
+        monitor = orchestrate.Monitor(out / "monitor.log", estimate_s=len(names) * 1200)
+        monitor.__enter__()
         for i, name in enumerate(names):
             if i:
                 time.sleep(args.idle_s)
@@ -562,9 +737,12 @@ def drive(args):
             state.update(status="RUNNING", started=time.strftime("%Y-%m-%dT%H:%M:%S"))
             _atomic(out / "report.json", report)
             before = interference(orchestrate)
-            error, problems, after, rec = None, [], None, None
+            error, problems, after, rec, expected = None, [], None, None, None
             if before["ok"]:
                 try:
+                    problems = guard_problems(
+                        start, _tree_state(fork, stack), reviewed=reviewed
+                    )
                     if ENTRIES[name] == "served":
                         path, text = stack / "main_models.yaml", registry
                     else:  # C199: the shipped MTP-ON form, the 16-state generator's exact block
@@ -574,61 +752,38 @@ def drive(args):
                     entry = {e["name"]: e for e in yaml.safe_load(text)["models"]}[name]
                     expected = expected_config(entry)
                     cmd, module_file = full_command(stack, path, name)
-                    problems = binding_problems(
+                    problems += binding_problems(
                         stack, module_file, registry_sha, orchestrate.sha256_file
                     ) + command_problems(expected, cmd, stack / ".venv" / "bin")
                     if not problems:
-                        argv = cmd[1:]
-                        model = argv[argv.index("--model") + 1]
-                        revisions = {"--model": orchestrate.weights_record(model)}
-                        if expected["drafter"]:
-                            revisions["--draft-model"] = orchestrate.weights_record(
-                                argv[argv.index("--draft-model") + 1]
-                            )
-                        job = dict(
-                            name=f"{name}/qualify",
-                            mode="qualify",
-                            argv=argv,
-                            expect=dict(
-                                drafter=expected["drafter"],
-                                verify_policy=expected["verify_policy"],
-                                revisions={
-                                    k: dict(revision=v["revision"], files=v["files"])
-                                    for k, v in revisions.items()
-                                },
-                                kv=kvmanifest.kv_from_argv(argv),
-                                drafter_shape=(
-                                    orchestrate.PICKS[name]["drafter"]
-                                    if expected["drafter"]
-                                    else None
-                                ),
-                            ),
-                            source_root=str(fork),
-                            dev_dir=str(fork / "dev"),
-                            out_dir=str(out / name),
-                            requests=[
-                                dict(
-                                    name="max-context",
-                                    model=name,
-                                    target=expected["prompt_tokens"],
-                                    prefix=orchestrate.SIZE_PREFIX,
-                                    suffix=orchestrate.SIZE_SUFFIX,
-                                    seed=SEED,
-                                    generation_defaults=expected["generation_defaults"],
-                                    timeout_s=REQUEST_S,
-                                )
-                            ],
-                            timeout_s=JOB_S,
-                        )
                         result = orchestrate.run_job(
-                            job,
+                            _job(
+                                name,
+                                cmd[1:],
+                                expected,
+                                fork,
+                                out,
+                                orchestrate,
+                                kvmanifest,
+                            ),
                             fork,
                             orchestrate.worker_env(dict(os.environ)),
                             monitor,
                             deadline=math.inf,
                         )
-                        rec = result["requests"][0]["qualify"]
+                        rec = dict(
+                            result["requests"][0]["qualify"],
+                            snapshots=result.get("snapshots"),
+                            versions=report["versions"],
+                        )
                         problems = request_problems(rec, expected)
+                        # D5: the bindings again after the job
+                        problems += guard_problems(
+                            start, _tree_state(fork, stack), reviewed=reviewed
+                        )
+                        problems += binding_problems(
+                            stack, module_file, registry_sha, orchestrate.sha256_file
+                        )
                 except SystemExit:
                     raise
                 except (
@@ -636,25 +791,42 @@ def drive(args):
                 ) as exc:  # recorded per entry; the run continues (plan v2 Q5)
                     error = f"{type(exc).__name__}: {exc}"
                 after = interference(orchestrate)
-            state.update(
-                entry_status(pre=before, post=after, error=error, problems=problems),
-                problems=problems[:50],
-                before=before,
-                after=after,
-                record=rec,
+            last = _last_tick_age(out / "monitor.log")
+            mon = monitor_problems(
+                alive=monitor._thread.is_alive(), last_tick_age_s=last
+            )
+            # code round 1 D6: every piece of evidence is final BEFORE the terminal status is written
+            final = dict(problems=problems[:50], before=before, after=after, record=rec)
+            if rec and not error and not problems:
+                peak = capacity_gb(rec["peaks"])
+                ref = references.get(name)
+                final.update(
+                    capacity_gb=peak,
+                    vs_guidance_gb=round(peak - 48.0, 3),
+                    reference=(
+                        None
+                        if ref is None
+                        else reference_comparison(
+                            ref, peak, fingerprint_of(rec, expected)
+                        )
+                    ),
+                )
+            final.update(
+                entry_status(
+                    pre=before, post=after, error=error, problems=problems, monitor=mon
+                ),
                 finished=time.strftime("%Y-%m-%dT%H:%M:%S"),
             )
-            if rec and state["status"] == "COMPLETED":
-                peak = capacity_gb(rec["peaks"])
-                state["capacity_gb"] = peak
-                state["vs_guidance_gb"] = round(peak - 48.0, 3)
-                ref = references.get(name)
-                state["reference"] = (
-                    None
-                    if ref is None
-                    else reference_comparison(ref, peak, fingerprint_of(rec, expected))
-                )
+            state.update(final)
             _atomic(out / "report.json", report)
+        report["end"] = _tree_state(fork, stack)
+        report["end_problems"] = guard_problems(start, report["end"], reviewed=reviewed)
+        if report["end_problems"]:
+            for state in report["entries"].values():
+                if state["status"] == "COMPLETED":
+                    state.update(
+                        status="INVALID", reason=f"at exit: {report['end_problems']}"
+                    )
     finally:
         for state in report["entries"].values():
             if state["status"] in ("PENDING", "RUNNING"):
@@ -666,9 +838,72 @@ def drive(args):
                 )
         report["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S")
         _atomic(out / "report.json", report)
-        monitor.__exit__(None, None, None)
+        if monitor is not None:
+            monitor.__exit__(None, None, None)
         orchestrate.release_lock(lock)
     return exit_code(report["entries"])
+
+
+def _resolve_ref(path, ref):
+    import subprocess
+
+    return subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "--verify", f"{ref}^{{commit}}"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+
+def _last_tick_age(path):
+    import time
+
+    try:
+        return time.time() - Path(path).stat().st_mtime
+    except OSError:
+        return None
+
+
+def _job(name, argv, expected, fork, out, orchestrate, kvmanifest):
+    model = argv[argv.index("--model") + 1]
+    revisions = {"--model": orchestrate.weights_record(model)}
+    if expected["drafter"]:
+        revisions["--draft-model"] = orchestrate.weights_record(
+            argv[argv.index("--draft-model") + 1]
+        )
+    return dict(
+        name=f"{name}/qualify",
+        mode="qualify",
+        argv=argv,
+        expect=dict(
+            drafter=expected["drafter"],
+            verify_policy=expected["verify_policy"],
+            revisions={
+                k: dict(revision=v["revision"], files=v["files"])
+                for k, v in revisions.items()
+            },
+            kv=kvmanifest.kv_from_argv(argv),
+            drafter_shape=(
+                orchestrate.PICKS[name]["drafter"] if expected["drafter"] else None
+            ),
+        ),
+        source_root=str(fork),
+        dev_dir=str(fork / "dev"),
+        out_dir=str(out / name),
+        requests=[
+            dict(
+                name="max-context",
+                model=name,
+                target=expected["prompt_tokens"],
+                prefix=orchestrate.SIZE_PREFIX,
+                suffix=orchestrate.SIZE_SUFFIX,
+                seed=SEED,
+                generation_defaults=expected["generation_defaults"],
+                timeout_s=REQUEST_S,
+            )
+        ],
+        timeout_s=JOB_S,
+    )
 
 
 def fingerprint_of(rec, expected):
@@ -688,10 +923,15 @@ def fingerprint_of(rec, expected):
         prefill_step=expected["prefill_step"],
         mlx=(rec.get("versions") or {}).get("mlx"),
         method="mx.get_peak_memory phases (P415)",
-        snapshot=rec.get("snapshot"),
+        snapshot={
+            k: v.get("revision") for k, v in (rec.get("snapshots") or {}).items()
+        },  # code round 1 D11
         harness="p415",
         context_cap=expected["cap"],
-        memory_limits=expected["memory_limit_frac"],
+        memory_limits=dict(
+            memory=(rec.get("memory") or {}).get("set_memory_limit"),
+            cache=(rec.get("memory") or {}).get("set_cache_limit"),
+        ),
         shrink="on" if expected["shrink"] else "off",
         output_tokens=rec.get("generation_tokens"),
         backend=VISION_SERVER,
@@ -709,6 +949,7 @@ def main(argv=None):
     ap.add_argument("--out", required=True)
     ap.add_argument("--entry", action="append")
     ap.add_argument("--p369-summary")
+    ap.add_argument("--reviewed-head", required=True)  # code round 1 D5
     ap.add_argument("--idle-s", type=float, default=IDLE_S)
     args = ap.parse_args(argv)
     if args.idle_s < IDLE_S:

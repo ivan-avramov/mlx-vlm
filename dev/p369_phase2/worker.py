@@ -1272,14 +1272,17 @@ def compare_pair(ref, recorder, n, params, exclude=()):
     )
 
 
-def record_memory_limits():
+def record_memory_limits(mx=None):
     """P415 (plan v4 Q2): the memory / cache limits the CLI sets, recorded from its own ``mx.set_*`` calls, plus the
-    inputs of mlx-serve's limit rule (physical memory, the recommended working set)."""
-    import mlx.core as mx
+    inputs of mlx-serve's limit rule (physical memory, the recommended working set). Returns ``(record, undo)``.
+    """
+    if mx is None:
+        import mlx.core as mx
 
     out = dict(set_memory_limit=[], set_cache_limit=[])
+    saved = {}
     for name in ("set_memory_limit", "set_cache_limit"):
-        real = getattr(mx, name)
+        real = saved[name] = getattr(mx, name)
 
         def recording(value, *a, _real=real, _name=name, **k):
             out[_name].append(int(value))
@@ -1293,7 +1296,51 @@ def record_memory_limits():
     out["rec_wss"] = (
         int(mx.device_info().get("max_recommended_working_set_size", 0)) or None
     )
+
+    def undo():
+        for name, real in saved.items():
+            setattr(mx, name, real)
+
+    return out, undo
+
+
+def _capacities(caches, prefix=""):
+    """``{path: allocated sequence length}`` over the same layer paths as ``kvmanifest.manifest`` (code round 1 D3)."""
+    out = {}
+    for i, leaf in enumerate(caches or []):
+        if leaf is None:
+            continue
+        path = f"{prefix}{i}"
+        if type(leaf).__name__ == "CacheList":
+            out.update(_capacities(leaf.caches, prefix=f"{path}."))
+        else:
+            out[path] = _leaf_capacity(leaf)
     return out
+
+
+def check_server_main():
+    """Code round 1 D4: ``mlx_vlm.server.main`` (the console script's entry point) runs ``mlx_vlm.server.cli.main``
+    — the function ``boot`` runs in-process."""
+    import mlx_vlm.server as server
+    from mlx_vlm.server import cli
+
+    class Reached(Exception):
+        pass
+
+    def sentinel(*a, **k):
+        raise Reached
+
+    real = cli.main
+    cli.main = sentinel
+    try:
+        server.main()
+    except Reached:
+        return True
+    except BaseException:
+        return False
+    finally:
+        cli.main = real
+    return False
 
 
 def _leaf_capacity(leaf):
@@ -1342,8 +1389,9 @@ def qualify_request(client, capture, rg, spec, memory):
     import mlx.core as mx
     from mlx_vlm.generate import dispatch
     from mlx_vlm.models import cache as cache_mod
+    from mlx_vlm.generate import ar
     from mlx_vlm.server import generation
-    from mlx_vlm.speculative.cache_state import iter_leaf_caches
+    from p369_phase2 import kvmanifest
 
     base = dict(model=spec["model"], stream=False)
     count = lambda text: prompt_tokens(  # noqa: E731
@@ -1364,7 +1412,12 @@ def qualify_request(client, capture, rg, spec, memory):
         peaks=dict(prefill=None, decode=None, retire=None),
         lazy_calls=0,
         shrink_calls=0,
-        memory=memory,
+        memory=dict(
+            memory,
+            heads=getattr(rg.model.language_model.args, "num_attention_heads", None),
+        ),  # D9: the derivation's input, from the loaded config
+        template=kvmanifest.manifest(rg.model.language_model.make_cache()),  # D3
+        delegates_to_cli_main=check_server_main(),  # D4
     )
     state = dict(phase="prefill", cache=None)
     patched = []
@@ -1378,10 +1431,8 @@ def qualify_request(client, capture, rg, spec, memory):
             return
         mx.synchronize()
         rec["peaks"]["prefill"] = int(mx.get_peak_memory())
-        rec["capacities"] = [
-            dict(leaf=f"leaf.{i}", cls=type(c).__name__, capacity=_leaf_capacity(c))
-            for i, c in enumerate(iter_leaf_caches(state["cache"] or []))
-        ]
+        rec["manifest"] = kvmanifest.manifest(state["cache"])  # code round 1 D3
+        rec["capacities_by_path"] = _capacities(state["cache"])
         mx.reset_peak_memory()
         state["phase"] = "decode"
         rec["boundary_seen"] = True
@@ -1469,15 +1520,15 @@ def qualify_request(client, capture, rg, spec, memory):
             patch(
                 cls, "shrink_to_offset", recording_shrink(vars(cls)["shrink_to_offset"])
             )
-        drafter = getattr(rg, "draft_model", None)
-        if drafter is not None:  # an MTP round's first work is the drafter's
-            draft = type(drafter).draft_block
+        rounds = ar.run_speculative_rounds
 
-            def recording_draft(self, *a, **k):
-                boundary()
-                return draft(self, *a, **k)
+        def recording_rounds(
+            *a, **k
+        ):  # code round 1 D7: before any speculative setup or drafter work
+            boundary()
+            yield from rounds(*a, **k)
 
-            patch(type(drafter), "draft_block", recording_draft)
+        patch(ar, "run_speculative_rounds", recording_rounds)
         mx.synchronize()
         mx.reset_peak_memory()
         got = post(
@@ -1525,8 +1576,8 @@ def run_job(job, out_dir, result):
 
     ROUTED_MODEL = argv_model(job["argv"])
 
-    memory = (
-        record_memory_limits() if job["mode"] == "qualify" else None
+    memory, undo_memory = (
+        record_memory_limits() if job["mode"] == "qualify" else (None, None)
     )  # P415: before the CLI sets them
     client = boot(job["argv"])
     with client, ExitStack() as stack:
@@ -1601,6 +1652,7 @@ def run_job(job, out_dir, result):
             write_progress(
                 out_dir, index=0, name=spec["name"], deadline_s=spec["timeout_s"]
             )
+            undo_memory()  # the CLI has set its limits; the request runs on the real functions
             record = qualify_request(client, capture, rg, spec, memory)
             record["drafter_live_checks"] = result.get("drafter_live_checks")
             result["requests"].append(dict(name=spec["name"], qualify=record))

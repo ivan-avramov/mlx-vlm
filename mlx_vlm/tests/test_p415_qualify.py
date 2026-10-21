@@ -146,9 +146,7 @@ def test_t1_the_seven_entries_and_their_arms():
     assert qualify.ENTRIES[FABLE] == qualify.ENTRIES[UNIFORM] == "mtp_on"
     assert qualify.ENTRIES[QWEN36] == "mtp_on_gated"
     assert qualify.ENTRIES[STATIC] == "served"
-    assert (
-        QWEN36 not in qualify.default_entries() and len(qualify.default_entries()) == 6
-    )
+    assert QWEN36 in qualify.default_entries() and len(qualify.default_entries()) == 7
 
 
 def test_t1_an_unknown_entry_or_an_ungated_qwen36_refuses(tmp_path):
@@ -162,15 +160,7 @@ def test_t1_an_unknown_entry_or_an_ungated_qwen36_refuses(tmp_path):
         [QWEN36], p369_summary=bad
     )  # a smoke is not the campaign
     good = tmp_path / "f.json"
-    good.write_text(
-        json.dumps(
-            dict(
-                phase="full",
-                status="PASS",
-                picks={QWEN36: dict(outcome=dict(e1c="PASS"), e2=dict(verdict="PASS"))},
-            )
-        )
-    )
+    good.write_text(json.dumps(_summary()))
     assert qualify.entry_problems([QWEN36], p369_summary=good) == []
     assert qualify.entry_problems([FABLE, STATIC], p369_summary=None) == []
 
@@ -243,6 +233,37 @@ def test_t15_the_prefill_chunk_sequence_is_derived_from_the_step():
     assert qualify.chunk_sequence(1030, 512) == [512, 512, 5]
 
 
+def _template():
+    return [
+        dict(path="0", kind="ArraysCache", cls="ArraysCache", batch=False),
+        dict(path="1", kind="native", cls="KVCache", batch=False),
+        dict(path="2", kind="ArraysCache", cls="ArraysCache", batch=False),
+        dict(path="3", kind="native", cls="KVCache", batch=False),
+    ]
+
+
+def _native_manifest():
+    return [
+        dict(t, cls="PreallocKVCache") if t["kind"] == "native" else dict(t)
+        for t in _template()
+    ]
+
+
+def _tq_manifest():  # TurboQuant 4-bit: every KV layer but the last top-level entry (> 2 entries)
+    out = _native_manifest()
+    out[1] = dict(
+        path="1",
+        kind="tq",
+        cls="TurboQuantKVCache",
+        batch=False,
+        bits=4.0,
+        key_bits=4.0,
+        value_bits=4.0,
+        mode="mse",
+    )
+    return out
+
+
 def _record(**changes):
     sha = "ab" * 32
     rec = dict(
@@ -262,19 +283,21 @@ def _record(**changes):
         boundary_seen=True,
         peaks=dict(prefill=36.5e9, decode=36.9e9, retire=37.1e9),
         rates=dict(prefill_tps=700.0, decode_tps=12.0),
-        capacities=[
-            dict(leaf="layers.3", cls="PreallocKVCache", capacity=262144),
-            dict(leaf="layers.0", cls="ArraysCache", capacity=None),
-        ],
+        manifest=_native_manifest(),
+        template=_template(),
+        capacities_by_path={"0": None, "1": 262144, "2": None, "3": 262144},
+        delegates_to_cli_main=True,
         sdpa_forced=640,
         lazy_calls=1,
         shrink_calls=1,
         memory=dict(
-            memory_limit_frac=0.85,
             phys=128e9,
             rec_wss=110e9,
-            set_memory_limit=[108.8e9],
-            set_cache_limit=[20e9],
+            heads=24,
+            set_memory_limit=[int(min(0.85 * 128e9, 110e9))],
+            set_cache_limit=[
+                qualify.expected_cache_limit(24, qualify.expected_config(FABLE_ENTRY))
+            ],
         ),
         server_defaults=GEN,
         drafter_live_checks=[[]],
@@ -345,8 +368,17 @@ def test_c198_the_request_resolves_the_registry_defaults_with_the_servers_own_cl
 
 def test_t15_a_served_auto_entry_must_not_take_the_fused_or_lazy_paths():
     want = qualify.expected_config(STATIC_ENTRY)
-    ok = _record(sdpa_forced=0, lazy_calls=0, shrink_calls=0, drafter_live_checks=None)
+    ok = _record(
+        sdpa_forced=0,
+        lazy_calls=0,
+        shrink_calls=0,
+        drafter_live_checks=None,
+        manifest=_tq_manifest(),
+    )
     ok["peaks"] = dict(prefill=30e9, decode=30.2e9, retire=None)
+    ok["memory"] = dict(
+        ok["memory"], set_cache_limit=[qualify.expected_cache_limit(24, want)]
+    )
     assert qualify.request_problems(ok, want) == []
     for change in (dict(sdpa_forced=3), dict(lazy_calls=1), dict(shrink_calls=1)):
         bad = dict(ok, **change)
@@ -354,14 +386,12 @@ def test_t15_a_served_auto_entry_must_not_take_the_fused_or_lazy_paths():
 
 
 def test_t15_preallocated_kv_leaves_must_hold_the_registry_floor():
-    rec = _record(
-        capacities=[dict(leaf="layers.3", cls="PreallocKVCache", capacity=4096)]
-    )
+    rec = _record(capacities_by_path={"0": None, "1": 262144, "2": None, "3": 4096})
     assert any(
         "capacity" in p
         for p in qualify.request_problems(rec, qualify.expected_config(FABLE_ENTRY))
     )
-    rec = _record(capacities=[])
+    rec = _record(capacities_by_path={})
     assert any(
         "capacity" in p
         for p in qualify.request_problems(rec, qualify.expected_config(FABLE_ENTRY))
@@ -505,7 +535,25 @@ def _drive(tmp_path, monkeypatch, run_job, names=(FABLE, STATIC)):
 
     monkeypatch.setattr(registry_states, "fixture_text", lambda d: "fx")
     monkeypatch.setattr(registry_states, "classify", lambda text, fx: set())
-    monkeypatch.setattr(qualify, "load_references", lambda p: {})
+    monkeypatch.setattr(qualify, "load_references", lambda p, **k: {})
+    monkeypatch.setattr(qualify, "_resolve_ref", lambda path, ref: "a" * 40)
+    monkeypatch.setattr(
+        qualify,
+        "_tree_state",
+        lambda fork, stack: dict(
+            fork_head="a" * 40, fork_clean=True, stack_head="s" * 40
+        ),
+    )
+    monkeypatch.setattr(
+        qualify,
+        "console_script_info",
+        lambda stack: dict(
+            shebang=str(Path(stack) / ".venv" / "bin" / "python"),
+            entry="mlx_vlm.server:main",
+            stack_mlx_vlm="x",
+        ),
+    )
+    monkeypatch.setattr(qualify, "_last_tick_age", lambda p: 1.0)
     monkeypatch.setattr(qualify, "interference", lambda o: dict(ok=True, why=None))
     monkeypatch.setattr(qualify, "binding_problems", lambda *a: [])
     monkeypatch.setattr(qualify, "_git_head", lambda p: "h")
@@ -528,6 +576,7 @@ def _drive(tmp_path, monkeypatch, run_job, names=(FABLE, STATIC)):
         entry=list(names),
         p369_summary=None,
         idle_s=600.0,
+        reviewed_head="a" * 40,
     )
     (tmp_path / "stack" / ".venv" / "bin").mkdir(parents=True)
     code = qualify.drive(args)
@@ -536,7 +585,10 @@ def _drive(tmp_path, monkeypatch, run_job, names=(FABLE, STATIC)):
 
 class _NullMonitor:
     def __init__(self, *a, **k):
-        pass
+        import threading
+
+        self._thread = threading.Thread(target=lambda: None)
+        self._thread.is_alive = lambda: True
 
     def __enter__(self):
         return self
@@ -555,8 +607,16 @@ def _good(job, *a, **k):
             shrink_calls=0,
             drafter_live_checks=None,
             peaks=dict(prefill=30e9, decode=30.2e9, retire=None),
+            manifest=_tq_manifest(),
         )
     )
+    if not job["name"].startswith(FABLE):
+        rec["memory"] = dict(
+            rec["memory"],
+            set_cache_limit=[
+                qualify.expected_cache_limit(24, qualify.expected_config(STATIC_ENTRY))
+            ],
+        )
     return dict(requests=[dict(qualify=rec)])
 
 
