@@ -1325,6 +1325,14 @@ def note_generate_step(rec, state, kwargs):
     if rec["generate_calls"] == 1:
         state["cache"] = kwargs.get("prompt_cache")
         rec["generate_seed"] = generation_seed(kwargs)
+        rec["landings"] = dict(  # R7 full run 1: what the chunk loop lands on
+            snapshot_at_offset=kwargs.get("snapshot_at_offset"),
+            retain_at_offset=kwargs.get("retain_at_offset"),
+            prompt_end_offset=kwargs.get("prompt_end_offset") is not None,
+            checkpoint_lengths=list(
+                kwargs.get("prompt_cache_checkpoint_lengths") or []
+            ),
+        )
 
 
 def generation_seed(kwargs):

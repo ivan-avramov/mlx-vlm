@@ -239,14 +239,39 @@ def command_problems(expected, cmd, venv_bin):
     return problems
 
 
-def chunk_sequence(prompt_tokens, step):
-    """The chunked prefill's forwards for a fresh prompt (``generate/ar.py``: chunks of ``min(step, left − 1)`` while
-    more than one token is left; the last token goes through the prompt step)."""
-    out, left = [], prompt_tokens
-    while left > 1:
-        n = min(step, left - 1)
+def landing_offsets(landings, prompt_tokens):
+    """R7 full run 1: the absolute offsets production's chunk loop lands on exactly (``generate/ar.py``): the snapshot
+    offset, the retention boundary (only with a prompt-end capture, and only inside the prompt), the APC checkpoints.
+    """
+    out = []
+    if landings.get("snapshot_at_offset") is not None:
+        out.append(int(landings["snapshot_at_offset"]))
+    retain = landings.get("retain_at_offset")
+    if (
+        landings.get("prompt_end_offset")
+        and retain is not None
+        and 0 < int(retain) < prompt_tokens
+    ):
+        out.append(int(retain))
+    out += [int(n) for n in (landings.get("checkpoint_lengths") or [])]
+    return sorted(set(out))
+
+
+def chunk_sequence(prompt_tokens, step, landings=()):
+    """The chunked prefill's forwards for a fresh prompt (``generate/ar.py``): chunks of ``min(step, left − 1)`` while
+    more than one token is left, each shrunk to end exactly on a landing offset it would cross
+    (``_adjust_chunk_for_snapshot_landing``: strict crossing only); the last token goes through the prompt step.
+    """
+    out, done, pending = [], 0, sorted(set(landings))
+    while prompt_tokens - done > 1:
+        n = min(step, prompt_tokens - done - 1)
+        for target in pending:
+            if done < target < done + n:
+                n = target - done
+                break
         out.append(n)
-        left -= n
+        done += n
+        pending = [t for t in pending if t > done]
     return out
 
 
@@ -311,7 +336,12 @@ def request_problems(rec, expected):
         problems.append("no prefill / decode boundary observed (Q11)")
     if rec.get("prompt_step_tokens") != 1:
         problems.append(f"prompt step {rec.get('prompt_step_tokens')} tokens, not 1")
-    if rec.get("chunks") != chunk_sequence(target, expected["prefill_step"]):
+    landings = rec.get("landings")
+    if landings is None:
+        problems.append("no landing kwargs recorded for the chunk sequence")
+    elif rec.get("chunks") != chunk_sequence(
+        target, expected["prefill_step"], landing_offsets(landings, target)
+    ):
         got = rec.get("chunks") or []
         problems.append(
             f"prefill chunks {len(got)} / {sum(got)} tokens != the step's sequence"

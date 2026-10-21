@@ -279,6 +279,12 @@ def _record(**changes):
         finish_reason="stop",
         generation_tokens=1500,
         chunks=qualify.chunk_sequence(260096, 512),
+        landings=dict(
+            snapshot_at_offset=None,
+            retain_at_offset=None,
+            prompt_end_offset=False,
+            checkpoint_lengths=[],
+        ),
         prompt_step_tokens=1,
         boundary_seen=True,
         peaks=dict(prefill=36.5e9, decode=36.9e9, retire=37.1e9),
