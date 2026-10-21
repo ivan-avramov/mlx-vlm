@@ -1318,6 +1318,15 @@ def _capacities(caches, prefix=""):
     return out
 
 
+def note_generate_step(rec, state, kwargs):
+    """R7 smoke 2: record the FIRST ``generate_step`` call of the request (its cache and seed); later calls — session
+    retention's prompt-only canonical prefill (fork M48) — are only counted."""
+    rec["generate_calls"] = rec.get("generate_calls", 0) + 1
+    if rec["generate_calls"] == 1:
+        state["cache"] = kwargs.get("prompt_cache")
+        rec["generate_seed"] = generation_seed(kwargs)
+
+
 def generation_seed(kwargs):
     """R7 smoke 1: the seed ``generate_step`` samples with — its sampler's (the cached path builds
     ``_PositionedTargetSampler(seed=args.seed)``; ``stream_generate`` consumes the ``seed`` keyword itself), else the
@@ -1470,8 +1479,7 @@ def qualify_request(client, capture, rg, spec, memory):
     step = dispatch.generate_step
 
     def recording_step(*a, **k):
-        state["cache"] = k.get("prompt_cache")
-        rec["generate_seed"] = generation_seed(k)  # R7 smoke 1: the sampler's seed
+        note_generate_step(rec, state, k)  # R7 smoke 2: the request's own call only
         yield from step(*a, **k)
 
     lm_cls = type(rg.model.language_model)
