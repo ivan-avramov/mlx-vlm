@@ -98,16 +98,38 @@ def check_fixture(text):
         raise ValueError(f"golden fixture sha256 {got} != pinned {FIXTURE_SHA256}")
 
 
-_NAME = re.compile(r"""^  - name:\s*(["']?)(.+?)\1\s*(#.*)?$""")
-
-
 def _span(lines, entry):
-    starts = [i for i, line in enumerate(lines) if line.startswith("  - name:")]
-    hits = [i for i in starts if (m := _NAME.match(lines[i])) and m.group(2) == entry]
+    """``[start, end)`` line span of ``entry``'s ``models`` item, from the YAML STRUCTURE (B4 code round 2 F3: any key order,
+    quoted / commented names); trailing comment lines up to the next item belong to it, the last item runs to the end.
+    """
+    import yaml
+
+    try:
+        root = yaml.compose("\n".join(lines), Loader=yaml.SafeLoader)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"{entry}: registry is not YAML: {exc}") from exc
+    models = next(
+        (
+            v
+            for k, v in getattr(root, "value", [])
+            if getattr(k, "value", None) == "models"
+        ),
+        None,
+    )
+    items = list(getattr(models, "value", None) or [])
+    names = [
+        next(
+            (v.value for k, v in getattr(item, "value", []) if k.value == "name"), None
+        )
+        for item in items
+    ]
+    hits = [i for i, name in enumerate(names) if name == entry]
     if len(hits) != 1:
         raise ValueError(f"{entry}: {len(hits)} registry blocks")
-    end = next((i for i in starts if i > hits[0]), len(lines))
-    return hits[0], end
+    i = hits[0]
+    start = items[i].start_mark.line
+    end = items[i + 1].start_mark.line if i + 1 < len(items) else len(lines)
+    return start, end
 
 
 def block(text, entry):
@@ -244,12 +266,17 @@ def overlay_on(text, fixture, entry):
             for i in range(start, end)
             if (m := commented.match(lines[i])) and m.group(1) == value
         ]
-        if len(hits) > 1:
-            raise ValueError(f"{entry}: {len(hits)} commented {key} lines")
-        if hits:
+        if (
+            hits
+        ):  # comments are inert: the first matching marker is restored, any duplicate stays a comment
             lines[hits[0]] = old
-        else:
-            lines.insert(start + 1, old)
+        else:  # a removed marker: after the item's last setting line (never inside a nested mapping's first key)
+            last = max(
+                i
+                for i in range(start, end)
+                if lines[i].strip() and not lines[i].lstrip().startswith("#")
+            )
+            lines.insert(last + 1, old)
             end += 1
         restored.append(old)
     on = "\n".join(lines)

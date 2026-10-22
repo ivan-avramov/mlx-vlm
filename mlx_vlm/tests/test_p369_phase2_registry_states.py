@@ -147,13 +147,22 @@ def test_c203_a_settings_edit_refuses(label, change):
         rs.overlay_on(text, FIXTURE, "Qwen3.8-27B-mlx-uniform-4bit")
 
 
-def test_c203_an_ambiguous_commented_line_refuses_the_overlay():
-    """Two commented ``draft_kind:`` lines in one block: which one is the restored setting is not decidable."""
+def test_c203_duplicate_identical_marker_comments_never_block_the_overlay():
+    """B4 code round 2 F3: comments are inert — two identical commented ``draft_kind: mtp`` markers: the first is restored,
+    the other stays a comment, and the settings are the fixture's."""
     off = frozenset(ENTRIES)
-    text = rs.apply(FIXTURE, off).replace(ORNITH_OFF, ORNITH_OFF + "\n" + ORNITH_OFF, 1)
+    lines = rs.apply(FIXTURE, off).split("\n")
+    start, end = rs._span(lines, "Ornith-1.0-35B-mlx-uniform-4bit")
+    i = next(i for i in range(start, end) if lines[i] == ORNITH_OFF)
+    lines.insert(i + 1, ORNITH_OFF)
+    text = "\n".join(lines)
     assert rs.classify(text, FIXTURE) == off  # comments only
-    with pytest.raises(ValueError, match="commented draft_kind"):
-        rs.overlay_on(text, FIXTURE, "Ornith-1.0-35B-mlx-uniform-4bit")
+    on, _ = rs.overlay_on(text, FIXTURE, "Ornith-1.0-35B-mlx-uniform-4bit")
+    assert (
+        rs.settings(on)["Ornith-1.0-35B-mlx-uniform-4bit"]
+        == rs.settings(FIXTURE)["Ornith-1.0-35B-mlx-uniform-4bit"]
+    )
+    assert ORNITH_OFF in rs.block(on, "Ornith-1.0-35B-mlx-uniform-4bit")
 
 
 def test_the_fixture_is_pinned_by_sha():
@@ -223,3 +232,21 @@ def test_f4_merge_keys_resolve_and_only_explicit_duplicates_refuse():
     assert doc == {"a": {"k": 1}, "b": {"k": 1, "j": 2}, "c": {"k": 3}}
     with pytest.raises(ValueError, match="duplicate"):
         rs.parse("a:\n  k: 1\n  k: 2\n")
+
+
+def test_f3_round2_a_reordered_name_key_keeps_the_overlay_working():
+    """B4 code round 2 F3: the entry's span comes from the YAML structure, not from ``name`` being the first key."""
+    lines = ALL_OFF.split("\n")
+    start, _ = rs._span(lines, ORNITH)
+    assert lines[start] == f"  - name: {ORNITH}" and lines[start + 1].startswith(
+        "    type:"
+    )
+    lines[start], lines[start + 1] = (
+        "  - " + lines[start + 1].strip(),
+        f"    name: {ORNITH}",
+    )
+    text = "\n".join(lines)
+    assert rs.classify(text, FIXTURE) == frozenset(ENTRIES)
+    on, _ = rs.overlay_on(text, FIXTURE, ORNITH)
+    assert rs.classify(on, FIXTURE) == frozenset(ENTRIES) - {ORNITH}
+    assert rs.settings(on)[ORNITH] == rs.settings(FIXTURE)[ORNITH]
