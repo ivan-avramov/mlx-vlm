@@ -109,14 +109,19 @@ class Model(nn.Module):
         )
 
     def _masks(self, attention_mask, dtype):
+        # Fork: upstream fills the mask with -1e9, which casts to -inf in float16;
+        # a padding query whose whole sliding window is padding then softmaxes a
+        # row of -inf to NaN, and mean pooling spreads it to the short texts of a
+        # batch. Use the compute dtype's finite minimum (docs/upstream-bugs.md 6).
+        neg = mx.finfo(dtype).min
         B, L = attention_mask.shape
-        additive = mx.where(attention_mask == 1, 0.0, -1e9)[:, None, None, :]
+        additive = mx.where(attention_mask == 1, 0.0, neg)[:, None, None, :]
         global_mask = mx.broadcast_to(additive, (B, 1, L, L))
         rows = mx.arange(L)[None, :]
         distance = mx.abs(rows - rows.T)
         window = distance <= (self.local_attention // 2)
         window = mx.broadcast_to(window[None, None, :, :], global_mask.shape)
-        sliding_mask = mx.where(window, global_mask, -1e9)
+        sliding_mask = mx.where(window, global_mask, neg)
         return global_mask.astype(dtype), sliding_mask.astype(dtype)
 
     def _encode(self, input_ids, attention_mask=None):

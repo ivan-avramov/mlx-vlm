@@ -251,3 +251,31 @@ hold back a trailing *partial* sequence, which is what
 fork's own `/v1/completions` endpoint had the partial half of this same bug** — see
 the `# Fork:` comment on its streaming stop hold-back and
 `tests/test_completions_endpoint.py`.
+
+---
+
+## 6. ModernBERT masks overflow to `-inf` in float16 and NaN short texts in a padded batch
+
+`mlx_vlm/models/modernbert/modernbert.py::Model._masks` fills the additive mask with
+`-1e9` and then casts it to the compute dtype. float16 tops out at 65504, so the cast
+yields `-inf`. A padding query position whose whole sliding window (`local_attention
+// 2` on each side, 64 for the published configs) is also padding gets a row of
+`-inf` scores, and `mx.fast.scaled_dot_product_attention` softmaxes that row to NaN.
+The NaN sits in a padding position, but mean pooling multiplies the hidden state by
+the zero mask and `NaN * 0` is NaN, so the whole embedding of the short text is NaN.
+Single-text embedding and float32 compute are unaffected; bfloat16 represents `-1e9`
+and is unaffected.
+
+Reproduced with `Alibaba-NLP/gte-modernbert-base` (float16 weights) on sixteen
+retrieval chunks batched together, token lengths 66 to 448: every row padded by more
+than 64 tokens (six of sixteen) came back NaN. `tests/test_modernbert_fp16_mask.py`
+reproduces it on a tiny random model and fails against upstream's `_masks`.
+
+**This fork diverges deliberately here**, the second load-bearing divergence after
+item 4: `_masks` uses `mx.finfo(dtype).min` instead of `-1e9`, as `bert.py` and
+`xlm_roberta.py` already do, marked `# Fork:`. The fused kernel keeps a fully masked
+row finite with that constant even at scores of several thousand (checked directly).
+Decided 2026-10-21 in the Premisa forest (P570): the embedder cannot move onto the
+MLX task server with NaN rows in batched embedding, and the server batches.
+
+The fix upstream is the same one-line constant change.
