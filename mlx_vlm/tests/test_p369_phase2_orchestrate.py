@@ -47,7 +47,11 @@ def test_overlay_of_an_entry_already_on_changes_nothing():
 
 def test_overlay_refuses_a_registry_outside_the_16_states():
     with pytest.raises(ValueError, match="not one of the 16"):
-        orchestrate.overlay_registry(ALL_OFF + "# edited\n", FABLE, FIXTURE_TEXT)
+        orchestrate.overlay_registry(  # C203: a SETTINGS edit (a comment alone is accepted)
+            ALL_OFF.replace("      temperature: 0.4", "      temperature: 0.41", 1),
+            FABLE,
+            FIXTURE_TEXT,
+        )
     with pytest.raises(ValueError, match="registry blocks"):
         orchestrate.overlay_registry(ALL_OFF, "Missing-Model", FIXTURE_TEXT)
 
