@@ -279,3 +279,32 @@ Decided 2026-10-21 in the Premisa forest (P570): the embedder cannot move onto t
 MLX task server with NaN rows in batched embedding, and the server batches.
 
 The fix upstream is the same one-line constant change.
+
+---
+
+## 7. Qwen3 text rerankers score every pair the same with the checkpoint's own chat template
+
+`mlx_vlm/server/reranking.py::_score_text_batch` builds the prompt by passing generic
+`system` and `user` messages through `tokenizer.apply_chat_template`. The
+`Qwen/Qwen3-Reranker-0.6B` repository (revision `e61197e`) now ships a
+`chat_template.jinja` written for sentence-transformers' CrossEncoder: it reads the
+instruction from the `system` message and the query and document from messages with
+roles `query` and `document`. Rendered with the generic messages it emits
+`<Query>: ` and `<Document>: ` empty and puts the system text where the instruction
+goes, so every (query, document) pair tokenizes to the same prompt and scores
+identically.
+
+Reproduced on the real checkpoint on 2026-10-22: five documents, one clearly relevant,
+all scored 0.0049 through `score_documents`; the rendered prompt showed the empty
+fields.
+
+**This fork diverges deliberately here** (`_text_prompt`, marked `# Fork:`): the prompt
+is rendered from the format on the model card (system block, `<Instruct>`, `<Query>`,
+`<Document>`, then the fixed assistant suffix the code already appended as tokens),
+with no dependency on whatever template the checkpoint carries. After the change the
+same five documents score 1.0, 0.0, 1.0, 0.0, 0.0004. Test:
+`tests/test_qwen3_reranker_prompt.py`. Decided in the Premisa forest (P568 screening,
+2026-10-22): the candidate cannot be screened, nor served, with constant scores.
+
+The fix upstream is the same: render the published format, or pass `query` and
+`document` roles when the checkpoint's template declares them.
