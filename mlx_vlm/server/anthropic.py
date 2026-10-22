@@ -20,6 +20,7 @@ from ..tools import (
     process_tool_calls,
 )
 from ..utils import prepare_inputs
+from .generation import draft_counters_of  # Fork (P426)
 from .generation import (  # Fork: resolve_backend_label is fork-only — it reports the generation path that RAN
     GenerationMetrics,
     PromptTooLongError,
@@ -887,6 +888,7 @@ async def anthropic_messages_endpoint(http_request: Request):
                         sdpa_forced=metrics.sdpa_forced,  # Fork (M57)
                         sdpa_auto=metrics.sdpa_auto,  # Fork (M57)
                         verify_counters=metrics.verify_counters,  # Fork (M58)
+                        draft_counters=draft_counters_of(metrics),  # Fork (P426)
                         prompt_tokens=prompt_tokens,
                         completion_tokens=completion_tokens,
                         generated_tokens=output_tokens,
@@ -1098,6 +1100,7 @@ async def anthropic_messages_endpoint(http_request: Request):
                 sdpa_forced=metrics.sdpa_forced,  # Fork (M57)
                 sdpa_auto=metrics.sdpa_auto,  # Fork (M57)
                 verify_counters=metrics.verify_counters,  # Fork (M58)
+                draft_counters=draft_counters_of(metrics),  # Fork (P426)
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 generated_tokens=output_tokens,
