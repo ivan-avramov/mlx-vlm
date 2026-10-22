@@ -365,3 +365,38 @@ def test_the_live_cache_manifest_is_kept_verbatim_per_request():
     assert (
         rep["live_cache"] == live and json.loads(json.dumps(rep))["live_cache"] == live
     )
+
+
+def test_p429_a_completed_leg_exits_without_interpreter_finalization(monkeypatch):
+    """P429 (R5 Qwen3.6 leg 1-B, rc -11): a background thread's MLX compile-cache destructor re-entered a finalized
+    interpreter at exit and segfaulted AFTER the leg's result was written. A completed leg flushes and ``os._exit(0)``s.
+    """
+    calls = []
+    monkeypatch.setattr(probe, "leg", lambda job: calls.append(("leg", job)))
+    monkeypatch.setattr(
+        probe.os,
+        "_exit",
+        lambda code: calls.append(("_exit", code))
+        or (_ for _ in ()).throw(SystemExit(code)),
+    )
+    try:
+        probe.main(["leg", "job.json"])
+    except SystemExit as exc:
+        assert exc.code == 0
+    assert calls == [("leg", "job.json"), ("_exit", 0)]
+
+
+def test_p429_a_failing_leg_still_raises_and_never_exits_zero(monkeypatch):
+    def boom(job):
+        raise RuntimeError("request 3: problems")
+
+    monkeypatch.setattr(probe, "leg", boom)
+    monkeypatch.setattr(
+        probe.os,
+        "_exit",
+        lambda code: (_ for _ in ()).throw(AssertionError("_exit called")),
+    )
+    import pytest
+
+    with pytest.raises(RuntimeError, match="request 3"):
+        probe.main(["leg", "job.json"])
