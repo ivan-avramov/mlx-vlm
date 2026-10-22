@@ -1,8 +1,9 @@
-"""P369 v13 (V5 / V10): the ONE byte-state generator for the stack registry (fork-only, CPU).
+"""P369 v13 (V5 / V10) + C203: the ONE state generator / classifier for the stack registry (fork-only, CPU).
 
-Each MTP-certified entry's MTP-OFF form is an ATOMIC raw-byte substitution of the pinned golden fixture (C177 for the two
-Qwen3.8-27B picks, P406 / C191 for `Ornith-1.0-35B-mlx-uniform-4bit` and `Qwen3.6-27B-Opus-Distill-OptiQ-4bit`). The accepted
-live registries are exactly the 2**4 = 16 combinations; anything else refuses. `Campaign.prepare`, the overlays and the
+Each MTP-certified entry's MTP-OFF form is an ATOMIC substitution of the pinned golden fixture (C177 for the two Qwen3.8-27B
+picks, P406 / C191 for `Ornith-1.0-35B-mlx-uniform-4bit` and `Qwen3.6-27B-Opus-Distill-OptiQ-4bit`). C203: the live registry is
+classified on its SETTINGS — equal to the fixture except that each of the four entries has all or none of its MTP keys (the 16
+states); comments never refuse; any settings change, duplicate key, CR line ending or unparseable text does. `Campaign.prepare`, the overlays and the
 fork's opt-in live-registry test all use this module.
 """
 
@@ -62,49 +63,97 @@ def _half(text):
     return text.replace(new, old, 1)
 
 
-@pytest.mark.parametrize(
-    ("label", "change"),
-    [
-        ("half an atomic block", _half),
-        (
-            "a changed P406 marker",
-            lambda t: t.replace("(C191 2026-10-20)", "(C191 2026-10-21)", 1),
+ORNITH_OFF = rs.ENTRY_OFF["Ornith-1.0-35B-mlx-uniform-4bit"][0][1]
+COMMENT_ONLY = [  # C203: comments never refuse — the state is read from the SETTINGS
+    (
+        "a changed P406 marker",
+        lambda t: t.replace("(C191 2026-10-20)", "(C191 2026-10-21)", 1),
+    ),
+    (
+        "a changed commented drafter path",
+        lambda t: t.replace(
+            "# draft_model: caslca/Ornith-1.0-35B-mlx-uniform-4bit-mtp-drafter",
+            "# draft_model: caslca/x",
+            1,
         ),
-        (
-            "a changed commented drafter path",
-            lambda t: t.replace(
-                "# draft_model: caslca/Ornith-1.0-35B-mlx-uniform-4bit-mtp-drafter",
-                "# draft_model: caslca/x",
-                1,
-            ),
+    ),
+    ("another comment line", lambda t: t + "# edited\n"),
+    ("trailing whitespace", lambda t: t.replace(ORNITH_OFF, ORNITH_OFF + " ", 1)),
+    (
+        "a CERTIFIED note in generation_defaults",
+        lambda t: t.replace(
+            "  - name: Qwen3.8-27B-mlx-uniform-4bit\n",
+            "  - name: Qwen3.8-27B-mlx-uniform-4bit\n    # CERTIFIED P426 2026-10-30 (example)\n",
+            1,
         ),
-        (
-            "a duplicate marker line",
-            lambda t: t.replace(
-                rs.ENTRY_OFF["Ornith-1.0-35B-mlx-uniform-4bit"][0][1],
-                rs.ENTRY_OFF["Ornith-1.0-35B-mlx-uniform-4bit"][0][1]
-                + "\n"
-                + rs.ENTRY_OFF["Ornith-1.0-35B-mlx-uniform-4bit"][0][1],
-                1,
-            ),
+    ),
+    ("no trailing newline", lambda t: t.rstrip("\n")),
+]
+
+
+@pytest.mark.parametrize(("label", "change"), COMMENT_ONLY)
+def test_c203_a_comment_only_edit_keeps_the_state(label, change):
+    off = frozenset(ENTRIES)
+    text = change(rs.apply(FIXTURE, off))
+    assert rs.classify(text, FIXTURE) == off, label
+    for (
+        entry
+    ) in (
+        ENTRIES
+    ):  # the overlay still restores exactly that entry, to the fixture's settings
+        on, restored = rs.overlay_on(text, FIXTURE, entry)
+        assert rs.classify(on, FIXTURE) == off - {entry}
+        assert restored == [line for line, _ in rs.ENTRY_OFF[entry]]
+        assert rs.settings(on)[entry] == rs.settings(FIXTURE)[entry]
+
+
+def _setting(old, new):
+    return lambda t: t.replace(old, new, 1)
+
+
+SETTINGS = [
+    ("half an atomic block", _half),
+    (
+        "a changed sampling setting",
+        _setting("      temperature: 0.4", "      temperature: 0.41"),
+    ),
+    (
+        "an uncommented foreign drafter",
+        _setting(
+            "    # draft_model: caslca/Ornith-1.0-35B-mlx-uniform-4bit-mtp-drafter",
+            "    draft_kind: mtp\n    draft_model: caslca/x",
         ),
-        ("another edit", lambda t: t + "# edited\n"),
-        ("CRLF", lambda t: t.replace("\n", "\r\n")),
-        (
-            "trailing whitespace",
-            lambda t: t.replace(
-                rs.ENTRY_OFF["Ornith-1.0-35B-mlx-uniform-4bit"][0][1],
-                rs.ENTRY_OFF["Ornith-1.0-35B-mlx-uniform-4bit"][0][1] + " ",
-                1,
-            ),
+    ),
+    (
+        "a duplicate key",
+        _setting(
+            "  - name: Qwen3.8-27B-mlx-uniform-4bit\n",
+            "  - name: Qwen3.8-27B-mlx-uniform-4bit\n    hf_path: caslca/x\n",
         ),
-    ],
-)
-def test_anything_else_refuses(label, change):
+    ),
+    ("CRLF", lambda t: t.replace("\n", "\r\n")),
+    ("not YAML", lambda t: t + "\n  : : [\n"),
+]
+
+
+@pytest.mark.parametrize(("label", "change"), SETTINGS)
+def test_c203_a_settings_edit_refuses(label, change):
     text = change(rs.apply(FIXTURE, frozenset(ENTRIES)))
+    assert text != rs.apply(
+        FIXTURE, frozenset(ENTRIES)
+    ), f"{label}: the edit did not apply"
     assert rs.classify(text, FIXTURE) is None, label
     with pytest.raises(ValueError, match="not one of the 16"):
         rs.overlay_on(text, FIXTURE, "Qwen3.8-27B-mlx-uniform-4bit")
+
+
+def test_c203_an_ambiguous_commented_line_refuses_the_overlay():
+    """Two commented ``draft_kind:`` lines in one block: which one is the restored setting is not decidable."""
+    off = frozenset(ENTRIES)
+    text = rs.apply(FIXTURE, off).replace(ORNITH_OFF, ORNITH_OFF + "\n" + ORNITH_OFF, 1)
+    assert rs.classify(text, FIXTURE) == off  # comments only
+    with pytest.raises(ValueError, match="commented draft_kind"):
+        rs.overlay_on(text, FIXTURE, "Ornith-1.0-35B-mlx-uniform-4bit")
 
 
 def test_the_fixture_is_pinned_by_sha():
