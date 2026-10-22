@@ -698,6 +698,14 @@ def main(argv=None):
         drive_codec(args)
     else:
         leg(args.job)
+        # P429: a completed leg skips interpreter finalization — a background thread's thread-local MLX compile cache
+        # re-entered a finalized interpreter and segfaulted after the result was written (rc -11).
+        import logging
+
+        logging.shutdown()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
 
 
 if __name__ == "__main__":
