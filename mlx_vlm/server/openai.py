@@ -40,6 +40,7 @@ from ..tools import (
 )
 from ..utils import prepare_inputs, sanitize_strict_json  # Fork: sanitize_strict_json
 from . import compaction
+from .generation import draft_counters_of  # Fork (P426)
 from .generation import (  # Fork: resolve_backend_label is fork-only — it reports the generation path that RAN
     GenerationMetrics,
     PromptTooLongError,
@@ -2030,6 +2031,7 @@ async def responses_endpoint(request: Request):
                         sdpa_forced=metrics.sdpa_forced,  # Fork (M57)
                         sdpa_auto=metrics.sdpa_auto,  # Fork (M57)
                         verify_counters=metrics.verify_counters,  # Fork (M58)
+                        draft_counters=draft_counters_of(metrics),  # Fork (P426)
                         prompt_tokens=usage_stats["input_tokens"],
                         completion_tokens=usage_stats["output_tokens"],
                         generated_tokens=usage_stats["output_tokens"],
@@ -2253,6 +2255,7 @@ async def responses_endpoint(request: Request):
                     sdpa_forced=metrics.sdpa_forced,  # Fork (M57)
                     sdpa_auto=metrics.sdpa_auto,  # Fork (M57)
                     verify_counters=metrics.verify_counters,  # Fork (M58)
+                    draft_counters=draft_counters_of(metrics),  # Fork (P426)
                     prompt_tokens=prompt_tokens,
                     completion_tokens=output_tokens,
                     generated_tokens=output_tokens,
@@ -3059,6 +3062,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         sdpa_forced=metrics.sdpa_forced,  # Fork (M57)
                         sdpa_auto=metrics.sdpa_auto,  # Fork (M57)
                         verify_counters=metrics.verify_counters,  # Fork (M58)
+                        draft_counters=draft_counters_of(metrics),  # Fork (P426)
                         prompt_tokens=(
                             ctx.prompt_tokens
                             if runtime.response_generator is not None
@@ -3396,6 +3400,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     sdpa_forced=metrics.sdpa_forced,  # Fork (M57)
                     sdpa_auto=metrics.sdpa_auto,  # Fork (M57)
                     verify_counters=metrics.verify_counters,  # Fork (M58)
+                    draft_counters=draft_counters_of(metrics),  # Fork (P426)
                     prompt_tokens=prompt_tokens,
                     completion_tokens=completion_tokens,
                     generated_tokens=output_tokens,
@@ -3702,6 +3707,7 @@ async def completions_endpoint(request: Request):
                         sdpa_forced=metrics.sdpa_forced,  # Fork (M57)
                         sdpa_auto=metrics.sdpa_auto,  # Fork (M57)
                         verify_counters=metrics.verify_counters,  # Fork (M58)
+                        draft_counters=draft_counters_of(metrics),  # Fork (P426)
                         prompt_tokens=prompt_tokens,
                         completion_tokens=completion_tokens,
                         generated_tokens=output_tokens,
@@ -3875,6 +3881,7 @@ async def completions_endpoint(request: Request):
                 sdpa_forced=metrics.sdpa_forced,  # Fork (M57)
                 sdpa_auto=metrics.sdpa_auto,  # Fork (M57)
                 verify_counters=metrics.verify_counters,  # Fork (M58)
+                draft_counters=draft_counters_of(metrics),  # Fork (P426)
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 generated_tokens=output_tokens,

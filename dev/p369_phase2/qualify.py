@@ -60,17 +60,39 @@ class UnknownKey(ValueError):
     pass
 
 
+def arm_for(name, predictor):
+    """P426 B7: the arm ``name`` is measured in — C199's shipped arm without ``--predictor``; ``off`` serves the committed
+    registry (``mtp_off`` for an MTP-certified entry, ``served`` otherwise); ``on`` is the shipped MTP-ON arm.
+    """
+    shipped = ENTRIES[name]
+    if predictor is None:
+        return shipped
+    if predictor == "off":
+        return "served" if shipped == "served" else "mtp_off"
+    if shipped == "served":
+        raise ValueError(f"{name}: no MTP-ON arm (not MTP-certified)")
+    return shipped
+
+
 def default_entries():
     """Code round 1 D8: the full qualification is all seven (Qwen3.6 then needs its P369 evidence); a subset only via
     ``--entry``."""
     return list(ENTRIES)
 
 
-def entry_problems(names, *, p369_summary):
-    """Every name is one of the seven; ``Qwen3.6-27B-Opus-Distill-OptiQ-4bit`` only with a P369 FULL-run PASS for it."""
+def entry_problems(names, *, p369_summary, predictor=None):
+    """Every name is one of the seven; ``Qwen3.6-27B-Opus-Distill-OptiQ-4bit`` MTP-ON only with a P369 FULL-run PASS for it
+    (its ``--predictor off`` arm needs none, P426 B7)."""
     problems = [f"unknown entry {n!r}" for n in names if n not in ENTRIES]
     for name in names:
-        if ENTRIES.get(name) != "mtp_on_gated":
+        if name not in ENTRIES:
+            continue
+        try:
+            arm = arm_for(name, predictor)
+        except ValueError as exc:
+            problems.append(str(exc))
+            continue
+        if arm != "mtp_on_gated":
             continue
         summary = json.loads(Path(p369_summary).read_text()) if p369_summary else None
         pick = ((summary or {}).get("picks") or {}).get(name) or {}
@@ -794,11 +816,16 @@ def drive(args):
         Path(p).resolve() for p in (args.stack_root, args.fork_root, args.out)
     )
     names = list(args.entry or default_entries())
-    problems = entry_problems(names, p369_summary=args.p369_summary)
+    predictor = getattr(args, "predictor", None)
+    problems = entry_problems(
+        names, p369_summary=args.p369_summary, predictor=predictor
+    )
     if problems:
         raise SystemExit(f"refused: {problems}")
     reviewed = _resolve_ref(fork, args.reviewed_head)
-    if args.p369_summary and any(ENTRIES[n] == "mtp_on_gated" for n in names):
+    if args.p369_summary and any(
+        arm_for(n, predictor) == "mtp_on_gated" for n in names
+    ):
         problems = summary_artifact_problems(  # code round 2 D10
             args.p369_summary,
             json.loads(Path(args.p369_summary).read_text()),
@@ -845,7 +872,12 @@ def _drive_locked(
     import subprocess
     import time
 
-    report = dict(entries={n: dict(status="PENDING", arm=ENTRIES[n]) for n in names})
+    predictor = getattr(args, "predictor", None)
+    arms = {n: arm_for(n, predictor) for n in names}  # P426 B7
+    report = dict(
+        predictor=predictor,
+        entries={n: dict(status="PENDING", arm=arms[n]) for n in names},
+    )
     stop = dict(signal=None)
     monitor = None
     boot = orchestrate.BOOT_TIMEOUT_S
@@ -861,7 +893,8 @@ def _drive_locked(
         registry = orchestrate.read_registry(stack / "main_models.yaml")
         registry_sha = orchestrate.sha256_file(stack / "main_models.yaml")
         fixture = registry_states.fixture_text(fork / "mlx_vlm" / "tests" / "fixtures")
-        if registry_states.classify(registry, fixture) is None:
+        off_entries = registry_states.classify(registry, fixture)
+        if off_entries is None:
             problems.append(
                 "the live registry is not one of the 16 accepted byte states"
             )
@@ -927,7 +960,11 @@ def _drive_locked(
                     problems = guard_problems(
                         start, _tree_state(fork, stack), reviewed=reviewed
                     )
-                    if ENTRIES[name] == "served":
+                    if arms[name] == "mtp_off" and name not in (off_entries or ()):
+                        problems.append(  # P426 B7: OFF means the committed registry's OFF block
+                            f"--predictor off: the committed registry serves {name} MTP-ON"
+                        )
+                    if arms[name] in ("served", "mtp_off"):
                         path, text = stack / "main_models.yaml", registry
                     else:  # C199: the shipped MTP-ON form, the 16-state generator's exact block
                         text, _ = orchestrate.overlay_registry(registry, name, fixture)
@@ -1207,6 +1244,9 @@ def main(argv=None):
     ap.add_argument("--entry", action="append")
     ap.add_argument("--p369-summary")
     ap.add_argument("--reviewed-head", required=True)  # code round 1 D5
+    ap.add_argument(  # P426 B7: the M1 memory axis measures both predictor states
+        "--predictor", choices=("on", "off"), default=None
+    )
     ap.add_argument("--idle-s", type=float, default=IDLE_S)
     args = ap.parse_args(argv)
     if args.idle_s < IDLE_S:

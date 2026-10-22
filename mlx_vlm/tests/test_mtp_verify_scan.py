@@ -1877,6 +1877,22 @@ def _interim_variant(change):
                 INTERIM_LINES[FIRST_PICK][0][1], INTERIM_LINES[FIRST_PICK][0][0]
             ),
         ),
+        ("CRLF", lambda t: t.replace("\n", "\r\n")),
+        (
+            "a changed setting",
+            lambda t: t.replace("      temperature: 0.4", "      temperature: 0.41", 1),
+        ),
+    ],
+)
+def test_p387_the_classifier_refuses_every_other_state(label, change):
+    # Guard (characterizes the classifier; C203: settings, not bytes, decide).
+    assert _interim_variant(change) != expected_interim(_fixture_verbatim()), label
+    assert live_registry_state(_interim_variant(change)) is None, label
+
+
+@pytest.mark.parametrize(
+    ("label", "change"),
+    [
         (
             "an unmarked draft_kind",
             lambda t: t.replace(
@@ -1905,14 +1921,13 @@ def _interim_variant(change):
                 "    # moved\n" + INTERIM_LINES[FIRST_PICK][2][1] + "\n",
             ),
         ),
-        ("another edited line", lambda t: t + "# edited\n"),
-        ("CRLF", lambda t: t.replace("\n", "\r\n")),
+        ("another comment line", lambda t: t + "# edited\n"),
         ("a missing trailing newline", lambda t: t.rstrip("\n")),
     ],
 )
-def test_p387_the_classifier_refuses_every_other_state(label, change):
-    # Guard (characterizes the classifier; the old require mode refused these too).
-    assert live_registry_state(_interim_variant(change)) is None, label
+def test_c203_a_comment_only_variant_keeps_the_interim_state(label, change):
+    assert _interim_variant(change) != expected_interim(_fixture_verbatim()), label
+    assert live_registry_state(_interim_variant(change)) == "c177_interim", label
 
 
 def test_p387_live_registry_resolution(monkeypatch, tmp_path):
@@ -1944,7 +1959,11 @@ def test_p387_live_registry_resolution(monkeypatch, tmp_path):
             sys.modules[__name__], "SIBLING_REGISTRY", tmp_path / "absent.yaml"
         )
     drifted = tmp_path / "drifted.yaml"
-    drifted.write_text(_fixture_verbatim() + "# edited\n")
+    drifted.write_text(  # C203: a SETTINGS change (a comment alone is accepted)
+        _fixture_verbatim().replace(
+            "      temperature: 0.4", "      temperature: 0.41", 1
+        )
+    )
     monkeypatch.setenv("MLX_STACK_REGISTRY", str(drifted))
     with pytest.raises(pytest.fail.Exception, match="refresh"):
         live_registry()

@@ -1,15 +1,18 @@
 """P369 v13 (V5 / V10): the ONE byte-state generator for the stack registry (pure; no MLX import).
 
 The pinned golden fixture (`mlx_vlm/tests/fixtures/stack_registry_golden.yaml`, the shipped-when-ON registry: stack `59d7802f`
-with every substitution below reversed, P422) is the reference. Each MTP-certified entry's MTP-OFF form is an ATOMIC raw-byte substitution of its block: the C177 lines
+with every substitution below reversed, P422) is the reference. Each MTP-certified entry's MTP-OFF form is an ATOMIC substitution of its block: the C177 lines
 for the two Qwen3.8-27B picks, the P406 / C191 lines for `Ornith-1.0-35B-mlx-uniform-4bit` and
-`Qwen3.6-27B-Opus-Distill-OptiQ-4bit`. The accepted live registries are exactly the 2**4 = 16 combinations; `classify`
-returns the set of OFF entries or None, `overlay_on` turns one entry ON whatever the others are. `Campaign.prepare`, the
+`Qwen3.6-27B-Opus-Distill-OptiQ-4bit` (`apply` generates them byte-exactly). C203: the live registry is classified on its
+SETTINGS — parsed strictly (no CR, no duplicate key), equal to the fixture except that each of the four entries has all or
+none of its MTP keys, so the accepted states are the 2**4 = 16 combinations and comments never refuse; `classify` returns
+the set of OFF entries or None, `overlay_on` turns one entry ON (the fixture's exact lines in place of its commented ones)
+whatever the others are. `Campaign.prepare`, the
 overlays and the fork's opt-in live-registry test use this module.
 """
 
 import hashlib
-import itertools
+import re
 from pathlib import Path
 
 FIXTURE_NAME = "stack_registry_golden.yaml"
@@ -123,24 +126,112 @@ def apply(fixture, off):
     return "\n".join(lines)
 
 
+def _mtp_keys(entry):
+    return [old.strip().split(":", 1)[0] for old, _ in ENTRY_OFF[entry]]
+
+
+def _strict_loader():
+    import yaml
+
+    class Strict(
+        yaml.SafeLoader
+    ):  # C203: a duplicate key refuses (``safe_load`` keeps the last silently)
+        pass
+
+    def mapping(loader, node, deep=False):
+        keys = [loader.construct_object(k, deep=deep) for k, _ in node.value]
+        dupes = sorted({str(k) for k in keys if keys.count(k) > 1})
+        if dupes:
+            raise ValueError(f"duplicate registry keys {dupes}")
+        return yaml.SafeLoader.construct_mapping(loader, node, deep=deep)
+
+    Strict.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, mapping)
+    return Strict
+
+
+def parse(text):
+    """The registry document, parsed strictly (C203): no CR line ending, no duplicate key, YAML errors raise ValueError."""
+    import yaml
+
+    if "\r" in text:
+        raise ValueError("CR line ending in the registry")
+    try:
+        return yaml.load(text, Loader=_strict_loader())
+    except yaml.YAMLError as exc:
+        raise ValueError(f"registry is not YAML: {exc}") from exc
+
+
+def settings(text):
+    """``{name: entry}`` of the registry's models (unique names)."""
+    models = (parse(text) or {}).get("models") or []
+    names = [m.get("name") for m in models]
+    if len(set(names)) != len(names):
+        raise ValueError("duplicate model names in the registry")
+    return dict(zip(names, models))
+
+
 def classify(text, fixture):
-    """The frozenset of MTP-OFF entries if ``text`` is byte-identical to one of the 16 states, else None."""
-    for k in range(len(ENTRY_OFF) + 1):
-        for off in itertools.combinations(ENTRY_OFF, k):
-            if text == apply(fixture, off):
-                return frozenset(off)
-    return None
+    """C203: the frozenset of MTP-OFF entries if ``text``'s SETTINGS are one of the 16 states, else None."""
+    try:
+        doc, ref = parse(text), parse(fixture)
+    except ValueError:
+        return None
+    if not isinstance(doc, dict) or {k: v for k, v in doc.items() if k != "models"} != {
+        k: v for k, v in ref.items() if k != "models"
+    }:
+        return None
+    models, ref_models = doc.get("models") or [], ref.get("models") or []
+    if [m.get("name") for m in models] != [m.get("name") for m in ref_models]:
+        return None
+    off = set()
+    for got, want in zip(models, ref_models):
+        name = want.get("name")
+        if got == want:
+            continue
+        if name in ENTRY_OFF and got == {
+            k: v for k, v in want.items() if k not in _mtp_keys(name)
+        }:
+            off.add(name)
+            continue
+        return None
+    return frozenset(off)
 
 
 def overlay_on(text, fixture, entry):
-    """``(text with ``entry`` MTP-ON, the restored fixture lines)``; the other entries keep their state. Refuses a
-    ``text`` outside the 16 states, and asserts the entry's block equals the fixture's.
+    """``(text with ``entry`` MTP-ON, the restored fixture lines)``; the other entries keep their state (C203: built from the
+    LIVE text — each of the entry's commented MTP lines is replaced by the fixture's exact line). Refuses a ``text`` outside
+    the 16 states or an ambiguous commented line, and asserts the result turns exactly that entry ON with the fixture's
+    settings.
     """
     off = classify(text, fixture)
     if off is None:
         raise ValueError("the live registry is not one of the 16 accepted states")
-    on = apply(fixture, off - {entry})
-    if block(on, entry) != block(fixture, entry):
-        raise ValueError(f"{entry}: restored block differs from the fixture")
-    restored = [old for old, _ in ENTRY_OFF[entry]] if entry in off else []
+    _span(
+        text.split("\n"), entry
+    )  # an unknown / duplicated entry refuses ("… registry blocks")
+    if entry not in off:
+        return text, []
+    lines = text.split("\n")
+    start, end = _span(lines, entry)
+    restored = []
+    for key, (old, _) in zip(_mtp_keys(entry), ENTRY_OFF[entry]):
+        commented = re.compile(rf"^\s*#\s*{re.escape(key)}\s*:\s*(\S*)")
+        hits = [i for i in range(start, end) if commented.match(lines[i])]
+        if (
+            len(hits) > 1
+        ):  # e.g. a historical ``# draft_kind: suffix`` note: the commented ON value decides
+            value = old.split(":", 1)[1].split("#", 1)[0].strip()
+            hits = [i for i in hits if commented.match(lines[i]).group(1) == value]
+        if len(hits) != 1:
+            raise ValueError(f"{entry}: {len(hits)} commented {key} lines")
+        lines[hits[0]] = old
+        restored.append(old)
+    on = "\n".join(lines)
+    if (
+        classify(on, fixture) != off - {entry}
+        or settings(on)[entry] != settings(fixture)[entry]
+    ):
+        raise ValueError(
+            f"{entry}: the overlay does not restore exactly its fixture settings"
+        )
     return on, restored

@@ -763,11 +763,11 @@ def _decode_elapsed_from_metrics(
     return None
 
 
-def _format_verify_counters(payload: dict) -> str:  # Fork (M58)
+def _format_verify_counters(payload: dict) -> str:  # Fork (M58); P426: + draft_*
     import json
 
     parts = []
-    for key in sorted(k for k in payload if k.startswith("verify_")):
+    for key in sorted(k for k in payload if k.startswith(("verify_", "draft_"))):
         value = payload[key]
         if isinstance(value, dict):
             value = json.dumps(value, sort_keys=True, separators=(",", ":"))
@@ -808,6 +808,7 @@ def _build_metrics_envelope(
     sdpa_forced: Optional[int] = None,  # Fork (M57): fused_v1 request counters
     sdpa_auto: Optional[int] = None,  # Fork (M57)
     verify_counters: Optional[dict] = None,  # Fork (M58): joint_v1 request counters
+    draft_counters: Optional[dict] = None,  # Fork (P426): per-request drafter counters
 ) -> dict:
     token_times = token_times or []
     ttft_s = max(0.0, token_times[0] - request_started_s) if token_times else None
@@ -873,7 +874,24 @@ def _build_metrics_envelope(
         envelope["sdpa_auto"] = int(sdpa_auto or 0)
     if verify_counters:  # Fork (M58): absent under per_query (byte-identical)
         envelope.update(verify_counters)
+    if draft_counters:  # Fork (P426): absent when no drafter ran (byte-identical)
+        envelope.update(draft_counters)
     return envelope
+
+
+# Fork (P426): the per-request drafter counters of ``GenerationMetrics``
+_DRAFT_KEYS = ("draft_kind", "draft_rounds", "draft_n", "draft_n_accepted")
+
+
+def draft_counters_of(metrics) -> Optional[dict]:  # Fork (P426)
+    """A request's ``draft_*`` counters when a drafter ran (``draft_rounds`` set), else None.
+
+    They are diffs of the drafter's lifetime counters (``speculative_stats_since``): exact while the request is the only one
+    in flight, shared across concurrent requests otherwise — consumers needing exact attribution check ``in_flight`` on the
+    ``Request started`` lines (P426 B6 refuses any > 1)."""
+    if getattr(metrics, "draft_rounds", None) is None:
+        return None
+    return {key: getattr(metrics, key, None) for key in _DRAFT_KEYS}
 
 
 def load_model_resources(model_path: str, adapter_path: Optional[str]):
