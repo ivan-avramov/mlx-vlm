@@ -160,3 +160,66 @@ def test_the_fixture_is_pinned_by_sha():
     with pytest.raises(ValueError, match="sha256"):
         rs.check_fixture(FIXTURE + "# edited\n")
     rs.check_fixture(FIXTURE)
+
+
+# ------------------------------------------------------------------ B4 code round 1 (F2–F4)
+ALL_OFF = rs.apply(FIXTURE, frozenset(ENTRIES))
+ORNITH = "Ornith-1.0-35B-mlx-uniform-4bit"
+
+
+@pytest.mark.parametrize(
+    "old, new",
+    [
+        (
+            "    kv_bits: 0\n",
+            "    kv_bits: false\n",
+        ),  # F2: 0 == False in Python, not in YAML
+        ("    lazy_prompt_embeddings: true\n", "    lazy_prompt_embeddings: 1\n"),
+    ],
+)
+def test_f2_a_type_change_refuses(old, new):
+    assert ALL_OFF.count(old) >= 1
+    assert rs.classify(ALL_OFF.replace(old, new, 1), FIXTURE) is None
+
+
+def test_f2_a_lexically_different_equal_float_is_accepted():
+    text = ALL_OFF.replace("      temperature: 0.4\n", "      temperature: 0.40\n", 1)
+    assert text != ALL_OFF and rs.classify(text, FIXTURE) == frozenset(ENTRIES)
+
+
+@pytest.mark.parametrize(
+    "name_line",
+    [f"  - name: {ORNITH}  # a note", f'  - name: "{ORNITH}"', f"  - name: '{ORNITH}'"],
+)
+def test_f3_a_commented_or_quoted_name_line_keeps_the_overlay_working(name_line):
+    text = ALL_OFF.replace(f"  - name: {ORNITH}\n", name_line + "\n", 1)
+    assert rs.classify(text, FIXTURE) == frozenset(ENTRIES)
+    on, _ = rs.overlay_on(text, FIXTURE, ORNITH)
+    assert rs.classify(on, FIXTURE) == frozenset(ENTRIES) - {ORNITH}
+    assert rs.settings(on)[ORNITH] == rs.settings(FIXTURE)[ORNITH]
+
+
+def test_f3_a_removed_marker_is_inserted_and_a_historical_note_is_never_touched():
+    marker = rs.ENTRY_OFF[ORNITH][0][
+        1
+    ]  # the commented draft_kind: mtp line (shared verbatim with Qwen3.6's block)
+    lines = ALL_OFF.split("\n")
+    start, end = rs._span(lines, ORNITH)
+    hit = [i for i in range(start, end) if lines[i] == marker]
+    assert len(hit) == 1
+    del lines[hit[0]]
+    text = "\n".join(lines)
+    assert rs.classify(text, FIXTURE) == frozenset(ENTRIES)  # a comment removal
+    on, _ = rs.overlay_on(text, FIXTURE, ORNITH)
+    assert "    # draft_kind: suffix  # suffix WITHDRAWN 2026-08-16" in rs.block(
+        on, ORNITH
+    )
+    assert rs.settings(on)[ORNITH] == rs.settings(FIXTURE)[ORNITH]
+    assert rs.classify(on, FIXTURE) == frozenset(ENTRIES) - {ORNITH}
+
+
+def test_f4_merge_keys_resolve_and_only_explicit_duplicates_refuse():
+    doc = rs.parse("a: &x {k: 1}\nb:\n  <<: *x\n  j: 2\nc:\n  <<: *x\n  k: 3\n")
+    assert doc == {"a": {"k": 1}, "b": {"k": 1, "j": 2}, "c": {"k": 3}}
+    with pytest.raises(ValueError, match="duplicate"):
+        rs.parse("a:\n  k: 1\n  k: 2\n")

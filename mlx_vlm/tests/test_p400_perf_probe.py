@@ -365,3 +365,9 @@ def test_the_live_cache_manifest_is_kept_verbatim_per_request():
     assert (
         rep["live_cache"] == live and json.loads(json.dumps(rep))["live_cache"] == live
     )
+
+
+def test_b4_f1_the_registry_is_read_as_bytes_so_crlf_is_refused(tmp_path):
+    """B4 code round 1 F1: universal-newline reading would normalize CRLF before C203's raw check."""
+    (tmp_path / "main_models.yaml").write_bytes(b"models: []\r\n")
+    assert "\r" in probe.registry_text(tmp_path)
