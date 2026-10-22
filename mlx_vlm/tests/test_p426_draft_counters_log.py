@@ -269,10 +269,14 @@ def test_the_mtp_off_line_is_byte_identical_to_the_pre_p426_format(caplog):
 
 def test_started_lines_carry_in_flight_for_the_overlap_rule(monkeypatch, caplog):
     """Counters are exact only without overlap (drafter-global diffs, code round 1 D1); P426 B6 refuses any ON-leg
-    ``Request started`` line with in_flight > 1 — so the field must be on every started line.
+    ``Request started`` line with in_flight > 1 — so the field must be on every started line. A fresh store: the
+    process-wide one carries other tests' leaked counts (test_completions_endpoint patches record_success).
     """
     caplog.set_level(logging.INFO, logger="mlx_vlm.server")
     with TestClient(server.app) as client:
+        monkeypatch.setattr(
+            server.runtime, "metrics", server_generation.ServerMetricsStore()
+        )
         _post(client, monkeypatch, dict(ON))
     started = [
         r.getMessage() for r in caplog.records if "Request started" in r.getMessage()
