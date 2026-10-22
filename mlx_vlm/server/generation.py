@@ -884,7 +884,11 @@ _DRAFT_KEYS = ("draft_kind", "draft_rounds", "draft_n", "draft_n_accepted")
 
 
 def draft_counters_of(metrics) -> Optional[dict]:  # Fork (P426)
-    """A request's ``draft_*`` counters when a drafter ran (``draft_rounds`` set), else None."""
+    """A request's ``draft_*`` counters when a drafter ran (``draft_rounds`` set), else None.
+
+    They are diffs of the drafter's lifetime counters (``speculative_stats_since``): exact while the request is the only one
+    in flight, shared across concurrent requests otherwise — consumers needing exact attribution check ``in_flight`` on the
+    ``Request started`` lines (P426 B6 refuses any > 1)."""
     if getattr(metrics, "draft_rounds", None) is None:
         return None
     return {key: getattr(metrics, key, None) for key in _DRAFT_KEYS}
