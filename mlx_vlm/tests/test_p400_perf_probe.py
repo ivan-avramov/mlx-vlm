@@ -400,3 +400,9 @@ def test_p429_a_failing_leg_still_raises_and_never_exits_zero(monkeypatch):
 
     with pytest.raises(RuntimeError, match="request 3"):
         probe.main(["leg", "job.json"])
+
+
+def test_b4_f1_the_registry_is_read_as_bytes_so_crlf_is_refused(tmp_path):
+    """B4 code round 1 F1: universal-newline reading would normalize CRLF before C203's raw check."""
+    (tmp_path / "main_models.yaml").write_bytes(b"models: []\r\n")
+    assert "\r" in probe.registry_text(tmp_path)

@@ -98,9 +98,12 @@ def check_fixture(text):
         raise ValueError(f"golden fixture sha256 {got} != pinned {FIXTURE_SHA256}")
 
 
+_NAME = re.compile(r"""^  - name:\s*(["']?)(.+?)\1\s*(#.*)?$""")
+
+
 def _span(lines, entry):
-    starts = [i for i, line in enumerate(lines) if line.startswith("  - name: ")]
-    hits = [i for i in starts if lines[i] == f"  - name: {entry}"]
+    starts = [i for i, line in enumerate(lines) if line.startswith("  - name:")]
+    hits = [i for i in starts if (m := _NAME.match(lines[i])) and m.group(2) == entry]
     if len(hits) != 1:
         raise ValueError(f"{entry}: {len(hits)} registry blocks")
     end = next((i for i in starts if i > hits[0]), len(lines))
@@ -139,7 +142,12 @@ def _strict_loader():
         pass
 
     def mapping(loader, node, deep=False):
-        keys = [loader.construct_object(k, deep=deep) for k, _ in node.value]
+        # B4 code round 1 F4: merge keys (``<<``) are YAML semantics, not duplicates; explicit keys are checked
+        keys = [
+            loader.construct_object(k, deep=deep)
+            for k, _ in node.value
+            if k.tag != "tag:yaml.org,2002:merge"
+        ]
         dupes = sorted({str(k) for k in keys if keys.count(k) > 1})
         if dupes:
             raise ValueError(f"duplicate registry keys {dupes}")
@@ -170,15 +178,27 @@ def settings(text):
     return dict(zip(names, models))
 
 
+def _same(a, b):
+    """B4 code round 1 F2: type-aware equality (Python's 0 == False == 0.0 is not YAML's); equal floats stay equal."""
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, dict):
+        return a.keys() == b.keys() and all(_same(a[k], b[k]) for k in a)
+    if isinstance(a, list):
+        return len(a) == len(b) and all(_same(x, y) for x, y in zip(a, b))
+    return a == b
+
+
 def classify(text, fixture):
     """C203: the frozenset of MTP-OFF entries if ``text``'s SETTINGS are one of the 16 states, else None."""
     try:
         doc, ref = parse(text), parse(fixture)
     except ValueError:
         return None
-    if not isinstance(doc, dict) or {k: v for k, v in doc.items() if k != "models"} != {
-        k: v for k, v in ref.items() if k != "models"
-    }:
+    if not isinstance(doc, dict) or not _same(
+        {k: v for k, v in doc.items() if k != "models"},
+        {k: v for k, v in ref.items() if k != "models"},
+    ):
         return None
     models, ref_models = doc.get("models") or [], ref.get("models") or []
     if [m.get("name") for m in models] != [m.get("name") for m in ref_models]:
@@ -186,11 +206,11 @@ def classify(text, fixture):
     off = set()
     for got, want in zip(models, ref_models):
         name = want.get("name")
-        if got == want:
+        if _same(got, want):
             continue
-        if name in ENTRY_OFF and got == {
-            k: v for k, v in want.items() if k not in _mtp_keys(name)
-        }:
+        if name in ENTRY_OFF and _same(
+            got, {k: v for k, v in want.items() if k not in _mtp_keys(name)}
+        ):
             off.add(name)
             continue
         return None
@@ -215,21 +235,26 @@ def overlay_on(text, fixture, entry):
     start, end = _span(lines, entry)
     restored = []
     for key, (old, _) in zip(_mtp_keys(entry), ENTRY_OFF[entry]):
+        # B4 code round 1 F3: only a commented line holding the fixture's VALUE is the marker (a historical
+        # ``# draft_kind: suffix`` note never is); a removed marker is inserted after the name line (key order is no setting)
+        value = old.split(":", 1)[1].split("#", 1)[0].strip()
         commented = re.compile(rf"^\s*#\s*{re.escape(key)}\s*:\s*(\S*)")
-        hits = [i for i in range(start, end) if commented.match(lines[i])]
-        if (
-            len(hits) > 1
-        ):  # e.g. a historical ``# draft_kind: suffix`` note: the commented ON value decides
-            value = old.split(":", 1)[1].split("#", 1)[0].strip()
-            hits = [i for i in hits if commented.match(lines[i]).group(1) == value]
-        if len(hits) != 1:
+        hits = [
+            i
+            for i in range(start, end)
+            if (m := commented.match(lines[i])) and m.group(1) == value
+        ]
+        if len(hits) > 1:
             raise ValueError(f"{entry}: {len(hits)} commented {key} lines")
-        lines[hits[0]] = old
+        if hits:
+            lines[hits[0]] = old
+        else:
+            lines.insert(start + 1, old)
+            end += 1
         restored.append(old)
     on = "\n".join(lines)
-    if (
-        classify(on, fixture) != off - {entry}
-        or settings(on)[entry] != settings(fixture)[entry]
+    if classify(on, fixture) != off - {entry} or not _same(
+        settings(on)[entry], settings(fixture)[entry]
     ):
         raise ValueError(
             f"{entry}: the overlay does not restore exactly its fixture settings"
