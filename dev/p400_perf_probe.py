@@ -343,6 +343,12 @@ def served_check(worker, rg, argv, pick):
 
 
 # ------------------------------------------------------------------ one leg (a child process)
+def registry_text(stack):
+    """B4 code round 1 F1: the registry as BYTES decoded — never universal-newline normalized, so C203's raw CR check sees
+    a CRLF file (as ``orchestrate.read_registry``)."""
+    return (Path(stack) / "main_models.yaml").read_bytes().decode("utf-8")
+
+
 def leg(job_path):
     job = json.loads(Path(job_path).read_text())
     sys.path.insert(0, str(DEV))
@@ -482,7 +488,7 @@ def drive(args):
     stack = Path(args.stack_root).resolve()
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=False)
-    registry = (stack / "main_models.yaml").read_text()
+    registry = registry_text(stack)
     trees = dict(
         A=str(Path(args.old_tree).resolve()), B=str(Path(args.new_tree).resolve())
     )
@@ -571,7 +577,7 @@ def drive_codec(args):
     stack = Path(args.stack_root).resolve()
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=False)
-    registry = (stack / "main_models.yaml").read_text()
+    registry = registry_text(stack)
     tree = str(Path(args.tree).resolve())
     ref = resolve_ref(tree, args.ref)
     attest = attest_tree(tree)
