@@ -98,6 +98,28 @@ def check_fixture(text):
         raise ValueError(f"golden fixture sha256 {got} != pinned {FIXTURE_SHA256}")
 
 
+def _node_name(node, seen=None):
+    """A composed models item's ``name``: an explicit key first, else through its merge keys (B4 code round 3 I1)."""
+    seen = seen or set()
+    if id(node) in seen or not isinstance(getattr(node, "value", None), list):
+        return None
+    seen.add(id(node))
+    merges = []
+    for k, v in node.value:
+        if getattr(k, "tag", None) == "tag:yaml.org,2002:merge":
+            is_seq = isinstance(getattr(v, "value", None), list) and str(
+                v.tag
+            ).endswith(":seq")
+            merges.extend(v.value if is_seq else [v])
+        elif getattr(k, "value", None) == "name":
+            return v.value
+    for m in merges:
+        name = _node_name(m, seen)
+        if name is not None:
+            return name
+    return None
+
+
 def _span(lines, entry):
     """``[start, end)`` line span of ``entry``'s ``models`` item, from the YAML STRUCTURE (B4 code round 2 F3: any key order,
     quoted / commented names); trailing comment lines up to the next item belong to it, the last item runs to the end.
@@ -117,12 +139,7 @@ def _span(lines, entry):
         None,
     )
     items = list(getattr(models, "value", None) or [])
-    names = [
-        next(
-            (v.value for k, v in getattr(item, "value", []) if k.value == "name"), None
-        )
-        for item in items
-    ]
+    names = [_node_name(item) for item in items]
     hits = [i for i, name in enumerate(names) if name == entry]
     if len(hits) != 1:
         raise ValueError(f"{entry}: {len(hits)} registry blocks")
@@ -269,7 +286,9 @@ def overlay_on(text, fixture, entry):
         if (
             hits
         ):  # comments are inert: the first matching marker is restored, any duplicate stays a comment
-            lines[hits[0]] = old
+            line = lines[hits[0]]
+            # at the comment's own depth (I1: inside a merged mapping)
+            lines[hits[0]] = line[: len(line) - len(line.lstrip())] + old.lstrip()
         else:  # a removed marker: after the item's last setting line (never inside a nested mapping's first key)
             last = max(
                 i

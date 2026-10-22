@@ -250,3 +250,20 @@ def test_f3_round2_a_reordered_name_key_keeps_the_overlay_working():
     on, _ = rs.overlay_on(text, FIXTURE, ORNITH)
     assert rs.classify(on, FIXTURE) == frozenset(ENTRIES) - {ORNITH}
     assert rs.settings(on)[ORNITH] == rs.settings(FIXTURE)[ORNITH]
+
+
+def test_i1_a_merge_only_model_item_keeps_the_overlay_working():
+    """B4 code round 3 I1: a models item written as ``- <<:`` + its own mapping is settings-identical, so it classifies — and
+    the overlay must find it (the name comes from the merged mapping) and restore inside that mapping.
+    """
+    lines = ALL_OFF.split("\n")
+    start, end = rs._span(lines, ORNITH)
+    item = [f"      {lines[start][4:]}"] + [
+        ("  " + line) if line.startswith("    ") else line
+        for line in lines[start + 1 : end]
+    ]
+    text = "\n".join(lines[:start] + ["  - <<:"] + item + lines[end:])
+    assert rs.classify(text, FIXTURE) == frozenset(ENTRIES)
+    on, _ = rs.overlay_on(text, FIXTURE, ORNITH)
+    assert rs.classify(on, FIXTURE) == frozenset(ENTRIES) - {ORNITH}
+    assert rs.settings(on)[ORNITH] == rs.settings(FIXTURE)[ORNITH]
