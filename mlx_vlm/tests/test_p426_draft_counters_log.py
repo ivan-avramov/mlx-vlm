@@ -282,3 +282,99 @@ def test_started_lines_carry_in_flight_for_the_overlap_rule(monkeypatch, caplog)
         r.getMessage() for r in caplog.records if "Request started" in r.getMessage()
     ]
     assert started and all(m.endswith("in_flight=1") for m in started), started
+
+
+# ------------------------------------------------------------------ code round 2 D2: the REAL cached-path worker seam
+def _cached_path_generator(drafter, rounds_per_request):
+    """A response generator whose ``generate`` runs the real ``ResponseGenerator._process_cached_request`` (the path every
+    P426 lean-router request takes, ``backend=cached_session``) over a stream_generate that bumps the drafter's lifetime
+    counters as the inline MTP loop does — so the endpoint sees exactly what the worker emits.
+    """
+    import sys as _sys
+    from queue import Queue
+
+    from mlx_vlm.tests.test_server import TestCachedPathDraftCounters
+
+    rg = TestCachedPathDraftCounters._rg(drafter)
+    script = list(rounds_per_request)
+
+    def fake_stream_generate(**kwargs):
+        rounds, drafted, accepted = script.pop(0)
+        drafter.speculative_total_rounds += rounds
+        drafter.speculative_total_drafted += drafted
+        drafter.speculative_total_accepted += float(accepted)
+        yield SimpleNamespace(
+            token=1, text="hi", logprobs=None, finish_reason="stop", peak_memory=0.0
+        )
+
+    class Bridge:
+        tokenizer = SimpleNamespace(decode=lambda tokens: "")
+
+        def validate_context_budget(self, *a, **kw):
+            return None
+
+        def _cpu_preprocess(self, *a, **kw):
+            return {"input_ids": mx.zeros((1, 6), dtype=mx.int32)}
+
+        def generate(self, prompt=None, images=None, audio=None, args=None, **kw):
+            gen_module = _sys.modules["mlx_vlm.generate"]
+            real = gen_module.stream_generate
+            gen_module.stream_generate = fake_stream_generate
+            try:
+                q = Queue()
+                rg._process_cached_request(
+                    rqueue=q,
+                    prompt="x",
+                    images=None,
+                    args=server.GenerationArguments(),
+                    prompt_tokens=6,
+                    prompt_cache_state=SimpleNamespace(),
+                )
+            finally:
+                gen_module.stream_generate = real
+            items = []
+            while not q.empty():
+                items.append(q.get_nowait())
+            tokens = [it for it in items if isinstance(it, server.StreamingToken)]
+            return (
+                server.GenerationContext(
+                    uid=1, prompt_tokens=6, backend="cached_session"
+                ),
+                iter(tokens),
+            )
+
+    return Bridge()
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_the_real_cached_path_counters_reach_the_log_then_a_no_round_request_has_none(
+    monkeypatch, caplog, stream
+):
+    drafter = SimpleNamespace(
+        speculative_total_rounds=10,
+        speculative_total_accepted=20.0,
+        speculative_total_drafted=30,
+    )
+    gen = _cached_path_generator(drafter, [(3, 7, 5), (0, 0, 0)])
+    caplog.set_level(logging.INFO, logger="mlx_vlm.server")
+    with TestClient(server.app) as client:
+        monkeypatch.setattr(server.runtime, "response_generator", gen)
+        with patch.object(
+            server,
+            "get_cached_model",
+            return_value=(
+                SimpleNamespace(),
+                SimpleNamespace(),
+                SimpleNamespace(model_type="qwen2_vl"),
+            ),
+        ):
+            for _ in range(2):
+                r = client.post(
+                    "/chat/completions", json=REQUESTS["/chat/completions"](stream)
+                )
+                assert r.status_code == 200, r.text
+                r.read()
+    first, second = _completed_lines(caplog)[-2:]
+    assert "draft_kind=mtp draft_n=7 draft_n_accepted=5 draft_rounds=3" in first
+    assert "backend=cached_session" in first
+    assert "draft_" not in second
