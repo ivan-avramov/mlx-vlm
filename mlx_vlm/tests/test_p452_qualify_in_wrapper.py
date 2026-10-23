@@ -195,3 +195,18 @@ def test_real_topology_sequencer_and_wrapper_are_both_exempt(tmp_path):
     pids = [int(p.split()[1]) for p in doc["problems"]]
     assert doc["parent"] not in pids and doc["grandparent"] not in pids
     assert sibling in pids
+
+
+def test_the_script_entry_point_parses_its_arguments():
+    """P452: the leg runs `python dev/p369_phase2/qualify.py …` as a SCRIPT (no package on sys.path); build_parser's
+    import must work there too (M1 smoke 2026-10-23: ModuleNotFoundError: p369_phase2 at --help time)."""
+    script = DEV / "p369_phase2" / "qualify.py"
+    r = subprocess.run(
+        [sys.executable, str(script), "--help"],
+        capture_output=True,
+        text=True,
+        cwd=DEV.parent,
+        timeout=120,
+    )
+    assert r.returncode == 0, r.stderr[-800:]
+    assert "--production-ref" in r.stdout and "--predictor" in r.stdout
