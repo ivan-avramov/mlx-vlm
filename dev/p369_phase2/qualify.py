@@ -1242,7 +1242,11 @@ def fingerprint_of(rec, expected):
 
 def build_parser():
     import argparse
+    import sys
 
+    sys.path.insert(
+        0, str(Path(__file__).resolve().parents[1])
+    )  # as drive(): run as a script, not a package
     from p369_phase2 import orchestrate
 
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
