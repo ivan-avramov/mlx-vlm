@@ -14,13 +14,16 @@ defect, and to explain the one divergence we carry *because* upstream is wrong
   out of scope for this fork (decided 2026-08-10). An earlier handoff invented that
   task; it was never asked for and nothing else in `AGENTS.md`, `upstream-gaps.md` or
   `memory.md` ever proposed it. Don't re-propose it.
-* **These are not to be patched locally either.** A local fix to upstream code is a
-  new permanent conflict site, and for items 1-3 and 5 our copy is byte-identical to
-  upstream's — which is the state worth keeping. Item 4 is the exception and is
-  already diverged deliberately; its marker and guard say so.
+* **Patched here only when something downstream needs it** (rule changed 2026-10-22 by
+  the operator, Premisa P600). A local fix to upstream code is a new permanent conflict
+  site, so items 1-3 and 5, which block nothing, stay byte-identical to upstream. Items
+  4, 6 and 7 are deliberate divergences: each carries a `# Fork:` marker, a test, and an
+  entry below saying what upstream does wrong. A fix that a Premisa candidate or the
+  stack needs goes in the same way, as ordinary fork work; it is not avoided as a
+  one-off and never patched in a downstream repository.
 
-So the correct action on every entry below is: read it, understand why our tree looks
-the way it does, and move on.
+So the correct action on an entry below is: read it, understand why our tree looks
+the way it does, and move on; add a fix only with a marker, a test and an entry.
 
 Line numbers are `upstream/main` at base `ffd7aeff` unless stated. Verified
 2026-08-10; none had been filed by anyone else as of that date
