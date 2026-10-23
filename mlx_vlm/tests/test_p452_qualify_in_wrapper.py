@@ -22,6 +22,16 @@ LEG = ["/venv/bin/python", "-m", "bench.p426_leg", "--axis", "m1"]
 SEQ = ["/venv/bin/python", "-m", "bench.p426_wave1", "--stack-root", "/s"]
 
 
+def test_an_ancestor_pid_with_another_create_time_is_not_exempt():
+    """code round 2 F2: a reused pid (same number, different process) is not the launcher."""
+    procs = [(101, LEG, 2.0)]
+    assert orchestrate.foreign_process_problems(procs, me=102, ancestors={(101, 1.0)})
+    assert (
+        orchestrate.foreign_process_problems(procs, me=102, ancestors={(101, 2.0)})
+        == []
+    )
+
+
 def test_ancestors_are_not_foreign_but_others_are():
     procs = [(101, LEG), (100, SEQ), (300, LEG), (400, ["/bin/zsh"])]
     problems = orchestrate.foreign_process_problems(procs, me=102, ancestors={101, 100})
@@ -95,13 +105,13 @@ def test_the_production_ref_defaults_to_the_pin_and_is_parsed():
 
 # ------------------------------------------------------------------ code round 1 F2 / F3 / F4
 CHILD = """
-import json, os, sys
+import argparse, json, os, sys, tempfile
 sys.path.insert(0, {dev!r})
-import psutil
 from p369_phase2 import orchestrate
-procs = [(p.info["pid"], p.info["cmdline"]) for p in psutil.process_iter(["pid", "cmdline"])]
-print(json.dumps(dict(problems=orchestrate.foreign_process_problems(procs, os.getpid(), orchestrate.ancestor_pids()),
-                      parent=os.getppid())))
+# code round 2 F4: the REAL preflight (its other checks may add problems on a busy box; only its process census is asserted)
+args = argparse.Namespace(fork_root={fork!r}, production_ref="HEAD")
+pre = orchestrate.preflight(args, tempfile.mkdtemp())
+print(json.dumps(dict(problems=[p for p in pre["problems"] if p.startswith("process ")], parent=os.getppid())))
 """
 LAUNCH = """
 import subprocess, sys, time
@@ -127,11 +137,13 @@ def _launcher_tree(tmp_path, module):
     pkg.mkdir(exist_ok=True)
     (pkg / "__init__.py").write_text("")
     for name in {module, "p426_leg"}:
-        (pkg / f"{name}.py").write_text(LAUNCH.format(child=CHILD.format(dev=str(DEV))))
+        (pkg / f"{name}.py").write_text(
+            LAUNCH.format(child=CHILD.format(dev=str(DEV), fork=str(DEV.parent)))
+        )
     sibling = subprocess.Popen(
         [sys.executable, "-m", "bench.p426_leg", "--sibling"],
         cwd=tmp_path,
-        env={"PYTHONPATH": str(tmp_path), "PATH": "/usr/bin:/bin"},
+        env={"PYTHONPATH": str(tmp_path), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
         stdout=subprocess.DEVNULL,
     )
     time.sleep(0.5)
@@ -139,7 +151,7 @@ def _launcher_tree(tmp_path, module):
         out = subprocess.run(
             [sys.executable, "-m", f"bench.{module}"],
             cwd=tmp_path,
-            env={"PYTHONPATH": str(tmp_path), "PATH": "/usr/bin:/bin"},
+            env={"PYTHONPATH": str(tmp_path), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
             capture_output=True,
             text=True,
             check=True,
