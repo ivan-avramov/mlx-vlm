@@ -1213,13 +1213,17 @@ def foreign_process_problems(procs, me, ancestors):
     sequencer that launched it (code round 1 F2: any other refused ancestor, e.g. a benchmark parent, still refuses).
     """
     problems = []
-    for pid, argv in procs:
+    for item in procs:
+        pid, argv = item[0], item[1]
+        key = (
+            (pid, item[2]) if len(item) > 2 else pid
+        )  # code round 2 F2: (pid, create time) — never a reused pid
         if pid == me:
             continue
         why = refused_process(argv or [])
         if (
             why
-            and pid in ancestors
+            and key in ancestors
             and why in tuple(f"module {m}" for m in LAUNCHER_MODULES)
         ):
             continue
@@ -1252,9 +1256,10 @@ def resolve_production_ref(fork_root, ref, reviewed_head):
 
 
 def ancestor_pids():
+    """(pid, create time) of every ancestor — matched against the census by both (code round 2 F2)."""
     import psutil
 
-    return {p.pid for p in psutil.Process(os.getpid()).parents()}
+    return {(p.pid, p.create_time()) for p in psutil.Process(os.getpid()).parents()}
 
 
 def production_diff_problem(fork_root, ref):
@@ -1285,8 +1290,8 @@ def preflight(args, out):
     ancestors = ancestor_pids()
     problems = foreign_process_problems(
         [
-            (p.info["pid"], p.info["cmdline"])
-            for p in psutil.process_iter(["pid", "cmdline"])
+            (p.info["pid"], p.info["cmdline"], p.info["create_time"])
+            for p in psutil.process_iter(["pid", "cmdline", "create_time"])
         ],
         me,
         ancestors,
