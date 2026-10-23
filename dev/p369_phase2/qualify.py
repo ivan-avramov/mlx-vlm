@@ -930,7 +930,7 @@ def _drive_locked(
             started=time.strftime("%Y-%m-%dT%H:%M:%S"),
             reviewed_head=reviewed,
             start=start,
-            production=orchestrate.PRODUCTION,
+            production=getattr(args, "production_ref", None) or orchestrate.PRODUCTION,
             registry_sha256=registry_sha,
             versions=orchestrate.fork_versions(fork),
             console_script=console,
@@ -1233,9 +1233,10 @@ def fingerprint_of(rec, expected):
     )
 
 
-def main(argv=None):
+def build_parser():
     import argparse
-    import sys
+
+    from p369_phase2 import orchestrate
 
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--stack-root", required=True)
@@ -1248,6 +1249,16 @@ def main(argv=None):
         "--predictor", choices=("on", "off"), default=None
     )
     ap.add_argument("--idle-s", type=float, default=IDLE_S)
+    ap.add_argument(  # P452: the production tree this run attests (P426: stack S carries B1's log-only counters)
+        "--production-ref", default=orchestrate.PRODUCTION
+    )
+    return ap
+
+
+def main(argv=None):
+    import sys
+
+    ap = build_parser()
     args = ap.parse_args(argv)
     if args.idle_s < IDLE_S:
         ap.error(f"--idle-s must be at least {IDLE_S:.0f} (AGENTS.md)")

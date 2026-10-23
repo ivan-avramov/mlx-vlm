@@ -1202,18 +1202,53 @@ def sha256_file(path):
     return h.hexdigest()
 
 
+def foreign_process_problems(procs, me, ancestors):
+    """P452: refused processes beside the run — never the caller or its own ancestor chain (the P426 leg wrapper and
+    sequencer that launched it)."""
+    problems = []
+    for pid, argv in procs:
+        if pid == me or pid in ancestors:
+            continue
+        why = refused_process(argv or [])
+        if why:
+            problems.append(f"process {pid} ({why}): {' '.join(argv or [])[:120]}")
+    return problems
+
+
+def production_diff_problem(fork_root, ref):
+    """P452: the production tree (``mlx_vlm`` minus its tests) must equal ``ref``; None when it does."""
+    diff = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(fork_root),
+            "diff",
+            "--stat",
+            ref,
+            "--",
+            "mlx_vlm",
+            ":!mlx_vlm/tests",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    return f"production code differs from {ref}:\n{diff}" if diff else None
+
+
 def preflight(args, out):
     import psutil
 
-    problems = []
     me = os.getpid()
-    for p in psutil.process_iter(["pid", "cmdline"]):
-        if p.info["pid"] == me:
-            continue
-        why = refused_process(p.info["cmdline"] or [])
-        if why:
-            cmd = " ".join(p.info["cmdline"] or [])
-            problems.append(f"process {p.info['pid']} ({why}): {cmd[:120]}")
+    ancestors = {p.pid for p in psutil.Process(me).parents()}
+    problems = foreign_process_problems(
+        [
+            (p.info["pid"], p.info["cmdline"])
+            for p in psutil.process_iter(["pid", "cmdline"])
+        ],
+        me,
+        ancestors,
+    )
     for (
         port
     ) in (
@@ -1234,24 +1269,11 @@ def preflight(args, out):
     power = power_state()
     if not power["ac_ok"] or not power["battery_ok"]:
         problems.append(f"power {power}")
-    diff = subprocess.run(
-        [
-            "git",
-            "-C",
-            args.fork_root,
-            "diff",
-            "--stat",
-            PRODUCTION,
-            "--",
-            "mlx_vlm",
-            ":!mlx_vlm/tests",
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
+    diff = production_diff_problem(
+        args.fork_root, getattr(args, "production_ref", None) or PRODUCTION
+    )
     if diff:
-        problems.append(f"production code differs from {PRODUCTION}:\n{diff}")
+        problems.append(diff)
     porcelain = subprocess.run(
         ["git", "-C", args.fork_root, "status", "--porcelain", "--untracked-files=all"],
         capture_output=True,
