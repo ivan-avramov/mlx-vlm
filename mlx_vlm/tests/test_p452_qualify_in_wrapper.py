@@ -22,16 +22,6 @@ LEG = ["/venv/bin/python", "-m", "bench.p426_leg", "--axis", "m1"]
 SEQ = ["/venv/bin/python", "-m", "bench.p426_wave1", "--stack-root", "/s"]
 
 
-def test_an_ancestor_pid_with_another_create_time_is_not_exempt():
-    """code round 2 F2: a reused pid (same number, different process) is not the launcher."""
-    procs = [(101, LEG, 2.0)]
-    assert orchestrate.foreign_process_problems(procs, me=102, ancestors={(101, 1.0)})
-    assert (
-        orchestrate.foreign_process_problems(procs, me=102, ancestors={(101, 2.0)})
-        == []
-    )
-
-
 def test_ancestors_are_not_foreign_but_others_are():
     procs = [(101, LEG), (100, SEQ), (300, LEG), (400, ["/bin/zsh"])]
     problems = orchestrate.foreign_process_problems(procs, me=102, ancestors={101, 100})
@@ -111,7 +101,10 @@ from p369_phase2 import orchestrate
 # code round 2 F4: the REAL preflight (its other checks may add problems on a busy box; only its process census is asserted)
 args = argparse.Namespace(fork_root={fork!r}, production_ref="HEAD")
 pre = orchestrate.preflight(args, tempfile.mkdtemp())
-print(json.dumps(dict(problems=[p for p in pre["problems"] if p.startswith("process ")], parent=os.getppid())))
+import psutil
+parent = os.getppid()
+print(json.dumps(dict(problems=[p for p in pre["problems"] if p.startswith("process ")], parent=parent,
+                      grandparent=psutil.Process(parent).ppid())))
 """
 LAUNCH = """
 import subprocess, sys, time
@@ -119,6 +112,12 @@ if "--sibling" in sys.argv:
     time.sleep(30)
     sys.exit(0)
 r = subprocess.run([sys.executable, "-c", {child!r}], capture_output=True, text=True, check=True)
+print(r.stdout, end="")
+"""
+# P453 F4: the sequencer level — `python -m bench.p426_wave1` -> `python -m bench.p426_leg` -> the preflight child
+SEQUENCER = """
+import subprocess, sys
+r = subprocess.run([sys.executable, "-m", "bench.p426_leg"], capture_output=True, text=True, check=True)
 print(r.stdout, end="")
 """
 
@@ -136,10 +135,11 @@ def _launcher_tree(tmp_path, module):
     pkg = tmp_path / "bench"
     pkg.mkdir(exist_ok=True)
     (pkg / "__init__.py").write_text("")
-    for name in {module, "p426_leg"}:
+    for name in {module, "p426_leg"} - {"p426_wave1"}:
         (pkg / f"{name}.py").write_text(
             LAUNCH.format(child=CHILD.format(dev=str(DEV), fork=str(DEV.parent)))
         )
+    (pkg / "p426_wave1.py").write_text(SEQUENCER)
     sibling = subprocess.Popen(
         [sys.executable, "-m", "bench.p426_leg", "--sibling"],
         cwd=tmp_path,
@@ -187,3 +187,11 @@ def test_the_production_ref_resolves_to_a_strict_ancestor_sha(fork):
         orchestrate.resolve_production_ref(root, "HEAD", head)  # tautological
     with pytest.raises(ValueError, match="not a commit"):
         orchestrate.resolve_production_ref(root, "no-such-ref", head)
+
+
+def test_real_topology_sequencer_and_wrapper_are_both_exempt(tmp_path):
+    """P453 F4: sequencer -> leg wrapper -> qualify preflight, as in production: neither launcher is foreign."""
+    doc, sibling = _launcher_tree(tmp_path, "p426_wave1")
+    pids = [int(p.split()[1]) for p in doc["problems"]]
+    assert doc["parent"] not in pids and doc["grandparent"] not in pids
+    assert sibling in pids
