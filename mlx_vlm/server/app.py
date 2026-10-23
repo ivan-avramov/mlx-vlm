@@ -824,14 +824,16 @@ def get_cached_model(
                 detail="Adapters are not supported for embedding models.",
             )
         logger.info("Loading embedding model: %s", model_path)
-        from ..embedding_loader import load_embedding_model
+        from ..embedding_loader import load_embedding_model, load_embedding_processor
         from ..models.pooling import read_pooling_config
-        from ..utils import get_model_path, load_processor
+        from ..utils import get_model_path
 
         try:
             model_dir = get_model_path(model_path)
             model = load_embedding_model(model_dir)
-            processor = load_processor(model_dir, add_detokenizer=False)
+            # Fork: falls back to the tokenizer when the image processor cannot be
+            # built (mistral3 retrieval checkpoints without PyTorch).
+            processor = load_embedding_processor(model_dir)
         except RepositoryNotFoundError as e:
             raise HTTPException(
                 status_code=404,

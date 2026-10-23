@@ -1,6 +1,6 @@
-# Text-only embedding load for `mistral3` retrieval checkpoints (Nemotron 3.5 Embed 1B) — spec draft 2
+# Text-only embedding load for `mistral3` retrieval checkpoints (Nemotron 3.5 Embed 1B) — spec draft 4
 
-Status: design-reviewed once (four-eyes light, codex and opus, 2026-10-22; ledger in Premisa `docs/reviews/nemotron35-embed-loader/`). Draft 2 changes are the designer's and not re-reviewed. Not approved for build until Go.
+Status: design-reviewed once (four-eyes light, codex and opus, 2026-10-22; ledger in Premisa `docs/reviews/nemotron35-embed-loader/`); Go given by the operator on 2026-10-22 (P589). Draft 3 corrected the fallback's return type after the implementer and the test-writer both found that `load_tokenizer` returns a non-callable wrapper. Draft 4 folds in the change review (codex and opus, 2026-10-22): detection from the raw config.json, `config=None` treated as omitted, a WARNING-level fallback log with the message, `model.lm_head.` dropped, and the residuals named below. Both drafts are the designer's, made after Go, and are shown to the operator at Accept.
 
 ## Goal
 
@@ -38,7 +38,7 @@ Status: design-reviewed once (four-eyes light, codex and opus, 2026-10-22; ledge
 
 Current behaviour: reads `config.json`, applies `EMBEDDING_MODEL_REMAPPING` to `model_type`, loads every safetensors tensor in the directory, builds the model and calls `sanitize`.
 
-New behaviour, added before the existing path: if `config["model_type"] == "mistral3"` and `config.get("text_config", {}).get("model_type") == "ministral3"`, the loader derives a text config:
+New behaviour, added before the existing path and only when the caller passed no `config` (a `config=None` argument counts as none; an explicit dict keeps its meaning and skips detection): the loader reads the raw `config.json` with `json.load` (no transformers normalisation, no caller kwargs; a missing file falls through to the existing path, which reports it), and if `config["model_type"] == "mistral3"`, `config.get("text_config", {}).get("model_type") == "ministral3"` and the text config's `is_causal` is not `true` (a causal text model is an instruct checkpoint, not an embedder; added at the second change review, with a negative test), derives a text config:
 
 ```
 text = dict(config["text_config"])
@@ -51,13 +51,13 @@ and calls `load_encoder_model(model_path, model_remapping=..., config=text, ...)
 
 ### `ministral3_embedding.Model.sanitize(weights)`
 
-Current: drops `lm_head.*`; prefixes bare keys with `model.`.
+Current: drops `lm_head.*`; prefixes bare keys with `model.`. New: `model.lm_head.*` is dropped as well.
 
 New: first drops every key starting with `vision_tower.`, `multi_modal_projector.` or `model.vision_tower.` / `model.multi_modal_projector.`; strips a leading `language_model.` (or `model.language_model.`); then the current logic. Result for the reference layout: `language_model.layers.3.self_attn.q_proj.weight` → `model.layers.3.self_attn.q_proj.weight`; `language_model.embed_tokens.weight` → `model.embed_tokens.weight`; `language_model.norm.weight` → `model.norm.weight`. A quantized copy written by the Premisa spike already carries `model.*` keys and passes through unchanged. If two source keys map to the same destination (for example `language_model.norm.weight` beside `model.norm.weight`), `sanitize` raises `ValueError` naming both; it never keeps whichever came last.
 
 ### `load_embedding_processor(model_dir, **kwargs)` (new, `embedding_loader.py`)
 
-Returns `load_processor(model_dir, add_detokenizer=False, **kwargs)`; if that raises (an image processor whose dependencies are absent, as with the Pixtral processor offline), returns `load_tokenizer(model_dir)` and logs one line naming the exception class. The server's embedding load (`server/app.py`, the `load_as_embedding` branch) calls it in place of `load_processor`; the embedding path uses only the tokenizer either way.
+Returns `load_processor(model_dir, add_detokenizer=False, **kwargs)`; if that raises (an image processor whose dependencies are absent, as with the Pixtral processor offline), logs one WARNING line naming the exception class and its message and returns a callable tokenizer: the result of `load_tokenizer(model_dir)` when it is callable, otherwise the Hugging Face tokenizer it wraps (its `_tokenizer` attribute), since the server's `_embed` calls the tokenizer directly and `TokenizerWrapper` is not callable (draft 3 correction). The server's embedding load (`server/app.py`, the `load_as_embedding` branch) calls it in place of `load_processor`; the text embedding path uses only the tokenizer. Residual, recorded at the change review and not built against: the fallback applies to every embedder the server loads, so an image-capable embedder whose processor fails to build now loads text-only and reports "does not support image inputs" on an image request instead of failing at load; the WARNING line is the trace. Scoping the fallback to text-only checkpoints is a possible follow-up fork item; it would invalidate three frozen tests written to the unscoped rule. A second residual: if the Pixtral processor does build (PyTorch present), the text-only model ignores `pixel_values`, as every text embedder in the fork does; the Premisa inference environment has no PyTorch.
 
 ### Success path
 
@@ -73,12 +73,14 @@ See `load_embedding_processor`. The Premisa spike (test tooling in the Premisa r
 
 ## Acceptance criteria
 
-1. Synthetic mapping test: a temporary directory holding a `mistral3` config with a tiny `ministral3` `text_config` and a tiny `vision_config`, random text, `vision_tower.*` and `multi_modal_projector.*` tensors in one safetensors file, loads through `load_embedding_model`; the model has no parameter whose path contains `vision_tower` or `multi_modal_projector`; its embeddings for a fixed token batch equal, to 1e-5, those of a plain `ministral3` directory holding the same text weights under bare keys. Parametrised over the text key layouts `language_model.*`, `model.language_model.*`, `language_model.*` plus a `language_model.lm_head.weight`, and bare `model.*`. This proves the mapping, not the decoder (criterion 6 does that).
+1. Synthetic mapping test (the `language_model.model.*` layout of transformers-4 `Mistral3ForConditionalGeneration` saves is pinned as a fifth parametrisation): a temporary directory holding a `mistral3` config with a tiny `ministral3` `text_config` and a tiny `vision_config`, random text, `vision_tower.*` and `multi_modal_projector.*` tensors in one safetensors file, loads through `load_embedding_model`; the model has no parameter whose path contains `vision_tower` or `multi_modal_projector`; its embeddings for a fixed token batch equal, to 1e-5, those of a plain `ministral3` directory holding the same text weights under bare keys. Parametrised over the text key layouts `language_model.*`, `model.language_model.*`, `language_model.*` plus a `language_model.lm_head.weight`, and bare `model.*`. This proves the mapping, not the decoder (criterion 6 does that).
 2. Quantized round trip: the synthetic text weights quantized in memory with `nn.quantize` 8-bit (group 64), embedded, saved in the spike's layout (`model.*` keys, the `mistral3` config plus `"quantization": {"group_size": 64, "bits": 8, "mode": "affine"}`), reloaded through `load_embedding_model`, embedded again: identical to 1e-5, and cosine at or above 0.99 against the BF16 embeddings of the same synthetic weights.
 3. Negatives: a `mistral3` config whose `text_config.model_type` is not `ministral3` falls through and raises as before; a directory whose text keys appear under two aliases raises `ValueError` from `sanitize` naming both keys; a missing or shape-mismatched text tensor raises from strict loading.
 4. Processor fallback: `load_embedding_processor` returns the processor when `load_processor` succeeds and the tokenizer when it raises (unit test with a patched `load_processor`); on the real checkpoint offline it returns a tokenizer whose ids and mask for `query: x` equal the reference tokenizer's.
-5. `dev/check_fork_markers.py` reports no unmarked site in the three files; the fork suite passes except the one pre-existing failure (`test_golden_the_shipped_first_pick_passes_every_load_time_refusal`).
+5. `dev/check_fork_markers.py` reports no unmarked site in the three files; the fork suite passes in full in a checkout with `.git` (observed: 6,075 passed); in a plain copy without `.git` only the allowlist-pinning test of `test_audit_scoped_exclusions.py` fails, because it runs git.
 6. Reference parity (designer-run, reported, not a unit test): on the six saved reference texts (short and a 2,235-token passage, both prefixes), the fork at BF16 produces the same token ids and masks and per-row cosine at or above 0.999 against the transformers reference of F1; the minimum is reported. Then the 1,875-chunk set embeds with zero nonfinite rows, with peak process memory reported.
+   Measured 2026-10-22 on the candidate: token ids and masks identical on all six texts; per-row cosine 0.99997 to 0.99999 (minimum 0.99997); batched against single-text cosine minimum 0.99998; the model loads in 0.7 s with 1,140M parameters and no vision tensors; peak process RSS 2.78 GB at BF16 for the six texts.
+   Corpus runs 2026-10-22 on the candidate (batch 16, prefixes `query: ` and `passage: `): 1,875 chunks and 230 questions on the first corpus and 1,868 and 230 on the second, zero nonfinite rows, 38 to 41 s per corpus at BF16; the batched run pads six texts of 6 to 2,235 tokens through the fallback tokenizer (right padding, pad token present), so the pad-token concern raised at the change review does not arise. Real-checkpoint 8-bit round trip in the spike's layout (every module, group 64, 1.1 GB, 8.50 bits per weight stored): reloaded through the loader, chunk cosine 0.99988 minimum against BF16, top-8 neighbour overlap 0.991. Task-server peak with the 8-bit copy beside the 8-bit reranker and the task model: 3,871,297,904 bytes.
 
 ## Non-goals
 

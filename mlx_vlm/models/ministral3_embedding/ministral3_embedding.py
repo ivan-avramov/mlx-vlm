@@ -7,6 +7,14 @@ from ..ministral3.language import Ministral3Decoder, _get_llama_4_attn_scale
 from ..pooling import EmbeddingOutput, normalize_embeddings, pool_by_config
 from .config import ModelConfig
 
+# Fork: key prefixes of the mistral3 vision tower and projector, never loaded here.
+_NON_TEXT_PREFIXES = (
+    "vision_tower.",
+    "multi_modal_projector.",
+    "model.vision_tower.",
+    "model.multi_modal_projector.",
+)
+
 
 class Model(nn.Module):
     def __init__(self, config: ModelConfig):
@@ -45,14 +53,31 @@ class Model(nn.Module):
         )
         return EmbeddingOutput(last_hidden_state=h, text_embeds=text_embeds)
 
+    # Fork: accepts the multimodal `mistral3` key layout (drops the vision tower and
+    # projector, strips `language_model.` / `model.language_model.`) and raises when
+    # two source keys land on one destination instead of keeping the last one.
     def sanitize(self, weights):
         out = {}
+        sources = {}
         for k, v in weights.items():
-            if k.startswith("lm_head."):
+            if k.startswith(_NON_TEXT_PREFIXES):
+                continue
+            src = k
+            for prefix in ("model.language_model.", "language_model."):
+                if k.startswith(prefix):
+                    k = k[len(prefix) :]
+                    break
+            if k.startswith(("lm_head.", "model.lm_head.")):
                 continue
             if not k.startswith("model."):
                 k = "model." + k
+            if k in out:
+                raise ValueError(
+                    f"Conflicting checkpoint keys {sources[k]!r} and {src!r} "
+                    f"both map to {k!r}."
+                )
             out[k] = v
+            sources[k] = src
         return out
 
     @property
