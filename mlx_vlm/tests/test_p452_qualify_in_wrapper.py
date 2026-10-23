@@ -199,7 +199,8 @@ def test_real_topology_sequencer_and_wrapper_are_both_exempt(tmp_path):
 
 def test_the_script_entry_point_parses_its_arguments():
     """P452: the leg runs `python dev/p369_phase2/qualify.py …` as a SCRIPT (no package on sys.path); build_parser's
-    import must work there too (M1 smoke 2026-10-23: ModuleNotFoundError: p369_phase2 at --help time)."""
+    import must work there too (M1 smoke 2026-10-23: ModuleNotFoundError: p369_phase2 at --help time).
+    """
     script = DEV / "p369_phase2" / "qualify.py"
     r = subprocess.run(
         [sys.executable, str(script), "--help"],
