@@ -102,9 +102,11 @@ from p369_phase2 import orchestrate
 args = argparse.Namespace(fork_root={fork!r}, production_ref="HEAD")
 pre = orchestrate.preflight(args, tempfile.mkdtemp())
 import psutil
+from p369_phase2 import qualify
 parent = os.getppid()
 print(json.dumps(dict(problems=[p for p in pre["problems"] if p.startswith("process ")], parent=parent,
-                      grandparent=psutil.Process(parent).ppid())))
+                      grandparent=psutil.Process(parent).ppid(),
+                      interference=qualify.interference_problems(orchestrate))))
 """
 LAUNCH = """
 import subprocess, sys, time
@@ -211,3 +213,12 @@ def test_the_script_entry_point_parses_its_arguments():
     )
     assert r.returncode == 0, r.stderr[-800:]
     assert "--production-ref" in r.stdout and "--predictor" in r.stdout
+
+
+def test_real_topology_the_per_entry_interference_check_exempts_the_launchers_too(tmp_path):
+    """P452: qualify's per-entry before / after check (`interference`) is the SECOND process census; it refused the
+    sequencer on M1 smoke attempt 4 (2026-10-23) after the preflight passed. It must apply the same launcher rule."""
+    doc, sibling = _launcher_tree(tmp_path, "p426_wave1")
+    pids = [int(p.split()[1]) for p in doc["interference"]]
+    assert doc["parent"] not in pids and doc["grandparent"] not in pids
+    assert sibling in pids
