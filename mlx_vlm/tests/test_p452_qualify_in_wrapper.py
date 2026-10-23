@@ -91,3 +91,87 @@ def test_the_production_ref_defaults_to_the_pin_and_is_parsed():
         ]
     )
     assert args.production_ref == "abc123"
+
+
+# ------------------------------------------------------------------ code round 1 F2 / F3 / F4
+CHILD = """
+import json, os, sys
+sys.path.insert(0, {dev!r})
+import psutil
+from p369_phase2 import orchestrate
+procs = [(p.info["pid"], p.info["cmdline"]) for p in psutil.process_iter(["pid", "cmdline"])]
+print(json.dumps(dict(problems=orchestrate.foreign_process_problems(procs, os.getpid(), orchestrate.ancestor_pids()),
+                      parent=os.getppid())))
+"""
+LAUNCH = """
+import subprocess, sys, time
+if "--sibling" in sys.argv:
+    time.sleep(30)
+    sys.exit(0)
+r = subprocess.run([sys.executable, "-c", {child!r}], capture_output=True, text=True, check=True)
+print(r.stdout, end="")
+"""
+
+
+def _launcher_tree(tmp_path, module):
+    """A real process chain: `python -m bench.<module>` -> `python -c <preflight check>`, beside a SIBLING
+    `python -m bench.p426_leg` that is not an ancestor."""
+    import json
+    import time
+
+    pytest.importorskip(
+        "psutil",
+        reason="the preflight's process census needs psutil (fork-suite extra, P452)",
+    )
+    pkg = tmp_path / "bench"
+    pkg.mkdir(exist_ok=True)
+    (pkg / "__init__.py").write_text("")
+    for name in {module, "p426_leg"}:
+        (pkg / f"{name}.py").write_text(LAUNCH.format(child=CHILD.format(dev=str(DEV))))
+    sibling = subprocess.Popen(
+        [sys.executable, "-m", "bench.p426_leg", "--sibling"],
+        cwd=tmp_path,
+        env={"PYTHONPATH": str(tmp_path), "PATH": "/usr/bin:/bin"},
+        stdout=subprocess.DEVNULL,
+    )
+    time.sleep(0.5)
+    try:
+        out = subprocess.run(
+            [sys.executable, "-m", f"bench.{module}"],
+            cwd=tmp_path,
+            env={"PYTHONPATH": str(tmp_path), "PATH": "/usr/bin:/bin"},
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=60,
+        ).stdout
+    finally:
+        sibling.kill()
+        sibling.wait()
+    doc = json.loads(out)
+    return doc, sibling.pid
+
+
+def test_real_topology_the_launcher_parent_is_exempt_a_sibling_is_not(tmp_path):
+    doc, sibling = _launcher_tree(tmp_path, "p426_leg")
+    pids = [int(p.split()[1]) for p in doc["problems"]]
+    assert doc["parent"] not in pids  # the P426 leg wrapper that launched it
+    assert sibling in pids  # the same argv, but not an ancestor
+
+
+def test_real_topology_another_refused_parent_still_refuses(tmp_path):
+    doc, _ = _launcher_tree(tmp_path, "p426_other")
+    pids = [int(p.split()[1]) for p in doc["problems"]]
+    assert doc["parent"] in pids  # a bench.* parent that is not a P426 launcher
+
+
+def test_the_production_ref_resolves_to_a_strict_ancestor_sha(fork):
+    root, base, s = fork
+    head = _git(root, "rev-parse", "HEAD")
+    assert (
+        orchestrate.resolve_production_ref(root, s[:8], head) == s
+    )  # full sha, recorded as diffed
+    with pytest.raises(ValueError, match="strict ancestor"):
+        orchestrate.resolve_production_ref(root, "HEAD", head)  # tautological
+    with pytest.raises(ValueError, match="not a commit"):
+        orchestrate.resolve_production_ref(root, "no-such-ref", head)

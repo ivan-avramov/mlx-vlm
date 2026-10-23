@@ -1202,17 +1202,59 @@ def sha256_file(path):
     return h.hexdigest()
 
 
+LAUNCHER_MODULES = (
+    "bench.p426_leg",
+    "bench.p426_wave1",
+)  # P452: the only refused ancestors allowed
+
+
 def foreign_process_problems(procs, me, ancestors):
-    """P452: refused processes beside the run — never the caller or its own ancestor chain (the P426 leg wrapper and
-    sequencer that launched it)."""
+    """P452: refused processes beside the run — never the caller, and never an ANCESTOR that is the P426 leg wrapper or
+    sequencer that launched it (code round 1 F2: any other refused ancestor, e.g. a benchmark parent, still refuses).
+    """
     problems = []
     for pid, argv in procs:
-        if pid == me or pid in ancestors:
+        if pid == me:
             continue
         why = refused_process(argv or [])
+        if (
+            why
+            and pid in ancestors
+            and why in tuple(f"module {m}" for m in LAUNCHER_MODULES)
+        ):
+            continue
         if why:
             problems.append(f"process {pid} ({why}): {' '.join(argv or [])[:120]}")
     return problems
+
+
+def resolve_production_ref(fork_root, ref, reviewed_head):
+    """P452 code round 1 F3: the production ref, resolved ONCE to a full commit sha that is a STRICT ancestor of the
+    reviewed head (never the head itself — that would make the diff tautological); the same sha is diffed and recorded.
+    """
+
+    def git(*a):
+        return subprocess.run(
+            ["git", "-C", str(fork_root), *a], capture_output=True, text=True
+        )
+
+    sha = git("rev-parse", "--verify", f"{ref}^{{commit}}").stdout.strip()
+    head = git("rev-parse", "--verify", f"{reviewed_head}^{{commit}}").stdout.strip()
+    if not sha or not head:
+        raise ValueError(
+            f"production ref {ref!r} / reviewed head {reviewed_head!r} is not a commit"
+        )
+    if sha == head or git("merge-base", "--is-ancestor", sha, head).returncode != 0:
+        raise ValueError(
+            f"production ref {sha[:12]} is not a strict ancestor of the reviewed head {head[:12]}"
+        )
+    return sha
+
+
+def ancestor_pids():
+    import psutil
+
+    return {p.pid for p in psutil.Process(os.getpid()).parents()}
 
 
 def production_diff_problem(fork_root, ref):
@@ -1240,7 +1282,7 @@ def preflight(args, out):
     import psutil
 
     me = os.getpid()
-    ancestors = {p.pid for p in psutil.Process(me).parents()}
+    ancestors = ancestor_pids()
     problems = foreign_process_problems(
         [
             (p.info["pid"], p.info["cmdline"])

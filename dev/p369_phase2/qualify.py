@@ -885,6 +885,13 @@ def _drive_locked(
         BOOT_S  # code round 2 E2: the qualification's own boot limit
     )
     try:  # code round 1 D13: everything after the lock is inside the cleanup scope
+        if getattr(args, "production_ref", None) not in (None, orchestrate.PRODUCTION):
+            try:  # P452 code round 1 F3: one resolved sha, diffed by the preflight and recorded in the report
+                args.production_ref = orchestrate.resolve_production_ref(
+                    fork, args.production_ref, reviewed
+                )
+            except ValueError as exc:
+                raise SystemExit(f"refused: {exc}")
         pre = orchestrate.preflight(args, out)
         if pre["problems"]:
             raise SystemExit(f"refused: {pre['problems']}")
