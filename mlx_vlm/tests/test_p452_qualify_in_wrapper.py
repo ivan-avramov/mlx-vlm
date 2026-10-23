@@ -215,9 +215,12 @@ def test_the_script_entry_point_parses_its_arguments():
     assert "--production-ref" in r.stdout and "--predictor" in r.stdout
 
 
-def test_real_topology_the_per_entry_interference_check_exempts_the_launchers_too(tmp_path):
+def test_real_topology_the_per_entry_interference_check_exempts_the_launchers_too(
+    tmp_path,
+):
     """P452: qualify's per-entry before / after check (`interference`) is the SECOND process census; it refused the
-    sequencer on M1 smoke attempt 4 (2026-10-23) after the preflight passed. It must apply the same launcher rule."""
+    sequencer on M1 smoke attempt 4 (2026-10-23) after the preflight passed. It must apply the same launcher rule.
+    """
     doc, sibling = _launcher_tree(tmp_path, "p426_wave1")
     pids = [int(p.split()[1]) for p in doc["interference"]]
     assert doc["parent"] not in pids and doc["grandparent"] not in pids

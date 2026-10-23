@@ -685,20 +685,31 @@ BOOT_S, REQUEST_S, JOB_S = 600, 2400, 3600  # plan v2 Q8
 REFERENCES = Path(__file__).resolve().parents[1] / "p415_reference_peaks.json"
 
 
-def interference(orchestrate):
-    """C198 (3): power and the process scan, once before and once after each entry."""
+def interference_problems(orchestrate):
+    """The per-entry process census: refused processes other than this run's own children and (P452) its P426
+    launcher ancestors — the SAME rule as the preflight (``orchestrate.foreign_process_problems``).
+    """
     import psutil
 
+    mine = {c.pid for c in psutil.Process().children(recursive=True)}
+    procs = [
+        (p.info["pid"], p.info["cmdline"])
+        for p in psutil.process_iter(["pid", "cmdline"])
+        if p.info["pid"] not in mine
+    ]
+    return orchestrate.foreign_process_problems(
+        procs, os.getpid(), orchestrate.ancestor_pids()
+    )
+
+
+def interference(orchestrate):
+    """C198 (3): power and the process scan, once before and once after each entry."""
     power = orchestrate.power_state()
     if not (power["ac_ok"] and power["battery_ok"]):
         return dict(ok=False, why=f"power {power}", power=power)
-    me = {os.getpid(), *(c.pid for c in psutil.Process().children(recursive=True))}
-    for p in psutil.process_iter(["pid", "cmdline"]):
-        if p.info["pid"] in me:
-            continue
-        why = orchestrate.refused_process(p.info["cmdline"] or [])
-        if why:
-            return dict(ok=False, why=f"process {p.info['pid']} ({why})", power=power)
+    problems = interference_problems(orchestrate)
+    if problems:
+        return dict(ok=False, why=problems[0], power=power)
     return dict(ok=True, why=None, power=power)
 
 
