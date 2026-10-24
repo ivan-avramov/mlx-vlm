@@ -186,18 +186,27 @@ def _padded_tokens(tokenizer, sequences: List[List[int]]):
     return mx.array(input_ids), mx.array(attention_mask)
 
 
+def _text_prompt(query: RerankItem, document: RerankItem, instruction: str) -> str:
+    # Fork: the prompt is rendered from the published Qwen3-Reranker format rather than
+    # through the checkpoint's chat template. Qwen/Qwen3-Reranker-* now ships a
+    # chat_template.jinja that reads roles "query" and "document" (for sentence-
+    # transformers), so the generic system/user messages render an empty query and
+    # document and every pair scores the same (docs/upstream-bugs.md 7).
+    messages = _text_messages(query, document, instruction)
+    return (
+        f"<|im_start|>system\n{messages[0]['content']}<|im_end|>\n"
+        f"<|im_start|>user\n{messages[1]['content']}"
+    )
+
+
 def _score_text_batch(model, processor, query, documents, instruction):
     tokenizer = _tokenizer(processor)
     suffix = tokenizer.encode(TEXT_SUFFIX, add_special_tokens=False)
     sequences = []
     for document in documents:
-        tokens = _input_ids(
-            tokenizer.apply_chat_template(
-                _text_messages(query, document, instruction),
-                tokenize=True,
-                add_generation_prompt=False,
-                enable_thinking=False,
-            )
+        # Fork: see _text_prompt; the chat template is not used here.
+        tokens = tokenizer.encode(
+            _text_prompt(query, document, instruction), add_special_tokens=False
         )
         sequences.append(tokens[: DEFAULT_MAX_LENGTH - len(suffix)] + suffix)
     input_ids, attention_mask = _padded_tokens(tokenizer, sequences)

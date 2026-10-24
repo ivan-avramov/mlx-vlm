@@ -31,6 +31,9 @@ from .prompt_utils import (  # Fork: thread-safe cached encode for ThinkingBudge
     cached_special_token_encode,
 )
 from .quantization.one_bit import _quantization_for_path, replace_one_bit_modules
+from .tokenizer_lock import (  # Fork: serializes the processor's tokenizer for the GPU worker
+    serialize_fast_tokenizer,
+)
 from .tokenizer_utils import load_tokenizer
 from .trainer.utils import apply_lora_layers
 
@@ -1498,6 +1501,11 @@ def load_processor(
         kwargs.setdefault("fix_mistral_regex", True)
 
     processor = AutoProcessor.from_pretrained(model_path, **kwargs)
+    # Fork: serialize the fast tokenizer behind the processor (or the bare
+    # tokenizer AutoProcessor fell back to). The GPU worker tokenizes here
+    # (_process_cached_request) while request threads encode too, outside
+    # upstream's caller-side `_tokenizer_lock`; upstream-bugs.md item 8.
+    processor = serialize_fast_tokenizer(processor)
     if add_detokenizer:
         detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
 

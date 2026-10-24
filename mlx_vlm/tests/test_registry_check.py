@@ -391,13 +391,16 @@ class TestExclusionsFileParsing:
     def test_the_repo_baseline_is_the_five_reviewed_divergences(self, cur):
         """Pins the baseline, like the other audits' tests do.
 
-        Four entries cover fork API replacements; one retires the attention
-        mixin's storage constant now owned by concrete cache classes. Restored
-        top_p_sampling is no longer excluded. Any new entry requires review.
+        Five entries cover fork API replacements (`generation_stream` three
+        times, `_check_configured_context_budget`, and `server/app.py::
+        load_processor`, the mistral3 text-only embedding loader's replacement
+        of that import); a sixth retires the attention mixin's storage constant
+        now owned by concrete cache classes. Restored top_p_sampling is no longer
+        excluded. Any new entry requires review.
         """
         # Fork: 2026-10-06 audit baseline adds C104 entries -- test-file imports used only
         # by upstream tests the fork-owned copies do not carry. They stay confined to
-        # test files and carry a `REVIEWED: C104` reason; the five runtime ones are pinned.
+        # test files and carry a `REVIEWED: C104` reason; the six runtime ones are pinned.
         parsed = cur.load_exclusions()
         c104 = [e for e in parsed if e[2].startswith("REVIEWED: C104 unported @")]
         assert c104 and all(p.startswith("mlx_vlm/tests/") for p, _s, _r in c104)
@@ -415,7 +418,7 @@ class TestExclusionsFileParsing:
             assert symbol in found, (path, symbol, "excused but not missing")
         parsed = [e for e in parsed if e not in c104]
 
-        assert len(parsed) == 5
+        assert len(parsed) == 6
         assert all(reason.startswith("REVIEWED:") for _p, _s, reason in parsed)
         symbols = sorted(symbol for _p, symbol, _r in parsed)
         assert symbols == [
@@ -424,4 +427,5 @@ class TestExclusionsFileParsing:
             "generation_stream",
             "generation_stream",
             "generation_stream",
+            "load_processor",
         ]
