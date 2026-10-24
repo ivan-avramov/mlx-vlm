@@ -20,7 +20,9 @@ from p369_phase2 import qualify  # noqa: E402
 FABLE = "Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed"
 UNIFORM = "Qwen3.8-27B-mlx-uniform-4bit"
 QWEN36 = "Qwen3.6-27B-Opus-Distill-OptiQ-4bit"
-STATIC = "Qwen3.8-27B-static-mixed-4bit"
+# P476: the real registry no longer ships a non-MTP "served" entry; the served-arm code path is covered by a SYNTHETIC
+# entry injected into ``qualify.ENTRIES`` by the tests that need it (``_with_served``), never by a registry name.
+STATIC = "synthetic-served-27B"  # allow-shorthand
 VENV_BIN = Path("/stack/.venv/bin")
 
 GEN = dict(
@@ -133,23 +135,27 @@ def _cmd(entry):
 
 
 # ------------------------------------------------------------------ T1: the entries and their arms (C199)
-def test_t1_the_seven_entries_and_their_arms():
-    assert set(qualify.ENTRIES) == {
-        FABLE,
-        UNIFORM,
-        QWEN36,
-        STATIC,
-        "Qwen3.8-27B-OptiQ-4.5bpw-mixed",
-        "Qwen3.8-27B-Fable-Distill-mlx-uniform-4bit",
-        "Qwen3.8-27B-Opus-Distill-v2-mlx-uniform-4bit",
-    }
+def _with_served(monkeypatch):
+    """P476: inject the synthetic served-arm entry (the real ENTRIES keep only the three MTP entries)."""
+    monkeypatch.setitem(qualify.ENTRIES, STATIC, "served")  # allow-shorthand
+
+
+def test_t1_the_three_entries_and_their_arms():
+    assert set(qualify.ENTRIES) == {FABLE, UNIFORM, QWEN36}  # allow-shorthand
     assert qualify.ENTRIES[FABLE] == qualify.ENTRIES[UNIFORM] == "mtp_on"
     assert qualify.ENTRIES[QWEN36] == "mtp_on_gated"
+    assert QWEN36 in qualify.default_entries() and len(qualify.default_entries()) == 3
+
+
+def test_t1_a_synthetic_served_entry_takes_the_served_arm(monkeypatch):
+    assert STATIC not in qualify.ENTRIES  # allow-shorthand
+    _with_served(monkeypatch)
     assert qualify.ENTRIES[STATIC] == "served"
-    assert QWEN36 in qualify.default_entries() and len(qualify.default_entries()) == 7
+    assert qualify.arm_for(STATIC, None) == "served"  # allow-shorthand
 
 
-def test_t1_an_unknown_entry_or_an_ungated_qwen36_refuses(tmp_path):
+def test_t1_an_unknown_entry_or_an_ungated_qwen36_refuses(tmp_path, monkeypatch):
+    _with_served(monkeypatch)
     assert qualify.entry_problems(["nope"], p369_summary=None)
     assert qualify.entry_problems(
         [QWEN36], p369_summary=None
@@ -471,7 +477,7 @@ def test_t6_the_reference_table_loads_and_refuses_bad_rows(tmp_path):
             source_path="docs/campaign-results.md",
             fingerprint=FP,
         ),
-        "Qwen3.8-27B-Opus-Distill-v2-mlx-uniform-4bit": None,  # none recorded
+        UNIFORM: None,  # none recorded
     }
     p = tmp_path / "refs.json"
     p.write_text(json.dumps(good))
@@ -486,6 +492,13 @@ def test_t6_the_reference_table_loads_and_refuses_bad_rows(tmp_path):
 
 
 # ------------------------------------------------------------------ T5 / T10 / T7 / T11: outcomes and the schedule
+def test_p476_the_real_reference_table_loads_against_the_real_entries():
+    """P476: ``load_references`` refuses a reference for an entry outside ``ENTRIES``; the REAL file must pass."""
+    table = qualify.load_references(qualify.REFERENCES)
+    assert set(table) <= set(qualify.ENTRIES)
+    assert table[FABLE]["peak_gb"] == 37.97  # allow-shorthand
+
+
 def test_t5_idle_before_every_entry_after_the_first():
     assert qualify.idle_before(["a", "b", "c"]) == [False, True, True]
 
@@ -532,6 +545,7 @@ def _drive(
 
     from p369_phase2 import orchestrate
 
+    _with_served(monkeypatch)
     registry = "models: []\n"
     blocks = {FABLE: FABLE_ENTRY, STATIC: STATIC_ENTRY}
     for name, value in dict(
@@ -828,8 +842,8 @@ def test_d5_the_fork_must_be_at_the_reviewed_head_and_the_stack_unchanged():
     assert qualify.guard_problems(base, dict(base, fork_clean=False), reviewed="a" * 40)
 
 
-def test_d8_the_default_run_is_all_seven_and_needs_the_qwen36_evidence():
-    assert len(qualify.default_entries()) == 7 and QWEN36 in qualify.default_entries()
+def test_d8_the_default_run_is_all_three_and_needs_the_qwen36_evidence():
+    assert len(qualify.default_entries()) == 3 and QWEN36 in qualify.default_entries()
 
 
 def test_d9_the_auto_cache_limit_is_mlx_vlms_derivation():

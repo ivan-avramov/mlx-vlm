@@ -1,7 +1,8 @@
-# PINNED COPY of the stack's main_models.yaml in its shipped-when-ON form (P422): stack 59d7802f (C202 — all four
+# PINNED COPY of the stack's main_models.yaml in its shipped-when-ON form (P422): stack 2e258b99 (P476 prune to the five published entries; C202 — all four
 # MTP-certified entries OFF) with every dev/p369_phase2/registry_states.py ENTRY_OFF substitution reversed, i.e. all
-# four entries MTP-ON — the shipped-when-ON tuple the P369 tests certify (P387). It parses identically to the previous
-# fixture (stack 7021bdbb, the last real MTP-ON registry): the difference is comments only (two C202 PROVISIONAL blocks).
+# four entries MTP-ON — the shipped-when-ON tuple the P369 tests certify (P387). It differs from the previous
+# fixture (stack 7021bdbb, the last real MTP-ON registry) by the P476 prune: the six pruned `models:` entries are gone,
+# `openwebui.retired_model_ids` is added, and the C202 PROVISIONAL comment blocks are new.
 # Everything after the BEGIN marker is VERBATIM; its sha256 is pinned in registry_states.FIXTURE_SHA256 and
 # test_mtp_verify_scan.FIXTURE_SHA256. The ordinary suite reads ONLY this file; the opt-in live check
 # (MLX_REQUIRE_STACK_REGISTRY=1) accepts exactly the 16 per-entry ON / OFF states (registry_states.classify). REFRESH on
@@ -43,6 +44,13 @@ openwebui:
     - Qwen3.8-27B-mlx-uniform-4bit
     - Ornith-1.0-35B-mlx-uniform-4bit
     - NVIDIA-Nemotron-3.5-Lightning-30B-A3B-4bit
+  retired_model_ids:
+    - gemma-4-31B-it-qat-6bit
+    - gemma-4-26B-A4B-it-OptiQ-4bit
+    - Qwen3.8-27B-static-mixed-4bit
+    - Qwen3.8-27B-OptiQ-4.5bpw-mixed
+    - Qwen3.8-27B-Fable-Distill-mlx-uniform-4bit
+    - Qwen3.8-27B-Opus-Distill-v2-mlx-uniform-4bit
 
 agent_defaults:
   openwebui: Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed
@@ -79,69 +87,6 @@ task_model:
     output: 2048
 
 models:
-  # QAT / optimized-quant experiments (quality-vs-size; QAT/OptiQ earn their keep at 4-6 bit).
-  - name: gemma-4-31B-it-qat-6bit
-    type: vision
-    on_demand: true
-    hf_path: mlx-community/gemma-4-31B-it-qat-6bit
-    max_kv_cache_size: 196608      # 192K: weights ~31GB make 256K (~58GB) trip the RAM backstop
-    kv_prealloc_tokens: 196608
-    kv_quant_scheme: uniform
-    kv_bits: 4
-    prefill_step_size: 512
-    quantized_kv_start: 0
-    generation_defaults:
-      temperature: 0.7
-      top_p: 0.95
-      top_k: 64
-      min_p: 0.0
-      repetition_penalty: 1.08
-      max_tokens: 32768
-      thinking_budget: 16384
-      enable_thinking: true
-    presentation:
-      role: main
-      family: gemma
-      display_name: "gemma-4-31B-it-qat-6bit (dense)"
-      context: 196608
-      output: 32768
-      capabilities: [tools, vision, thinking, web_search, code_interpreter]
-    # draft_kind: suffix       # drafter-free suffix decoding (see gemma-4-31b-it-6bit)
-    # draft_block_size: 16
-    # suffix_min_match: 2
-    # draft_cooldown: 2
-
-  - name: gemma-4-26B-A4B-it-OptiQ-4bit
-    type: vision
-    on_demand: true
-    hf_path: mlx-community/gemma-4-26B-A4B-it-OptiQ-4bit
-    max_kv_cache_size: 262144
-    kv_prealloc_tokens: 262144
-    kv_quant_scheme: uniform
-    kv_bits: 4
-    prefill_step_size: 512
-    quantized_kv_start: 0
-    generation_defaults:
-      temperature: 0.7
-      top_p: 0.95
-      top_k: 64
-      min_p: 0.0
-      repetition_penalty: 1.08
-      max_tokens: 49152
-      thinking_budget: 32768
-      enable_thinking: true
-    presentation:
-      role: main
-      family: gemma
-      display_name: "gemma-4-26B-A4B-it-OptiQ-4bit (MoE)"
-      context: 262144
-      output: 49152
-      capabilities: [tools, vision, thinking, web_search, code_interpreter]
-    # draft_kind: suffix       # drafter-free suffix decoding (see gemma-4-31b-it-6bit)
-    # draft_block_size: 16
-    # suffix_min_match: 2
-    # draft_cooldown: 2
-
   # ── Campaign picks for 256K agentic coding (MLX quants, hosted on HF: caslca) ──
   # B MENU (operator C38 ruling 2026-08-29): 1st Qwen3.6-27B-Opus-Distill-OptiQ-4bit
   # (certified MTP triple, M6b), 2nd Ornith-1.0-35B-mlx-uniform-4bit (certified MTP triple,
@@ -405,105 +350,11 @@ models:
 
   # C51 2026-09-09: medium-effort bench clone retired; base entry now carries its certified tune.
 
-  - name: Qwen3.8-27B-static-mixed-4bit
-    type: vision
-    on_demand: true
-    hf_path: caslca/Qwen3.8-27B-static-mixed-4bit  # vision tower RESTORED 2026-08-23 (bf16 graft rev be1aa462; trunk md5+logit bit-identical)
-    max_kv_cache_size: 262144
-    kv_prealloc_tokens: 262144   # restored to cap (standing rule) — at TQ4 width the floor is ~4GB/session, bounded by MLX_VLM_CACHE_SESSION_MAX=2
-    # KV = deployed convention (operator ruling 2026-08-17: measure at expected deployment
-    # only, no bf16-KV arms — bf16 floor was 16GB/session, measured 51GB footprint).
-    # TQ4 matches both winners' shipped config.
-    kv_quant_scheme: turboquant
-    kv_bits: 4
-    quantized_kv_start: 0
-    prefill_step_size: 512
-    generation_defaults:
-      temperature: 1.0
-      top_p: 0.95
-      top_k: 20
-      min_p: 0.0
-      presence_penalty: 0.0
-      max_tokens: 102400
-      thinking_budget: 81920
-      enable_thinking: true
-
   # RETIRED 2026-08-26 (C33, operator): the M23 reference entry `Qwen3.8-27B-4bit`
   # (hf_path mlx-community/Qwen3.8-27B-4bit) was REMOVED — a full-tensor md5 sweep proved it
   # IDENTICAL to `Qwen3.8-27B-mlx-uniform-4bit` (2179/2180 tensors; sole delta = the bf16-grafted
   # vision tower, which only the caslca copy restores). One model, one name. Its m23/m23b/m23c
   # result rows remain on disk as same-model session replicates (C30).
-
-  - name: Qwen3.8-27B-OptiQ-4.5bpw-mixed
-    type: vision
-    on_demand: true
-    hf_path: caslca/Qwen3.8-27B-OptiQ-4.5bpw-mixed
-    max_kv_cache_size: 262144
-    kv_prealloc_tokens: 262144   # restored to cap (standing rule) — at TQ4 width the floor is ~4GB/session, bounded by MLX_VLM_CACHE_SESSION_MAX=2
-    # KV = deployed convention (operator ruling 2026-08-17: measure at expected deployment
-    # only, no bf16-KV arms — bf16 floor was 16GB/session, measured 51GB footprint).
-    # TQ4 matches both winners' shipped config.
-    kv_quant_scheme: turboquant
-    kv_bits: 4
-    quantized_kv_start: 0
-    prefill_step_size: 512
-    generation_defaults:
-      # 1.0 -> 0.6 (2026-08-28, M25 prep): 0.6 is this recipe's M2 Stage-1 SCREENED tune
-      # (conv 14/14 + the HumanEval/146 capped probe, pass@1 1.00 at t0.6) and the family's
-      # certified operating point on the sibling; t1.0 is the family's MEASURED-runaway temp
-      # (M2: checkpoint 1.0 AND 0.7 both ran away >3600 s). The 1.0 here was the checkpoint
-      # default the funnel screens FROM, never an operating point — updated before the
-      # first deployed-profile arm ever reads it.
-      temperature: 0.6
-      top_p: 0.95
-      top_k: 20
-      min_p: 0.0
-      presence_penalty: 0.0
-      max_tokens: 102400
-      thinking_budget: 81920
-      enable_thinking: true
-    presentation:
-      # role: candidate => bench carriers only, never client configs. Added 2026-08-28
-      # (M25, operator-requested paces run): enables the paired opencode arms vs
-      # Qwen3.8-27B-mlx-uniform-4bit and the winners.
-      role: candidate
-      family: qwen
-      display_name: "Qwen3.8-27B (OptiQ 4.5bpw mixed)"  # UI label, allow-shorthand
-      context: 262144
-      output: 102400
-      capabilities: [tools, vision, thinking]
-
-  - name: Qwen3.8-27B-Fable-Distill-mlx-uniform-4bit
-    type: vision
-    on_demand: true
-    hf_path: caslca/Qwen3.8-27B-Fable-Distill-mlx-uniform-4bit  # UPLOADED 2026-08-23 (public)
-    max_kv_cache_size: 262144
-    kv_prealloc_tokens: 262144   # standing rule: prealloc = cap
-    kv_quant_scheme: turboquant
-    kv_bits: 4
-    quantized_kv_start: 0
-    prefill_step_size: 512
-    generation_defaults:
-      temperature: 0.6  # CERTIFIED M19 2026-08-22 (deployed ladder; t0.5 knee was a profile artifact)
-      top_p: 0.95
-      top_k: 20
-      min_p: 0.0
-      presence_penalty: 0.0
-      max_tokens: 102400
-      thinking_budget: 81920
-      enable_thinking: true
-    presentation:
-      # role: candidate — durable form of the carrier entry hand-written in bcc6d37 for the
-      # M3 opencode arm (2026-08-22): the registry never carried a presentation block for this
-      # model, so `configgen generate` silently DROPPED it from benchmark/opencode_bench.json
-      # on the next re-emit (caught 2026-08-28 while landing the Qwen3.8-27B-mlx-uniform-4bit
-      # block — C36). Emission verified byte-reproducing the committed carrier entry.
-      role: candidate
-      family: qwen
-      display_name: "Qwen3.8-27B Fable-Distill (reasoning)"  # UI label, allow-shorthand
-      context: 262144
-      output: 102400
-      capabilities: [tools, vision, thinking]
 
   - name: Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed
     type: vision
@@ -582,23 +433,4 @@ models:
 
   # (the reasoning_effort=medium bench clone of this checkpoint was RETIRED 2026-09-07 when medium became its certified default; its rows live under results/Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed-MED)  # allow-shorthand
   # (the reasoning_effort=low bench clone was RETIRED 2026-09-07 after S2c: the effort curve's knee is at medium — see campaign-results 2026-09-07 S2c)  # allow-shorthand
-  - name: Qwen3.8-27B-Opus-Distill-v2-mlx-uniform-4bit
-    type: vision
-    on_demand: true
-    hf_path: caslca/Qwen3.8-27B-Opus-Distill-v2-mlx-uniform-4bit  # UPLOADED 2026-08-23 (public)
-    max_kv_cache_size: 262144
-    kv_prealloc_tokens: 262144   # standing rule: prealloc = cap
-    kv_quant_scheme: turboquant
-    kv_bits: 4
-    quantized_kv_start: 0
-    prefill_step_size: 512
-    generation_defaults:
-      temperature: 0.55  # CERTIFIED M20/O37 2026-08-23; evidence RESTATED by C46 2026-09-03 (strict 86/74 vs 86/70 at t0.6, budget hits 0 vs 2 per 100; the original 82/70 vs 76/68 rested on pre-C28 timeout DNFs)
-      top_p: 0.95
-      top_k: 20
-      min_p: 0.0
-      presence_penalty: 0.0
-      max_tokens: 102400
-      thinking_budget: 81920
-      enable_thinking: true
 

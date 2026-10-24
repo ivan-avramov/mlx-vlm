@@ -15,10 +15,6 @@ ENTRIES = {  # C199 (c): the arm each entry is qualified in
     "Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed": "mtp_on",
     "Qwen3.8-27B-mlx-uniform-4bit": "mtp_on",
     "Qwen3.6-27B-Opus-Distill-OptiQ-4bit": "mtp_on_gated",  # only after its P369 campaign passed
-    "Qwen3.8-27B-static-mixed-4bit": "served",
-    "Qwen3.8-27B-OptiQ-4.5bpw-mixed": "served",
-    "Qwen3.8-27B-Fable-Distill-mlx-uniform-4bit": "served",
-    "Qwen3.8-27B-Opus-Distill-v2-mlx-uniform-4bit": "served",
 }
 MIN_OUTPUT_TOKENS = (
     2048  # mlx-vlm server: a request leaving less is refused (fork 02e8046d)
@@ -75,13 +71,13 @@ def arm_for(name, predictor):
 
 
 def default_entries():
-    """Code round 1 D8: the full qualification is all seven (Qwen3.6 then needs its P369 evidence); a subset only via
+    """Code round 1 D8: the full qualification is all three MTP entries (`Qwen3.6-27B-Opus-Distill-OptiQ-4bit` then needs its P369 evidence); a subset only via
     ``--entry``."""
     return list(ENTRIES)
 
 
 def entry_problems(names, *, p369_summary, predictor=None):
-    """Every name is one of the seven; ``Qwen3.6-27B-Opus-Distill-OptiQ-4bit`` MTP-ON only with a P369 FULL-run PASS for it
+    """Every name is one of the three MTP entries; ``Qwen3.6-27B-Opus-Distill-OptiQ-4bit`` MTP-ON only with a P369 FULL-run PASS for it
     (its ``--predictor off`` arm needs none, P426 B7)."""
     problems = [f"unknown entry {n!r}" for n in names if n not in ENTRIES]
     for name in names:

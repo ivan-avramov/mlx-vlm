@@ -1727,11 +1727,12 @@ FIXTURE_REGISTRY = (
     Path(__file__).resolve().parent / "fixtures" / "stack_registry_golden.yaml"
 )
 FIXTURE_MARKER = "# ---- BEGIN VERBATIM main_models.yaml ----\n"
-FIXTURE_SHA256 = "96067c3d019375a19f28bd9546f45da9907da62ea75c2f8649deffd81b6ebfdb"
+FIXTURE_SHA256 = "b00648f84715a102b6cebdbf4c9038e72fca7cf697bb518203bf41f4517e7f18"
 UNIFORM_PICK = "Qwen3.8-27B-mlx-uniform-4bit"
-# P422: the stack registry at 59d7802f (C202, all four MTP-certified entries OFF) with every ENTRY_OFF substitution
-# reversed — the shipped-when-ON form; it parses identically to the previous fixture (stack 7021bdbb; comments only).
-FIXTURE_SOURCE = "59d7802f"
+# P476: the stack registry at 2e258b99 (the prune to the five published entries; C202, all four MTP-certified entries OFF)
+# with every ENTRY_OFF substitution reversed — the shipped-when-ON form. It differs from the previous fixture (stack
+# 59d7802f) by the six pruned `models:` entries and the added `openwebui.retired_model_ids`; the four entries are unchanged.
+FIXTURE_SOURCE = "2e258b99"
 _C177 = "  # P369 INTERIM (C177 2026-10-17): MTP OFF on the daily driver until the MTP EOS/budget fixes ship and are re-certified"
 # Per pick, (fixture line, its C177 interim line), verbatim — the ONLY lines the interim may change (K2).
 INTERIM_LINES = {

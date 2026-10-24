@@ -26,34 +26,6 @@
   },
   "source_path": "benchmark/results/Qwen3.8-27B-mlx-uniform-4bit/capacity_ladder.m43on-20260913.jsonl"
  },
- "Qwen3.8-27B-static-mixed-4bit": {
-  "peak_gb": 31.579,
-  "source": "benchmark/results/Qwen3.8-27B-static-mixed-4bit/capacity_ladder.jsonl (256000 row, 2026-08-18)",
-  "source_blob": "18f3d028ac147d5ed22e4440db249f8ea1f6bdb8",
-  "fingerprint": {
-   "prompt_tokens": 252070,
-   "kv_codec": "turboquant4",
-   "p405_window": false,
-   "mtp": "off",
-   "method": "mx.get_peak_memory (server_peak_gb)"
-  },
-  "source_path": "benchmark/results/Qwen3.8-27B-static-mixed-4bit/capacity_ladder.jsonl"
- },
- "Qwen3.8-27B-OptiQ-4.5bpw-mixed": {
-  "peak_gb": 33.715,
-  "source": "benchmark/results/Qwen3.8-27B-OptiQ-4.5bpw-mixed/capacity_ladder.jsonl (256000 row, 2026-08-18)",
-  "source_blob": "3d5df5bab1a94a2d25a7b110d5e5bee61af02c77",
-  "fingerprint": {
-   "prompt_tokens": 252070,
-   "kv_codec": "turboquant4",
-   "p405_window": false,
-   "mtp": "off",
-   "method": "mx.get_peak_memory (server_peak_gb)"
-  },
-  "source_path": "benchmark/results/Qwen3.8-27B-OptiQ-4.5bpw-mixed/capacity_ladder.jsonl"
- },
- "Qwen3.8-27B-Fable-Distill-mlx-uniform-4bit": null,
- "Qwen3.8-27B-Opus-Distill-v2-mlx-uniform-4bit": null,
  "Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed": {
   "peak_gb": 37.97,
   "source": "docs/campaign-results.md (M58 arms A/B 2026-10-06, '256K cold \u2026 37.97 GB'; M57 arm E 2026-10-05)",

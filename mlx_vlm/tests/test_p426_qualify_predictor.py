@@ -39,11 +39,14 @@ FABLE_OFF_ENTRY = {
         (STATIC, "off", "served"),
     ],
 )
-def test_the_arm_follows_the_predictor(name, predictor, arm):
+def test_the_arm_follows_the_predictor(monkeypatch, name, predictor, arm):
+    # P476: STATIC is the scoped SYNTHETIC served entry (as in test_p415_qualify), not a registry name.  # allow-shorthand
+    t415._with_served(monkeypatch)
     assert qualify.arm_for(name, predictor) == arm
 
 
-def test_a_served_entry_has_no_on_arm():
+def test_a_served_entry_has_no_on_arm(monkeypatch):
+    t415._with_served(monkeypatch)
     with pytest.raises(ValueError, match="no MTP-ON arm"):
         qualify.arm_for(STATIC, "on")
 
