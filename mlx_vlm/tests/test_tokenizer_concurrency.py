@@ -473,3 +473,546 @@ def test_real_fast_tokenizer_under_concurrent_padded_encodes():
             t.join()
 
     assert errors == []
+
+
+# ── Instance-level serialization (docs/proposals/tokenizer-concurrency.md) ───
+# A fork-only block: tests of `mlx_vlm.tokenizer_lock` against an in-memory
+# `PreTrainedTokenizerFast`, nothing from the Hugging Face cache.
+
+from tokenizers import Tokenizer  # noqa: E402
+from tokenizers.models import WordLevel  # noqa: E402
+from tokenizers.pre_tokenizers import Whitespace  # noqa: E402
+from transformers import PreTrainedTokenizerFast, ProcessorMixin  # noqa: E402
+
+try:
+    import mlx_vlm.tokenizer_lock as _lock_module  # noqa: E402
+    from mlx_vlm.tokenizer_lock import (  # noqa: E402
+        is_serialized,
+        resolve_fast_tokenizer,
+        serialize_fast_tokenizer,
+        tokenizer_lock,
+    )
+except ImportError:  # the baseline: the test must fail by collision, not import
+    _lock_module = None
+
+    def serialize_fast_tokenizer(obj, **kwargs):
+        return obj
+
+    def is_serialized(obj):
+        return False
+
+    def resolve_fast_tokenizer(obj):
+        return obj
+
+    _FALLBACK_LOCK = threading.RLock()
+
+    def tokenizer_lock(tok):
+        return _FALLBACK_LOCK
+
+
+_WORDS = [
+    "[PAD]",
+    "[UNK]",
+    "the",
+    "quick",
+    "brown",
+    "fox",
+    "jumps",
+    "over",
+    "lazy",
+    "dog",
+]
+_LONG = " ".join(_WORDS[2:] * 3000)
+
+
+def _make_fast_tokenizer():
+    vocab = {w: i for i, w in enumerate(_WORDS)}
+    backend = Tokenizer(WordLevel(vocab, unk_token="[UNK]"))
+    backend.pre_tokenizer = Whitespace()
+    return PreTrainedTokenizerFast(
+        tokenizer_object=backend, pad_token="[PAD]", unk_token="[UNK]"
+    )
+
+
+def _stress(tok, iterations=5000, seconds=10):
+    """One thread alternates padding, one encodes. Returns (errors, longest call s)."""
+    errors, longest = [], [0.0]
+    stop = threading.Event()
+    barrier = threading.Barrier(2)
+
+    def run(name, call):
+        barrier.wait()
+        deadline = time.monotonic() + seconds
+        for i in range(iterations):
+            if stop.is_set() or time.monotonic() > deadline:
+                return
+            try:
+                t0 = time.monotonic()
+                call(i)
+                longest[0] = max(longest[0], time.monotonic() - t0)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(f"{name} {type(exc).__name__}: {exc}")
+                stop.set()
+                return
+
+    threads = [
+        threading.Thread(
+            target=run,
+            args=("mutator", lambda i: tok([_LONG, _LONG[:50]], padding=bool(i % 2))),
+        ),
+        threading.Thread(target=run, args=("encoder", lambda i: tok.encode(_LONG))),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return errors, longest[0]
+
+
+class _TimingLock:
+    """Wraps the registry's RLock; records the longest time spent acquiring it."""
+
+    def __init__(self, real):
+        self._real = real
+        self.longest = 0.0
+
+    def acquire(self, *args, **kwargs):
+        t0 = time.monotonic()
+        got = self._real.acquire(*args, **kwargs)
+        self.longest = max(self.longest, time.monotonic() - t0)
+        return got
+
+    def release(self):
+        self._real.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+
+    def _is_owned(self):
+        return self._real._is_owned()
+
+
+def test_concurrent_padding_mutation_and_encode_do_not_collide():
+    """Criteria 1(a) and 1(i): fails by `Already borrowed` on the baseline.
+
+    1(i) bounds the lock WAIT (the encode itself is allowed to take as long as it
+    takes); the whole-call figure is printed for the record only."""
+    tok = serialize_fast_tokenizer(_make_fast_tokenizer())
+    timing = _TimingLock(tokenizer_lock(tok))
+    if _lock_module is not None:
+        _lock_module._LOCKS[tok] = timing
+    errors, longest = _stress(tok)
+    print(f"longest whole call {longest:.3f}s, longest lock wait {timing.longest:.3f}s")
+    assert errors == []
+    assert timing.longest < 1.0
+
+
+from mlx_vlm.tokenizer_utils import (  # noqa: E402
+    NaiveStreamingDetokenizer,
+    TokenizerWrapper,
+)
+
+_CHAT_TEMPLATE = "{% for m in messages %}{{ m['content'] }} {% endfor %}"
+
+
+class _Processorlike:
+    """Holds a tokenizer the way `ProcessorMixin` does, without forwarding."""
+
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+
+
+class _BorrowCheckingBackend:
+    """Proxies the Rust backend; records every call that touches padding,
+    truncation or the encode itself made without the instance lock held."""
+
+    _SETTERS = ("enable_padding", "no_padding", "enable_truncation", "no_truncation")
+
+    def __init__(self, real, tok):
+        self._real = real
+        self._tok = tok
+        self.violations = []
+        self.calls = []
+        self.hold = None  # (entered, release) events for the next encode_batch
+        self.setter_reached = threading.Event()
+
+    def _check(self, name):
+        self.calls.append(name)
+        if not tokenizer_lock(self._tok)._is_owned():
+            self.violations.append(name)
+
+    def encode_batch(self, *args, **kwargs):
+        self._check("encode_batch")
+        hold, self.hold = self.hold, None
+        if hold is not None:
+            entered, release = hold
+            entered.set()
+            assert release.wait(10)
+        return self._real.encode_batch(*args, **kwargs)
+
+    def __getattr__(self, name):
+        attr = getattr(self._real, name)
+        if name not in self._SETTERS:
+            return attr
+
+        def checked(*args, **kwargs):
+            self._check(name)
+            self.setter_reached.set()
+            return attr(*args, **kwargs)
+
+        return checked
+
+
+def _proxied():
+    tok = serialize_fast_tokenizer(_make_fast_tokenizer())
+    tok.chat_template = _CHAT_TEMPLATE
+    proxy = _BorrowCheckingBackend(tok._tokenizer, tok)
+    tok._tokenizer = proxy
+    return tok, proxy
+
+
+@pytest.mark.parametrize("driver", ["call", "encode", "chat_template"])
+def test_every_padding_truncation_and_encode_call_runs_under_the_lock(driver):
+    tok, proxy = _proxied()
+    batch = ["the quick fox", "lazy dog"]
+    messages = [{"role": "user", "content": "the quick fox"}]
+    for padding, truncation in [(1, 0), (0, 1), (0, 0), (1, 1)]:
+        kwargs = dict(padding=bool(padding), truncation=bool(truncation), max_length=3)
+        if driver == "call":
+            tok(batch, **kwargs)
+        elif driver == "encode":
+            tok.encode("the quick fox", **kwargs)
+        else:
+            tok.apply_chat_template(messages, tokenize=True, **kwargs)
+    assert "encode_batch" in proxy.calls
+    assert {"enable_padding", "no_padding"} <= set(proxy.calls)
+    assert {"enable_truncation", "no_truncation"} <= set(proxy.calls)
+    assert proxy.violations == []
+
+
+def test_a_settings_change_waits_for_an_encode_in_flight():
+    tok, proxy = _proxied()
+    entered, release = threading.Event(), threading.Event()
+    proxy.hold = (entered, release)
+    holder = threading.Thread(target=lambda: tok(["the quick fox", "lazy dog"]))
+    holder.start()
+    assert entered.wait(10)
+    proxy.setter_reached.clear()
+    changer = threading.Thread(
+        target=lambda: tok(["the quick fox", "lazy dog"], padding=True)
+    )
+    changer.start()
+    assert not proxy.setter_reached.wait(0.3), "setter ran during an encode"
+    release.set()
+    holder.join(10)
+    changer.join(10)
+    assert proxy.setter_reached.is_set()
+    assert proxy.violations == []
+
+
+def test_one_lock_per_tokenizer_however_it_is_reached():
+    tok = _make_fast_tokenizer()
+    wrapper = TokenizerWrapper(tok)
+    processor = _Processorlike(tok)
+    # Resolving through the wrapper first, on a fresh tokenizer.
+    first = tokenizer_lock(resolve_fast_tokenizer(wrapper))
+    assert first is tokenizer_lock(resolve_fast_tokenizer(processor))
+    assert first is tokenizer_lock(resolve_fast_tokenizer(tok))
+    assert first is tokenizer_lock(resolve_fast_tokenizer(TokenizerWrapper(tok)))
+    assert tokenizer_lock(_make_fast_tokenizer()) is not first
+
+
+def test_serializing_twice_leaves_the_bound_functions_alone_and_skips_wrappers():
+    tok = _make_fast_tokenizer()
+    wrapper = TokenizerWrapper(tok)
+    assert serialize_fast_tokenizer(wrapper) is wrapper
+    assert is_serialized(wrapper) and is_serialized(tok)
+    before = (vars(tok)["_encode_plus"], vars(tok)["set_truncation_and_padding"])
+    serialize_fast_tokenizer(tok)
+    serialize_fast_tokenizer(wrapper)
+    after = (vars(tok)["_encode_plus"], vars(tok)["set_truncation_and_padding"])
+    assert all(a is b for a, b in zip(before, after))
+    assert "_encode_plus" not in vars(wrapper)
+    assert "_mlx_vlm_serialized" not in vars(wrapper)
+
+
+def test_nothing_resolves_means_nothing_changes():
+    obj = object()
+    assert serialize_fast_tokenizer(obj) is obj
+    assert not is_serialized(obj)
+    assert resolve_fast_tokenizer(_Processorlike(object())) is None
+
+
+def test_outputs_are_identical_before_and_after_serialization():
+    prompts = [_LONG[:400], "the quick fox", "lazy dog over the"]
+    variants = [
+        dict(padding=True),
+        dict(padding=False),
+        dict(padding=True, truncation=True, max_length=5),
+        dict(padding="max_length", truncation=True, max_length=8),
+    ]
+    plain = _make_fast_tokenizer()
+    guarded = serialize_fast_tokenizer(_make_fast_tokenizer())
+    expected = [plain(prompts, **kw).data for kw in variants]
+    assert [guarded(prompts, **kw).data for kw in variants] == expected
+
+    results, errors = [], []
+
+    def worker():
+        try:
+            results.append([guarded(prompts, **kw).data for kw in variants])
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(repr(exc))
+
+    threads = [threading.Thread(target=worker) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+    assert results == [expected] * 6
+
+
+def _write_tokenizer_dir(path):
+    import json
+
+    path.mkdir(parents=True, exist_ok=True)
+    _make_fast_tokenizer().backend_tokenizer.save(str(path / "tokenizer.json"))
+    (path / "tokenizer_config.json").write_text(
+        json.dumps(
+            {
+                "tokenizer_class": "PreTrainedTokenizerFast",
+                "pad_token": "[PAD]",
+                "unk_token": "[UNK]",
+            }
+        )
+    )
+    (path / "config.json").write_text(json.dumps({"model_type": "gpt2"}))
+    return path
+
+
+def test_loaders_return_serialized_tokenizers(tmp_path):
+    """`gpt2` has no processor, so `AutoProcessor` falls back to the tokenizer."""
+    from mlx_vlm.tokenizer_utils import load_tokenizer
+    from mlx_vlm.utils import load_processor
+
+    path = _write_tokenizer_dir(tmp_path / "model")
+    wrapper = load_tokenizer(path)
+    assert isinstance(wrapper, TokenizerWrapper)
+    assert is_serialized(wrapper._tokenizer)
+    processor = load_processor(path, add_detokenizer=False)
+    assert is_serialized(processor)
+
+
+def test_retry_logs_one_warning_per_retried_attempt_without_the_prompt(caplog):
+    import logging
+
+    prompt = "SECRET-PROMPT-TEXT"
+    with caplog.at_level(logging.WARNING, logger="mlx_vlm.prompt_utils"):
+        _encode_retrying_on_borrow_error(_FlakyTokenizer(3), prompt, backoff=0)
+    records = [r for r in caplog.records if r.name == "mlx_vlm.prompt_utils"]
+    assert len(records) == 3
+    assert all(prompt not in r.getMessage() for r in records)
+    assert all("_FlakyTokenizer" in r.getMessage() for r in records)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="mlx_vlm.prompt_utils"):
+        _encode_retrying_on_borrow_error(_FlakyTokenizer(0), prompt, backoff=0)
+    assert caplog.records == []
+
+
+def test_installed_fast_tokenizer_exposes_the_names_the_lock_rebinds():
+    from mlx_vlm.tokenizer_lock import _REQUIRED
+
+    for name in _REQUIRED:
+        assert callable(getattr(PreTrainedTokenizerFast, name, None)), name
+
+
+def test_a_class_missing_a_required_name_logs_one_error_and_is_unchanged(caplog):
+    import logging
+
+    class _Future(PreTrainedTokenizerFast):
+        pass
+
+    tok = _Future(tokenizer_object=_make_fast_tokenizer().backend_tokenizer)
+    _Future.set_truncation_and_padding = None  # a future version without the name
+    with caplog.at_level(logging.ERROR):
+        assert serialize_fast_tokenizer(tok) is tok
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1
+    assert "set_truncation_and_padding" in errors[0].getMessage()
+    assert "tokenizer-concurrency" in errors[0].getMessage()
+    assert not is_serialized(tok)
+    assert "_encode_plus" not in vars(tok)
+
+
+def test_a_serialized_tokenizer_survives_copy_pickle_and_save(tmp_path):
+    import copy
+    import pickle
+
+    tok = serialize_fast_tokenizer(_make_fast_tokenizer())
+    clone = copy.deepcopy(tok)
+    assert is_serialized(clone)
+    assert vars(clone)["_encode_plus"].tok is clone
+    assert tokenizer_lock(clone) is not tokenizer_lock(tok)
+    assert clone(["the fox"]).data == tok(["the fox"]).data
+    restored = pickle.loads(pickle.dumps(tok))
+    # Both routes re-serialize on restore: no manual call is needed.
+    assert is_serialized(restored)
+    assert vars(restored)["_encode_plus"].tok is restored
+    assert restored(["the fox"]).data == tok(["the fox"]).data
+    errors, _longest = _stress(restored, iterations=1500, seconds=5)
+    assert errors == []
+    errors, _longest = _stress(clone, iterations=1500, seconds=5)
+    assert errors == []
+
+    holder = serialize_fast_tokenizer(_ProcessorWithoutDetokenizer(tok))
+    assert is_serialized(holder)
+    holder.save_pretrained(str(tmp_path / "saved"))
+    assert (tmp_path / "saved" / "tokenizer.json").is_file()
+    assert (tmp_path / "saved" / "processor_config.json").is_file()
+
+
+class _ProcessorWithoutDetokenizer(ProcessorMixin):
+    def __init__(self, tokenizer):
+        super().__init__(tokenizer=tokenizer)
+
+
+def _directory_bytes(path):
+    return {
+        str(p.relative_to(path)): p.read_bytes()
+        for p in sorted(path.rglob("*"))
+        if p.is_file()
+    }
+
+
+def test_saving_a_serialized_object_writes_the_same_bytes_as_an_unserialized_one(
+    tmp_path,
+):
+    """Criterion 1(k): serialization leaves no trace in what ``save_pretrained`` writes."""
+    from transformers import AutoProcessor
+
+    from mlx_vlm.utils import load_processor
+
+    pairs = {}
+    pairs["tokenizer"] = (
+        serialize_fast_tokenizer(_make_fast_tokenizer()),
+        _make_fast_tokenizer(),
+    )
+    path = _write_tokenizer_dir(tmp_path / "model")
+    pairs["fallback"] = (
+        load_processor(path, add_detokenizer=False),
+        AutoProcessor.from_pretrained(path),
+    )
+    for label, (serialized, plain) in pairs.items():
+        assert is_serialized(serialized), label
+        assert not is_serialized(plain), label
+        serialized.save_pretrained(tmp_path / f"{label}-serialized")
+        plain.save_pretrained(tmp_path / f"{label}-plain")
+        written = _directory_bytes(tmp_path / f"{label}-serialized")
+        assert written, label
+        assert written == _directory_bytes(tmp_path / f"{label}-plain"), label
+
+
+def test_a_class_that_stores_attributes_elsewhere_logs_one_error_and_is_unchanged(
+    caplog,
+):
+    import logging
+
+    class _Elsewhere(PreTrainedTokenizerFast):
+        def __setattr__(self, key, value):
+            if key in (
+                "_encode_plus",
+                "set_truncation_and_padding",
+                "_mlx_vlm_serialized",
+            ):
+                self.__dict__.setdefault("_elsewhere", {})[key] = value
+                return
+            super().__setattr__(key, value)
+
+    tok = _Elsewhere(tokenizer_object=_make_fast_tokenizer().backend_tokenizer)
+    before = dict(vars(tok))
+    with caplog.at_level(logging.ERROR):
+        assert serialize_fast_tokenizer(tok) is tok
+    assert not is_serialized(tok)
+    for name in ("_encode_plus", "set_truncation_and_padding", "_mlx_vlm_serialized"):
+        assert name not in vars(tok), name
+    assert {k: v for k, v in vars(tok).items() if k != "_elsewhere"} == before
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1
+    assert "_Elsewhere" in errors[0].getMessage()
+    assert "tokenizer-concurrency" in errors[0].getMessage()
+
+
+def test_a_refused_second_assignment_leaves_the_instance_as_it_was(caplog):
+    import logging
+
+    class _Refusing(PreTrainedTokenizerFast):
+        def __setattr__(self, key, value):
+            if key == "set_truncation_and_padding":
+                raise AttributeError("SECRET-EXCEPTION-TEXT")
+            super().__setattr__(key, value)
+
+    tok = _Refusing(tokenizer_object=_make_fast_tokenizer().backend_tokenizer)
+    vars(tok)["_encode_plus"] = prior = object()  # a prior attribute is put back
+    before = dict(vars(tok))
+    with caplog.at_level(logging.ERROR):
+        assert serialize_fast_tokenizer(tok) is tok
+    assert vars(tok) == before
+    assert vars(tok)["_encode_plus"] is prior
+    assert not is_serialized(tok)
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1
+    message = errors[0].getMessage()
+    assert "_Refusing" in message
+    assert "set_truncation_and_padding" in message
+    assert "AttributeError" in message
+    assert "SECRET-EXCEPTION-TEXT" not in message
+
+
+def test_loaders_with_the_default_detokenizer_return_serialized_tokenizers(tmp_path):
+    from mlx_vlm.utils import load_processor
+
+    path = _write_tokenizer_dir(tmp_path / "model")
+    processor = load_processor(path)
+    assert is_serialized(processor)
+    assert hasattr(processor, "detokenizer")
+
+
+def test_a_processormixin_around_the_tokenizer_is_serialized(tmp_path):
+    import json
+
+    from transformers import AutoProcessor
+    from transformers.processing_utils import ProcessorMixin
+
+    from mlx_vlm.utils import load_processor
+
+    path = _write_tokenizer_dir(tmp_path / "model")
+    (path / "processor_config.json").write_text(
+        json.dumps({"processor_class": "CLIPProcessor"})
+    )
+    (path / "preprocessor_config.json").write_text(
+        json.dumps({"image_processor_type": "CLIPImageProcessor"})
+    )
+    try:
+        processor = AutoProcessor.from_pretrained(path)
+        if not isinstance(processor, ProcessorMixin):
+            raise TypeError(type(processor).__name__)
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"no ProcessorMixin constructible offline: {type(exc).__name__}")
+    assert is_serialized(load_processor(path))
+
+
+def test_a_shallow_copy_is_unsupported_and_stays_bound_to_the_original():
+    import copy
+
+    tok = serialize_fast_tokenizer(_make_fast_tokenizer())
+    clone = copy.copy(tok)
+    assert vars(clone)["_encode_plus"].tok is tok
+    serialize_fast_tokenizer(clone)
+    assert vars(clone)["_encode_plus"].tok is tok
+    assert clone._tokenizer is tok._tokenizer  # one shared Rust backend
+    assert is_serialized(tok)

@@ -7,6 +7,10 @@ from typing import List, Optional
 
 from transformers import AutoTokenizer
 
+from .tokenizer_lock import (  # Fork: serializes the tokenizer load_tokenizer returns
+    serialize_fast_tokenizer,
+)
+
 REPLACEMENT_CHAR = "\ufffd"
 
 
@@ -476,8 +480,15 @@ def load_tokenizer(model_path, return_tokenizer=True, tokenizer_config_extra={})
                 detokenizer_class = BPEStreamingDetokenizer
 
     if return_tokenizer:
+        # Fork: defensive coverage (upstream-bugs.md item 8). Every fast tokenizer
+        # the fork hands out is serialized per instance at load. The only in-tree
+        # caller receiving one today is the embedding loader's tokenizer-only
+        # fallback, whose settings are constant, so no race is observed there. The
+        # worker-path reason is the hook in utils.py::load_processor.
         return TokenizerWrapper(
-            AutoTokenizer.from_pretrained(model_path, **tokenizer_config_extra),
+            serialize_fast_tokenizer(
+                AutoTokenizer.from_pretrained(model_path, **tokenizer_config_extra)
+            ),
             detokenizer_class,
         )
     else:

@@ -1,5 +1,6 @@
 import inspect
 import json
+import logging  # Fork: warning in _encode_retrying_on_borrow_error
 
 # Fork: `threading` and `dataclass` (and Optional/Tuple) are imported for the
 # fork-only registries below — CACHE_ALIGNMENT_KWARGS, THINKING_FORMATS and
@@ -18,6 +19,8 @@ from typing import (  # Fork: Optional/Tuple are for the registries below
     Tuple,
     Union,
 )
+
+logger = logging.getLogger(__name__)  # Fork: warning in the borrow-error retry
 
 # ---------------------------------------------------------------------------
 # Chat-template kwargs for prefix-cache-friendly multi-turn rendering.
@@ -334,6 +337,14 @@ def _encode_retrying_on_borrow_error(
         except RuntimeError as exc:
             if "borrowed" not in str(exc).lower() or attempt == attempts - 1:
                 raise
+            # Fork: each retry is logged (operator, 2026-10-23); the prompt is
+            # user data and stays out of the record.
+            logger.warning(
+                "Tokenizer borrow collision, retrying: attempt %d of %d on %s",
+                attempt + 1,
+                attempts,
+                type(tokenizer).__name__,
+            )
             time.sleep(backoff * (attempt + 1))
     raise AssertionError("unreachable")  # pragma: no cover
 

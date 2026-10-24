@@ -17,7 +17,7 @@ defect, and to explain the one divergence we carry *because* upstream is wrong
 * **Patched here only when something downstream needs it** (rule changed 2026-10-22 by
   the operator, Premisa P600). A local fix to upstream code is a new permanent conflict
   site, so items 1-3 and 5, which block nothing, stay byte-identical to upstream. Items
-  4, 6 and 7 are deliberate divergences: each carries a `# Fork:` marker, a test, and an
+  4, 6, 7 and 8 are deliberate divergences: each carries a `# Fork:` marker, a test, and an
   entry below saying what upstream does wrong. A fix that a Premisa candidate or the
   stack needs goes in the same way, as ordinary fork work; it is not avoided as a
   one-off and never patched in a downstream repository.
@@ -311,3 +311,79 @@ same five documents score 1.0, 0.0, 1.0, 0.0, 0.0004. Test:
 
 The fix upstream is the same: render the published format, or pass `query` and
 `document` roles when the checkpoint's template declares them.
+
+---
+
+## 8. Fast tokenizers race on their Rust object: a fork-introduced race with partial upstream exposure
+
+The Hugging Face fast tokenizer mutates its Rust object (`enable_padding`,
+`no_padding`, truncation) at the top of every encode whenever the call's target
+differs from the object's current state. Those are `&mut self` pyo3 methods, and
+`encode_batch` releases the GIL while holding a shared borrow, so a second thread's
+settings change fails with `RuntimeError: Already borrowed`. The server turns that into
+a 500 for one of two concurrent requests to the same served model.
+
+Measured 2026-10-23 on an in-memory `PreTrainedTokenizerFast` (`tokenizers` 0.22.2;
+`transformers` 5.14.1 here, 5.15.0 in Premisa's interpreter): one thread alternating
+`padding=True` and `padding=False` against a second thread running `encode` fails
+within the first iterations, 5 of 5 runs. The same mutator against `decode` of 3200
+ids, `batch_decode` of 64 sequences of 400 ids and `convert_tokens_to_ids` of 600
+tokens never fails over 3000 iterations: those hold the GIL, so the mutator cannot
+observe them mid-borrow. The victim set is the encode entry point and the setter, and
+the setter and the encode must be one critical section (`_encode_plus` calls the
+setter); locking the Rust calls individually would let a second thread's settings
+change land between them and return a silently wrong result.
+
+**Where it comes from.** The path both production tracebacks end in, the GPU worker's
+own tokenization inside `_process_cached_request` through `_stream_generate` and
+`prepare_inputs`, is fork-only (ported in `cb585a75`; upstream's `generation.py` has no
+`_process_cached_request`, and its comment at the `_tokenizer_lock` block says its
+design keeps tokenization on the caller side so the worker never races request
+threads). The fork's retention and anchor encodes in `server/openai.py` and
+`generate/common.py` are fork-only too. **Upstream is exposed only where two request
+threads use one tokenizer with differing settings outside `_tokenizer_lock`**, which
+its embeddings and reranking routes allow (text against image requests). That
+exposure is reasoned, not reproduced upstream. In Premisa's task server it shows at
+every chat start, when Open WebUI sends title generation and query generation
+together.
+
+**Three partial mitigations stay.** Upstream's `_tokenizer_lock` (`ff295e36`)
+serializes the caller-side preprocessing, and also guards thinking-budget state. The
+fork's `7e3477b0` added `cached_special_token_encode`, `prewarm_special_token_encodes`
+and `_encode_retrying_on_borrow_error` in `prompt_utils.py`. None reaches the worker's
+encodes, the request-side encodes outside the preprocessing block, or the direct
+tokenizer calls in `server/embeddings.py::_embed` and `server/reranking.py`; a
+call-site inventory is the wrong unit (round 1 of the design review kept finding sites).
+They stay because retiring them belongs to the upstream-merge session.
+
+**This fork diverges deliberately here**, marked `# Fork:` throughout: the new module
+`mlx_vlm/tokenizer_lock.py` rebinds, on each fast tokenizer instance, `_encode_plus` and
+`set_truncation_and_padding` to callables that take one re-entrant lock per
+instance (a `WeakKeyDictionary` outside the instance, so `copy.deepcopy`,
+`pickle.dumps` and `save_pretrained` keep working). Two hooks apply it once at load:
+`tokenizer_utils.py::load_tokenizer` and `utils.py::load_processor`, which together
+cover the chat path, the embedding and reranker loaders and the tokenizer-only
+fallback. `prompt_utils.py` gains a module logger and a warning per retried borrow
+error (operator, 2026-10-23), naming the attempt and the tokenizer class and nothing
+from the prompt. Decode, `batch_decode`, id lookups and the detokenizers are not
+locked, which keeps the worker's per-token decode off the lock; the lock is a leaf and
+is never held across a model call, a vision encoder call or media work. The worker's
+encodes can wait for one in-flight encode on a request thread, bounded by that encode.
+The bound methods are instances of a small callable class whose `__reduce__`
+rebuilds it from the restored tokenizer, so `copy.deepcopy` and a pickle round trip
+return a serialized tokenizer. A pickled serialized tokenizer references
+`mlx_vlm.tokenizer_lock`, so unpickling needs the fork importable. `copy.copy` of a serialized tokenizer is unsupported: the clone's
+instance-bound methods act on the original and the two share one Rust backend; use
+`copy.deepcopy`. A class lacking either method, or refusing the assignment, logs one
+ERROR at load (the class, the attribute and the exception's class name) and is left
+unchanged, instead of silently running unprotected.
+
+Tests: `tests/test_tokenizer_concurrency.py` (the instance-level block): the stress
+reproduction, lock ownership inside every padding, truncation and encode call driven
+through `__call__`, `encode` and `apply_chat_template`, a settings change waiting for an
+encode in flight, lock identity, output equality, the loaders, the retry warning, the
+version guard and copy safety.
+
+The fix upstream could take is the same serialization applied in `load_tokenizer` and
+`load_processor`, or a lock around `_encode_plus` and `set_truncation_and_padding` in
+whatever creates the tokenizer.

@@ -54,6 +54,7 @@ mlx_vlm/generate/dispatch.py::generation_stream  # REVIEWED: replaced by _get_ge
 # instead, so it imports `_resolve_generation_budget` (plus THINKING_BUDGET_CLAMP_RATIO)
 # in its place. Covered by the fork-only tests/test_context_budget.py, and the same
 # supersession is already recorded in .symbol-exclusions.
+mlx_vlm/server/app.py::load_processor  # REVIEWED: 07228726 replaced the app.py import of load_processor with load_embedding_processor for mistral3 text-only loads; the fork's call sites go through that loader (docs/proposals/tokenizer-concurrency.md, criterion 3)
 mlx_vlm/server/__init__.py::_check_configured_context_budget  # REVIEWED: superseded by _resolve_generation_budget's clamp-instead-of-reject policy (02e8046d); see .symbol-exclusions for the same event
 
 # RESOLVED 2026-09-13: sampler helpers remain import-compatible aliases;

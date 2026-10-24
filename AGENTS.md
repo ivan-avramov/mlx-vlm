@@ -31,7 +31,7 @@ git fetch upstream && git log --oneline HEAD..upstream/main   # MUST be empty; m
 grep -cE '^mlx_vlm' .symbol-exclusions .deletion-exclusions .fork-marker-allowlist \
     .dead-helper-exclusions .body-divergence-exclusions .registry-exclusions \
     .call-argument-exclusions
-# expect 269, 675, 3, 0, 34, 50, 16 (2026-10-10, sync 952d4f6b) — see "Exclusion baselines" below
+# expect 269, 675, 3, 0, 34, 51, 16 (2026-10-24, sync 952d4f6b) — see "Exclusion baselines" below
 grep -cE '^mlx_vlm.*# baseline: pre-existing divergence, unreviewed' .symbol-exclusions
 # expect 0 — every remaining exclusion carries a real reason
 ```
@@ -54,7 +54,7 @@ and update this table in the merge commit when a number moves.
 | `.fork-marker-allowlist` | **3** | fork-owned test copies pinned by blob (`test_generate.py`, `test_server.py`, `test_speculative.py`; C104) |
 | `.dead-helper-exclusions` | **0** | upstream-called helpers unreachable here |
 | `.body-divergence-exclusions` | **34** | misalignments claimed deliberate, each reviewed |
-| `.registry-exclusions` | **50** | API replacements, re-exports and retired fields, all reviewed |
+| `.registry-exclusions` | **51** | API replacements, re-exports and retired fields, all reviewed |
 | `.call-argument-exclusions` | **16** | calls passing fewer args, reviewed (`[**]` / `[arity]` tagged) |
 
 An empty file is **not** a reason to delete it — each keeps its header and RESOLVED
@@ -590,7 +590,7 @@ is deliberate — values diverge legitimately across this fork (every tuned cons
 while keys almost never do. A wrong value is `check_body_divergence.py --file`'s job;
 that is the shape of #1402's test-certified cache-key bug.
 
-Reviewed hits go in `.registry-exclusions` (**50** at the 2026-10-10 sync); the founding
+Reviewed hits go in `.registry-exclusions` (**51** at the 2026-10-24 sync); the founding
 entries were re-exports the fork replaced (`generation_stream` ×3 for the lazy per-thread stream,
 `_check_configured_context_budget` for the clamp-instead-of-reject budget,
 `top_p_sampling` for the `_filter` that also applies min_p and top_k). Runs in ~13s.
