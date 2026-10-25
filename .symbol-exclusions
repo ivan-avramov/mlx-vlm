@@ -401,3 +401,5 @@ mlx_vlm/tests/test_speculative.py::test_load_bundled_qwen_mtp  # C104 unported: 
 mlx_vlm/tests/test_speculative.py::test_load_bundled_qwen_mtp_rejects_missing_weights  # C104 unported: upstream test PASSES against fork (stage-A merge of e182243b, run 2026-10-25)
 mlx_vlm/tests/test_speculative.py::test_load_registered_native_drafter  # C104 unported: upstream test PASSES against fork (stage-A merge of e182243b, run 2026-10-25)
 mlx_vlm/tests/test_speculative.py::test_standalone_drafter_with_mtp_backbone  # C104 unported: upstream test PASSES against fork (stage-A merge of e182243b, run 2026-10-25)
+mlx_vlm/tests/test_speculative.py::test_qwen3_5_cancelled_prefill_row_preserves_survivor_output  # C104 unported: upstream test PASSES against fork (stage-B merge of 4623cf9d, run 2026-10-25)
+mlx_vlm/tests/test_speculative.py::test_speculative_prefill_filter_keeps_hidden_chunks_aligned  # C104 unported: upstream test PASSES against fork (stage-B merge of 4623cf9d, run 2026-10-25)

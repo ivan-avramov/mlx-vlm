@@ -38,6 +38,7 @@ from ..tools import (
     load_tool_module,
     process_tool_calls,
 )
+from ..tools.streaming import ToolCallDeltaState
 from ..utils import prepare_inputs, sanitize_strict_json  # Fork: sanitize_strict_json
 from . import compaction
 from .generation import draft_counters_of  # Fork (P426)
@@ -105,7 +106,6 @@ from .schemas import (  # Fork: adds the /v1/completions response models and Cha
     OpenAIRequest,
     OpenAIResponse,
     OpenAIUsage,
-    ResponseCompletedEvent,
     ResponseContentPartAddedEvent,
     ResponseContentPartDoneEvent,
     ResponseCreatedEvent,
@@ -1536,7 +1536,11 @@ async def responses_endpoint(request: Request):
             covered=context.covered,
         )
 
+        output_limit = None
+
         def apply_compaction(result):
+            nonlocal output_limit
+            output_limit = result.max_output_tokens
             if not result.changed:
                 return result.items, []
             return result.items, [
@@ -1580,6 +1584,8 @@ async def responses_endpoint(request: Request):
             raise HTTPException(status_code=400, detail=str(e))
         if chat_tools and tool_module is not None:
             gen_args.skip_special_tokens = False
+        if output_limit is not None:
+            gen_args.max_tokens = output_limit
 
         template_kwargs = gen_args.to_template_kwargs()
         if openai_request.tool_choice is not None:
@@ -1684,6 +1690,7 @@ async def responses_endpoint(request: Request):
                             async for update in progress:
                                 if isinstance(update, compaction.CompactedContext):
                                     items, compaction_output = apply_compaction(update)
+                                    gen_args.max_tokens = output_limit
                                     formatted_prompt, images, starts_in_thinking = (
                                         render_prompt(items)
                                     )
@@ -1717,6 +1724,13 @@ async def responses_endpoint(request: Request):
 
                     output_indices = {}
                     pending_whitespace = {}
+                    tool_delta_state = ToolCallDeltaState(tool_module, chat_tools)
+                    tool_thinking_state = ThinkingStreamState(
+                        starts_in_thinking,
+                        gen_args.thinking_start_token,
+                        gen_args.thinking_end_token,
+                    )
+                    function_item_ids = {}
 
                     def start_output_item(item):
                         item_id = item["id"]
@@ -1729,6 +1743,8 @@ async def responses_endpoint(request: Request):
                             pending["content"] = []
                         elif item["type"] == "reasoning":
                             pending["summary"] = []
+                        elif item["type"] == "function_call":
+                            pending["arguments"] = ""
                         yield _response_sse_event(
                             "response.output_item.added",
                             {
@@ -1783,6 +1799,39 @@ async def responses_endpoint(request: Request):
                                 ),
                             },
                         )
+
+                    def stream_tool_deltas(text):
+                        for delta in tool_delta_state.feed(text):
+                            call = tool_delta_state.calls[delta["index"]]
+                            function = call["function"]
+                            if (
+                                tool_registry.get(function["name"], "function")
+                                != "function"
+                            ):
+                                continue
+                            item_id = function_item_ids.setdefault(
+                                call["id"], f"fc_{uuid.uuid4().hex}"
+                            )
+                            yield from start_output_item(
+                                {
+                                    "id": item_id,
+                                    "type": "function_call",
+                                    "call_id": call["id"],
+                                    "name": function["name"],
+                                    "arguments": "",
+                                }
+                            )
+                            arguments = delta["function"].get("arguments", "")
+                            if arguments:
+                                yield _response_sse_event(
+                                    "response.function_call_arguments.delta",
+                                    {
+                                        "type": "response.function_call_arguments.delta",
+                                        "item_id": item_id,
+                                        "output_index": output_indices[item_id],
+                                        "delta": arguments,
+                                    },
+                                )
 
                     # Stream text deltas using ResponseGenerator (continuous batching)
                     full_text = ""
@@ -1850,6 +1899,12 @@ async def responses_endpoint(request: Request):
                                     "reasoning", thinking_delta.reasoning, chunk_rate
                                 ):
                                     yield event
+                            for event in stream_tool_deltas(
+                                tool_thinking_state.feed(
+                                    raw_delta, last=bool(token.finish_reason)
+                                ).content
+                            ):
+                                yield event
                             delta = thinking_delta.content
                             delta = tool_call_state.feed(
                                 delta, last=bool(token.finish_reason)
@@ -1897,6 +1952,12 @@ async def responses_endpoint(request: Request):
                                     "reasoning", thinking_delta.reasoning, chunk_rate
                                 ):
                                     yield event
+                            for event in stream_tool_deltas(
+                                tool_thinking_state.feed(
+                                    raw_delta, last=bool(chunk_finish)
+                                ).content
+                            ):
+                                yield event
                             delta = thinking_delta.content
                             delta = tool_call_state.feed(delta, last=bool(chunk_finish))
                             if chunk_finish is not None:
@@ -1936,8 +1997,12 @@ async def responses_endpoint(request: Request):
                             reasoning_item_id,
                             processor=processor,
                             starts_in_thinking=starts_in_thinking,
+                            tool_delta_state=tool_delta_state,
                         )
                     )
+                    for item in output_items:
+                        if item.get("call_id") in function_item_ids:
+                            item["id"] = function_item_ids[item["call_id"]]
                     if clean_text and not any(
                         item["type"] == "message" for item in output_items
                     ):
@@ -2007,11 +2072,14 @@ async def responses_endpoint(request: Request):
                             },
                         )
 
-                    # Send response.completed event (to match the openai pipeline)
                     finish_reason = (
-                        "tool_calls"
-                        if output_finish_reason == "tool_calls"
-                        else finish_reason or "stop"
+                        "length"
+                        if finish_reason == "length"
+                        else (
+                            "tool_calls"
+                            if output_finish_reason == "tool_calls"
+                            else finish_reason or "stop"
+                        )
                     )
                     envelope = _build_metrics_envelope(
                         endpoint="/responses",
@@ -2050,7 +2118,16 @@ async def responses_endpoint(request: Request):
                     metrics_finalized = True
                     completed_response = base_response.model_copy(
                         update={
-                            "status": "completed",
+                            "status": (
+                                "incomplete"
+                                if finish_reason == "length"
+                                else "completed"
+                            ),
+                            "incomplete_details": (
+                                {"reason": "max_output_tokens"}
+                                if finish_reason == "length"
+                                else None
+                            ),
                             "output": completed_output,
                             "output_text": clean_text,
                             "usage": OpenAIUsage.from_metrics(
@@ -2066,7 +2143,14 @@ async def responses_endpoint(request: Request):
                         completed_output,
                         openai_request.previous_response_id,
                     )
-                    yield f"event: response.completed\ndata: {ResponseCompletedEvent(type='response.completed', response=completed_response).model_dump_json()}\n\n"
+                    terminal_event = f"response.{completed_response.status}"
+                    yield _response_sse_event(
+                        terminal_event,
+                        {
+                            "type": terminal_event,
+                            "response": completed_response.model_dump(),
+                        },
+                    )
 
                 except Exception as e:
                     if not metrics_finalized:
@@ -2199,7 +2283,7 @@ async def responses_endpoint(request: Request):
                         starts_in_thinking=starts_in_thinking,
                     )
                 )
-                if output_finish_reason == "tool_calls":
+                if finish_reason != "length" and output_finish_reason == "tool_calls":
                     finish_reason = "tool_calls"
 
                 output_items = compaction_output + output_items
@@ -2207,7 +2291,12 @@ async def responses_endpoint(request: Request):
                     id=response_id,
                     object="response",
                     created_at=int(generated_at),
-                    status="completed",
+                    status="incomplete" if finish_reason == "length" else "completed",
+                    incomplete_details=(
+                        {"reason": "max_output_tokens"}
+                        if finish_reason == "length"
+                        else None
+                    ),
                     instructions=instructions,
                     max_output_tokens=openai_request.max_output_tokens,
                     model=openai_request.model,
@@ -2335,6 +2424,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             else _INHERIT_ADAPTER
         )
 
+        compacted_context = None
         # Fork: chat compaction is a server switch, default OFF (MLX_VLM_CHAT_COMPACTION /
         # --chat-compaction). Upstream compacts automatically whenever the rendered
         # prompt exceeds limit - max_tokens, which re-renders and re-tokenizes every
@@ -2374,6 +2464,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                 generate=generate,
                 automatic=True,
             )
+            compacted_context = result
             if result.changed:
                 request = request.model_copy(
                     update={
@@ -2469,6 +2560,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
             raise HTTPException(status_code=400, detail=str(e))
         if tools and tool_module is not None:
             gen_args.skip_special_tokens = False
+        if compacted_context is not None:
+            gen_args.max_tokens = compacted_context.max_output_tokens
 
         # Per-chat PromptCacheState for prefix-cache reuse across turns.
         # Resolve the session BEFORE rendering the chat template — when
@@ -2641,6 +2734,19 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     output_text = ""
                     stream_prompt_tokens = 0
                     tool_calls_made = False
+                    tool_delta_state = ToolCallDeltaState(tool_module, tools)
+                    # Response templates consume structured tool regions. Split
+                    # reasoning separately so the tool parser still sees their markup.
+                    tool_thinking_state = ThinkingStreamState(
+                        prompt_has_open_thinking(
+                            formatted_prompt,
+                            gen_args.enable_thinking,
+                            gen_args.thinking_start_token,
+                            gen_args.thinking_end_token,
+                        ),
+                        gen_args.thinking_start_token,
+                        gen_args.thinking_end_token,
+                    )
 
                     # Use ResponseGenerator if available, otherwise fall back to stream_generate
                     if runtime.response_generator is not None:
@@ -2766,6 +2872,11 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                     accumulated,
                                     thinking_format,
                                 )
+                            tool_deltas = tool_delta_state.feed(
+                                tool_thinking_state.feed(
+                                    token.text, last=bool(token.finish_reason)
+                                ).content
+                            )
 
                             # Suppress tool-call markup from content
                             delta_content = tool_call_state.feed(
@@ -2796,6 +2907,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             has_payload = (
                                 bool(delta_content)
                                 or bool(delta_reasoning)
+                                or bool(tool_deltas)
                                 or chunk_logprobs is not None
                             )
                             if has_payload:
@@ -2805,6 +2917,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                             role="assistant",
                                             content=delta_content,
                                             reasoning=delta_reasoning,
+                                            tool_calls=tool_deltas or None,
                                         ),
                                         logprobs=chunk_logprobs,
                                     )
@@ -2851,6 +2964,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         terminal_emitted = False
                         if tool_module is not None:
                             tc = process_tool_calls(full_output, tool_module, tools)
+                            remaining_calls = tool_delta_state.finish(tc.calls)
                             if tc.calls:
                                 tool_calls_made = True
                                 finish_reason = "tool_calls"
@@ -2860,7 +2974,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                         finish_reason="tool_calls",
                                         delta=ChatMessage(
                                             role="assistant",
-                                            tool_calls=tc.calls,
+                                            tool_calls=remaining_calls or None,
                                         ),
                                     )
                                 ]
@@ -2939,16 +3053,22 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             thinking_delta = thinking_state.feed(
                                 chunk.text, last=bool(chunk_finish)
                             )
+                            tool_deltas = tool_delta_state.feed(
+                                tool_thinking_state.feed(
+                                    chunk.text, last=bool(chunk_finish)
+                                ).content
+                            )
                             delta_content = tool_call_state.feed(
                                 thinking_delta.content, last=bool(chunk_finish)
                             )
-                            if delta_content or thinking_delta.reasoning:
+                            if delta_content or thinking_delta.reasoning or tool_deltas:
                                 choices = [
                                     ChatStreamChoice(
                                         delta=ChatMessage(
                                             role="assistant",
                                             content=delta_content,
                                             reasoning=thinking_delta.reasoning,
+                                            tool_calls=tool_deltas or None,
                                         )
                                     )
                                 ]
@@ -2992,6 +3112,9 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             if tool_module is not None
                             else None
                         )
+                        remaining_calls = tool_delta_state.finish(
+                            tc.calls if tc else []
+                        )
                         if tc is not None and tc.calls:
                             tool_calls_made = True
                             finish_reason = "tool_calls"
@@ -3004,7 +3127,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                                         finish_reason="tool_calls",
                                         delta=ChatMessage(
                                             role="assistant",
-                                            tool_calls=tc.calls,
+                                            tool_calls=remaining_calls or None,
                                         ),
                                     )
                                 ],
