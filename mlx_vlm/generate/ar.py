@@ -2451,6 +2451,9 @@ class PromptProcessingBatch:
         ):
             if rows:
                 rows.pop(idx)
+        # Fork (O30): per-row seeds are fork-only state (upstream has none).
+        if self.seeds is not None:
+            self.seeds.pop(idx)
         self._finished_prompt_logits.pop(uid, None)
         self._speculative_prefill.filter(keep)
         self._total_prompt_tokens = sum(self._suffix_lens)

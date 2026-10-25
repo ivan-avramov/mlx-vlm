@@ -2426,12 +2426,15 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
 
         compacted_context = None
         # Fork: chat compaction is a server switch, default OFF (MLX_VLM_CHAT_COMPACTION /
-        # --chat-compaction). Upstream compacts automatically whenever the rendered
-        # prompt exceeds limit - max_tokens, which re-renders and re-tokenizes every
-        # request and would summarize 160K-260K prompts that the fork serves via its
-        # soft clamp (_apply_generation_budget). Off: context_management is never read.
-        # On: it is validated as upstream does (422) and only a non-empty list reaches
-        # compaction. Tests: test_chat_request_contracts.py.
+        # --chat-compaction). Upstream (since #2458) compacts automatically whenever
+        # the actual rendered input leaves no room for generation, which re-renders and
+        # re-tokenizes every request to measure it and would summarize oversized
+        # prompts that the fork instead serves via its soft clamp
+        # (_apply_generation_budget). Re-decided at the 2026-10-25 sync: keep the gate.
+        # Off: context_management is never read. On: it is validated as upstream does
+        # (422) and only a non-empty list reaches compaction, which then bounds
+        # max_tokens by the remaining context as upstream does. Tests:
+        # test_chat_request_contracts.py.
         if chat_compaction_enabled():
             try:
                 context_management = validate_chat_context_management(

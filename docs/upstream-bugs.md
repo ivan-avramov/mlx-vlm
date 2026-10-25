@@ -16,7 +16,7 @@ defect, and to explain the one divergence we carry *because* upstream is wrong
   `memory.md` ever proposed it. Don't re-propose it.
 * **Patched here only when something downstream needs it** (rule changed 2026-10-22 by
   the operator, Premisa P600). A local fix to upstream code is a new permanent conflict
-  site, so items 1-3 and 5, which block nothing, stay byte-identical to upstream. Items
+  site, so items 1-3, 5 and 9, which block nothing, stay byte-identical to upstream. Items
   4, 6, 7 and 8 are deliberate divergences: each carries a `# Fork:` marker, a test, and an
   entry below saying what upstream does wrong. A fix that a Premisa candidate or the
   stack needs goes in the same way, as ordinary fork work; it is not avoided as a
@@ -387,3 +387,30 @@ version guard and copy safety.
 The fix upstream could take is the same serialization applied in `load_tokenizer` and
 `load_processor`, or a lock around `_encode_plus` and `set_truncation_and_padding` in
 whatever creates the tokenizer.
+
+## 9. The Qwen3.5 exact speculative verifier ignores `norm_topk_prob`
+
+`mlx_vlm/models/qwen3_5/speculative_verifier.py`,
+`Qwen3_5ExactSpeculativeVerifier._feed_forward` (upstream `4623cf9d`):
+
+```python
+scores = mx.take_along_axis(gates, indices, axis=-1)
+scores = scores / scores.sum(axis=-1, keepdims=True)
+```
+
+#2457 (`c32e07b8`) gave `Qwen3_5MoeSparseMoeBlock` a `norm_topk_prob` flag
+(`TextConfig.norm_topk_prob`, default `True`) and made the block renormalize only
+when it is set. The exact verifier re-implements the block's routing and still
+renormalizes unconditionally, so for a checkpoint with `norm_topk_prob: false` the
+verified logits differ from the target's own forward pass and exact speculative
+decoding stops being exact.
+
+Reproduce: `test_qwen_exact_verifier_moe_matches_singleton_path` with
+`norm_topk_prob=False` added to its `SimpleNamespace` config fails (max abs diff
+well above the bf16 tolerance); with `True` it passes.
+
+**Not patched here** (P600): no Qwen3.5/3.6/3.8 MoE checkpoint the stack serves sets
+`norm_topk_prob: false` (the HF configs omit it, so the default `True` applies), so
+nothing downstream needs the fix. Found during the 2026-10-25 staged sync (stage A
+review). The fix upstream could take is
+`if getattr(feed_forward, "norm_topk_prob", True):` around the division.

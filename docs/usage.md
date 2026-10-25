@@ -143,11 +143,13 @@ works while that response is stored. `/v1/responses/input_tokens` counts the
 decoded context, not the encrypted payload's string length. Normal response
 usage counts the final inference; explicit compact usage counts the summary pass.
 
-Chat Completions (when enabled -- see the fork note above) automatically compacts
-supported history when the actual input leaves no room for generation within the
-context limit. No threshold setting is needed.
-The optional `context_management` field enables earlier compaction; an empty list
-explicitly disables compaction. Recovery supports text, images, and tool history;
+Upstream's Chat Completions automatically compacts supported history when the actual
+input leaves no room for generation within the context limit, and the optional
+`context_management` field enables earlier compaction; an empty list explicitly
+disables it. **In this fork** Chat Completions compacts only when the server switch is
+on (see the fork note above) **and** the request carries a non-empty
+`context_management`; compaction then triggers when the actual input leaves no room
+for generation or exceeds its `compact_threshold`. Recovery supports text, images, and tool history;
 audio/video requests keep their existing behavior. Compaction finishes before the
 Chat Completions stream opens and leaves its response format unchanged. It is
 request-local: clients that resend their full history may need compaction again

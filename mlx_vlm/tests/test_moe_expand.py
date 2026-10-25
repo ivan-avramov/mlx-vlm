@@ -257,6 +257,33 @@ def _qwen_model_config():
     )
 
 
+@pytest.mark.parametrize("norm_topk_prob", [True, False])
+def test_qwen_expanded_route_follows_norm_topk_prob(norm_topk_prob):
+    # The expanded route must renormalize exactly when the block does (#2457's
+    # norm_topk_prob); hard-coding either choice fails one parametrization.
+    from mlx_vlm.models.moe_expand import MoeExpansion, expand_route
+    from mlx_vlm.models.qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
+
+    mx.random.seed(7)
+    config = _qwen_config()
+    config.norm_topk_prob = norm_topk_prob
+    block = Qwen3_5MoeSparseMoeBlock(config, layer_idx=1)
+    block.moe_expand = MoeExpansion(layers=(0, 3), n=4, t=0.5, d=0.5)
+    x = mx.random.normal((1, 3, 16))
+
+    gates = mx.softmax(block.gate(x), axis=-1, precise=True)
+    inds, weights = expand_route(gates, 2, 4, 0.5, 0.5, normalize=norm_topk_prob)
+    routed = (block.switch_mlp(x, inds) * weights[..., None]).sum(axis=-2)
+    expected = routed + block._shared_expert_scale(x) * block.shared_expert(x)
+
+    sums = weights.sum(axis=-1)
+    if norm_topk_prob:
+        assert mx.allclose(sums, mx.ones_like(sums), atol=1e-5).item()
+    else:
+        assert (sums < 0.999).all().item()
+    assert mx.allclose(block(x), expected, atol=1e-5).item()
+
+
 class TestQwenModelIntegration:
     def _model(self):
         from mlx_vlm.models.qwen3_5_moe.language import LanguageModel

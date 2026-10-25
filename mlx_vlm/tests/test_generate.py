@@ -1362,6 +1362,37 @@ class TestBatchGenerator:
         decoded = batch.generate(lambda x: mx.argmax(x, axis=-1), lambda _: False)
         assert [(r.uid, r.token) for r in decoded.next()] == [(11, 6), (12, 8)]
 
+    # Fork (O30): per-row seeds must follow a row removed during prefill, or
+    # the survivors' first positioned sample rejects the batch size.
+    @pytest.mark.parametrize("cancelled", [10, 11])
+    def test_remove_from_prefill_keeps_per_row_seeds_aligned(self, cancelled):
+        class EchoModel:
+            def __call__(self, inputs, **kwargs):
+                return SimpleNamespace(logits=mx.eye(16)[inputs])
+
+        seeds = {10: 101, 11: 202, 12: 303}
+        batch = PromptProcessingBatch(
+            model=EchoModel(),
+            uids=list(seeds),
+            input_ids=[[1, 2, 3, 4], [5, 6, 7, 8], [6, 7, 8, 9]],
+            max_tokens=[1, 1, 1],
+            inputs_embeds=mx.zeros((3, 4, 4)),
+            prompt_kwargs={},
+            prefill_step_size=2,
+            warm_cache=[],
+            seeds=list(seeds.values()),
+        )
+        batch.prompt_step()
+        batch.remove(cancelled)
+        survivors = [uid for uid in seeds if uid != cancelled]
+        assert batch.seeds == [seeds[uid] for uid in survivors]
+        while batch.needs_processing():
+            batch.prompt_step()
+        sampler = ar_module._PositionedTargetSampler(temperature=1.0, top_p=1.0, seed=0)
+        decoded = batch.generate(sampler, lambda _: False)
+        assert decoded.seeds == [seeds[uid] for uid in survivors]
+        assert [r.uid for r in decoded.next()] == survivors
+
     def test_remove_cancels_image_prefill_and_releases_cache(
         self, mock_model, mock_processor
     ):

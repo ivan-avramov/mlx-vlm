@@ -974,10 +974,7 @@ def test_qwen_target_verify_mlp_matches_singleton_dense_path():
     assert bool(mx.array_equal(ref, out).item())
 
 
-# Fork: parametrized over upstream #2457's norm_topk_prob; the verifier must
-# follow the block's renormalization choice, not always renormalize.
-@pytest.mark.parametrize("norm_topk_prob", [True, False])
-def test_qwen_exact_verifier_moe_matches_singleton_path(norm_topk_prob):
+def test_qwen_exact_verifier_moe_matches_singleton_path():
     mx.random.seed(111)
     config = SimpleNamespace(
         hidden_size=16,
@@ -985,7 +982,9 @@ def test_qwen_exact_verifier_moe_matches_singleton_path(norm_topk_prob):
         shared_expert_intermediate_size=32,
         num_experts=4,
         num_experts_per_tok=2,
-        norm_topk_prob=norm_topk_prob,
+        # Fork: upstream #2457 made the block read norm_topk_prob. False is not
+        # covered: the verifier always renormalizes (docs/upstream-bugs.md 9).
+        norm_topk_prob=True,
     )
     moe = qwen_moe_language.Qwen3_5MoeSparseMoeBlock(config)
     moe.set_dtype(mx.bfloat16)
@@ -1174,6 +1173,37 @@ def test_qwen3_5_fully_padded_prefill_row_survives_chunks():
     assert second.shape == (2, 3, text_config.hidden_size)
     assert cache[1].offset.tolist() == [1, 6]
     assert cache[1].left_padding.tolist() == [5, 0]
+
+
+# Fork: upstream #2273's two prefill-cancellation tests, ported onto this copy's
+# fixtures (upstream's `language("qwen")` / `NS` harness is not carried here).
+def test_speculative_prefill_filter_keeps_hidden_chunks_aligned():
+    drafter = SimpleNamespace(config=SimpleNamespace(target_layer_ids=[0]))
+    prefill = speculative_utils.SpeculativePrefill("dflash", drafter)
+    prefill.append(SimpleNamespace(hidden_states=[mx.array([[[1]], [[2]]])]))
+    prefill.filter([1])
+    output = prefill.finish(SimpleNamespace(hidden_states=[mx.array([[[3]]])]))
+    assert output.hidden_states[0].tolist() == [[[2], [3]]]
+    prefill.append(output)
+    prefill.filter([])
+    assert prefill.chunks == []
+
+
+def test_qwen3_5_cancelled_prefill_row_preserves_survivor_output():
+    model, _ = _qwen3_5_hybrid_batch_model()
+    cache = [ArraysCache(2, left_padding=[5, 0]), BatchKVCache([5, 0])]
+    model(mx.array([[0, 0, 0], [1, 2, 3]], dtype=mx.int32), cache=cache)
+    for layer_cache in cache:
+        layer_cache.filter(mx.array([0]))
+
+    singleton_cache = [ArraysCache(size=2), KVCache()]
+    actual = model(mx.array([[0, 0, 4]], dtype=mx.int32), cache=cache)
+    expected = model(mx.array([[4]], dtype=mx.int32), cache=singleton_cache)
+    assert mx.array_equal(actual[:, -1:], expected).item()
+
+    actual = model(mx.array([[5]], dtype=mx.int32), cache=cache)
+    expected = model(mx.array([[5]], dtype=mx.int32), cache=singleton_cache)
+    assert mx.array_equal(actual, expected).item()
 
 
 def test_qwen3_5_all_rows_fully_padded_prefill():

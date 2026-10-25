@@ -3,10 +3,7 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..moe_expand import (  # Fork: M34 opt-in routing
-    MoeExpansion,
-    expand_route_with_weight_base,
-)
+from ..moe_expand import MoeExpansion, expand_route  # Fork: M34 opt-in routing
 from ..qwen3_5.language import LanguageModel as Qwen3_5LanguageModel
 from ..qwen3_5.language import Qwen3_5Attention as Qwen3_5MoeAttention
 from ..qwen3_5.language import Qwen3_5GatedDeltaNet as Qwen3_5MoeGatedDeltaNet
@@ -19,7 +16,7 @@ from .config import ModelConfig, TextConfig
 class Qwen3_5MoeSparseMoeBlock(nn.Module):
     # Fork: M34 layer-scoped expert expansion; default route remains native.
     # The expanded route honours upstream's norm_topk_prob (#2457) via
-    # expand_route_with_weight_base(normalize=...).
+    # expand_route(normalize=...).
     def __init__(self, args: TextConfig, layer_idx: int = 0):
         super().__init__()
         dim = args.hidden_size
@@ -51,8 +48,8 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         k = self.top_k
         exp = self.moe_expand
         if exp is not None and exp.n > k and exp.in_range(self.layer_idx):
-            inds, scores = expand_route_with_weight_base(
-                gates, gates, k, exp.n, exp.t, exp.d, normalize=self.norm_topk_prob
+            inds, scores = expand_route(
+                gates, k, exp.n, exp.t, exp.d, normalize=self.norm_topk_prob
             )
         else:
             inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]

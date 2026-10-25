@@ -132,7 +132,7 @@ def _normalized_weights(
 
 
 def expand_route(
-    p: mx.array, k: int, n: int, t: float, d: float
+    p: mx.array, k: int, n: int, t: float, d: float, normalize: bool = True
 ) -> Tuple[mx.array, mx.array]:
     """Expanded routing over a single probability/score array `p`.
 
@@ -141,11 +141,13 @@ def expand_route(
     native top-K rule extended). Returns `(inds, weights)`, both shape
     `(..., n)`; pruned ranks carry weight 0 (kept shape, per the static-kernel
     requirement). When `n == k`, `weights` reduces exactly to the native
-    top-K renormalization (`p / p.sum()` over the kept set).
+    top-K renormalization (`p / p.sum()` over the kept set). `normalize=False`
+    mirrors a block whose `norm_topk_prob` is off: the weights are the raw
+    `p * factor * kept`.
     """
     inds, factor, kept = _rank_and_factor(p, k, n, t, d)
     ranked_p = mx.take_along_axis(p, inds, axis=-1)
-    weights = _normalized_weights(ranked_p, factor, kept, normalize=True)
+    weights = _normalized_weights(ranked_p, factor, kept, normalize=normalize)
     return inds, weights
 
 
