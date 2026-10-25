@@ -14,6 +14,10 @@ import numpy as np
 import pytest
 
 from mlx_vlm.convert import _preserve_existing_deepseek_v4_quantization
+from mlx_vlm.quantization.checkpoint import (  # Fork: moved out of utils by #2437
+    _transform_compressed_tensors_weights,
+    _transform_modelopt_nvfp4_weights,
+)
 from mlx_vlm.utils import (
     DEFAULT_VIDEO_SAMPLING,
     StoppingCriteria,
@@ -23,8 +27,6 @@ from mlx_vlm.utils import (
     _load_safetensors,
     _quantization_for_module_path,
     _quantization_path_aliases,
-    _transform_compressed_tensors_weights,
-    _transform_modelopt_nvfp4_weights,
     apply_generation_config_defaults,
     estimate_num_image_tokens,
     get_model_and_args,
@@ -45,61 +47,39 @@ from mlx_vlm.utils import (
 )
 
 
-@pytest.mark.parametrize(
-    ("quant_method", "quant_algo"),
-    [
-        ("modelopt", "NVFP4"),
-        ("modelopt", "W4A16_NVFP4"),
-        ("modelopt_mixed", "NVFP4"),
-    ],
-)
-def test_transform_modelopt_nvfp4_weights(quant_method, quant_algo):
-    packed = mx.arange(32, dtype=mx.uint8).reshape(2, 16)
-    weights = {
-        "layer.weight": packed,
-        "layer.weight_scale": mx.array([[56, 64], [72, 80]], dtype=mx.uint8),
-        "layer.weight_scale_2": mx.array(0.5, dtype=mx.float32),
-        "layer.input_scale": mx.array(0.25, dtype=mx.float32),
-        "layer.bias": mx.ones((2,)),
-    }
+def test_modelopt_mixed_fp8_decode_is_evaluated_in_bounded_batches(monkeypatch):
+    """Fork: guard for the Apodex 1.1 `[metal::malloc] Resource limit` load crash.
 
-    transformed, quantization = _transform_modelopt_nvfp4_weights(
-        weights,
-        {"quant_method": quant_method, "quant_algo": quant_algo},
-    )
+    Replaces the 24k-tensor folding test #2437 made obsolete: NVFP4 tensors are
+    no longer folded, but lone-``weight_scale`` FP8 linears are still decoded
+    per tensor, and an unbatched decode builds one lazy graph across the whole
+    checkpoint. A size-based test cannot catch that on current MLX (100k tiny
+    tensors load fine unbatched), so this pins the batching itself.
+    """
+    count = 1000
+    weights = {}
+    for index in range(count):
+        weights[f"l.{index}.weight"] = mx.zeros((2, 16), dtype=mx.uint8)
+        weights[f"l.{index}.weight_scale"] = mx.array(0.5, dtype=mx.float32)
 
-    assert transformed["layer.weight"].dtype == mx.uint32
-    assert transformed["layer.weight"].shape == (2, 4)
-    assert transformed["layer.scales"].tolist() == [[48, 56], [64, 72]]
-    assert mx.array_equal(transformed["layer.bias"], weights["layer.bias"])
-    assert "layer.weight_scale" not in transformed
-    assert "layer.weight_scale_2" not in transformed
-    assert "layer.input_scale" not in transformed
-    assert quantization == {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+    batch_sizes = []
+    real_eval = mx.eval
 
+    def counting_eval(*args):
+        arrays = args[0] if len(args) == 1 and isinstance(args[0], list) else args
+        batch_sizes.append(len(arrays))
+        return real_eval(*args)
 
-def test_transform_modelopt_mixed_nvfp4_fp8_weights():
-    weights = {
-        "experts.weight": mx.arange(32, dtype=mx.uint8).reshape(2, 16),
-        "experts.weight_scale": mx.array([[56, 64], [72, 80]], dtype=mx.uint8),
-        "experts.weight_scale_2": mx.array(0.5, dtype=mx.float32),
-        "experts.input_scale": mx.array(0.25, dtype=mx.float32),
-        "attention.weight": mx.array([[56, 64], [68, 72]], dtype=mx.uint8),
-        "attention.weight_scale": mx.array([0.5, 0.25], dtype=mx.bfloat16),
-        "attention.input_scale": mx.array(0.125, dtype=mx.float32),
-    }
-
+    monkeypatch.setattr(mx, "eval", counting_eval)
     transformed, quantization = _transform_modelopt_nvfp4_weights(
         weights,
         {"quant_method": "modelopt_mixed", "quant_algo": "MIXED_PRECISION"},
     )
 
-    assert transformed["experts.weight"].dtype == mx.uint32
-    assert transformed["experts.scales"].dtype == mx.uint8
-    assert transformed["attention.weight"].dtype == mx.bfloat16
-    assert transformed["attention.weight"].tolist() == [[0.5, 1.0], [0.75, 1.0]]
-    assert not any("weight_scale" in key or "input_scale" in key for key in transformed)
-    assert quantization == {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+    assert quantization is None
+    assert len(transformed) == count
+    assert sum(batch_sizes) == count
+    assert max(batch_sizes) <= 256
 
 
 def test_transform_compressed_tensors_pure_fp8_weights():
@@ -1603,31 +1583,6 @@ def test_modelopt_mixed_drops_fp8_kv_cache_scales():
     )
     assert transformed["layer.weight"].dtype == mx.uint32
     assert quantization == {"group_size": 16, "bits": 4, "mode": "nvfp4"}
-
-
-def test_modelopt_mixed_folds_many_tensors_without_exhausting_buffers():
-    """Folding must not accumulate one lazy graph across the whole checkpoint.
-
-    A 256-expert MoE export has tens of thousands of quantized tensors. If the
-    per-tensor folds are left unevaluated, the intermediates exceed Metal's
-    live-buffer limit and loading dies with ``[metal::malloc] Resource limit``.
-    24k tensors is below a real export (Apodex 1.1 mini NVFP4 has 30,720) but
-    above the point where an unbatched implementation fails.
-    """
-    count = 24000
-    weights = {}
-    for index in range(count):
-        weights[f"l.{index}.weight"] = mx.zeros((2, 16), dtype=mx.uint8)
-        weights[f"l.{index}.weight_scale"] = mx.zeros((2, 2), dtype=mx.uint8)
-        weights[f"l.{index}.weight_scale_2"] = mx.array(0.5, dtype=mx.float32)
-
-    transformed, _ = _transform_modelopt_nvfp4_weights(
-        weights,
-        {"quant_method": "modelopt_mixed", "quant_algo": "MIXED_PRECISION"},
-    )
-
-    assert len(transformed) == 2 * count
-    assert transformed[f"l.{count - 1}.scales"].dtype == mx.uint8
 
 
 @pytest.fixture(scope="module")

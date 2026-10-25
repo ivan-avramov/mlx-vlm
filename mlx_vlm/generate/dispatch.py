@@ -608,7 +608,8 @@ def parse_arguments():
         "--draft-model",
         type=str,
         default=None,
-        help="Speculative drafter path or HF id (e.g. z-lab/Qwen3.5-4B-DFlash).",
+        help="Speculative drafter path or HF id. Qwen3.5/3.6/3.8 checkpoints "
+        "with bundled MTP weights can use the same path as --model.",
     )
     parser.add_argument(
         "--draft-kind",
@@ -617,7 +618,7 @@ def parse_arguments():
         choices=["dflash", "eagle3", "mtp", "suffix"],
         help="Drafter family. Supported: 'dflash' (Qwen3.5 DFlash), "
         "'eagle3' (Speculators/SGLang EAGLE-3), "
-        "'mtp' (Gemma 4 Multi-Token Prediction / Assistant model), "
+        "'mtp' (native Multi-Token Prediction / Assistant model), "
         "'suffix' (drafter-free n-gram / prompt-lookup; no --draft-model). "
         "Default: auto-detected from the drafter's HF model_type.",
     )

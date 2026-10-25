@@ -51,8 +51,8 @@ KNOBS = [
     (["--kv-quant-scheme", "turboquant"], "kv_quant_scheme", "turboquant"),
     (["--quantized-kv-start", "2"], "quantized_kv_start", 2),
     (["--max-kv-size", "4096"], "max_kv_size", 4096),
-    (["--draft-model", "/drafts/mtp"], "spec_draft_model", "/drafts/mtp"),
-    (["--draft-kind", "mtp"], "spec_draft_kind", "mtp"),
+    (["--draft-model", "/drafts/mtp"], "draft_model", "/drafts/mtp"),
+    (["--draft-kind", "mtp"], "draft_kind", "mtp"),
     (["--vision-cache-size", "7"], "vision_cache_size", 7),
 ]
 

@@ -76,6 +76,9 @@ def _qwen3_next_source(tmp, nested_type):
         text["intermediate_size"] = (
             64  # a real Qwen3-Next config carries it (a dense TextConfig then builds)
         )
+    # A real Qwen3-Next config carries these; the splitter derives the
+    # drafter's RoPE from them (#2457).
+    text.update(partial_rotary_factor=0.25, rope_theta=10000.0)
     config = dict(model_type="qwen3_next", text_config=text)
     (path / "config.json").write_text(json.dumps(config))
     mx.save_safetensors(str(path / "model.safetensors"), tensors)

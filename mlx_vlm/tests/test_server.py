@@ -7307,8 +7307,8 @@ class TestRuntimeConfigAdditions:
         for name in (
             "max_kv_size",
             "token_queue_timeout",
-            "spec_draft_model",
-            "spec_draft_kind",
+            "draft_model",
+            "draft_kind",
         ):
             assert name in spec
             assert spec[name]["reload_kinds"] == ["text_generation"]
@@ -7364,8 +7364,8 @@ class TestRuntimeConfigAdditions:
         monkeypatch.setattr(server.runtime, "model_cache", {})
         monkeypatch.setattr(server.runtime, "response_generator", None)
         monkeypatch.setattr(server.runtime, "apc_manager", None)
-        monkeypatch.setattr(server.runtime.config, "spec_draft_model", "draft-x")
-        monkeypatch.setattr(server.runtime.config, "spec_draft_kind", "auto")
+        monkeypatch.setattr(server.runtime.config, "draft_model", "draft-x")
+        monkeypatch.setattr(server.runtime.config, "draft_kind", "auto")
 
         server.get_cached_model("demo-model")
         assert FakeResponseGenerator.last_kwargs["draft_model_path"] == "draft-x"

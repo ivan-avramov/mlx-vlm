@@ -270,7 +270,17 @@ class TestMTPSplit(unittest.TestCase):
                     )
             src = self._write_source(
                 tmp,
-                {"text_config": {"model_type": "qwen3_next", "num_experts": 2}},
+                {
+                    "text_config": {
+                        "model_type": "qwen3_next",
+                        "num_experts": 2,
+                        # Every real Qwen3-Next config carries these; the
+                        # splitter derives the drafter's RoPE from them (#2457).
+                        "head_dim": 8,
+                        "partial_rotary_factor": 0.25,
+                        "rope_theta": 10000.0,
+                    }
+                },
                 tensors,
             )
             splitter = detect_mtp_splitter(Path(src))

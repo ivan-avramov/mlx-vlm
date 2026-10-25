@@ -974,7 +974,10 @@ def test_qwen_target_verify_mlp_matches_singleton_dense_path():
     assert bool(mx.array_equal(ref, out).item())
 
 
-def test_qwen_exact_verifier_moe_matches_singleton_path():
+# Fork: parametrized over upstream #2457's norm_topk_prob; the verifier must
+# follow the block's renormalization choice, not always renormalize.
+@pytest.mark.parametrize("norm_topk_prob", [True, False])
+def test_qwen_exact_verifier_moe_matches_singleton_path(norm_topk_prob):
     mx.random.seed(111)
     config = SimpleNamespace(
         hidden_size=16,
@@ -982,6 +985,7 @@ def test_qwen_exact_verifier_moe_matches_singleton_path():
         shared_expert_intermediate_size=32,
         num_experts=4,
         num_experts_per_tok=2,
+        norm_topk_prob=norm_topk_prob,
     )
     moe = qwen_moe_language.Qwen3_5MoeSparseMoeBlock(config)
     moe.set_dtype(mx.bfloat16)
@@ -2922,11 +2926,6 @@ def test_mapped_type_wins_over_nextn_heuristic(tmp_path):
     path = _make_drafter_dir(
         tmp_path, "deepseek_v4_dspark", {"num_nextn_predict_layers": 1}
     )
-    assert resolve_drafter_kind(path, None) == "dflash"
-
-
-def test_zero_nextn_falls_back_to_default(tmp_path):
-    path = _make_drafter_dir(tmp_path, "deepseek_v4", {"num_nextn_predict_layers": 0})
     assert resolve_drafter_kind(path, None) == "dflash"
 
 

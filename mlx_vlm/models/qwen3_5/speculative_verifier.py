@@ -199,7 +199,10 @@ class Qwen3_5BatchInvariantForward:
             # Fork note: next line is upstream #2409 (v0.7.6 sync), not M58.
             indices = mx.stop_gradient(indices)
             scores = mx.take_along_axis(gates, indices, axis=-1)
-            scores = scores / scores.sum(axis=-1, keepdims=True)
+            # Fork: follow the block's norm_topk_prob (upstream #2457 added it to
+            # Qwen3_5MoeSparseMoeBlock but this verifier always renormalized).
+            if getattr(feed_forward, "norm_topk_prob", True):
+                scores = scores / scores.sum(axis=-1, keepdims=True)
 
             shared_output = self._feed_forward(feed_forward.shared_expert, x)
             shared_output = (

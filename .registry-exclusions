@@ -110,3 +110,5 @@ mlx_vlm/tests/test_speculative.py::quantized  # REVIEWED: C104 unported @1dcc142
 mlx_vlm/tests/test_speculative.py::speculative  # REVIEWED: C104 unported @1dcc142d: re-export used only by upstream tests not carried in the fork-owned copy
 mlx_vlm/tests/test_speculative.py::start_speculative_cache  # REVIEWED: C104 unported @1dcc142d: re-export used only by upstream tests not carried in the fork-owned copy
 mlx_vlm/tests/test_speculative.py::tiny_config  # REVIEWED: C104 unported @1dcc142d: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_speculative.py::get_mtp_splitter  # REVIEWED: C104 unported @e182243b: re-export used only by upstream tests not carried in the fork-owned copy
+mlx_vlm/tests/test_speculative.py::load_drafter  # REVIEWED: C104 unported @e182243b: re-export used only by upstream tests not carried in the fork-owned copy

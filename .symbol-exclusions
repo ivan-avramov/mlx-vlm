@@ -380,7 +380,7 @@ mlx_vlm/tests/test_speculative.py::test_quantized_moe_hyperconnection  # C104 un
 mlx_vlm/tests/test_speculative.py::test_qwen_quantized_cache_ragged_rollback  # C104 unported: upstream test PASSES against fork 664c2ead (run 2026-10-06)
 mlx_vlm/tests/test_speculative.py::test_rotating_cache_commit_abort  # C104 unported: upstream test PASSES against fork 664c2ead (run 2026-10-06)
 mlx_vlm/tests/test_speculative.py::test_rotating_ragged_commit_masks_rejected_tokens  # C104 unported: upstream test PASSES against fork 664c2ead (run 2026-10-06)
-mlx_vlm/tests/test_speculative.py::test_round_commit_close_and_abort  # C104 unported: upstream test PASSES against fork 664c2ead (run 2026-10-06)
+mlx_vlm/tests/test_speculative.py::test_round_commit_close_and_abort  # C104 unported: upstream test passes against fork 664c2ead (run 2026-10-06) except its 3 `mtp` parametrizations, which fail BY DESIGN since P369 F12 (batched MTP decoding refused; re-verified 2026-10-25 vs e182243b)
 mlx_vlm/tests/test_speculative.py::test_sampler_rng_isolation  # C104 unported: upstream test PASSES against fork 664c2ead (run 2026-10-06)
 mlx_vlm/tests/test_speculative.py::test_shared_kv_metadata_and_rotating_prompt_cache  # C104 unported: upstream test PASSES against fork 664c2ead (run 2026-10-06)
 mlx_vlm/tests/test_speculative.py::test_shared_kv_padding  # C104 unported: upstream test PASSES against fork 664c2ead (run 2026-10-06)
@@ -395,3 +395,9 @@ mlx_vlm/tests/test_speculative.py::test_verify_commit_matches_decode  # C104 unp
 mlx_vlm/tests/test_speculative.py::test_wide_quantized_verifier  # C104 unported: upstream test PASSES against fork 664c2ead (run 2026-10-06)
 mlx_vlm/tests/test_speculative.py::.values  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy (same name also defined in mlx_vlm/apc_storage.py,mlx_vlm/server/runtime.py,mlx_vlm/tests/test_cache.py) [scope-qualified at the v0.7.6 sync]
 mlx_vlm/tests/test_speculative.py::test_verify_commit_matches_decode.verify  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy (same name also defined in mlx_vlm/models/qwen3_5/speculative_verifier.py) [scope-qualified at the v0.7.6 sync]
+mlx_vlm/tests/test_speculative.py::test_bundled_qwen_mtp_kind_and_standalone_loading  # C104 unported: upstream test PASSES against fork (stage-A merge of e182243b, run 2026-10-25)
+mlx_vlm/tests/test_speculative.py::test_custom_drafter_with_mtp_backbone  # C104 unported: upstream test PASSES against fork (stage-A merge of e182243b, run 2026-10-25)
+mlx_vlm/tests/test_speculative.py::test_load_bundled_qwen_mtp  # C104 unported: upstream test PASSES against fork (stage-A merge of e182243b, run 2026-10-25)
+mlx_vlm/tests/test_speculative.py::test_load_bundled_qwen_mtp_rejects_missing_weights  # C104 unported: upstream test PASSES against fork (stage-A merge of e182243b, run 2026-10-25)
+mlx_vlm/tests/test_speculative.py::test_load_registered_native_drafter  # C104 unported: upstream test PASSES against fork (stage-A merge of e182243b, run 2026-10-25)
+mlx_vlm/tests/test_speculative.py::test_standalone_drafter_with_mtp_backbone  # C104 unported: upstream test PASSES against fork (stage-A merge of e182243b, run 2026-10-25)

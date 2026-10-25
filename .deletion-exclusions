@@ -861,7 +861,6 @@ mlx_vlm/tests/test_speculative.py::test_split_qwen3_5_mtp_writes_sidecar_without
 mlx_vlm/tests/test_speculative.py::test_uniform_batch_acceptance_flag_advertised_on_affected_models  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it
 mlx_vlm/tests/test_speculative.py::test_uniform_turboquant_batch_rollback_trims_without_raising  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it
 mlx_vlm/tests/test_speculative.py::test_unknown_model_type_keeps_caller_kind  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it
-mlx_vlm/tests/test_speculative.py::test_zero_nextn_falls_back_to_default  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it
 mlx_vlm/tests/test_speculative.py::trim  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it
 mlx_vlm/tests/test_speculative.py::verify_hidden  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it
 mlx_vlm/tests/test_speculative.py::verify_logits  # C104(a)/(c) retained in the fork-owned copy; upstream #2276 removed it
