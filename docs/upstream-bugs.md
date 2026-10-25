@@ -16,7 +16,7 @@ defect, and to explain the one divergence we carry *because* upstream is wrong
   `memory.md` ever proposed it. Don't re-propose it.
 * **Patched here only when something downstream needs it** (rule changed 2026-10-22 by
   the operator, Premisa P600). A local fix to upstream code is a new permanent conflict
-  site, so items 1-3, 5, 9, 10 and 11, which block nothing, stay byte-identical to upstream. Items
+  site, so items 1-3, 5, 9, 10, 11 and 13, which block nothing, stay byte-identical to upstream. Items
   4, 6, 7, 8 and 12 are deliberate divergences: each carries a `# Fork:` marker, a test, and an
   entry below saying what upstream does wrong. A fix that a Premisa candidate or the
   stack needs goes in the same way, as ordinary fork work; it is not avoided as a
@@ -469,3 +469,19 @@ delegates to the layer's own `_normalize_qk` when it has one (marked `# Fork:`),
 falling back to upstream's body otherwise, so any later change to the layer flows
 through. The fix upstream could take is the same delegation, or the same epsilon
 in both copies.
+
+## 13. LoRA/PEFT cannot target NVFP4 projections that carry a global scale
+
+#2437 (`035d6abb`) loads NVFP4 linears that have a per-tensor global scale
+(`weight_scale_2` / `weight_global_scale`) as `quantization/nvfp4.py::ScaledQuantizedLinear`,
+an `nn.Module` wrapper. Before that change they loaded as ordinary
+`nn.QuantizedLinear`. `trainer/peft/utils.py` (target discovery) and
+`trainer/peft/lora.py` (`_to_lora`, restore and fuse) accept only `nn.Linear` /
+`nn.QuantizedLinear`. On such a checkpoint, adapter discovery silently skips those
+projections, and explicitly restoring an adapter that targets one raises
+`Can't convert layer of type ScaledQuantizedLinear to LoRA`.
+
+Found by the stage A change review (codex) of the 2026-10-25 sync. Confirmed by
+reading `trainer/peft/`, which is byte-identical to upstream `e9af3766`.
+
+**Not patched here** (P600): the stack does not fine-tune NVFP4 checkpoints.
