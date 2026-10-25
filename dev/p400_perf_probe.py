@@ -398,8 +398,9 @@ def leg(job_path):
         gen_module = sys.modules["mlx_vlm.generate"]
         real_stream = gen_module.stream_generate
         probe = {}
-        from mlx_vlm.generate import dispatch
         from p369_phase2 import kvmanifest
+
+        from mlx_vlm.generate import dispatch
 
         real_step, captured = dispatch.generate_step, {}
 

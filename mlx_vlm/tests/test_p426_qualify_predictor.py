@@ -5,7 +5,6 @@ COMMITTED registry and requires it to hold the entry MTP-OFF (one of the 16 stat
 A served (non-MTP) entry has no ON arm. Pure / mocked (CPU only).
 """
 
-import argparse
 import sys
 from pathlib import Path
 

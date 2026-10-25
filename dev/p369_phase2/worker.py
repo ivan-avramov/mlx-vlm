@@ -158,8 +158,9 @@ def boot(argv):
 
 
 def served_state():
-    import mlx_vlm.server as server
     from p369_phase2 import kvmanifest  # function-level: `python -I` (smoke 12)
+
+    import mlx_vlm.server as server
     from mlx_vlm.server import session_manager
 
     rg = server.runtime.response_generator
@@ -1412,11 +1413,11 @@ def qualify_request(client, capture, rg, spec, memory):
     chunk sequence, the prefill / decode boundary (Q11), the retire shrink, the lazy-embedding path, the fused attention
     counter and every KV leaf's allocated capacity at the boundary."""
     import mlx.core as mx
-    from mlx_vlm.generate import dispatch
-    from mlx_vlm.models import cache as cache_mod
-    from mlx_vlm.generate import ar
-    from mlx_vlm.server import generation
     from p369_phase2 import kvmanifest
+
+    from mlx_vlm.generate import ar, dispatch
+    from mlx_vlm.models import cache as cache_mod
+    from mlx_vlm.server import generation
 
     base = dict(model=spec["model"], stream=False)
     count = lambda text: prompt_tokens(  # noqa: E731

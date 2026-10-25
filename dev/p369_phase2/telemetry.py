@@ -467,6 +467,7 @@ class KernelTelemetry:
                 self._patch(cls, name, self._readout(name, getattr(cls, name)))
         # v13 V3 / V15: routed banks, their fused helpers, and the drafter's own MoE path
         import mlx.nn as nn
+
         from mlx_vlm.models import fast_ops, quantized_verifier, switch_layers
 
         helpers = dict(fast_ops=fast_ops, quantized_verifier=quantized_verifier)
@@ -518,6 +519,7 @@ def tuple_kernel_eligible(linears, x):
     for the exact group and verify block: 2–4 bias-free affine QuantizedLinears of one bits / group size /
     mode, each eligible for the optimized kernel, 1 < T <= 8."""
     import mlx.nn as nn
+
     from mlx_vlm.models import quantized_verifier as qv
 
     linears = list(linears) if isinstance(linears, (list, tuple)) else [linears]
@@ -564,6 +566,7 @@ def expected_families(module, dtype):
     """
     import mlx.core as mx
     import mlx.nn as nn
+
     from mlx_vlm.models import quantized_verifier as qv
 
     if isinstance(module, nn.QuantizedLinear):

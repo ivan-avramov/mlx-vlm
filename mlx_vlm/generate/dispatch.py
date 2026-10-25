@@ -57,8 +57,8 @@ from .common import (  # Fork: the snapshot-ring helpers (_capture/_restore_*, _
     _retire_asymmetric_session,
     _rotating_rewind_safe,
     _trim_cache,
-    session_retain_prompt_end,
     resolve_sampling_defaults,
+    session_retain_prompt_end,
     wired_limit,
 )
 from .image import DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_TASK, run_image_generation_cli

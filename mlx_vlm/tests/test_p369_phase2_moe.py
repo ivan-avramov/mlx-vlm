@@ -139,15 +139,15 @@ from test_mtp_exactness import PROMPT, deployed_sampling, fake_model  # noqa: E4
 from test_mtp_stop_state import turn  # noqa: E402
 
 from mlx_vlm.generate.common import PromptCacheState  # noqa: E402
-from mlx_vlm.models.qwen3_5_moe.config import (
+from mlx_vlm.models.qwen3_5_moe.config import (  # noqa: E402
     ModelConfig as MoeModelConfig,
-)  # noqa: E402
-from mlx_vlm.models.qwen3_5_moe.config import (
+)
+from mlx_vlm.models.qwen3_5_moe.config import (  # noqa: E402
     VisionConfig as MoeVisionConfig,
-)  # noqa: E402
-from mlx_vlm.models.qwen3_5_moe.language import (
+)
+from mlx_vlm.models.qwen3_5_moe.language import (  # noqa: E402
     LanguageModel as MoeLanguageModel,
-)  # noqa: E402
+)
 
 LAYERS = 4  # full attention every 2nd: GDN, attention, GDN, attention
 PARAMS = deployed_sampling("Qwen3.8-27B-mlx-uniform-4bit")
@@ -945,7 +945,6 @@ def test_p417_a_bound_drafter_never_reports_the_targets_quantization():
     must be the drafter's own modules only (an 8-bit target embedding is not the drafter's).
     """
     import mlx.nn as nn
-
     from p369_phase2 import worker
 
     lm = served_moe_target()

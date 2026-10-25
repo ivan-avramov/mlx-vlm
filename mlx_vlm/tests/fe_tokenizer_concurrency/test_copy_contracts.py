@@ -60,9 +60,10 @@ def test_restored_tokenizers_stay_serialized_under_contention(
 
         def mutate(i, clone=clone, expected=expected):
             pad = bool(i % 2)
-            assert dict(
-                clone(BATCH, padding=pad, add_special_tokens=False)
-            ) == expected[pad]
+            assert (
+                dict(clone(BATCH, padding=pad, add_special_tokens=False))
+                == expected[pad]
+            )
 
         def read(i, clone=clone, expected_ids=expected_ids):
             assert clone.encode(LONG, add_special_tokens=False) == expected_ids

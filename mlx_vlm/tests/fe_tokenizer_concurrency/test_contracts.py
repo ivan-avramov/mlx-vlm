@@ -86,7 +86,9 @@ def test_idempotence_and_truthful_serialization_mark(api, tok):
     """New behaviour: binding is idempotent and a mark alone is insufficient."""
     assert not api.is_serialized(tok)
     tok._mlx_vlm_serialized = True
-    assert not api.is_serialized(tok), "a mark without both bindings is not serialization"
+    assert not api.is_serialized(
+        tok
+    ), "a mark without both bindings is not serialization"
     del tok._mlx_vlm_serialized
     assert api.serialize_fast_tokenizer(tok) is tok
     assert api.is_serialized(tok)

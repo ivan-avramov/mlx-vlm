@@ -68,9 +68,7 @@ def test_alternating_batch_against_public_encode_paths(
         pad: dict(tok(BATCH, padding=pad, add_special_tokens=False))
         for pad in (False, True)
     }
-    expected_truncated = dict(
-        tok(BATCH, padding=True, truncation=True, max_length=127)
-    )
+    expected_truncated = dict(tok(BATCH, padding=True, truncation=True, max_length=127))
     expected_victim = invoke(tok, victim, long=True)
     serialization(tok)
 
@@ -79,9 +77,10 @@ def test_alternating_batch_against_public_encode_paths(
         actual = dict(tok(BATCH, padding=pad, add_special_tokens=False))
         assert actual == expected_batches[pad]
         if i % 11 == 0:
-            assert dict(
-                tok(BATCH, padding=True, truncation=True, max_length=127)
-            ) == expected_truncated
+            assert (
+                dict(tok(BATCH, padding=True, truncation=True, max_length=127))
+                == expected_truncated
+            )
 
     def reader(i):
         assert invoke(tok, victim, long=True) == expected_victim
@@ -110,9 +109,9 @@ class BackendProbe:
         self.calls.add(name)
         if threading.current_thread().name == "settings-contender":
             self.contender_touched.set()
-        assert tokenizer_lock(self.tok)._is_owned(), (
-            f"{name} outside instance lock; fallback={USING_FALLBACK}"
-        )
+        assert tokenizer_lock(
+            self.tok
+        )._is_owned(), f"{name} outside instance lock; fallback={USING_FALLBACK}"
         return getattr(self.real, name)(*args, **kwargs)
 
     def encode_batch(self, *args, **kwargs):
@@ -186,13 +185,17 @@ def test_settings_and_encode_are_one_reentrant_critical_section(
             assert time.monotonic() < deadline, "holder never reached encode_batch"
         if not errors:
             assert attempted.is_set()
-            assert not probe.contender_touched.wait(0.04), "settings interleaved with encode"
+            assert not probe.contender_touched.wait(
+                0.04
+            ), "settings interleaved with encode"
     finally:
         probe.release.set()
         for worker in workers:
             worker.join(timeout=1)
         stop.set()
-    assert not any(worker.is_alive() for worker in workers), "deadlocked critical section"
+    assert not any(
+        worker.is_alive() for worker in workers
+    ), "deadlocked critical section"
     assert not errors, f"fallback={USING_FALLBACK}; thread exceptions={errors}"
     assert probe.contender_touched.is_set()
     assert probe.calls == {
