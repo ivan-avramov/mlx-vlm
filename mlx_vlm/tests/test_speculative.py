@@ -2918,7 +2918,8 @@ def test_kind_none_autodetects_mtp_for_glm4_moe_lite_mtp(tmp_path):
 
 
 def test_kind_none_autodetects_mtp_for_nemotron_h_mtp(tmp_path):
-    # Fork: fork-only — covers the fork's native nemotron_h MTP drafter (d06ed84e).
+    # Fork: kind auto-detection for nemotron_h_mtp (upstream's drafter since the
+    # 2026-10-25 sync; upstream's own suite has no equivalent of this test).
     path = _make_drafter_dir(tmp_path, "nemotron_h_mtp")
     assert resolve_drafter_kind(path, None) == "mtp"
     assert resolve_drafter_kind(path, "dflash") == "mtp"
@@ -5906,8 +5907,8 @@ def test_nemotron_mtp_mamba_rollback_matches_accepted_prefix(accepted):
     )
 
 
-# Fork: upstream #2273's two prefill-cancellation tests, ported onto this copy's
-# fixtures (upstream's `language("qwen")` / `NS` harness is not carried here).
+# Fork: upstream #2273's two prefill-cancellation tests, adapted to this copy's
+# qwen3_5 fixtures (upstream's `language("qwen")` helper is not carried here).
 def test_speculative_prefill_filter_keeps_hidden_chunks_aligned():
     drafter = SimpleNamespace(config=SimpleNamespace(target_layer_ids=[0]))
     prefill = speculative_utils.SpeculativePrefill("dflash", drafter)

@@ -168,8 +168,8 @@ FORK_DIVERGENT_UPSTREAM_TESTS: dict[str, str] = {
         f"tests/test_sampling_defaults.py::test_python_sampling_defaults[{case}-42-*]": (
             "seeded path: the fork's _PositionedTargetSampler also receives min_p "
             "(C26, the full top_p/min_p/top_k chain); upstream asserts the exact "
-            "call without it. Greedy and unseeded parametrizations, which cover "
-            "#2545's default resolution, run normally"
+            "call without it. tests/test_sampling_defaults_fork.py runs the same "
+            "seeded cases with the fork's call shape and every other assertion"
         )
         for case in (
             "sampling",

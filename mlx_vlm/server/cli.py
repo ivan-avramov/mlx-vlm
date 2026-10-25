@@ -29,8 +29,8 @@ from .request_normalization import (  # Fork: chat compaction switch (v0.7.6 syn
     CHAT_COMPACTION_ENV,
     chat_compaction_enabled,
 )
-from .runtime import runtime  # Fork (P405)
-from .runtime_config import RuntimeConfig  # Fork (P405)
+from .runtime import runtime
+from .runtime_config import RuntimeConfig
 from .session_manager import (  # Fork: session manager is fork
     _env_choice,
     _env_float,

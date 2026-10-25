@@ -162,13 +162,25 @@ class TestRounds:
             )
 
 
-class TestChunkedPrefill:
+class TestPrefill:
+    def test_mtp_prefill_is_not_chunked_for_this_drafter(self):
+        # Upstream's policy: an MTP drafter is prefilled in chunks only when it
+        # says it supports that. This one does not, so the target prefills the
+        # whole prompt and the drafter gets one hidden state per prompt token.
+        # The fork's own chunked-MTP branch was dead behind it and was removed
+        # at the 2026-10-25 sync (it would have fed only the last chunk).
+        target = _target()
+        policy = target.language_model.chunked_prefill_policy(
+            draft_model=_drafter(),
+            draft_kind="mtp",
+            prefill_kwargs={"return_hidden": True, "return_shared_kv": True},
+        )
+        assert policy is False
+
     @pytest.mark.parametrize("prefill_step_size", [2, 4])
     def test_mtp_on_a_long_prompt_matches_plain_decode(self, prefill_step_size):
-        # Upstream's drafter rejects a prefill whose hidden states do not cover
-        # every prompt token; the fork's nemotron_h target has its own
-        # chunked-prefill policy. A prompt longer than prefill_step_size must
-        # still reach the drafter whole, and speculation must stay exact.
+        from unittest.mock import Mock
+
         from mlx_vlm.generate.ar import generate_step
 
         mx.random.seed(5)
@@ -177,6 +189,8 @@ class TestChunkedPrefill:
         )
         target = NemotronHTarget(text)
         draft = NemotronHMTPDraftModel(NemotronHMTPConfig(text_config=text))
+        prefill = Mock(wraps=draft.prefill_from_target_hidden)
+        draft.prefill_from_target_hidden = prefill
         ids = mx.array([[1, 5, 9, 2, 7, 3, 8, 4, 6, 11, 13]])
         common = dict(
             max_tokens=10, temperature=0.0, prefill_step_size=prefill_step_size
@@ -197,3 +211,72 @@ class TestChunkedPrefill:
         ]
         assert actual == expected
         assert draft.draft_lens
+        prompt_ids, prompt_hidden = prefill.call_args.args[:2]
+        assert prompt_ids.tolist() == ids.tolist()
+        assert prompt_hidden.shape[1] == ids.shape[1]
+
+
+class TestBundledLoading:
+    @pytest.mark.parametrize("model_type", ["nemotron_h", "nemotron_h_nano_omni"])
+    def test_registry_resolves_the_nemotron_splitter(self, model_type):
+        from mlx_vlm.speculative.drafters.mtp_split import get_mtp_splitter
+        from mlx_vlm.speculative.drafters.nemotron_h_mtp.split import (
+            NemotronHMTPSplitter,
+        )
+
+        splitter = get_mtp_splitter(model_type)
+        assert isinstance(splitter, NemotronHMTPSplitter)
+        assert splitter.output_model_type == "nemotron_h_mtp"
+
+    def test_a_flat_nemotron_h_checkpoint_loads_and_drafts_on_the_fork_target(
+        self, tmp_path
+    ):
+        # The ported upstream tests reach this drafter only through the
+        # nemotron_h_nano_omni target (`llm_config`). Pin the flat nemotron_h
+        # path too: config.json is the text config itself, mtp.* tensors sit
+        # beside the target's, and binding uses the fork's target.
+        import json
+
+        from mlx.utils import tree_flatten
+
+        from mlx_vlm.speculative.drafters import load_drafter
+        from mlx_vlm.speculative.drafters.mtp_split import get_mtp_splitter
+        from mlx_vlm.speculative.drafters.nemotron_h_mtp.split import (
+            NemotronHMTPSplitter,
+        )
+
+        mx.random.seed(11)
+        text = _tiny_nemotron_h_text_config()
+        reference = _drafter()
+        weights = {
+            "mtp." + key: value for key, value in tree_flatten(reference.parameters())
+        }
+        weights["backbone.embeddings.weight"] = mx.zeros((VOCAB_SIZE, HIDDEN_SIZE))
+        config = {
+            key: value
+            for key, value in vars(text).items()
+            if not key.startswith("_") and value is not None
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config, default=list))
+        mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+
+        assert isinstance(get_mtp_splitter(source_config=config), NemotronHMTPSplitter)
+        draft, kind = load_drafter(str(tmp_path))
+        assert kind == "mtp" and isinstance(draft, NemotronHMTPDraftModel)
+        actual = dict(tree_flatten(draft.parameters()))
+        expected = dict(tree_flatten(reference.parameters()))
+        assert actual.keys() == expected.keys()
+        for key, value in actual.items():
+            assert mx.array_equal(value, expected[key]), key
+
+        target = _target()
+        draft.reset(target)
+        assert draft._input_embed is target.language_model.backbone.embeddings
+        hidden = mx.random.normal((1, 3, HIDDEN_SIZE))
+        draft.prefill_from_target_hidden(
+            mx.array([[1, 2, 3]]), hidden, 4, _greedy, greedy=True
+        )
+        tokens = draft.draft_block(
+            mx.array([4]), hidden[:, -1:], None, 3, _greedy, greedy=True
+        )
+        assert tokens.shape == (1, 2)

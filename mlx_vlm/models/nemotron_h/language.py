@@ -850,10 +850,6 @@ class LanguageModel(RecurrentStateRollbackMixin, nn.Module):
         if draft_kind == "mtp":
             return bool(getattr(draft_model, "supports_chunked_prefill", False))
         prefill_kwargs = prefill_kwargs or {}
-        if draft_kind == "mtp":
-            return bool(prefill_kwargs.get("return_hidden")) and bool(
-                prefill_kwargs.get("return_shared_kv")
-            )
         if draft_kind in ("dflash", "dspark"):
             return prefill_kwargs.get("capture_layer_ids") is not None
         return False

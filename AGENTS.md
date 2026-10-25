@@ -31,7 +31,7 @@ git fetch upstream && git log --oneline HEAD..upstream/main   # MUST be empty; m
 grep -cE '^mlx_vlm' .symbol-exclusions .deletion-exclusions .fork-marker-allowlist \
     .dead-helper-exclusions .body-divergence-exclusions .registry-exclusions \
     .call-argument-exclusions
-# expect 266, 674, 3, 0, 49, 43, 16 (2026-10-25, sync e9af3766) — see "Exclusion baselines" below
+# expect 265, 674, 3, 0, 49, 43, 16 (2026-10-25, sync e9af3766) — see "Exclusion baselines" below
 grep -cE '^mlx_vlm.*# baseline: pre-existing divergence, unreviewed' .symbol-exclusions
 # expect 0 — every remaining exclusion carries a real reason
 ```
@@ -49,7 +49,7 @@ and update this table in the merge commit when a number moves.
 
 | file | baseline | meaning |
 |---|---|---|
-| `.symbol-exclusions` | **266** | upstream symbols we deliberately lack; zero unreviewed |
+| `.symbol-exclusions` | **265** | upstream symbols we deliberately lack; zero unreviewed |
 | `.deletion-exclusions` | **674** | upstream deletions we deliberately kept (fork-owned copies and their helpers) |
 | `.fork-marker-allowlist` | **3** | fork-owned test copies pinned by blob (`test_generate.py`, `test_server.py`, `test_speculative.py`; C104) |
 | `.dead-helper-exclusions` | **0** | upstream-called helpers unreachable here |
@@ -824,16 +824,17 @@ positives. Every hit still needs `git log -S` and a read.
 cd mlx_vlm/ && pytest -s ./tests --ignore=tests/test_smoke.py
 ```
 
-The suite is **green: 5357 passed, 10 skipped, 149 passing subtests, 0 failed** (2026-09-13, MLX/MLX-Metal 0.32.2). Scope CPU-only test device changes to restoring fixtures; do not change the default device during collection. Keep it that
+The suite is **green on mlx 0.32.3 and has 5 known failures on 0.32.4** (2026-10-25: ~8800 collected; the five are fork-only quantized exact-verify tests listed in `memory.md`'s 2026-10-25 block). Upstream tests that fail on upstream's own tree, or assert behaviour the fork changes on purpose, are strict-xfailed through `tests/conftest.py`'s `KNOWN_UPSTREAM_FAILURES` / `FORK_DIVERGENT_UPSTREAM_TESTS`; each entry names its reason. Scope CPU-only test device changes to restoring fixtures; do not change the default device during collection. Keep it that
 way. (This
 line goes stale on every restore that adds a guard — trust the run, not the number.)
 
-**`mlx-audio>=0.4.8` is required and `requirements.txt` says so as a fork bump.**
-Upstream's nemotron_voicechat (#1817) imports `mlx_audio.codec.models.nemotron_voicechat`,
-which only exists from 0.4.8, while upstream's floor still reads `>=0.4.3`. On 0.4.7
-three test files fail *at collection*, which pytest reports as `Interrupted` — the whole
-suite does not run, and a `| tail` of that output looks nothing like a test failure. If
-the suite reports errors rather than failures, check the dependency floors first.
+**Dependency floors are upstream's now** (`mlx>=0.32.4`, `mlx-audio>=0.5.2`,
+`transformers>=5.14.0`, `datasets>=4.0.0`). The lesson from the old `mlx-audio` 0.4.8 fork
+bump still holds: a missing floor makes test files fail *at collection*, which pytest
+reports as `Interrupted` — the whole suite does not run, and a `| tail` of that output
+looks nothing like a test failure. If the suite reports errors rather than failures,
+check the dependency floors first (and a new upstream test file importing a fixture the
+fork-owned `test_server.py` lacks does the same; that happened at the 2026-10-25 sync).
 
 **Compare failing test IDs, not counts.** A change that fixes one test and breaks
 another shows the same total:
@@ -1094,12 +1095,13 @@ top of `reranking.py`. **Re-check this after every merge that adds a server modu
 
 ## CI
 
-- `tests.yml` — runs on **pull_request only**, macOS-14 / Python 3.10. Runs
-  `pre-commit run --all` and fails if `git diff` is non-empty, then pytest
-  (excluding `test_smoke.py` only — this file previously claimed it also excluded
-  `test_utils.py`; it never did, so CI would have been red on any PR while that
-  file had failures). Because it is PR-only, pushes straight to `main` are never
-  style-checked — which is how style drift went unnoticed.
+- `tests.yml` — upstream's sharded workflow (#2567, taken at the 2026-10-25 sync):
+  runs on **pushes to `main` and PRs**. A lint job runs `pre-commit` and a "Validate
+  test groups" step that fails unless every `tests/**/test_*.py` is assigned to exactly
+  one matrix group; tests run per group with `pytest -n 3` (xdist). The fork adds two
+  groups, `fork-a` / `fork-b` (marked), holding every fork-only test file. **A new fork
+  test file must be added to one of them**, or the lint job goes red. Fork addition: the
+  optional `cryptography` install, for the capsule contract tests.
 - `upstream-parity.yml` — runs on pushes to `main` as well as PRs, since this fork
   is usually committed to directly. Runs the eight gating audit scripts against
   `UPSTREAM_SYNC_REF` (the last merged upstream ref, bumped at every sync -- see "Fork &
