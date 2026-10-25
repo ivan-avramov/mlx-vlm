@@ -681,7 +681,10 @@ class TestBPEStreamingDetokenizer:
         detokenizer.reset()
 
         assert detokenizer.text == ""
-        assert detokenizer._unflushed == ""
+        # Fork: upstream #2562 replaced the `_unflushed` buffer with an
+        # incremental UTF-8 decoder; reset clears the offset and start state.
+        assert detokenizer.offset == 0
+        assert not detokenizer._started
 
     def test_byte_decoder_singleton(self):
         """Test that byte decoder is created only once (class-level)."""

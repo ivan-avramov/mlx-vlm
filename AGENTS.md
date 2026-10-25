@@ -31,7 +31,7 @@ git fetch upstream && git log --oneline HEAD..upstream/main   # MUST be empty; m
 grep -cE '^mlx_vlm' .symbol-exclusions .deletion-exclusions .fork-marker-allowlist \
     .dead-helper-exclusions .body-divergence-exclusions .registry-exclusions \
     .call-argument-exclusions
-# expect 269, 675, 3, 0, 34, 51, 16 (2026-10-24, sync 952d4f6b) — see "Exclusion baselines" below
+# expect 266, 674, 3, 0, 49, 43, 16 (2026-10-25, sync e9af3766) — see "Exclusion baselines" below
 grep -cE '^mlx_vlm.*# baseline: pre-existing divergence, unreviewed' .symbol-exclusions
 # expect 0 — every remaining exclusion carries a real reason
 ```
@@ -43,18 +43,18 @@ The pytest `cd` **must** be in a subshell as written. After any bare `cd mlx_vlm
 
 Eight gating audits, each with its own reviewed baseline. **These are the progress
 signal, not any report's count.** Counts below are entry lines (`grep -cE '^mlx_vlm'`)
-as of the 2026-10-10 sync to upstream `952d4f6b`; every entry carries a reviewed reason
+as of the 2026-10-25 sync to upstream `e9af3766`; every entry carries a reviewed reason
 and zero carry the "pre-existing divergence, unreviewed" tag. Re-count after every merge
 and update this table in the merge commit when a number moves.
 
 | file | baseline | meaning |
 |---|---|---|
-| `.symbol-exclusions` | **269** | upstream symbols we deliberately lack; zero unreviewed |
-| `.deletion-exclusions` | **675** | upstream deletions we deliberately kept (fork-owned copies and their helpers) |
+| `.symbol-exclusions` | **266** | upstream symbols we deliberately lack; zero unreviewed |
+| `.deletion-exclusions` | **674** | upstream deletions we deliberately kept (fork-owned copies and their helpers) |
 | `.fork-marker-allowlist` | **3** | fork-owned test copies pinned by blob (`test_generate.py`, `test_server.py`, `test_speculative.py`; C104) |
 | `.dead-helper-exclusions` | **0** | upstream-called helpers unreachable here |
-| `.body-divergence-exclusions` | **34** | misalignments claimed deliberate, each reviewed |
-| `.registry-exclusions` | **51** | API replacements, re-exports and retired fields, all reviewed |
+| `.body-divergence-exclusions` | **49** | misalignments claimed deliberate, each reviewed |
+| `.registry-exclusions` | **43** | API replacements, re-exports and retired fields, all reviewed |
 | `.call-argument-exclusions` | **16** | calls passing fewer args, reviewed (`[**]` / `[arity]` tagged) |
 
 An empty file is **not** a reason to delete it — each keeps its header and RESOLVED
@@ -65,7 +65,8 @@ Two non-gating lead generators, which are read rather than gated on:
 "the dropped-hunk report has bottomed out"; that count will never reach zero) and
 `find_untested_fork_code.py` (**17** with zero test mentions as of 2026-08-22 — the
 2026-08-10 coverage run confirmed the then-9; the growth since is recent fork work
-(D6 session-floor helpers, O30 seeds, the nemotron_h_mtp splitter) awaiting the next
+(D6 session-floor helpers, O30 seeds; the nemotron_h_mtp splitter it also listed was
+retired at the 2026-10-25 sync for upstream's) awaiting the next
 coverage pass, not a regression signal).
 
 **The dropped-hunk count moves when the FORK edits a file, not only when upstream
@@ -590,7 +591,7 @@ is deliberate — values diverge legitimately across this fork (every tuned cons
 while keys almost never do. A wrong value is `check_body_divergence.py --file`'s job;
 that is the shape of #1402's test-certified cache-key bug.
 
-Reviewed hits go in `.registry-exclusions` (**51** at the 2026-10-24 sync); the founding
+Reviewed hits go in `.registry-exclusions` (**43** at the 2026-10-25 sync); the founding
 entries were re-exports the fork replaced (`generation_stream` ×3 for the lazy per-thread stream,
 `_check_configured_context_budget` for the clamp-instead-of-reject budget,
 `top_p_sampling` for the `_filter` that also applies min_p and top_k). Runs in ~13s.
@@ -1000,9 +1001,11 @@ into it.
 
 ### Fine-tuning (`trainer/`)
 
-LoRA/QLoRA via `SFTTrainer` and `ORPOTrainer`; entry point `lora.py`. Adapter
-layers are native: `trainer/lora_layers.py`, `trainer/dora_layers.py`,
-`trainer/adapter_utils.py`.
+Restructured by upstream #1939 (2026-10-25 sync): `SFTTrainer` (`trainer/vlm/sft/`),
+`ORPOTrainer` (`trainer/vlm/orpo/`) and GRPO (#2504), with the CLI entry point
+`python -m mlx_vlm.train` (`mlx_vlm/train.py`; the old top-level `lora.py` is gone).
+Adapter layers are native under `trainer/peft/`: `lora_layers.py`, `dora_layers.py`,
+`adapter_utils.py`, `lora.py`. Training needs `datasets` (now in `requirements.txt`).
 
 ## mlx-lm: vendored, not depended on
 
@@ -1104,9 +1107,12 @@ top of `reranking.py`. **Re-check this after every merge that adds a server modu
 
 ## Key dependencies
 
-- `mlx` >= 0.32.0 — core framework (tests effectively need 0.32.1; see "Tests")
-- `mlx-audio` >= 0.4.8 — fork bump; upstream's floor still reads 0.4.3
-- `transformers` >= 5.5.0 — configs, tokenizers, processors
+- `mlx` >= 0.32.4 — core framework (upstream's floor since the 2026-10-25 sync).
+  Five fork-only quantized exact-verify tests fail on 0.32.4 and pass on 0.32.3;
+  see `memory.md`'s 2026-10-25 row before moving the stack off 0.32.3
+- `mlx-audio` >= 0.5.2 — same floor as upstream (the old 0.4.8 fork bump is moot)
+- `transformers` >= 5.14.0 — configs, tokenizers, processors; keep
+  `huggingface-hub` < 2.0 when installing extras into an existing env (5.14 rejects 2.x)
 - `huggingface-hub` — model downloads
 - `Pillow`, `opencv-python`, `miniaudio` — image/video/audio
 - `fastapi`, `uvicorn` — server

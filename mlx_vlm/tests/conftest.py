@@ -158,7 +158,41 @@ KNOWN_UPSTREAM_FAILURES: dict[str, str] = {
 }
 
 
-def pytest_collection_modifyitems(config, items):  # Fork: see KNOWN_UPSTREAM_FAILURES
+# Fork: upstream tests (kept verbatim) that assert behaviour this fork changes on
+# purpose. Node-id pattern (only `*` is a wildcard; brackets are literal) ->
+# reason naming the divergence. Strict xfail, so a
+# pattern that stops failing (the divergence was retired, or the pattern is too
+# broad) turns red and must be narrowed or removed.
+FORK_DIVERGENT_UPSTREAM_TESTS: dict[str, str] = {
+    **{
+        f"tests/test_sampling_defaults.py::test_python_sampling_defaults[{case}-42-*]": (
+            "seeded path: the fork's _PositionedTargetSampler also receives min_p "
+            "(C26, the full top_p/min_p/top_k chain); upstream asserts the exact "
+            "call without it. Greedy and unseeded parametrizations, which cover "
+            "#2545's default resolution, run normally"
+        )
+        for case in (
+            "sampling",
+            "gemma",
+            "null-overrides",
+            "partial-override",
+            "override-do-not-sample",
+        )
+    },
+}
+
+
+def _node_pattern(pattern: str) -> "re.Pattern[str]":
+    import re
+
+    return re.compile(".*".join(re.escape(part) for part in pattern.split("*")) + "$")
+
+
+def pytest_collection_modifyitems(config, items):  # Fork: see the two maps above
+    divergent = [
+        (_node_pattern(pattern), why)
+        for pattern, why in FORK_DIVERGENT_UPSTREAM_TESTS.items()
+    ]
     root = pathlib.Path(__file__).resolve().parent.parent
     for item in items:
         nodeid = item.nodeid
@@ -168,6 +202,10 @@ def pytest_collection_modifyitems(config, items):  # Fork: see KNOWN_UPSTREAM_FA
         except (ValueError, AttributeError):
             pass
         reason = KNOWN_UPSTREAM_FAILURES.get(nodeid)
+        if reason is None:
+            reason = next(
+                (why for pattern, why in divergent if pattern.match(nodeid)), None
+            )
         if reason is not None:
             item.add_marker(pytest.mark.xfail(reason=reason, strict=True))
 

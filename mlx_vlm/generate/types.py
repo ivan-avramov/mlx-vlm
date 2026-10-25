@@ -19,16 +19,16 @@ class ProcessorLike(Protocol):
 
 class GenerateKwargs(TypedDict, total=False):
     max_tokens: int
-    temperature: float
+    temperature: float | None
     repetition_penalty: float | None
     repetition_context_size: int | None
     presence_penalty: float | None
     presence_context_size: int | None
     frequency_penalty: float | None
     frequency_context_size: int | None
-    top_p: float
+    top_p: float | None
     min_p: float
-    top_k: int
+    top_k: int | None
     # Fork: declared here because GenerationArguments.to_generate_kwargs() emits
     # all three; upstream's GenerateKwargs omits them, so they were invisible to
     # type checkers while silently landing in generate_step's **kwargs.

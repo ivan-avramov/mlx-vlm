@@ -455,6 +455,7 @@ MODEL_CONFIG = {
     "glm5_next": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm_ocr": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "dots_ocr": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "oxr": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "ernie4_5_moe_vl": MessageFormat.LIST_WITH_IMAGE_URL_FIRST,
     "internvl_chat": MessageFormat.LIST_WITH_IMAGE_TYPE,
     "internvl": MessageFormat.LIST_WITH_IMAGE_TYPE,
@@ -485,6 +486,8 @@ MODEL_CONFIG = {
     "step3p7": MessageFormat.IMAGE_PATCH_TOKEN,
     "minimax_m3_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "muse_glimmer": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "muse_spark": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "muse_spark_open": MessageFormat.LIST_WITH_IMAGE_FIRST,
     # Token-based models
     "llava-qwen2": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "llava_qwen2": MessageFormat.IMAGE_TOKEN_NEWLINE,  # fastvlm
@@ -743,6 +746,8 @@ class MessageFormatter:
             "minicpmv4_6",
             "minicpmv4_7",
             "minimax_m3_vl",
+            "muse_spark",
+            "muse_spark_open",
             "llava_onevision",
             "glm5_next",
             "nemotron_h_omni",
@@ -1393,7 +1398,7 @@ def apply_chat_template(
         if isinstance(prompt, str):
             messages = [{"role": "user", "content": prompt}]
         elif isinstance(prompt, dict):
-            msg = dict(prompt)
+            msg = _normalize_tool_message(prompt)
             msg["content"] = extract_text_from_content(msg.get("content", ""))
             messages = [msg]
         elif isinstance(prompt, list):
@@ -1403,7 +1408,11 @@ def apply_chat_template(
                     messages.append({"role": "user", "content": item})
                 elif (role_content := _get_role_content(item)) is not None:
                     role, content = role_content
-                    msg = dict(item) if isinstance(item, dict) else {"role": role}
+                    msg = (
+                        _normalize_tool_message(item)
+                        if isinstance(item, dict)
+                        else {"role": role}
+                    )
                     if role != "tool":
                         msg["content"] = extract_text_from_content(content)
                     messages.append(msg)

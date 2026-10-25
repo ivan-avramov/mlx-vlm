@@ -679,6 +679,7 @@ class OpenAIResponse(BaseModel):
     usage: OpenAIUsage = Field(
         ..., description="Token usage details"
     )  # we need the model to return stats
+    timings: Optional[GenerationTimings] = None
     user: Optional[str] = Field(
         None, description="A unique identifier representing your end-user"
     )
@@ -767,6 +768,7 @@ class ResponseOutputItemDoneEvent(BaseStreamEvent):
 class ResponseCompletedEvent(BaseStreamEvent):
     type: Literal["response.completed"]
     response: OpenAIResponse
+    timings: Optional[GenerationTimings] = None
 
 
 StreamEvent = Union[

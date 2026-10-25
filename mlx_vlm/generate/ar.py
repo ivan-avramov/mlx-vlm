@@ -55,9 +55,6 @@ from .common import (  # Fork: the 5e9b9503 engine port's own helpers
     DEFAULT_PREFILL_STEP_SIZE,
     DEFAULT_QUANTIZED_KV_START,
     DEFAULT_REPETITION_CONTEXT_SIZE,
-    DEFAULT_TEMPERATURE,
-    DEFAULT_TOP_K,
-    DEFAULT_TOP_P,
     _adjust_chunk_for_snapshot_landing,
     _capture_anchor_state,
     _chunked_prefill_enabled,
@@ -68,6 +65,7 @@ from .common import (  # Fork: the 5e9b9503 engine port's own helpers
     _should_capture_anchor_pre_prefill,
     maybe_preallocate_kv_cache,
     maybe_quantize_kv_cache,
+    resolve_sampling_defaults,
     wired_limit,
 )
 from .types import GenerateKwargs, ProcessorLike, Unpack
@@ -261,16 +259,16 @@ def generate_step(
     mask,
     *,
     max_tokens: int = DEFAULT_MAX_TOKENS,
-    temperature: float = DEFAULT_TEMPERATURE,
+    temperature: Optional[float] = None,
     repetition_penalty: Optional[float] = None,
     repetition_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE,
     presence_penalty: Optional[float] = None,
     presence_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE,
     frequency_penalty: Optional[float] = None,
     frequency_context_size: Optional[int] = DEFAULT_REPETITION_CONTEXT_SIZE,
-    top_p: float = DEFAULT_TOP_P,
+    top_p: Optional[float] = None,
     min_p: float = DEFAULT_MIN_P,
-    top_k: int = DEFAULT_TOP_K,
+    top_k: Optional[int] = None,
     top_n_sigma: float = DEFAULT_TOP_N_SIGMA,
     p_less: bool = False,
     typical_p: float = 1.0,
@@ -316,7 +314,10 @@ def generate_step(
         pixel_values: The pixel values for vision models (optional).
         mask: The attention mask (optional).
         max_tokens (int): Maximum number of tokens to generate.
-        temperature (float): The temperature for sampling, if 0 the argmax is used.
+        temperature (float, optional): The temperature for sampling; 0 uses argmax.
+          Unset sampling options use the checkpoint's generation_config.json,
+          falling back to temperature=0.0, top_p=1.0, top_k=0. A checkpoint with
+          do_sample=False defaults to greedy unless temperature is explicit.
         repetition_penalty (float, optional): The penalty factor for repeating
           tokens.
         repetition_context_size (int, optional): The number of tokens to
@@ -395,6 +396,12 @@ def generate_step(
         kv_prealloc_tokens=kv_prealloc_tokens,
     )
 
+    temperature, top_p, top_k = resolve_sampling_defaults(
+        getattr(model, "config", None),
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+    )
     temperature = clamp_temperature(temperature)
     sampler_is_greedy = sampler is None and temperature == 0
     if sampler is None:
@@ -443,7 +450,9 @@ def generate_step(
         processors.extend(logits_processors)
 
     y = input_ids
-    tokens = mx.array([], dtype=input_ids.dtype)
+    # Processor history follows text IDs, independently of embedding chunks.
+    # Visual prefixes can add embedding positions without corresponding IDs.
+    tokens = input_ids.flatten()
     target_sample_position = 0
 
     thinking_budget_criteria = kwargs.pop("thinking_budget_criteria", None)
@@ -501,7 +510,7 @@ def generate_step(
             lm._rope_deltas = None
 
     def _step(y, inputs_embeds=None):
-        nonlocal tokens, kwargs, last_outputs, target_sample_position
+        nonlocal kwargs, last_outputs, target_sample_position
 
         step_kwargs = {
             **kwargs,
@@ -526,11 +535,8 @@ def generate_step(
             last_outputs = outputs
             logits = outputs.logits[:, -1, :]
 
-            if len(processors) > 0 and len(y) > 0:
-                tokens = mx.concat([tokens, y.flatten()])
-
-                for processor in processors:
-                    logits = processor(tokens, logits)
+            for processor in processors:
+                logits = processor(tokens, logits)
 
             quantize_cache_fn(prompt_cache)
             preallocate_cache_fn(prompt_cache)
@@ -865,6 +871,9 @@ def generate_step(
     n = 0
     while True:
         if n != max_tokens:
+            if processors:
+                with mx.stream(_get_generation_stream()):  # Fork: per-thread stream
+                    tokens = mx.concat([tokens, y.flatten()])
             next_y, next_logprobs = _step(y[None])
             mx.async_eval(next_y, next_logprobs)
         if n == 0:

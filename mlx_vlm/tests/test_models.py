@@ -9,11 +9,17 @@ import itertools  # Fork: seed-corpus product in the MoE precision test
 import json
 import logging
 import math
+import os
+import signal
+import socket
 import struct
+import subprocess
+import sys
 import textwrap
 import unittest
 from contextlib import ExitStack, contextmanager
 from dataclasses import asdict
+from fnmatch import fnmatchcase
 from operator import attrgetter
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,8 +33,8 @@ import pytest
 from mlx.utils import tree_flatten, tree_map
 
 from mlx_vlm import embedding_loader
-from mlx_vlm.models.base import InputEmbeddingsFeatures
-from mlx_vlm.models.cache import make_prompt_cache
+from mlx_vlm.models.base import InputEmbeddingsFeatures, create_attention_mask
+from mlx_vlm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
 from mlx_vlm.models.lfm2_encoder import Model as Lfm2Encoder
 from mlx_vlm.utils import (
     _drop_modules_without_weights,
@@ -39,6 +45,784 @@ from mlx_vlm.utils import (
     load_config,
     load_model,
 )
+
+
+class TestMiniMaxM31Flash(unittest.TestCase):
+    def test_router_dtype_sanitization_is_idempotent(self):
+        from mlx_vlm.models.minimax_m3_vl import Model, ModelConfig
+
+        config = ModelConfig.from_dict(
+            {
+                "text_config": {
+                    "hidden_size": 64,
+                    "intermediate_size": 64,
+                    "shared_intermediate_size": 64,
+                    "num_hidden_layers": 1,
+                    "num_attention_heads": 2,
+                    "num_key_value_heads": 1,
+                    "head_dim": 32,
+                    "vocab_size": 128,
+                    "num_local_experts": 2,
+                    "num_experts_per_tok": 1,
+                    "moe_layer_freq": [1],
+                    "nvfp4_experts": True,
+                },
+                "vision_config": {
+                    "hidden_size": 32,
+                    "intermediate_size": 64,
+                    "num_attention_heads": 4,
+                    "num_hidden_layers": 0,
+                    "image_size": 8,
+                    "patch_size": 2,
+                },
+                "projector_hidden_size": 64,
+            }
+        )
+        model = Model(config)
+        prefix = "language_model.model.layers.0.block_sparse_moe"
+        gate_key = f"{prefix}.gate.weight"
+        bias_key = f"{prefix}.e_score_correction_bias"
+        scale_key = f"{prefix}.switch_mlp.gate_proj.weight_global_scale"
+        for dtype in (mx.bfloat16, mx.float16, mx.float32):
+            with self.subTest(dtype=dtype):
+                gate = mx.arange(128).reshape(2, 64) / 129.0
+                bias = mx.array([0.137, -0.271])
+                source = {
+                    "language_model.model.embed_tokens.weight": mx.zeros(
+                        (128, 64), dtype
+                    ),
+                    gate_key: gate,
+                    bias_key: bias,
+                    scale_key: mx.array([17.3, 15123.7]),
+                }
+                first = model.sanitize(dict(source))
+                second = model.sanitize(dict(first))
+                for key in source:
+                    expected = (
+                        source[key].astype(dtype)
+                        if key in (gate_key, bias_key)
+                        else source[key]
+                    )
+                    self.assertEqual(first[key].dtype, expected.dtype)
+                    np.testing.assert_array_equal(
+                        np.array(first[key].astype(mx.float32)),
+                        np.array(expected.astype(mx.float32)),
+                    )
+                    np.testing.assert_array_equal(
+                        np.array(second[key].astype(mx.float32)),
+                        np.array(first[key].astype(mx.float32)),
+                    )
+                self.assertTrue(model.cast_predicate(gate_key))
+                self.assertTrue(model.cast_predicate(bias_key))
+                self.assertFalse(model.cast_predicate(scale_key))
+
+                # A previously quantized router must retain its packed bits.
+                source[gate_key] = mx.full((2, 16), 0x12345678, dtype=mx.uint32)
+                sanitized = model.sanitize(dict(source))
+                self.assertEqual(sanitized[gate_key].dtype, mx.uint32)
+                np.testing.assert_array_equal(
+                    np.array(sanitized[gate_key]), np.array(source[gate_key])
+                )
+
+    def test_nvfp4_global_scales_match_explicit_dequantization(self):
+        from mlx_vlm.models.switch_layers import QuantizedSwitchLinear
+        from mlx_vlm.quantization.nvfp4 import ScaledQuantizedSwitchLinear
+
+        mx.random.seed(31)
+
+        layer = ScaledQuantizedSwitchLinear(
+            QuantizedSwitchLinear(
+                64, 32, 3, bias=False, group_size=16, bits=4, mode="nvfp4"
+            ),
+            mx.array([0.5, 17.3, 15123.7]),
+            "weight_global_scale",
+        )
+        layer.weight, layer.scales = mx.quantize(
+            mx.random.normal((3, 32, 64)) * 1000,
+            group_size=16,
+            bits=4,
+            mode="nvfp4",
+        )
+        # Decode the source E2M1 nibbles and E4M3 bytes independently of MLX.
+        packed = np.array(layer.weight).view(np.uint8)
+        codes = np.stack((packed & 15, packed >> 4), axis=-1).reshape(3, 32, 64)
+        fp4 = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6], dtype=np.float32)
+        values = fp4[codes & 7] * np.where(codes & 8, -1.0, 1.0)
+        scales = np.array(layer.scales)
+        exponent = (scales >> 3) & 15
+        mantissa = scales & 7
+        decoded_scales = np.where(
+            exponent == 0,
+            mantissa / 512.0,
+            (1 + mantissa / 8.0) * np.exp2(exponent.astype(np.int32) - 7),
+        ) * np.where(scales & 128, -1.0, 1.0)
+        weights = values * np.repeat(decoded_scales, 16, axis=-1)
+        weights /= np.array(layer.weight_global_scale)[:, None, None]
+
+        for sorted_indices in (False, True):
+            indices = mx.array([0, 1, 2] if sorted_indices else [2, 0, 1])
+            for dtype in (mx.float32, mx.float16, mx.bfloat16):
+                with self.subTest(sorted_indices=sorted_indices, dtype=dtype):
+                    x = mx.random.normal((3, 1, 64)).astype(dtype)
+                    actual = layer(x, indices, sorted_indices=sorted_indices)
+                    expected = np.array(x.astype(mx.float32)) @ weights[
+                        np.array(indices)
+                    ].transpose(0, 2, 1)
+                    np.testing.assert_allclose(
+                        np.array(actual.astype(mx.float32)),
+                        expected,
+                        rtol=0.02 if dtype == mx.bfloat16 else 0.002,
+                        atol=2.0 if dtype != mx.float32 else 0.02,
+                    )
+                    self.assertEqual(actual.dtype, dtype)
+
+    def test_mixed_checkpoint_load_forward_cache_and_roundtrip(self):
+        import copy
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from mlx_vlm.models.minimax_m3_vl import Model, ModelConfig
+        from mlx_vlm.quantization.nvfp4 import ScaledQuantizedSwitchLinear
+        from mlx_vlm.utils import load_model, save_weights
+
+        config = {
+            "model_type": "minimax_m3_vl",
+            "text_config": {
+                "hidden_size": 64,
+                "intermediate_size": 64,
+                "dense_intermediate_size": 128,
+                "shared_intermediate_size": 64,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "head_dim": 32,
+                "rotary_dim": 16,
+                "rope_theta": 10000000,
+                "vocab_size": 128,
+                "num_local_experts": 2,
+                "num_experts_per_tok": 1,
+                "moe_layer_freq": [0, 1],
+                "pack_shared_expert": False,
+                "sparse_attention_config": {
+                    "use_sparse_attention": True,
+                    "sparse_attention_freq": [1, 1],
+                    "sparse_index_dim": 32,
+                    "sparse_num_index_heads": 1,
+                    "sparse_block_size": 4,
+                    "sparse_topk_blocks": 2,
+                },
+            },
+            "vision_config": {
+                "hidden_size": 32,
+                "intermediate_size": 64,
+                "num_attention_heads": 4,
+                "num_hidden_layers": 0,
+                "image_size": 8,
+                "patch_size": 2,
+            },
+            "projector_hidden_size": 64,
+            "vocab_size": 128,
+        }
+        mx.random.seed(31)
+        reference = Model(ModelConfig.from_dict(copy.deepcopy(config)))
+        source = {}
+        reference_weights = {}
+        for key, value in tree_flatten(reference.parameters()):
+            if ".switch_mlp." in key:
+                prefix, projection = key.split(".switch_mlp.")
+                source_name = {
+                    "gate_proj.weight": "w1",
+                    "down_proj.weight": "w2",
+                    "up_proj.weight": "w3",
+                }[projection]
+                dequantized = []
+                for expert in range(2):
+                    global_scale = mx.array(0.7 if expert == 0 else 15123.7)
+                    packed, scales = mx.quantize(
+                        value[expert] * global_scale,
+                        group_size=16,
+                        bits=4,
+                        mode="nvfp4",
+                    )
+                    target = f"{prefix}.experts.{expert}.{source_name}"
+                    source[f"{target}.weight_packed"] = packed.view(mx.uint8)
+                    source[f"{target}.weight_scale"] = scales
+                    source[f"{target}.weight_global_scale"] = global_scale
+                    source[f"{target}.input_global_scale"] = mx.array(1.0)
+                    dequantized.append(
+                        mx.dequantize(
+                            packed, scales, group_size=16, bits=4, mode="nvfp4"
+                        )
+                        / global_scale
+                    )
+                reference_weights[key] = mx.stack(dequantized)
+            elif key.startswith("language_model.") and key.endswith("_proj.weight"):
+                packed, scales = mx.quantize(value, 32, 8, mode="mxfp8")
+                source[key] = packed.view(mx.uint8)
+                source[key.replace(".weight", ".weight_scale_inv")] = scales
+                reference_weights[key] = mx.dequantize(
+                    packed, scales, group_size=32, bits=8, mode="mxfp8"
+                )
+            else:
+                source[key] = value
+                reference_weights[key] = value
+        reference.load_weights(list(reference_weights.items()))
+        reference.eval()
+        config["quantization_config"] = {
+            "quant_method": "mxfp8",
+            "weight_block_size": [1, 32],
+            "group_size": 16,
+            "moe_quant_algo": "NVFP4",
+            "moe_quant_format": "nvfp4-pack-quantized",
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / "config.json").write_text(json.dumps(config))
+            mx.save_safetensors(str(path / "model.safetensors"), source)
+            model = load_model(path)
+            moe = model.layers[1].block_sparse_moe
+            self.assertIsInstance(moe.switch_mlp.gate_proj, ScaledQuantizedSwitchLinear)
+            self.assertIsInstance(moe.shared_experts.gate_proj, nn.QuantizedLinear)
+            self.assertEqual(moe.shared_experts.gate_proj.mode, "mxfp8")
+            self.assertFalse(moe.pack_shared_expert)
+            self.assertTrue(
+                all(layer.self_attn.has_sparse_index for layer in model.layers)
+            )
+            self.assertFalse(
+                model.cast_predicate(
+                    "language_model.model.layers.1.block_sparse_moe.switch_mlp.gate_proj.weight_global_scale"
+                )
+            )
+
+            tokens = mx.array([[1, 2, 3, 4, 5]])
+            expected = reference(tokens).logits
+            actual = model(tokens).logits
+            np.testing.assert_allclose(np.array(actual), np.array(expected), atol=2e-4)
+            cache = model.make_cache()
+            model(tokens[:, :-1], cache=cache)
+            decoded = model(tokens[:, -1:], cache=cache).logits
+            np.testing.assert_allclose(
+                np.array(decoded), np.array(actual[:, -1:]), atol=2e-4
+            )
+
+            converted = path / "converted"
+            save_weights(converted, model)
+            (converted / "config.json").write_text(json.dumps(config))
+            reloaded = load_model(converted)
+            np.testing.assert_allclose(
+                np.array(reloaded(tokens).logits), np.array(actual), atol=2e-4
+            )
+
+
+class TestMiniMaxSparseAccuracy(unittest.TestCase):
+    @staticmethod
+    def round_bf16(value):
+        bits = np.asarray(value, dtype=np.float32).view(np.uint32)
+        rounded = bits + np.uint32(0x7FFF) + ((bits >> 16) & 1)
+        return (rounded & np.uint32(0xFFFF0000)).view(np.float32)
+
+    def test_swiglu_preserves_bf16_operation_boundaries(self):
+        from mlx_vlm.models.minimax_m3_vl.language import _swiglu_oai
+
+        rng = np.random.default_rng(876)
+        gate = self.round_bf16(rng.normal(size=(4, 257)) * 4)
+        up = self.round_bf16(rng.normal(size=gate.shape) * 4)
+        clipped_gate = np.minimum(gate, 7)
+        clipped_up = np.clip(up, -7, 7)
+        scaled = self.round_bf16(clipped_gate * np.float32(1.702))
+        sigmoid = self.round_bf16(1 / (1 + np.exp(-scaled.astype(np.float64))))
+        glu = self.round_bf16(clipped_gate * sigmoid)
+        linear = self.round_bf16(clipped_up + np.float32(1))
+        expected = self.round_bf16(linear * glu)
+        actual = _swiglu_oai(
+            mx.array(up).astype(mx.bfloat16), mx.array(gate).astype(mx.bfloat16)
+        )
+        self.assertEqual(actual.dtype, mx.bfloat16)
+        np.testing.assert_array_equal(np.array(actual.astype(mx.float32)), expected)
+
+    def test_expert_sum_is_independent_of_topk_output_order(self):
+        from mlx_vlm.models.minimax_m3_vl.config import TextConfig
+        from mlx_vlm.models.minimax_m3_vl.language import MiniMaxSparseMoeBlock
+
+        layer = MiniMaxSparseMoeBlock(
+            TextConfig(
+                hidden_size=32,
+                intermediate_size=32,
+                num_local_experts=4,
+                num_experts_per_tok=4,
+                n_shared_experts=0,
+                pack_shared_expert=False,
+                routed_scaling_factor=1.0,
+            )
+        )
+        # Equal probabilities, different selection orders. The BF16 reference
+        # sums 256, 1, -256, 1 in expert-ID order, producing 1 rather than 2.
+        layer.gate = lambda x: mx.zeros((*x.shape[:-1], 4))
+        values = mx.broadcast_to(
+            mx.array([1024, 4, -1024, 4], mx.bfloat16)[:, None], (4, 32)
+        )
+        layer.switch_mlp = lambda x, indices: values[indices]
+        x = mx.zeros((1, 1, 32), mx.bfloat16)
+        for bias in ([1, 2, 4, 3], [4, 3, 2, 1], [2, 4, 1, 3]):
+            with self.subTest(bias=bias):
+                layer.e_score_correction_bias = mx.array(bias, mx.float32)
+                np.testing.assert_array_equal(
+                    np.array(layer(x).astype(mx.float32)), np.ones((1, 1, 32))
+                )
+
+    @staticmethod
+    def attention():
+        from mlx_vlm.models.minimax_m3_vl.config import TextConfig
+        from mlx_vlm.models.minimax_m3_vl.language import MiniMaxAttention
+
+        return MiniMaxAttention(
+            TextConfig(
+                hidden_size=64,
+                num_attention_heads=8,
+                num_key_value_heads=4,
+                head_dim=32,
+                rotary_dim=16,
+                num_hidden_layers=1,
+                sparse_attention_config={
+                    "use_sparse_attention": True,
+                    "sparse_attention_freq": [1],
+                    "sparse_index_dim": 32,
+                    "sparse_num_index_heads": 4,
+                    "sparse_block_size": 4,
+                    "sparse_topk_blocks": 2,
+                    "sparse_local_block": 1,
+                },
+            ),
+            0,
+        )
+
+    @staticmethod
+    def attention_reference(q, k, v, mask):
+        # Independent FP64 attention over explicitly expanded KV heads.
+        q, k, v = (
+            np.asarray(a.astype(mx.float32), dtype=np.float64) for a in (q, k, v)
+        )
+        k = np.repeat(k, q.shape[1] // k.shape[1], axis=1)
+        v = np.repeat(v, q.shape[1] // v.shape[1], axis=1)
+        scores = (q @ k.swapaxes(-1, -2)) / np.sqrt(q.shape[-1])
+        scores = (
+            np.where(mask, scores, -np.inf) if mask.dtype == bool else scores + mask
+        )
+        peak = np.max(scores, axis=-1, keepdims=True)
+        scores = np.exp(scores - np.where(np.isfinite(peak), peak, 0))
+        return (scores / np.maximum(scores.sum(-1, keepdims=True), 1e-30)) @ v
+
+    def test_independent_index_heads_and_padding(self):
+        attention = self.attention()
+        rng = np.random.default_rng(31)
+        for batch in (1, 4):
+            queries = rng.normal(size=(batch, 4, 3, 4)).astype(np.float32)
+            keys = rng.normal(size=(batch, 1, 23, 4)).astype(np.float32)
+            positions = np.broadcast_to([0, 17, 22], (batch, 3)).copy()
+            for score_type, masked, initial in (
+                ("max", False, 0),
+                ("max", False, 1),
+                ("max", True, 0),
+                ("lse", True, 0),
+            ):
+                with self.subTest(
+                    batch=batch, score_type=score_type, masked=masked, initial=initial
+                ):
+                    attention.indexer.score_type = score_type
+                    attention.indexer.init_blocks = initial
+                    valid = np.ones((batch, 1, 3, 23), dtype=bool)
+                    if masked:
+                        valid[..., 4:8] = False  # Exclude an entire earlier block.
+                        valid[..., 21:] = False  # Partially padded final block.
+                    scores = (queries @ keys.swapaxes(-1, -2)) * attention.scale
+                    causal = (
+                        np.arange(23)[None, None, None, :]
+                        <= positions[:, None, :, None]
+                    )
+                    scores = np.where(causal & valid, scores, -np.inf)
+                    scores = np.pad(
+                        scores,
+                        ((0, 0), (0, 0), (0, 0), (0, 1)),
+                        constant_values=-np.inf,
+                    )
+                    blocks = scores.reshape(batch, 4, 3, 6, 4)
+                    pooled = (
+                        blocks.max(-1)
+                        if score_type == "max"
+                        else np.logaddexp.reduce(blocks, axis=-1)
+                    )
+                    allowed = np.isfinite(pooled)
+                    if initial:
+                        pooled[..., :initial] = np.where(
+                            allowed[..., :initial], 1e30, -np.inf
+                        )
+                    for b in range(batch):
+                        for t in range(3):
+                            local = positions[b, t] // 4
+                            pooled[b, :, t, local] = np.where(
+                                allowed[b, :, t, local], 1e29, -np.inf
+                            )
+                    selected = np.argsort(-pooled, axis=-1)[..., :2]
+                    selected = np.where(
+                        np.take_along_axis(allowed, selected, -1), selected, 6
+                    )
+                    selected = np.sort(selected, axis=-1)
+                    selected[selected == 6] = -1
+                    actual = attention.indexer.select_blocks(
+                        mx.array(queries),
+                        mx.array(keys),
+                        0,
+                        mx.array(valid) if masked else None,
+                        mx.array(positions),
+                    )
+                    np.testing.assert_array_equal(np.array(actual), selected)
+                    if not initial:
+                        self.assertFalse(np.array_equal(selected[:, 0], selected[:, 1]))
+                    expected_mask = np.any(
+                        selected[..., None] == np.arange(23) // 4, axis=-2
+                    )
+                    expected_mask = np.repeat(expected_mask & causal & valid, 2, axis=1)
+                    actual_mask = attention.indexer.build_block_mask(
+                        actual,
+                        mx.array(valid) if masked else None,
+                        23,
+                        mx.float32,
+                        mx.array(positions),
+                    )
+                    np.testing.assert_array_equal(np.array(actual_mask), expected_mask)
+                    unsorted = attention.indexer.select_blocks(
+                        mx.array(queries),
+                        mx.array(keys),
+                        0,
+                        mx.array(valid) if masked else None,
+                        mx.array(positions),
+                        sort_blocks=False,
+                    )
+                    unsorted_mask = attention.indexer.build_block_mask(
+                        unsorted,
+                        mx.array(valid) if masked else None,
+                        23,
+                        mx.float32,
+                        mx.array(positions),
+                    )
+                    np.testing.assert_array_equal(
+                        np.array(unsorted_mask), expected_mask
+                    )
+                    legacy = attention._build_sparse_mask(
+                        mx.array(queries),
+                        mx.array(keys),
+                        0,
+                        mx.array(valid) if masked else None,
+                        q_positions=mx.array(positions),
+                    )
+                    np.testing.assert_array_equal(np.array(legacy), expected_mask)
+
+    def test_sparse_block_mask_invalid_duplicate_and_partial_blocks(self):
+        attention = self.attention()
+        indices = np.array(
+            [
+                [
+                    [[5, 1, 1, -1], [-1, -1, 6, 99], [0, 5, -2, 2]],
+                    [[0, 2, 4, 4], [1, -1, 3, 5], [-1, -1, -1, -1]],
+                ]
+            ],
+            dtype=np.int32,
+        )
+        positions = np.array([[10, 17, 22]])
+        expected = np.any(indices[..., None] == np.arange(23) // 4, axis=-2)
+        expected &= np.arange(23)[None, None, None, :] <= positions[:, None, :, None]
+        expected = np.repeat(expected, 4, axis=1)
+        allowed = np.ones((1, 8, 3, 23), dtype=bool)
+        allowed[:, ::2, :, 4:9] = False
+        for kind in ("none", "bool", "additive"):
+            with self.subTest(mask=kind):
+                mask = None
+                ref = expected
+                if kind == "bool":
+                    mask = mx.array(allowed)
+                    ref = expected & allowed
+                elif kind == "additive":
+                    bias = np.where(allowed, -0.25, -np.inf).astype(np.float32)
+                    mask = mx.array(bias)
+                    ref = np.where(expected, 0.0, -np.inf) + bias
+                actual = attention.indexer.build_block_mask(
+                    mx.array(indices), mask, 23, mx.float32, mx.array(positions)
+                )
+                np.testing.assert_array_equal(np.array(actual), ref)
+
+    def test_sparse_attention_full_prefill_matches_cached_chunks(self):
+        from mlx_vlm.models.minimax_m3_vl.language import MiniMaxM3KVCache
+
+        mx.random.seed(31)
+        attention = self.attention()
+        for batch in (1, 4):
+            for length in (23, 513):
+                with self.subTest(batch=batch, length=length):
+                    x = mx.random.normal((batch, length, 64))
+                    expected = attention(x, mask="causal")
+                    cache = MiniMaxM3KVCache()
+                    chunks = []
+                    # The long case crosses the dense/sparse decode boundary.
+                    stops = (
+                        (0, 7, 14, 22, 23) if length == 23 else (0, 500, 511, 512, 513)
+                    )
+                    for start, stop in zip(stops, stops[1:]):
+                        chunk = attention(x[:, start:stop], mask="causal", cache=cache)
+                        mx.eval(chunk)
+                        chunks.append(chunk)
+                    np.testing.assert_allclose(
+                        np.array(mx.concatenate(chunks, axis=1)),
+                        np.array(expected),
+                        rtol=2e-5,
+                        atol=2e-6,
+                    )
+
+    @unittest.skipUnless(mx.metal.is_available(), "Requires Metal sparse attention")
+    def test_sparse_metal_kernel_per_group(self):
+        from mlx_vlm.models.minimax_m3_vl.language import (
+            _minimax_m3_sparse_prefill_attention,
+        )
+
+        mx.random.seed(31)
+        for batch, heads in ((1, 1), (1, 4), (4, 2), (4, 4)):
+            for dtype in (mx.float16, mx.bfloat16):
+                with self.subTest(batch=batch, index_heads=heads, dtype=dtype):
+                    q = mx.random.normal((batch, 8, 3, 32)).astype(dtype)
+                    k = mx.random.normal((batch, 4, 137, 32)).astype(dtype)
+                    v = mx.random.normal(k.shape).astype(dtype)
+                    indices = np.empty((batch, heads, 3, 2), dtype=np.int32)
+                    for b in range(batch):
+                        for h in range(heads):
+                            indices[b, h, :, 0] = 1 + (b + h) % 4
+                            indices[b, h, :, 1] = 34
+                    indices[..., 0, 1] = -1
+                    positions = np.broadcast_to([20, 130, 136], (batch, 3)).copy()
+                    mask = np.any(indices[..., None] == np.arange(137) // 4, axis=-2)
+                    mask &= (
+                        np.arange(137)[None, None, None, :]
+                        <= positions[:, None, :, None]
+                    )
+                    mask = np.repeat(mask, 8 // heads, axis=1)
+                    actual = _minimax_m3_sparse_prefill_attention(
+                        q,
+                        k,
+                        v,
+                        mx.array(indices),
+                        mx.array(positions),
+                        32**-0.5,
+                        4,
+                    )
+                    self.assertIsNotNone(actual)
+                    expected = self.attention_reference(q, k, v, mask)
+                    np.testing.assert_allclose(
+                        np.array(actual.astype(mx.float32)),
+                        expected,
+                        rtol=0.008 if dtype == mx.bfloat16 else 0.002,
+                        atol=0.004 if dtype == mx.bfloat16 else 0.0005,
+                    )
+
+    def test_sparse_gather_decode_per_group(self):
+        attention = self.attention()
+        mx.random.seed(31)
+        for heads in (1, 2, 4):
+            for mask_type in ("none", "bool", "additive"):
+                with self.subTest(index_heads=heads, mask_type=mask_type):
+                    batch, length = 4, 1027
+                    q = mx.random.normal((batch, 8, 1, 32))
+                    k = mx.random.normal((batch, 4, length, 32))
+                    v = mx.random.normal(k.shape)
+                    indices = np.empty((batch, heads, 1, 2), dtype=np.int32)
+                    for b in range(batch):
+                        for h in range(heads):
+                            indices[b, h, 0] = [1 + b + h, 256]
+                    indices[0, 0, 0, 1] = -1
+                    positions = np.array([[1024], [1025], [1026], [1026]])
+                    mask = np.any(indices[..., None] == np.arange(length) // 4, axis=-2)
+                    mask &= (
+                        np.arange(length)[None, None, None, :]
+                        <= positions[:, None, :, None]
+                    )
+                    mask = np.repeat(mask, 8 // heads, axis=1)
+                    explicit = None
+                    if mask_type != "none":
+                        allowed = np.ones((batch, 8, 1, length), dtype=bool)
+                        allowed[:, ::2, :, ::3] = False
+                        explicit = (
+                            allowed
+                            if mask_type == "bool"
+                            else np.where(allowed, -0.7, -np.inf).astype(np.float32)
+                        )
+                        mask = (
+                            mask & explicit
+                            if mask_type == "bool"
+                            else np.where(mask, explicit, -np.inf)
+                        )
+                    actual = attention._sparse_decode_attention(
+                        q,
+                        k,
+                        v,
+                        mx.array(indices),
+                        None if explicit is None else mx.array(explicit),
+                        mx.array(positions),
+                    )
+                    self.assertIsNotNone(actual)
+                    np.testing.assert_allclose(
+                        np.array(actual),
+                        self.attention_reference(q, k, v, mask),
+                        rtol=2e-5,
+                        atol=2e-6,
+                    )
+
+    def test_router_projection_rounds_before_fp32_scoring(self):
+        from mlx_vlm.models.minimax_m3_vl.config import TextConfig
+        from mlx_vlm.models.minimax_m3_vl.language import MiniMaxSparseMoeBlock
+
+        mx.random.seed(31)
+        layer = MiniMaxSparseMoeBlock(
+            TextConfig(
+                hidden_size=32,
+                intermediate_size=32,
+                num_local_experts=4,
+                num_experts_per_tok=2,
+                n_shared_experts=0,
+                pack_shared_expert=False,
+            )
+        )
+        layer.gate.weight = mx.random.normal((4, 32)).astype(mx.bfloat16)
+        x = mx.random.normal((2, 3, 32)).astype(mx.bfloat16)
+        values = (mx.random.normal((4, 32)) * 100).astype(mx.bfloat16)
+        layer.switch_mlp = lambda x, inds: values[inds]
+        logits = (
+            np.array(x.astype(mx.float32)).astype(np.float64)
+            @ np.array(layer.gate.weight.astype(mx.float32)).astype(np.float64).T
+        )
+        rounded = np.array(
+            mx.array(logits.astype(np.float32)).astype(mx.bfloat16).astype(mx.float32)
+        ).astype(np.float64)
+        probabilities = 1 / (1 + np.exp(-rounded))
+        indices = np.argsort(-probabilities, axis=-1)[..., :2]
+        scores = np.take_along_axis(probabilities, indices, axis=-1)
+        scores = scores / scores.sum(-1, keepdims=True)
+        order = np.argsort(indices, axis=-1)
+        indices = np.take_along_axis(indices, order, -1)
+        scores = np.take_along_axis(scores, order, -1).astype(np.float32)
+        weighted = self.round_bf16(
+            np.array(values.astype(mx.float32))[indices] * scores[..., None]
+        )
+        expected = self.round_bf16(weighted[..., 0, :] + weighted[..., 1, :])
+        expected = self.round_bf16(expected * layer.routed_scaling_factor)
+        actual = layer(x)
+        self.assertEqual(actual.dtype, mx.bfloat16)
+        np.testing.assert_array_equal(
+            np.array(actual.astype(mx.float32)),
+            expected,
+        )
+
+    def test_expert_contributions_round_in_expert_order(self):
+        from mlx_vlm.models.minimax_m3_vl.config import TextConfig
+        from mlx_vlm.models.minimax_m3_vl.language import MiniMaxSparseMoeBlock
+
+        mx.random.seed(31)
+        for biased in (False, True):
+            for packed in (False, True):
+                with self.subTest(biased=biased, packed=packed):
+                    layer = MiniMaxSparseMoeBlock(
+                        TextConfig(
+                            hidden_size=32,
+                            intermediate_size=32,
+                            shared_intermediate_size=32,
+                            num_local_experts=4,
+                            num_experts_per_tok=2,
+                            pack_shared_expert=packed,
+                            n_shared_experts=int(packed),
+                            use_routing_bias=biased,
+                            routed_scaling_factor=1.7,
+                        )
+                    )
+                    logits = mx.array([[-1.25, 0.17, 1.13, 0.61]])[None]
+                    bias = mx.array([0.0, 0.5, 0.0, 0.0]) if biased else mx.zeros(4)
+                    layer.gate = lambda x: logits
+                    if biased:
+                        layer.e_score_correction_bias = bias
+                    expert_outputs = (mx.random.normal((5, 32)) * 10).astype(
+                        mx.bfloat16
+                    )
+                    layer.switch_mlp = lambda x, inds: expert_outputs[inds]
+                    x = mx.zeros((1, 1, 32), dtype=mx.bfloat16)
+                    probability = 1 / (1 + np.exp(-np.array(logits).astype(np.float64)))
+                    indices = np.argsort(-(probability + np.array(bias)), axis=-1)[
+                        ..., :2
+                    ]
+                    weights = np.take_along_axis(probability, indices, -1)
+                    weights = weights / weights.sum(-1, keepdims=True)
+                    order = np.argsort(indices, axis=-1)
+                    indices = np.take_along_axis(indices, order, -1)
+                    weights = np.take_along_axis(weights, order, -1)
+                    values = np.array(expert_outputs.astype(mx.float32)).astype(
+                        np.float64
+                    )
+                    weighted = self.round_bf16(values[indices] * weights[..., None])
+                    expected = self.round_bf16(
+                        weighted[..., 0, :] + weighted[..., 1, :]
+                    )
+                    expected = self.round_bf16(expected * np.float32(1.7))
+                    if packed:
+                        expected = self.round_bf16(expected + values[4])
+                    actual = layer(x)
+                    self.assertEqual(actual.dtype, mx.bfloat16)
+                    np.testing.assert_array_equal(
+                        np.array(actual.astype(mx.float32)),
+                        expected,
+                    )
+
+    def test_gemma_norm_preserves_small_weight_offsets(self):
+        from mlx_vlm.models.minimax_m3_vl.language import MiniMaxRMSNorm
+
+        mx.random.seed(31)
+        norm = MiniMaxRMSNorm(128)
+        for dtype in (mx.bfloat16, mx.float16, mx.float32):
+            with self.subTest(dtype=dtype):
+                norm.weight = (mx.random.normal((128,)) * 0.003).astype(dtype)
+                x = mx.random.normal((2, 3, 128)).astype(dtype)
+                xf = np.array(x.astype(mx.float32)).astype(np.float64)
+                weight = np.array(norm.weight.astype(mx.float32)).astype(np.float64)
+                expected = xf / np.sqrt(
+                    np.mean(xf * xf, axis=-1, keepdims=True) + norm.eps
+                )
+                expected = mx.array(
+                    (expected * (1 + weight)).astype(np.float32)
+                ).astype(dtype)
+                actual = norm(x)
+                self.assertEqual(actual.dtype, dtype)
+                np.testing.assert_allclose(
+                    np.array(actual.astype(mx.float32)),
+                    np.array(expected.astype(mx.float32)),
+                    rtol=2e-6,
+                    atol=2e-6,
+                )
+
+    @unittest.skipUnless(mx.metal.is_available(), "Requires Metal")
+    def test_gemma_norm_matches_live_weights_and_strided_inputs(self):
+        from mlx_vlm.models.minimax_m3_vl.language import MiniMaxRMSNorm
+
+        mx.random.seed(41)
+        for dtype in (mx.bfloat16, mx.float16, mx.float32):
+            for dims in (7, 128, 6144):
+                norm = MiniMaxRMSNorm(dims)
+                norm.eval()
+                x = mx.random.normal((2, 3, dims * 2)).astype(dtype)[..., ::2]
+                norm.weight = (mx.random.normal((dims,)) * 0.003).astype(dtype)
+                for change in (False, True):
+                    with self.subTest(dtype=dtype, dims=dims, changed=change):
+                        if change:
+                            norm.weight[::2] = mx.array(0.25, dtype)
+                        expected = mx.fast.rms_norm(
+                            x, norm.weight.astype(mx.float32) + 1, norm.eps
+                        ).astype(dtype)
+                        self.assertTrue(mx.array_equal(norm(x), expected))
+
 
 # Shared model contracts
 
@@ -76,6 +860,31 @@ _MOE_SORTED_QUANT_NOTE = (
 
 class ModelChecks:
     """Reusable assertions; each JSON case constructs fresh configs and models."""
+
+    def causal_visual_prefix(self, language, config):
+        vision = mx.random.normal((1, 3, config.d_model))
+        prompt = mx.array([[2, 0, 7]])
+        embeddings = mx.concatenate([vision, language.embed(prompt)], axis=1)
+        full = language(inputs_embeds=embeddings).logits
+        # A later visual token cannot change earlier visual states.
+        changed = mx.concatenate(
+            [vision[:, :2], vision[:, 2:] + 10, language.embed(prompt)], axis=1
+        )
+        np.testing.assert_allclose(
+            np.asarray(full[:, :2]),
+            np.asarray(language(inputs_embeds=changed).logits[:, :2]),
+            atol=1e-5,
+        )
+        cache = language.make_cache()
+        first = language(inputs_embeds=embeddings[:, :4], cache=cache).logits
+        rest = language(inputs_embeds=embeddings[:, 4:], cache=cache).logits
+        np.testing.assert_allclose(
+            np.asarray(full),
+            np.asarray(mx.concatenate([first, rest], axis=1)),
+            atol=1e-5,
+        )
+        assert cache[0].offset == 6
+        assert cache[0].keys.shape[1] == config.self_attention_kv_heads
 
     def forward_cache(self, model, vocab_size, *, chunk_sizes=()):
         model.eval()
@@ -119,24 +928,36 @@ class ModelChecks:
 
     def assert_close(self, actual, expected, *, logits=False):
         assert actual.shape == expected.shape
-        assert mx.all(mx.isfinite(actual)).item()
         tolerance = 5e-3 if actual.dtype == mx.float16 else 1e-4
         # One-token attention uses a different Metal kernel from full prefill.
         if logits:
             tolerance = max(tolerance, 2e-3)
+        actual, expected = actual.astype(mx.float32), expected.astype(mx.float32)
+        mx.eval(actual, expected)
+        actual, expected = np.array(actual), np.array(expected)
+        assert np.isfinite(actual).all()
         np.testing.assert_allclose(
-            np.array(actual.astype(mx.float32)),
-            np.array(expected.astype(mx.float32)),
+            actual,
+            expected,
             atol=tolerance,
             rtol=tolerance,
         )
 
-    def prefill_parity(self, model, ids, media, chunk_sizes):
+    def prefill_parity(self, model, ids, media, chunk_sizes, *, features=None):
         """Compare full, cached and chunked prefill, then decode one new token."""
         language = model.language_model
-        features = model.get_input_embeddings(ids, **media).to_dict()
+        if features is None:
+            features = model.get_input_embeddings(ids, **media)
+        features = features.to_dict()
         embeds = features.pop("inputs_embeds")
-        reference = model(ids, cache=make_prompt_cache(language), **media).logits
+        token = mx.full((ids.shape[0], 1), 7, mx.int32)
+        full = model(
+            mx.concatenate([ids, token], axis=1),
+            cache=make_prompt_cache(language),
+            **media,
+        ).logits
+        # One causal full pass supplies both the prefill and decode references.
+        reference, extended = full[:, :-1], full[:, -1:]
         if ids.shape[0] > 1:
             solo = []
             for row in range(ids.shape[0]):
@@ -153,12 +974,6 @@ class ModelChecks:
                     ).logits
                 )
             self.assert_close(reference, mx.concatenate(solo), logits=True)
-        token = mx.full((ids.shape[0], 1), 7, mx.int32)
-        extended = model(
-            mx.concatenate([ids, token], axis=1),
-            cache=make_prompt_cache(language),
-            **media,
-        ).logits[:, -1:]
         for size in (ids.shape[1] - 1, *chunk_sizes):
             cache, chunks = make_prompt_cache(language), []
             for start in range(0, ids.shape[1], size):
@@ -214,6 +1029,7 @@ class ModelChecks:
                             ids += [config.vision_end_token_id]
                         rows.append(ids + [3, 4, 5])
                     ids = mx.array(rows, mx.int32)
+                    flat_ids = [token for row in rows for token in row]
                     for kind in layout:
                         pixels = mx.random.normal(
                             (batch * math.prod(grids[kind]), patch_width)
@@ -236,11 +1052,7 @@ class ModelChecks:
                     expected_embeds = model.language_model.model.embed_tokens(ids)
                     for kind in layout:
                         positions = mx.array(
-                            [
-                                i
-                                for i, t in enumerate(ids.flatten().tolist())
-                                if t == tokens[kind]
-                            ],
+                            [i for i, t in enumerate(flat_ids) if t == tokens[kind]],
                             mx.uint32,
                         )
                         embeddings, layer_features = encoded[kind]
@@ -256,7 +1068,7 @@ class ModelChecks:
                         self.assert_close(residuals, expected)
                     else:
                         positions = mx.array(
-                            [i for i, v in enumerate(mask.flatten().tolist()) if v],
+                            [i for i, t in enumerate(flat_ids) if t in tokens.values()],
                             mx.uint32,
                         )
                         self.assert_close(
@@ -275,7 +1087,9 @@ class ModelChecks:
                             mx.zeros_like(features.inputs_embeds), mask, value
                         )
                         self.assert_close(injected, expected[:, :, layer])
-                    self.prefill_parity(model, ids, media, chunk_sizes)
+                    self.prefill_parity(
+                        model, ids, media, chunk_sizes, features=features
+                    )
 
     def input_embeddings(self, model, model_name):
         result = model.get_input_embeddings(input_ids=mx.array([[1, 2, 3, 4, 5]]))
@@ -397,7 +1211,7 @@ class ModelChecks:
         batch = kwargs.pop("batch_size", 1)
         flat = (
             "qwen2_5_vl qwen3_5 qwen3_5_moe qwen4_exp "
-            "glm4v_moe glm4v hunyuan_vl siglip2_vision_model mimovl"
+            "glm4v_moe glm4v hunyuan_vl siglip2_vision_model mimovl siglip2_navit"
         ).split()
         shape = (
             image_size
@@ -596,6 +1410,8 @@ def check_arguments(kind, case, model, config):
     )
     if kind == "forward_cache":
         return (model, text.vocab_size), case.get("forward_cache", {})
+    if kind == "causal_visual_prefix":
+        return (model.language_model, text), {}
     if kind in {"masked_lm", "token_embeddings", "sentence_embeddings"}:
         return (model, config), {}
     if kind == "multimodal":
@@ -677,7 +1493,7 @@ def check_arguments(kind, case, model, config):
 
 @pytest.mark.parametrize("case", DATA["cases"], ids=lambda case: case["id"])
 def test_model_contract(case):
-    if "multimodal" in case["checks"]:
+    if {"multimodal", "causal_visual_prefix"}.intersection(case["checks"]):
         mx.random.seed(17)
     module = importlib.import_module("mlx_vlm.models." + case["module"])
     config = build_config(module, case["config"])
@@ -686,6 +1502,261 @@ def test_model_contract(case):
     for kind in case["checks"]:
         args, kwargs = check_arguments(kind, case, model, config)
         getattr(checks, kind)(*args, **kwargs)
+
+
+def test_nemotron_parse_source_architecture_and_tied_head_mapping():
+    config = {
+        "model_type": "nemotron_parse",
+        "architectures": ["RadioMBartPrefixForCausalLM"],
+        "decoder": {"vocab_size": 72512, "self_attention_kv_heads": 8},
+    }
+    module, model_type = get_model_and_args(config)
+    assert model_type == "nemotron_parse_v3_5"
+    assert module.ModelConfig.from_dict(config).text_config.vocab_size == 72512
+    weights = module.Model.sanitize(
+        {
+            "decoder.embed_tokens.weight": mx.zeros((4, 2)),
+            "decoder.extra_heads.0.weight": mx.ones((2, 2)),
+            "lm_head.weight": mx.zeros((4, 2)),
+        }
+    )
+    assert list(weights) == ["language_model.embed_tokens.weight"]
+
+
+@pytest.fixture
+def flint_model():
+    from mlx_vlm.models import flint
+
+    mx.random.seed(17)
+    model = flint.Model(build_config(flint, model_case("flint")["config"]))
+    model.eval()
+    mx.eval(model.parameters())
+    return model
+
+
+def _flint_numpy_reference(model, ids):
+    """Independent dense attention and explicit expert oracle for tiny Flint."""
+    config = model.config
+    weights = {
+        k.removeprefix("language_model."): np.array(v.astype(mx.float32)).astype(
+            np.float64
+        )
+        for k, v in tree_flatten(model.parameters())
+    }
+
+    def linear(x, name):
+        return x @ weights[name + ".weight"].T
+
+    def norm(x, name):
+        return (
+            x
+            / np.sqrt(np.mean(x * x, axis=-1, keepdims=True) + config.rms_norm_eps)
+            * weights[name + ".weight"]
+        )
+
+    def mlp(x, prefix):
+        gate = linear(x, prefix + ".gate_proj")
+        return linear(
+            gate / (1 + np.exp(-gate)) * linear(x, prefix + ".up_proj"),
+            prefix + ".down_proj",
+        )
+
+    x = weights["model.embed_tokens.weight"][ids]
+    batch, length, _ = x.shape
+    positions = np.arange(length)
+    for i in range(config.num_hidden_layers):
+        prefix = f"model.layers.{i}"
+        a = prefix + ".self_attn"
+        hidden = norm(x, prefix + ".input_layernorm")
+        q = norm(
+            linear(hidden, a + ".q_proj").reshape(
+                batch, length, config.num_attention_heads, config.head_dim
+            ),
+            a + ".q_norm",
+        )
+        k = norm(
+            linear(hidden, a + ".k_proj").reshape(
+                batch, length, config.num_key_value_heads, config.head_dim
+            ),
+            a + ".k_norm",
+        )
+        v = linear(hidden, a + ".v_proj").reshape(
+            batch, length, config.num_key_value_heads, config.head_dim
+        )
+        if i not in config.no_rope_layer_indices:
+            angles = positions[:, None] / config.rope_theta ** (
+                np.arange(0, config.head_dim, 2) / config.head_dim
+            )
+            angles = np.concatenate([angles, angles], -1)[None, :, None, :]
+
+            def rotate(t):
+                left, right = np.split(t, 2, axis=-1)
+                return t * np.cos(angles) + np.concatenate([-right, left], -1) * np.sin(
+                    angles
+                )
+
+            q, k = rotate(q), rotate(k)
+        repeat = config.num_attention_heads // config.num_key_value_heads
+        q = q.transpose(0, 2, 1, 3)
+        k, v = (np.repeat(t, repeat, axis=2).transpose(0, 2, 1, 3) for t in (k, v))
+        scores = (q @ k.swapaxes(-2, -1)) / np.sqrt(config.head_dim)
+        allowed = positions[:, None] >= positions[None, :]
+        if config.layer_types[i] == "sliding_attention" and config.sliding_window:
+            allowed &= positions[:, None] - positions[None, :] < config.sliding_window
+        scores = np.where(allowed, scores, -np.inf)
+        sink = np.broadcast_to(
+            weights[a + ".softmax_offset"][None, :, None, None], (*scores.shape[:-1], 1)
+        )
+        scores = np.concatenate([scores, sink], axis=-1)
+        probs = np.exp(scores - scores.max(axis=-1, keepdims=True))
+        probs /= probs.sum(axis=-1, keepdims=True)
+        attention = (
+            (probs[..., :-1] @ v).transpose(0, 2, 1, 3).reshape(batch, length, -1)
+        )
+        x = x + linear(attention, a + ".o_proj")
+        hidden = norm(x, prefix + ".post_attention_layernorm")
+        p = prefix + ".mlp"
+        if i in config.mlp_only_layers:
+            x = x + mlp(hidden, p)
+            continue
+        scores = 1 / (1 + np.exp(-linear(hidden, p + ".gate")))
+        indices = np.argsort(scores + weights[p + ".expert_bias"], axis=-1)[
+            ..., -config.num_experts_per_tok :
+        ]
+        route_weights = np.take_along_axis(scores, indices, axis=-1)
+        route_weights /= route_weights.sum(axis=-1, keepdims=True) + 1e-20
+        routed = np.zeros_like(hidden)
+        for b in range(batch):
+            for t in range(length):
+                for e, score in zip(indices[b, t], route_weights[b, t]):
+                    gate = (
+                        hidden[b, t] @ weights[p + ".switch_mlp.gate_proj.weight"][e].T
+                    )
+                    up = hidden[b, t] @ weights[p + ".switch_mlp.up_proj.weight"][e].T
+                    routed[b, t] += score * (
+                        (gate / (1 + np.exp(-gate)) * up)
+                        @ weights[p + ".switch_mlp.down_proj.weight"][e].T
+                    )
+        shared = (
+            mlp(hidden, p + ".shared_expert")
+            if config.shared_expert_intermediate_size
+            else 0
+        )
+        x = x + routed + shared
+    return linear(norm(x, "model.norm"), "lm_head")
+
+
+def test_flint_matches_independent_attention_and_moe_reference(flint_model):
+    for layer in flint_model.layers:
+        layer.self_attn.softmax_offset = mx.array([-2.0, 0.0, 1.0, 3.0])
+        if hasattr(layer.mlp, "expert_bias"):
+            layer.mlp.expert_bias = mx.array([0.5, -0.4, 0.1, 0.3])
+    ids = np.array([[1, 4, 7, 2, 9, 3, 8, 5, 6], [7, 3, 8, 5, 6, 1, 2, 9, 4]])
+    actual = flint_model(mx.array(ids)).logits
+    expected = _flint_numpy_reference(flint_model, ids)
+    np.testing.assert_allclose(np.array(actual), expected, atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.parametrize("window", [1, 4, None])
+def test_flint_hybrid_cache_matches_full_forward(flint_model, window):
+    flint_model.layers[1].self_attn.window_size = window
+    ids = (mx.arange(41)[None] * 7 + 3) % flint_model.config.vocab_size
+    expected = flint_model(ids).logits
+    for schedule in ([1] * 41, [17, 7, 8, 8, 1], [1] * 19 + [5, 8, 8, 1]):
+        cache = flint_model.make_cache()
+        out, start = [], 0
+        for size in schedule:
+            logits = flint_model(ids[:, start : start + size], cache=cache).logits
+            mx.eval(logits)
+            out.append(logits)
+            start += size
+        np.testing.assert_allclose(
+            np.array(mx.concatenate(out, axis=1)),
+            np.array(expected),
+            atol=2e-5,
+            rtol=2e-5,
+        )
+        assert isinstance(cache[0], KVCache)
+        assert isinstance(cache[1], KVCache if window is None else RotatingKVCache)
+        assert all(c.offset == 41 for c in cache)
+
+
+def test_flint_padded_batch_matches_individual_decoding(flint_model):
+    from mlx_vlm.models.cache import BatchKVCache, BatchRotatingKVCache
+
+    ids = mx.array([[0, 0, 1, 2, 3, 4, 5], [1, 2, 3, 4, 5, 6, 7]])
+    cache = [
+        (
+            BatchRotatingKVCache(layer.self_attn.window_size, [2, 0])
+            if layer.self_attn.window_size
+            else BatchKVCache([2, 0])
+        )
+        for layer in flint_model.layers
+    ]
+    actual = flint_model(ids, cache=cache).logits[:, -1:]
+    for row, pad in enumerate([2, 0]):
+        expected = flint_model(ids[row : row + 1, pad:]).logits[:, -1:]
+        np.testing.assert_allclose(
+            np.array(actual[row : row + 1]), np.array(expected), atol=2e-5, rtol=2e-5
+        )
+    token = mx.array([[8], [9]])
+    actual = flint_model(token, cache=cache).logits
+    for row, pad in enumerate([2, 0]):
+        extended = mx.concatenate(
+            [ids[row : row + 1, pad:], token[row : row + 1]], axis=1
+        )
+        expected = flint_model(extended).logits[:, -1:]
+        np.testing.assert_allclose(
+            np.array(actual[row : row + 1]), np.array(expected), atol=2e-5, rtol=2e-5
+        )
+
+
+@pytest.mark.parametrize("with_bias", [False, True])
+@pytest.mark.parametrize("quantized", [False, True])
+def test_flint_checkpoint_strict_loading_and_roundtrip(
+    flint_model, tmp_path, with_bias, quantized
+):
+    model = flint_model
+    if quantized:
+        nn.quantize(
+            model,
+            group_size=32,
+            bits=4,
+            class_predicate=lambda path, m: hasattr(m, "to_quantized")
+            and "mlp.gate" not in path
+            and m.weight.shape[-1] % 32 == 0,
+        )
+    expected = dict(tree_flatten(model.parameters()))
+    checkpoint = {}
+    for key, value in expected.items():
+        key = key.removeprefix("language_model.")
+        if key.endswith(".mlp.expert_bias"):
+            if with_bias:
+                checkpoint[
+                    key.replace(".mlp.expert_bias", ".mlp.gate.e_score_correction_bias")
+                ] = value
+        elif ".mlp.switch_mlp." in key:
+            prefix, suffix = key.split(".mlp.switch_mlp.")
+            for e in range(model.config.num_experts):
+                checkpoint[f"{prefix}.mlp.experts.{e}.{suffix}"] = value[e]
+        else:
+            checkpoint[key] = value
+    sanitized = model.sanitize(checkpoint)
+    assert sanitized.keys() == expected.keys()
+    assert model.sanitize(sanitized).keys() == expected.keys()
+    for key, value in expected.items():
+        assert mx.array_equal(sanitized[key], value).item(), key
+    model.load_weights(list(sanitized.items()), strict=True)
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), sanitized)
+    config = model.config.to_dict()
+    if quantized:
+        config["quantization"] = {"group_size": 32, "bits": 4}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    reloaded = load_model(tmp_path)
+    ids = mx.array([[1, 2, 3, 4, 5]])
+    np.testing.assert_array_equal(
+        np.array(reloaded(ids).logits), np.array(model(ids).logits)
+    )
 
 
 @pytest.fixture
@@ -1251,6 +2322,384 @@ def tiny_config(family, profile=None, **overrides):
     return build_config(module, fields | overrides, case["config_type"])
 
 
+def _prepare_minimax_distributed(model, dtype):
+    from mlx_vlm.quantization.nvfp4 import ScaledQuantizedSwitchLinear
+
+    for layer in model.layers:
+        if not layer.is_moe_layer:
+            continue
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            projection = getattr(layer.block_sparse_moe.switch_mlp, name)
+            scale = mx.arange(1, projection.num_experts + 1, dtype=mx.float32) * 1344
+            setattr(
+                layer.block_sparse_moe.switch_mlp,
+                name,
+                ScaledQuantizedSwitchLinear(projection, scale, "weight_global_scale"),
+            )
+
+
+DISTRIBUTED_MODEL_SETUPS = {"minimax_m3_nvfp4": _prepare_minimax_distributed}
+
+
+@pytest.mark.parametrize(
+    "family", ["minimax_m3", "minimax_m3_nvfp4", "minimax_m3_packed"]
+)
+def test_minimax_shard_validation_and_partitioning(family):
+    mx.random.seed(19)
+    model = _make_distributed_test_model(family, mx.bfloat16)
+    original = dict(tree_flatten(model.parameters()))
+    model.shard(SimpleNamespace(size=lambda: 1, rank=lambda: 0))
+    assert all(p is original[k] for k, p in tree_flatten(model.parameters()))
+    with pytest.raises(ValueError, match="Expert count"):
+        model.shard(SimpleNamespace(size=lambda: 3, rank=lambda: 0))
+    assert all(p is original[k] for k, p in tree_flatten(model.parameters()))
+
+    model.shard(SimpleNamespace(size=lambda: 2, rank=lambda: 1))
+    for key, value in tree_flatten(model.parameters()):
+        old = original[key]
+        if ".switch_mlp." in key:
+            routed = model.args.num_local_experts
+            expected = old[routed // 2 : routed]
+            if model.args.pack_shared_expert:
+                expected = mx.concatenate([expected, old[-1:]], axis=0)
+            assert mx.array_equal(value, expected).item(), key
+        elif key.startswith("lm_head."):
+            assert mx.array_equal(value, old[old.shape[0] // 2 :]).item(), key
+        else:
+            assert value is old, key
+    with pytest.raises(ValueError, match="already sharded"):
+        model.shard(SimpleNamespace(size=lambda: 2, rank=lambda: 1))
+
+
+def test_minimax_shard_rejects_invalid_scales_without_mutating_weights():
+    model = _make_distributed_test_model("minimax_m3_nvfp4", mx.bfloat16)
+    projection = model.layers[-1].block_sparse_moe.switch_mlp.down_proj
+    projection.weight_global_scale = mx.ones(3)
+    original = dict(tree_flatten(model.parameters()))
+    with pytest.raises(ValueError):
+        model.shard(SimpleNamespace(size=lambda: 2, rank=lambda: 0))
+    assert all(p is original[k] for k, p in tree_flatten(model.parameters()))
+
+
+@pytest.mark.parametrize("tied,vocab_size", [(True, 128), (False, 129)])
+def test_minimax_shard_keeps_unsplittable_vocabulary_replicated(tied, vocab_size):
+    from mlx_vlm.models.minimax_m3_vl.language import LanguageModel
+
+    model = LanguageModel(
+        tiny_config("minimax_m3", tie_word_embeddings=tied, vocab_size=vocab_size)
+    )
+    head = model.model.embed_tokens if tied else model.lm_head
+    weight = head.weight
+    model.shard(SimpleNamespace(size=lambda: 2, rank=lambda: 0))
+    assert head.weight is weight
+    assert not model._sharded_lm_head
+
+
+@pytest.mark.parametrize("per_expert", [False, True])
+def test_minimax_shard_preserves_quantization_scale_layouts(per_expert):
+    model = _make_distributed_test_model("minimax_m3_nvfp4", mx.bfloat16)
+    projection = model.layers[-1].block_sparse_moe.switch_mlp.down_proj
+    projection.weight_global_scale = (
+        mx.arange(4 * 128, dtype=mx.float32).reshape(4, 128) + 1
+        if per_expert
+        else mx.array(2688.0)
+    )
+    projection.pre_quant_scale = mx.arange(128, dtype=mx.float32) + 1
+    if per_expert:
+        projection.pre_quant_scale = mx.broadcast_to(
+            projection.pre_quant_scale, (4, 128)
+        )
+    scale, smoothing = projection.weight_global_scale, projection.pre_quant_scale
+    model.shard(SimpleNamespace(size=lambda: 2, rank=lambda: 1))
+    if per_expert:
+        assert mx.array_equal(projection.weight_global_scale, scale[2:]).item()
+        assert mx.array_equal(projection.pre_quant_scale, smoothing[2:]).item()
+    else:
+        assert projection.weight_global_scale is scale
+        assert projection.pre_quant_scale is smoothing
+
+
+def test_minimax_shard_preserves_head_output_scale_broadcasting():
+    from mlx_vlm.quantization.nvfp4 import ScaledQuantizedLinear
+
+    model = _make_distributed_test_model("minimax_m3", mx.bfloat16)
+    model.lm_head = ScaledQuantizedLinear(
+        model.lm_head.to_quantized(group_size=16, bits=4, mode="nvfp4"),
+        (mx.arange(128, dtype=mx.float32) + 1) * 128,
+        "weight_global_scale",
+    )
+    hidden = mx.random.normal((1, 1, 128)).astype(mx.bfloat16)
+    expected = model.lm_head(hidden)[..., 64:]
+    mx.eval(expected)
+    model.shard(SimpleNamespace(size=lambda: 2, rank=lambda: 1))
+    actual = model.lm_head(hidden)
+    assert actual.shape == expected.shape
+    assert mx.array_equal(actual, expected).item()
+
+
+def test_minimax_multimodal_model_exposes_sharding():
+    from mlx_vlm.models import minimax_m3_vl
+
+    model = minimax_m3_vl.Model(
+        build_config(minimax_m3_vl, model_case("minimax_m3_vl")["config"])
+    )
+    group = SimpleNamespace(size=lambda: 1, rank=lambda: 0)
+    with patch.object(model.language_model, "shard") as shard:
+        model.shard(group)
+    shard.assert_called_once_with(group)
+
+
+# Distributed language-model contracts
+
+
+def _make_distributed_test_model(family, dtype):
+    case = TINY_MODELS[family]
+    config = tiny_config(family, "distributed")
+    module = importlib.import_module("mlx_vlm.models." + case["module"] + ".language")
+    model = module.LanguageModel(config)
+    model.update(
+        tree_map(
+            lambda p: p.astype(dtype) if mx.issubdtype(p.dtype, mx.floating) else p,
+            model.parameters(),
+        )
+    )
+    if setup := DISTRIBUTED_MODEL_SETUPS.get(family):
+        setup(model, dtype)
+    if quantization := case["distributed"].get("quantization"):
+        quantization = copy.deepcopy(quantization)
+        if patterns := quantization.pop("modules", None):
+
+            def predicate(path, module):
+                if hasattr(module, "to_quantized"):
+                    for pattern, overrides in patterns.items():
+                        if fnmatchcase(path, pattern):
+                            return overrides
+                return False
+
+            quantization["class_predicate"] = predicate
+        nn.quantize(model, **quantization)
+    model.eval()
+    return model
+
+
+def _distributed_model_worker(family, dtype_name):
+    group = mx.distributed.init(strict=True, backend="ring")
+    options = TINY_MODELS[family]["distributed"]
+    dtype = getattr(mx, dtype_name)
+    mx.random.seed(19)
+    reference = _make_distributed_test_model(family, dtype)
+    mx.eval(reference.parameters())
+    weights = dict(tree_flatten(reference.parameters()))
+    sharded = _make_distributed_test_model(family, dtype)
+    sharded.load_weights(list(weights.items()), strict=True)
+    sharded.shard(group)
+    if error := options.get("reshard_error"):
+        with pytest.raises(ValueError, match=error):
+            sharded.shard(group)
+    mx.eval(sharded.parameters())
+    local_weights = dict(tree_flatten(sharded.parameters()))
+    for pattern in options["sharded_weights"]:
+        names = [name for name in weights if fnmatchcase(name, pattern)]
+        assert names, f"No weights match {pattern!r}"
+        for name in names:
+            assert local_weights[name].size * group.size() == weights[name].size, name
+
+    records = []
+    # Keep model-specific reference tolerances in the fixture. Every rank must
+    # return identical logits; MiniMax also requires exact BF16 reference parity.
+    tolerance = options["tolerances"][dtype_name]
+    vocab_size = reference.args.vocab_size
+    for batch in (1, 4):
+        actual_cache = make_prompt_cache(sharded)
+        expected_cache = make_prompt_cache(reference)
+        for step, tokens in enumerate(
+            ([1, 7, 9, 3, 11, 15, 2, 6, 8, 10, 12, 14], [13], [17], [19], [2, 4, 6])
+        ):
+            ids = mx.array(
+                [[(t + row) % vocab_size for t in tokens] for row in range(batch)]
+            )
+            expected = reference(ids, cache=expected_cache).logits
+            mx.eval(expected)
+            # Finish independent reference work on every rank before queuing
+            # distributed work on the shared GPU. Keep test-only collectives
+            # on the CPU so a faster rank cannot block another rank's GPU work.
+            mx.distributed.all_sum(mx.array(0), group=group, stream=mx.cpu).item()
+            actual = sharded(ids, cache=actual_cache).logits
+            mx.eval(actual)
+            gathered = mx.distributed.all_gather(actual, group=group, stream=mx.cpu)
+            mx.eval(gathered)
+            ranks_agree = all(
+                mx.array_equal(
+                    gathered[:batch], gathered[rank * batch : (rank + 1) * batch]
+                ).item()
+                for rank in range(1, group.size())
+            )
+            records.append(
+                dict(
+                    batch=batch,
+                    step=step,
+                    max_error=mx.max(mx.abs(actual - expected)).item(),
+                    ranks_agree=ranks_agree,
+                    passed=mx.allclose(
+                        actual, expected, atol=tolerance, rtol=tolerance
+                    ).item(),
+                )
+            )
+    passed = mx.distributed.all_sum(
+        mx.array(int(all(r["passed"] and r["ranks_agree"] for r in records))),
+        group=group,
+        stream=mx.cpu,
+    ).item()
+    print(
+        json.dumps(dict(rank=group.rank(), passed_ranks=passed, checks=records)),
+        flush=True,
+    )
+    assert passed == group.size(), records
+
+
+def _run_distributed_model_test(family, dtype, world_size):
+    repo = Path(__file__).resolve().parents[2]
+    # The ring launcher needs one consecutive port per rank. Probe the entire
+    # range while holding the sockets so a four-rank case cannot reuse a port.
+    for _ in range(100):
+        with ExitStack() as stack:
+            sockets = [stack.enter_context(socket.socket()) for _ in range(world_size)]
+            sockets[0].bind(("127.0.0.1", 0))
+            port = sockets[0].getsockname()[1]
+            if port + world_size > 65536:
+                continue
+            try:
+                for rank, sock in enumerate(sockets[1:], 1):
+                    sock.bind(("127.0.0.1", port + rank))
+            except OSError:
+                continue
+            break
+    else:
+        pytest.fail(f"Could not find {world_size} consecutive ring ports")
+    command = [
+        sys.executable,
+        "-c",
+        "from mlx._distributed_utils.launch import main; main()",
+        "--backend",
+        "ring",
+        "-n",
+        str(world_size),
+        "--starting-port",
+        str(port),
+        "--env",
+        f"PYTHONPATH={repo}",
+        "--",
+        sys.executable,
+        "-c",
+        "import sys; from mlx_vlm.tests.test_models import _distributed_model_worker; "
+        "_distributed_model_worker(*sys.argv[1:])",
+        family,
+        dtype,
+    ]
+    process = subprocess.Popen(
+        command,
+        cwd=repo,
+        env=dict(os.environ, PYTHONPATH=str(repo)),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        output, _ = process.communicate(timeout=180)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        output, _ = process.communicate()
+        pytest.fail(
+            f"Distributed test timed out: {family}/{dtype}/{world_size}\n{output}"
+        )
+    assert process.returncode == 0, output
+    records = [json.loads(line) for line in output.splitlines() if line.startswith("{")]
+    assert len(records) == world_size, output
+    assert {r["rank"] for r in records if r["passed_ranks"] == world_size} == set(
+        range(world_size)
+    ), output
+
+
+@pytest.mark.skipif(not mx.distributed.is_available("ring"), reason="ring required")
+@pytest.mark.parametrize("world_size", [2, 4])
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+@pytest.mark.parametrize(
+    "family", [name for name, case in TINY_MODELS.items() if "distributed" in case]
+)
+def test_distributed_model(family, dtype, world_size):
+    _run_distributed_model_test(family, dtype, world_size)
+
+
+def test_gemma4_modelopt_awq_strict_load_and_forward(tmp_path):
+    module = importlib.import_module("mlx_vlm.models.gemma4")
+    fields = model_case("gemma4")["config"]
+    fields["audio_config"] = None
+    fields["text_config"].update(
+        num_hidden_layers=2,
+        head_dim=16,
+        global_head_dim=16,
+        layer_types=["sliding_attention", "full_attention"],
+        attention_k_eq_v=True,
+        use_double_wide_mlp=False,
+    )
+    mx.random.seed(661)
+    reference = module.Model(build_config(module, fields))
+    expected_weights = dict(tree_flatten(reference.parameters()))
+    source = {}
+    for key, value in expected_weights.copy().items():
+        source_key = "model." + key.replace("language_model.model.", "language_model.")
+        if (
+            key.endswith(".weight")
+            and any(
+                f".{projection}." in key
+                for projection in (
+                    "q_proj",
+                    "k_proj",
+                    "v_proj",
+                    "o_proj",
+                    "gate_proj",
+                    "up_proj",
+                    "down_proj",
+                )
+            )
+            and key.startswith("language_model.")
+        ):
+            prefix = source_key.removesuffix(".weight")
+            factor = mx.array(0.137, mx.float32)
+            packed, scales = mx.quantize(value / factor, mode="nvfp4")
+            source[source_key] = packed.view(mx.uint8)
+            source[prefix + ".weight_scale"] = scales
+            source[prefix + ".weight_scale_2"] = factor
+            source[prefix + ".input_scale"] = mx.array(0.25, mx.float32)
+            decoded = mx.dequantize(packed, scales, mode="nvfp4") * factor
+            if key.endswith(("down_proj.weight", "o_proj.weight")):
+                pre_scale = mx.linspace(0.25, 2.0, value.shape[-1]).astype(mx.bfloat16)
+                source[prefix + ".pre_quant_scale"] = pre_scale
+                decoded *= pre_scale.astype(mx.float32)
+            expected_weights[key] = decoded
+        else:
+            source[source_key] = value
+
+    config = asdict(reference.config)
+    config["quantization_config"] = {
+        "quant_method": "modelopt",
+        "quant_algo": "NVFP4_AWQ",
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), source)
+    loaded = load_model(tmp_path, strict=True)
+    reference.load_weights(list(expected_weights.items()))
+    tokens = mx.array([[1, 5, 9]])
+    expected = reference(tokens).logits
+    actual = loaded(tokens).logits
+    assert mx.allclose(actual, expected, atol=2e-5, rtol=2e-4).item()
+    cache = loaded.language_model.make_cache()
+    loaded(tokens[:, :2], cache=cache)
+    decoded = loaded(tokens[:, 2:], cache=cache).logits
+    assert mx.allclose(decoded, expected[:, 2:], atol=2e-5, rtol=2e-4).item()
+
+
 def test_gemma3_can_preserve_caller_supplied_embedding_scale():
     case = next(case for case in DATA["cases"] if case["module"] == "gemma3")
     module = importlib.import_module(f"mlx_vlm.models.{case['module']}.language")
@@ -1269,6 +2718,206 @@ def test_gemma3_can_preserve_caller_supplied_embedding_scale():
 
     assert mx.array_equal(capture.call_args.args[0], expected)
     assert mx.array_equal(output, expected)
+
+
+def rotating_language_model(case):
+    """Reuse model contracts and tiny defaults for cache-specific model checks."""
+    name = case["module"]
+    module = importlib.import_module(f"mlx_vlm.models.{name}")
+    language = importlib.import_module(f"mlx_vlm.models.{name}.language")
+    outer, text = None, {}
+    if "case" in case:
+        outer = build_config(module, model_case(case["case"])["config"])
+        outer = getattr(outer, "thinker_config", outer)
+        text = asdict(outer.text_config)
+    defaults = {} if name == "florence2" else TINY_DEFAULTS
+    config = build_config(
+        language,
+        text | defaults | case["config"],
+        case.get("config_type", "TextConfig"),
+    )
+    if name == "florence2":
+        return language.Florence2Decoder(config), config
+    if name in ("qwen2", "qwen3", "mllama", "moondream3", "minimax_m3_vl", "gemma3n"):
+        return language.LanguageModel(config), config
+    if outer is None:
+        outer = module.ModelConfig(
+            text_config=config, vision_config=module.VisionConfig()
+        )
+    else:
+        outer.text_config = config
+    model = (
+        language.LanguageModel(outer)
+        if name == "hunyuan_vl"
+        else language.LanguageModel(config, outer)
+    )
+    return model, config
+
+
+@pytest.mark.parametrize(
+    "case",
+    [c for c in DATA["rotating_cache"] if "chunk_parity" in c["checks"]],
+    ids=lambda c: c["module"],
+)
+@pytest.mark.parametrize("keep", [0, 2])
+def test_rotating_cache_random_model_chunk_parity(case, keep):
+    mx.random.seed(17)
+    model, config = rotating_language_model(case)
+    model.eval()
+    mx.eval(model.parameters())
+    ids = (mx.arange(41)[None] * 7 + 3) % config.vocab_size
+
+    def forward(schedule):
+        for attr in ("_rope_deltas", "_position_ids"):
+            if hasattr(model, attr):
+                setattr(model, attr, None)
+        caches = [RotatingKVCache(8, keep=keep) for _ in model.layers]
+        result, start = [], 0
+        for n in schedule:
+            logits = model(ids[:, start : start + n], cache=caches).logits
+            mx.eval(logits, [c.state for c in caches])
+            result.append(logits)
+            start += n
+        assert start == ids.shape[1]
+        return np.array(mx.concatenate(result, axis=1))
+
+    expected = forward([1] * 41)
+    # Include a chunk larger than the cache and multi-token continuation after
+    # single-token decoding has wrapped the storage cursor.
+    for schedule in ([3] * 13 + [1, 1], [17, 7, 8, 8, 1], [1] * 19 + [5, 8, 8, 1]):
+        np.testing.assert_allclose(forward(schedule), expected, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [c for c in DATA["rotating_cache"] if "prompt_metadata" in c["checks"]],
+    ids=lambda c: c["module"],
+)
+def test_rotated_model_slices_full_prompt_metadata(case):
+    name = case["module"]
+    mx.random.seed(19)
+    model, config = rotating_language_model(case)
+    model.eval()
+    ids = (mx.arange(24)[None] * 7 + 3) % config.vocab_size
+    positions = mx.broadcast_to(mx.arange(24)[None, None, :], (3, 1, 24))
+    positions = positions + mx.array([3, 7, 11])[:, None, None]
+    if name == "falcon_ocr":
+        positions = positions[0]
+    metadata = {"position_ids": positions}
+    if name in ("qwen3_vl", "qwen3_vl_moe", "qwen3_omni_moe"):
+        metadata["visual_pos_masks"] = mx.ones((1, 24), mx.bool_)
+        metadata["deepstack_visual_embeds"] = (
+            mx.random.normal((1, 24, 2, config.hidden_size))
+            if name == "qwen3_omni_moe"
+            else [mx.random.normal((24, config.hidden_size)) for _ in range(2)]
+        )
+
+    def forward(full_metadata):
+        for attr in ("_rope_deltas", "_position_ids"):
+            if hasattr(model, attr):
+                setattr(model, attr, None)
+        cache = [RotatingKVCache(8, keep=2) for _ in model.layers]
+        for start in range(21):
+            out = model(ids[:, start : start + 1], cache=cache)
+            mx.eval(out.logits)
+        assert cache[0].offset == 21 and cache[0]._idx != 21
+        kwargs = dict(metadata)
+        if not full_metadata:
+            kwargs["position_ids"] = positions[..., 21:24]
+            if "visual_pos_masks" in kwargs:
+                kwargs["visual_pos_masks"] = kwargs["visual_pos_masks"][:, 21:24]
+                embeds = kwargs["deepstack_visual_embeds"]
+                kwargs["deepstack_visual_embeds"] = (
+                    [e[21:24] for e in embeds]
+                    if isinstance(embeds, list)
+                    else embeds[:, 21:24]
+                )
+        if name == "falcon_ocr":
+            # Falcon's full-prompt metadata is passed with precomputed embeddings.
+            kwargs["inputs_embeds"] = model.model.embed_tokens(ids[:, 21:24])
+            if not full_metadata:
+                # This wrapper accepts full position IDs only; compare the
+                # internally selected positions against a direct model call.
+                mask = create_attention_mask(kwargs["inputs_embeds"], cache)
+                return np.array(
+                    model.lm_head(
+                        model.model(
+                            ids[:, 21:24],
+                            inputs_embeds=kwargs["inputs_embeds"],
+                            position_ids=positions[..., 21:24],
+                            mask=mask,
+                            cache=cache,
+                        )
+                    )
+                )
+        return np.array(model(ids[:, 21:24], cache=cache, **kwargs).logits)
+
+    np.testing.assert_allclose(forward(True), forward(False), atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [c for c in DATA["rotating_cache"] if "per_layer_inputs" in c["checks"]],
+    ids=lambda c: c["module"],
+)
+def test_rotated_per_layer_inputs(case):
+    mx.random.seed(23)
+    model, config = rotating_language_model(case)
+    # The constructor initializes this gate to zero, which would hide a bad
+    # per-layer-input slice in an otherwise randomly initialized model.
+    for layer in model.layers:
+        layer.altup.correct_output_scale = mx.random.uniform(
+            low=0.5, high=1.5, shape=(config.hidden_size,)
+        )
+    model.eval()
+    ids = (mx.arange(41)[None] * 7 + 3) % config.vocab_size
+    per_layer_inputs = model.model.get_per_layer_inputs(ids)
+
+    def forward(step, full_metadata):
+        cache, outputs = model.make_cache(), []
+        for start in range(0, 41, step):
+            metadata = (
+                per_layer_inputs
+                if full_metadata
+                else per_layer_inputs[:, start : start + step]
+            )
+            out = model(
+                ids[:, start : start + step], cache=cache, per_layer_inputs=metadata
+            )
+            mx.eval(out.logits)
+            outputs.append(out.logits)
+        return np.array(mx.concatenate(outputs, axis=1))
+
+    expected = forward(1, False)
+    np.testing.assert_allclose(forward(3, True), expected, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [c for c in DATA["rotating_cache"] if "decoder_positions" in c["checks"]],
+    ids=lambda c: c["module"],
+)
+def test_rotated_decoder_positions_and_mask(case):
+    mx.random.seed(29)
+    decoder, config = rotating_language_model(case)
+    decoder.eval()
+    encoder_states = mx.random.normal((1, 4, config.d_model))
+    embeddings = mx.random.normal((1, 41, config.d_model))
+
+    def forward(step):
+        cache = [[RotatingKVCache(8, keep=2), KVCache()] for _ in decoder.layers]
+        outputs = []
+        for start in range(0, 41, step):
+            out = decoder(
+                inputs_embeds=embeddings[:, start : start + step],
+                encoder_hidden_states=encoder_states,
+                cache=cache,
+            )
+            mx.eval(out)
+            outputs.append(out)
+        return np.array(mx.concatenate(outputs, axis=1))
+
+    np.testing.assert_allclose(forward(3), forward(1), atol=1e-4, rtol=1e-4)
 
 
 # Document layout
@@ -2691,30 +4340,38 @@ class TestDeepseekV41EndToEnd(unittest.TestCase):
         )
         self.assertIsNone(output.hidden_states)
         expected = output.logits
-        mx.eval(expected)
-
+        comparisons = []
         for chunks in ((8,), (3, 2, 3), (1,) * 8):
-            with self.subTest(chunks=chunks):
-                cache = model.make_cache()
-                outputs, start = [], 0
-                for length in chunks:
-                    stop = start + length
-                    outputs.append(
-                        model(
-                            inputs=ids[:, start:stop],
-                            inputs_embeds=embeds[:, start:stop],
-                            cache=cache,
-                            n_to_process=length,
-                        ).logits
-                    )
-                    start = stop
-                actual = mx.concatenate(outputs, axis=1)
-                mx.eval(actual)
-                self.assertTrue(
-                    bool(mx.array_equal(cache[0].engram, reference_cache[0].engram))
+            cache = model.make_cache()
+            outputs, start = [], 0
+            for length in chunks:
+                stop = start + length
+                outputs.append(
+                    model(
+                        inputs=ids[:, start:stop],
+                        inputs_embeds=embeds[:, start:stop],
+                        cache=cache,
+                        n_to_process=length,
+                    ).logits
                 )
-                self.assertTrue(bool(mx.all(cache[0].engram[:, 2:5] == -1)))
-                self.assertTrue(bool(mx.allclose(actual, expected, atol=1e-4)))
+                start = stop
+            comparisons.append(
+                (
+                    chunks,
+                    (
+                        mx.array_equal(cache[0].engram, reference_cache[0].engram),
+                        mx.all(cache[0].engram[:, 2:5] == -1),
+                        mx.allclose(
+                            mx.concatenate(outputs, axis=1), expected, atol=1e-4
+                        ),
+                    ),
+                )
+            )
+        mx.eval([checks for _, checks in comparisons])
+        for chunks, checks in comparisons:
+            with self.subTest(chunks=chunks):
+                for check in checks:
+                    self.assertTrue(check.item())
 
 
 class TestMoERouterStopGradient:

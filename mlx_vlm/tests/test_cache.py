@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from itertools import product
 from pathlib import Path
@@ -42,6 +43,8 @@ from mlx_vlm.models.base import (
     LanguageModelOutput,
     _turboquant_attention_applies,
     align_attention_mask_to_scores,
+    cache_position_offset,
+    create_attention_mask,
     quantized_scaled_dot_product_attention,
     scaled_dot_product_attention,
 )
@@ -51,6 +54,7 @@ from mlx_vlm.models.cache import (
     BatchPoolingCache,
     BatchQuantizedKVCache,
     BatchRotatingKVCache,
+    BufferedRotatingKVCache,
     CacheList,
     ChunkedKVCache,
     KVCache,
@@ -217,13 +221,26 @@ def test_deepseek_v41_batch_cache_matches_independent_requests(right_pad, chunks
         config, model.layout, token_map=[i % 7 for i in range(config.vocab_size)]
     )
     model.head.weight = mx.random.normal(model.head.weight.shape) * 0.05
-    prompts = [[3, 7, 5, 5, 11, 15, 19, 23, 27], [9, 5, 13]]
+    prompts = [[3, 7, 5, 5, 11, 15, 19, 23, 27], [9, 5, 13], [17, 5, 21, 25]]
+    continuations = [[31, 32, 33, 34, 36, 37], [32, 33, 34, 35], [35, 36, 35, 36]]
+    streams = [prompt + tokens for prompt, tokens in zip(prompts, continuations)]
+    # Causal full-sequence logits are an independent oracle for every prefix.
+    # Reuse their slices instead of recomputing each growing history.
+    full_logits = [model(mx.array([stream])).logits for stream in streams]
 
-    def assert_logits(actual, expected):
-        mx.eval(actual, expected)
-        assert mx.allclose(actual, expected, atol=1e-4).item()
+    comparisons = []
 
-    references = [model.make_cache() for _ in prompts]
+    def compare_logits(actual, expected):
+        comparisons.append(mx.allclose(actual, expected, atol=1e-4))
+
+    def check_comparisons():
+        # Evaluate each phase together instead of synchronizing every row/check.
+        mx.eval(comparisons)
+        for index, comparison in enumerate(comparisons):
+            assert comparison.item(), f"comparison {index}"
+        comparisons.clear()
+
+    references = [model.make_cache() for _ in prompts[:2]]
     padding = [0, 6]
     cache = _make_cache(model, [0, 0] if right_pad else padding)
     if right_pad:
@@ -231,44 +248,50 @@ def test_deepseek_v41_batch_cache_matches_independent_requests(right_pad, chunks
     ids = mx.array(
         [
             prompt + [0] * pad if right_pad else [0] * pad + prompt
-            for prompt, pad in zip(prompts, padding)
+            for prompt, pad in zip(prompts[:2], padding)
         ]
     )
     # One row is entirely padding in two of these chunks.
     for start, stop in chunks:
         actual = model(ids[:, start:stop], cache=cache).logits
         mx.eval(actual, cache[0].state)
-        for index, (prompt, reference) in enumerate(zip(prompts, references)):
+        for index, (prompt, reference) in enumerate(zip(prompts[:2], references)):
             first = 0 if right_pad else padding[index]
             begin, end = max(start, first), min(stop, first + len(prompt))
             if begin < end:
                 expected = model(
                     ids[index : index + 1, begin:end], cache=reference
                 ).logits
-                full = model(mx.array([prompt[: end - first]])).logits
-                assert_logits(expected, full[:, -(end - begin) :])
-                assert_logits(
+                full = full_logits[index][:, begin - first : end - first]
+                compare_logits(expected, full)
+                compare_logits(
                     actual[index : index + 1, begin - start : end - start],
                     expected,
                 )
+        check_comparisons()
     if right_pad:
         cache[0].finalize()
     assert cache[0].offset.tolist() == [9, 3]
 
     # Exercise different compression phases, then admit a new request.
-    histories = [list(prompt) for prompt in prompts]
+    active = [0, 1]
+    lengths = [len(prompt) for prompt in prompts[:2]]
     for step in range(6):
         if step == 2:
             joined = model.make_cache()
-            mx.eval(model(mx.array([[17, 5, 21, 25]]), cache=joined).logits)
+            mx.eval(model(mx.array([prompts[2]]), cache=joined).logits)
             cache = _extend_cache(cache, joined)
             references.append([joined[0].extract(0)])
-            histories.append([17, 5, 21, 25])
+            active.append(2)
+            lengths.append(len(prompts[2]))
         if step == 4:
             cache[0].filter(mx.array([2, 0]))
             references = [references[2], references[0]]
-            histories = [histories[2], histories[0]]
-        tokens = mx.array([[31 + index + step] for index in range(len(references))])
+            active = [active[2], active[0]]
+            lengths = [lengths[2], lengths[0]]
+        tokens = mx.array(
+            [[streams[request][length]] for request, length in zip(active, lengths)]
+        )
         actual = model(tokens, cache=cache).logits
         expected = mx.concatenate(
             [
@@ -276,11 +299,11 @@ def test_deepseek_v41_batch_cache_matches_independent_requests(right_pad, chunks
                 for index, reference in enumerate(references)
             ]
         )
-        assert_logits(actual, expected)
+        compare_logits(actual, expected)
         for index, reference in enumerate(references):
-            histories[index].append(31 + index + step)
-            full = model(mx.array([histories[index]])).logits[:, -1:]
-            assert_logits(actual[index : index + 1], full)
+            lengths[index] += 1
+            full = full_logits[active[index]][:, lengths[index] - 1 : lengths[index]]
+            compare_logits(actual[index : index + 1], full)
             row = cache[0].extract(index)
             assert row.offset == reference[0].offset
             for ring in row.window:
@@ -292,12 +315,13 @@ def test_deepseek_v41_batch_cache_matches_independent_requests(right_pad, chunks
                 if array is not None and array.shape[1]
             )
             assert row.memory_profile(row.offset).fixed_bytes == fixed + reserve
-            assert mx.array_equal(row.engram, reference[0].engram).item()
+            comparisons.append(mx.array_equal(row.engram, reference[0].engram))
+        check_comparisons()
 
     # Merging already-populated scalar caches is the server join path.
     merged = _extend_cache(references[0], references[1])
     tokens = mx.array([[41], [43]])
-    assert_logits(
+    compare_logits(
         model(tokens, cache=merged).logits,
         model(tokens, cache=cache).logits,
     )
@@ -309,10 +333,11 @@ def test_deepseek_v41_batch_cache_matches_independent_requests(right_pad, chunks
     assert not cache[0].is_trimmable()
     assert all(not row.is_trimmable() for row in restored)
     # Restored compressor state must continue from each request's exact prefix.
-    assert_logits(
+    compare_logits(
         model(tokens, cache=cache).logits,
         model(tokens, cache=merged).logits,
     )
+    check_comparisons()
 
 
 @pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
@@ -692,6 +717,85 @@ def test_chunked_kv_cache_trims_on_valid_length_not_buffer_width():
     assert window[-1] == n_tokens - 1
     assert window == list(range(window[0], window[0] + len(window)))
     assert cache.start_position <= cache.offset
+
+
+@pytest.mark.parametrize("size", [2, 8, 255, 256, 257])
+@pytest.mark.parametrize("keep_kind", ["none", "prefix", "all_but_one"])
+def test_rotating_cache_visible_tokens(size, keep_kind):
+    keep = {"none": 0, "prefix": min(4, size - 1), "all_but_one": size - 1}[keep_kind]
+    cache = RotatingKVCache(size, keep)
+    retained, start = [], 0
+    # Exercise allocation, rotation, and concatenation in both directions.
+    for n in [1] * (size + 3) + [7, 1, size + 5, 1, 3]:
+        mask = cache.make_mask(n)
+        kv = mx.arange(start, start + n).reshape(1, 1, n, 1)
+        keys, _ = cache.update_and_fetch(kv, kv)
+        ids = keys[0, 0, :, 0].tolist()
+        rows = mask.tolist() if isinstance(mask, mx.array) else None
+        for row in range(n):
+            # Independent reference: evict the oldest token outside the prefix.
+            retained.append(start + row)
+            if len(retained) > size:
+                del retained[keep]
+            visible = [
+                token
+                for col, token in enumerate(ids)
+                if (token <= start + row if rows is None else rows[row][col])
+            ]
+            assert sorted(visible) == retained
+        start += n
+
+
+def test_rotating_cache_explicit_windows():
+    for keep, history, n, window, return_array in product(
+        [0, 1, 3], [0, 3, 4, 9], [2, 6], [1, 2, 3, 7], [False, True]
+    ):
+        cache = RotatingKVCache(4, keep)
+        kv = mx.zeros((1, 1, 1, 1))
+        for _ in range(history):
+            cache.update_and_fetch(kv, kv)
+        actual = cache.make_mask(n, window, return_array)
+        offset = min(3, history)
+        if offset + n > window or return_array:
+            expected = create_causal_mask(n, offset, window_size=window)
+            assert mx.array_equal(actual, expected)
+        else:
+            assert actual == "causal"
+
+
+@pytest.mark.parametrize("container", [None, list, tuple])
+def test_rotating_cache_mask_dispatch(container):
+    cache = RotatingKVCache(8, keep=2)
+    wrapped = container([cache]) if container in (list, tuple) else cache
+    mask = create_attention_mask(mx.zeros((1, 20, 8)), wrapped)
+    assert mask.shape == (20, 20)
+    assert mx.all(mask[2:, :2])
+    assert mask[-1].sum().item() == 8
+
+
+@pytest.mark.parametrize("kind", [KVCache, RotatingKVCache, BufferedRotatingKVCache])
+def test_cache_position_offset_is_absolute(kind):
+    cache = kind() if kind is KVCache else kind(8, keep=2)
+    for _ in range(21):
+        kv = mx.zeros((1, 1, 1, 8))
+        cache.update_and_fetch(kv, kv)
+    assert cache_position_offset(cache) == 21
+    if kind is not KVCache:
+        assert cache._idx != 21
+
+
+@pytest.mark.parametrize("rotating", [False, True])
+def test_cache_position_offset_includes_batch_padding(rotating):
+    cache = (
+        BatchRotatingKVCache(8, left_padding=[2, 3])
+        if rotating
+        else BatchKVCache(left_padding=[2, 3])
+    )
+    for _ in range(21):
+        kv = mx.zeros((2, 1, 1, 8))
+        cache.update_and_fetch(kv, kv)
+    assert cache_position_offset(cache) == 21
+    assert cache.offset.tolist() == [19, 18]
 
 
 @pytest.mark.parametrize("max_kv_size", [None, 1024])
@@ -1123,6 +1227,10 @@ def coordinate(manager, caches):
 @pytest.fixture
 def managers(tmp_path, monkeypatch):
     """Own writers and readers, including reopened namespaces and memory budgets."""
+    # Keep one real host-memory reading per case. Budget/pressure tests override
+    # this explicitly; repeated vm_stat processes add no cache-lifecycle coverage.
+    free_ram = P._free_ram_bytes()
+    monkeypatch.setattr(P, "_free_ram_bytes", lambda: free_ram)
     owned = []
 
     def make(
@@ -1233,12 +1341,14 @@ def test_hashes_and_dependencies():
     variants = [("a", image), ("b", image), ("a", 42)]
     assert len({tenant_hash(t, i) for t, i in variants}) == 3
     code = "from mlx_vlm.apc import tenant_scoped_hash; print(tenant_scoped_hash('a', 123456789))"
-    outputs = [
-        subprocess.check_output(
+
+    def run(seed):
+        return subprocess.check_output(
             [sys.executable, "-c", code], env={**os.environ, "PYTHONHASHSEED": seed}
         )
-        for seed in ("1", "2")
-    ]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outputs = list(pool.map(run, ("1", "2")))
     assert outputs[0] == outputs[1]
     base = P.semantic_extra_hash(image_hash=5)
     good = NS(apc_key_dependencies=lambda: ["adapter-x"])

@@ -12,6 +12,7 @@ from ...speculative.mtp_profile import cache_state_arrays  # Fork (M57)
 from ..activations import swiglu
 from ..base import (
     LanguageModelOutput,
+    cache_position_offset,
     create_attention_mask,
     scaled_dot_product_attention,
 )
@@ -1826,7 +1827,7 @@ class LanguageModel(nn.Module):
         c0 = None
         if cache and cache[self.model.fa_idx] is not None:
             c0 = cache[self.model.fa_idx]
-            cache_offset = c0._idx if hasattr(c0, "_idx") else c0.offset
+            cache_offset = cache_position_offset(c0)
             if (
                 isinstance(c0.offset, mx.array)
                 and c0.offset.ndim > 0

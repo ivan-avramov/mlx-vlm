@@ -35,6 +35,15 @@ output = generate(model, processor, formatted_prompt, image, verbose=False)
 print(output)
 ```
 
+The CLI, `generate()`, and `stream_generate()` use the checkpoint's
+`generation_config.json` defaults for `temperature`, `top_p`, and `top_k` when
+you omit them (or pass `None` in Python). Missing or null checkpoint values fall
+back to `0.0`, `1.0`, and `0`, respectively. A checkpoint with `do_sample: false`
+defaults to greedy decoding. Explicit sampling options take precedence, so
+`--temperature 0` (or `temperature=0` in Python) always selects greedy decoding,
+while an explicit positive temperature enables sampling. A custom Python
+`sampler` continues to take precedence over these options.
+
 ## Streaming tool calls
 
 With `stream: true`, Chat Completions sends argument fragments in
@@ -503,3 +512,22 @@ mlx.launch \
 ```
 
 We recommend you use the JACCL protocol over Thunderbolt. For more information, please refer to [the MLX distributed communication guide](https://ml-explore.github.io/mlx/build/html/usage/distributed.html).
+
+
+MiniMax-M3.1-Flash also supports distributed inference through this example. It
+partitions complete routed experts and the untied vocabulary projection across
+ranks, while attention, shared experts and vision remain replicated. The number
+of ranks must divide the routed-expert count. Native MXFP8/NVFP4 checkpoints can
+be loaded directly:
+
+```bash
+mlx.launch --hostfile /path/to/hosts.json --backend jaccl -- \
+    python examples/sharded_generate.py --backend jaccl \
+    --model MiniMaxAI/MiniMax-M3.1-Flash \
+    --prompt "Explain how expert parallel inference works." --max-tokens 128
+```
+
+Use `ring` in both backend arguments for TCP transport. Each rank reconstructs
+expert outputs before BF16 weighting and accumulation, then gathers vocabulary
+logits so all ranks receive the same result. This mode uses expert parallelism;
+MiniMax pipeline parallelism is not implemented.

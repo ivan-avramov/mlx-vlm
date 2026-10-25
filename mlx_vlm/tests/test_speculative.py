@@ -5622,19 +5622,27 @@ def module(name):
 
 
 def equal(actual, expected, **tolerance):
-    if isinstance(actual, dict):
-        assert actual.keys() == expected.keys()
-        for key in actual:
-            equal(actual[key], expected[key], **tolerance)
-    elif isinstance(actual, (list, tuple)):
-        assert len(actual) == len(expected)
-        for a, b in zip(actual, expected):
-            equal(a, b, **tolerance)
-    elif actual is None or expected is None:
-        assert actual is expected
-    else:
-        compare = mx.allclose if tolerance else mx.array_equal
-        assert compare(actual, expected, **tolerance).item()
+    comparisons = []
+
+    def collect(actual, expected):
+        if isinstance(actual, dict):
+            assert actual.keys() == expected.keys()
+            for key in actual:
+                collect(actual[key], expected[key])
+        elif isinstance(actual, (list, tuple)):
+            assert len(actual) == len(expected)
+            for a, b in zip(actual, expected):
+                collect(a, b)
+        elif actual is None or expected is None:
+            assert actual is expected
+        else:
+            compare = mx.allclose if tolerance else mx.array_equal
+            comparisons.append(compare(actual, expected, **tolerance))
+
+    collect(actual, expected)
+    mx.eval(comparisons)
+    for index, comparison in enumerate(comparisons):
+        assert comparison.item(), f"comparison {index}"
 
 
 @parametrize("bits", [4, 5])

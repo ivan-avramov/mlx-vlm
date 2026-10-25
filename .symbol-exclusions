@@ -224,7 +224,6 @@ mlx_vlm/tests/test_server.py::make_batch  # C104 unported: helper/fixture of ups
 mlx_vlm/tests/test_server.py::push_audio  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy (same name also defined in mlx_vlm/models/nemotron_voicechat/streaming.py)
 mlx_vlm/tests/test_server.py::raise_not_found  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
 mlx_vlm/tests/test_server.py::realtime_client  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
-mlx_vlm/tests/test_server.py::reset_audio_runtime  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
 mlx_vlm/tests/test_server.py::run_worker  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy (same name also defined in mlx_vlm/tests/test_apc_settings.py)
 mlx_vlm/tests/test_server.py::score  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy (same name also defined in mlx_vlm/turboquant.py)
 mlx_vlm/tests/test_server.py::stream  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy (same name also defined in mlx_vlm/generate/ar.py,mlx_vlm/models/sam3d_objects/pipeline.py,mlx_vlm/models/sapiens2/generate.py)

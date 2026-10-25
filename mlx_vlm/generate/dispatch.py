@@ -58,6 +58,7 @@ from .common import (  # Fork: the snapshot-ring helpers (_capture/_restore_*, _
     _rotating_rewind_safe,
     _trim_cache,
     session_retain_prompt_end,
+    resolve_sampling_defaults,
     wired_limit,
 )
 from .image import DEFAULT_IMAGE_SIZE, DEFAULT_IMAGE_TASK, run_image_generation_cli
@@ -413,21 +414,25 @@ def parse_arguments():
     parser.add_argument(
         "--temperature",
         type=float,
-        default=DEFAULT_TEMPERATURE,
-        help="Temperature for sampling. Zero is greedy; positive values below 0.01 are clamped to 0.01.",
+        default=None,
+        help="Temperature for sampling. Defaults to the checkpoint setting, "
+        f"or {DEFAULT_TEMPERATURE} if unset. Zero is greedy; positive values below "
+        "0.01 are clamped to 0.01.",
     )
     parser.add_argument(
         "--top-p",
         type=float,
-        default=DEFAULT_TOP_P,
+        default=None,
         help="Nucleus sampling: keep the smallest set of tokens whose "
-        "probabilities sum to this. 1.0 disables it.",
+        "probabilities sum to this. 1.0 disables it. Defaults to the checkpoint "
+        f"setting, or {DEFAULT_TOP_P} if unset.",
     )
     parser.add_argument(
         "--top-k",
         type=int,
-        default=DEFAULT_TOP_K,
-        help="Keep only the k most probable tokens. 0 disables it.",
+        default=None,
+        help="Keep only the k most probable tokens. 0 disables it. Defaults "
+        f"to the checkpoint setting, or {DEFAULT_TOP_K} if unset.",
     )
     parser.add_argument(
         "--min-p",
@@ -960,6 +965,14 @@ def stream_generate(
         )
 
     if is_diffusion_model(model, kwargs):
+        kwargs["temperature"], kwargs["top_p"], kwargs["top_k"] = (
+            resolve_sampling_defaults(
+                model.config,
+                temperature=kwargs.get("temperature"),
+                top_p=kwargs.get("top_p"),
+                top_k=kwargs.get("top_k"),
+            )
+        )
         yield from stream_diffusion_generate_from_kwargs(
             model,
             processor,
@@ -1737,7 +1750,9 @@ def generate(
        model (nn.Module): The language model.
        tokenizer (PreTrainedTokenizer): The tokenizer.
        prompt (str): The string prompt.
-       temperature (float): The temperature for sampling (default 0).
+       temperature (float, optional): Sampling temperature. Unset temperature,
+           top_p, and top_k use the checkpoint defaults, then 0.0, 1.0, and 0.
+           An explicit temperature overrides the checkpoint's do_sample flag.
        max_tokens (int): The maximum number of tokens (default 100).
        verbose (bool): If ``True``, print tokens and timing information
            (default ``False``).
@@ -1910,6 +1925,12 @@ def main():
         max_kv_size=args.max_kv_size,
     )
     config = model.config
+    args.temperature, args.top_p, args.top_k = resolve_sampling_defaults(
+        config,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.top_k,
+    )
 
     draft_model = None
     if args.draft_model is not None:
