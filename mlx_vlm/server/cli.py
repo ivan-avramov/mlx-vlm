@@ -872,11 +872,6 @@ def main():
         ),
     )
 
-    # Fork (P405): `runtime.config` was built from the environment when the server package was
-    # imported, before the writes above, so its import-time defaults won (`kv_quant_scheme="uniform"`
-    # over --kv-quant-scheme). Rebuild it, and its /v1/settings replace restore point, from the final env.
-    runtime.config = RuntimeConfig.from_env()
-
     logger.debug("Command-line arguments: %s", args)
     logger.info("Starting MLX VLM Server")
     logger.info("Host: %s, Port: %s", args.host, args.port)
