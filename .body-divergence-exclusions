@@ -54,7 +54,7 @@
 # helpers PORTED byte-identically (C104(c)) into the fork-owned copies of test_generate /
 # test_server, placed in the fork's file layout. Ordering only; content matches upstream.
 mlx_vlm/tests/test_generate.py::test_prompt_processing_requests_only_required_trailing_logits  # C104(c) port @1dcc142d: byte-identical to upstream v0.7.6; placed in the fork-owned copy's layout, not upstream's order
-mlx_vlm/tests/test_server.py::TestModelDiscovery  # C104(c) port @1dcc142d: byte-identical to upstream v0.7.6; placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::TestModelDiscovery  # C104(c) port @b8bf04c6: byte-identical to upstream b8bf04c6 (re-pinned at the stage-C sync, which took upstream's body); placed in the fork-owned copy's layout, not upstream's order
 mlx_vlm/tests/test_server.py::_assert_fields  # C104(c) port @1dcc142d: byte-identical to upstream v0.7.6; placed in the fork-owned copy's layout, not upstream's order
 mlx_vlm/tests/test_server.py::_deltas  # C104(c) port @1dcc142d: byte-identical to upstream v0.7.6; placed in the fork-owned copy's layout, not upstream's order
 mlx_vlm/tests/test_server.py::_endpoint  # C104(c) port @1dcc142d: byte-identical to upstream v0.7.6; placed in the fork-owned copy's layout, not upstream's order
@@ -90,3 +90,12 @@ mlx_vlm/tests/test_server.py::test_stream_without_finish_token_flushes_held_text
 mlx_vlm/tests/test_server.py::test_tool_call_content_keeps_angle_bracket_text  # C104(c) port @1dcc142d: byte-identical to upstream v0.7.6; placed in the fork-owned copy's layout, not upstream's order
 mlx_vlm/tests/test_server.py::test_tool_stream_finalization  # C104(c) port @1dcc142d: byte-identical to upstream v0.7.6; placed in the fork-owned copy's layout, not upstream's order
 mlx_vlm/tests/test_server.py::test_tool_stream_matches_non_streamed_content  # C104(c) port @1dcc142d: byte-identical to upstream v0.7.6; placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::TestImageProcessingOptions  # C104(c) port @b8bf04c6: byte-identical to upstream b8bf04c6 (#2529, stage-C sync); placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::test_invalid_live_image_limits_keep_pair  # C104(c) port @b8bf04c6: byte-identical to upstream b8bf04c6 (#2529, stage-C sync); placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::test_live_image_defaults_reach_inference_endpoints  # C104(c) port @b8bf04c6: byte-identical to upstream b8bf04c6 (#2529, stage-C sync); placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::test_live_image_limits_preserve_loaded_model_and_request_snapshot  # C104(c) port @b8bf04c6: byte-identical to upstream b8bf04c6 (#2529, stage-C sync); placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::_capture_requests  # C104(c) port @b8bf04c6: byte-identical to upstream b8bf04c6 (harness for the #2529 ports, stage-C sync); placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::_chat_request  # C104(c) port @b8bf04c6: byte-identical to upstream b8bf04c6 (harness for the #2529 ports, stage-C sync); placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::_generator  # C104(c) port @b8bf04c6: byte-identical to upstream b8bf04c6 (harness for the #2529 ports, stage-C sync); placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::_ready_generator  # C104(c) port @b8bf04c6: byte-identical to upstream b8bf04c6 (harness for the #2529 ports, stage-C sync); placed in the fork-owned copy's layout, not upstream's order
+mlx_vlm/tests/test_server.py::settings_client  # C104(c) port @b8bf04c6: byte-identical to upstream b8bf04c6 (harness for the #2529 ports, stage-C sync); placed in the fork-owned copy's layout, not upstream's order

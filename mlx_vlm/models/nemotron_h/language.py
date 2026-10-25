@@ -538,8 +538,8 @@ class NemotronHModel(nn.Module):
         if with_embeddings:
             self.embeddings = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
-            NemotronHBlock(args, block_type, layer_idx=i)
-            for i, block_type in enumerate(args.hybrid_override_pattern)
+            NemotronHBlock(args.for_layer(index), block_type, layer_idx=index)
+            for index, block_type in enumerate(args.hybrid_override_pattern)
         ]
         self.norm_f = nn.RMSNorm(args.hidden_size, eps=args.layer_norm_epsilon)
         self.fa_idx = 0
@@ -585,7 +585,11 @@ class NemotronHModel(nn.Module):
         # own `final_layernorm`, so capturing post-norm hidden here would
         # double-normalize whatever the drafter feeds forward. Mirrors the
         # `hidden_sink`/`skip_final_norm` contract other MTP-capable
-        # backbones (deepseek_v4, qwen3_5) already expose.
+        # backbones (deepseek_v4, qwen3_5) already expose. Kept at the
+        # 2026-10-25 sync, when the drafter itself converged on upstream's
+        # class (bit-exact equivalent math); upstream's target feeds it the
+        # post-norm hidden instead (docs/proposals/nemotron-h-mtp-convergence.md,
+        # fact 8: the measured ~0.90 acceptance is under this pre-norm feed).
         def _finish(hidden_states):
             if final_hidden_sink is not None:
                 final_hidden_sink.append(hidden_states)
@@ -681,6 +685,11 @@ class Model(nn.Module):
 
         for layer_idx in range(self.args.num_hidden_layers):
             prefix = f"backbone.layers.{layer_idx}.mixer"
+            num_experts = self.args.n_routed_experts
+            if block_configs := getattr(self.args, "block_configs", None):
+                num_experts = (
+                    block_configs[layer_idx].get("n_routed_experts") or num_experts
+                )
             for m, n in [("down_proj", "fc2"), ("up_proj", "fc1")]:
                 for suffix in ("weight", "scales", "biases", "weight_scale_2"):
                     first_key = f"{prefix}.experts.0.{m}.{suffix}"
@@ -688,7 +697,7 @@ class Model(nn.Module):
                         continue
                     to_join = [
                         weights.pop(f"{prefix}.experts.{e}.{m}.{suffix}")
-                        for e in range(self.args.n_routed_experts)
+                        for e in range(num_experts)
                     ]
                     weights[f"{prefix}.switch_mlp.{n}.{suffix}"] = mx.stack(to_join)
 
@@ -838,6 +847,8 @@ class LanguageModel(RecurrentStateRollbackMixin, nn.Module):
         del input_ids, inputs_embeds, prompt_cache
         if draft_model is None:
             return True
+        if draft_kind == "mtp":
+            return bool(getattr(draft_model, "supports_chunked_prefill", False))
         prefill_kwargs = prefill_kwargs or {}
         if draft_kind == "mtp":
             return bool(prefill_kwargs.get("return_hidden")) and bool(

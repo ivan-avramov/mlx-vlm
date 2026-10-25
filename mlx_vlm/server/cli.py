@@ -14,9 +14,12 @@ from ..generate import (
 from ..snapshot import DEFAULT_RING_SIZE  # Fork: the snapshot ring is fork-only
 from .generation import (  # Fork: generation_defaults + thinking getters are fork
     DEFAULT_ENABLE_THINKING,
+    GenerationArguments,
     get_log_progress_interval,
     get_server_generation_defaults,
+    get_server_max_pixels,
     get_server_max_tokens,
+    get_server_min_pixels,
     get_server_thinking_budget,
     get_server_thinking_end_token,
     get_server_thinking_start_token,
@@ -272,6 +275,18 @@ def main():
         type=int,
         default=20,
         help="Max number of cached vision features (default: 20).",
+    )
+    parser.add_argument(
+        "--min-pixels",
+        type=int,
+        default=get_server_min_pixels(),
+        help="Default minimum image pixel area for supported processors; requests may override it.",
+    )
+    parser.add_argument(
+        "--max-pixels",
+        type=int,
+        default=get_server_max_pixels(),
+        help="Default maximum image pixel area for supported processors; requests may override it.",
     )
     parser.add_argument(
         "--prefill-step-size",
@@ -720,6 +735,14 @@ def main():
         policy=_resolve_attention_policy(args.attention_policy),  # Fork (M57)
     )
 
+    try:
+        GenerationArguments(min_pixels=args.min_pixels, max_pixels=args.max_pixels)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.min_pixels is not None:
+        os.environ["MLX_VLM_MIN_PIXELS"] = str(args.min_pixels)
+    if args.max_pixels is not None:
+        os.environ["MLX_VLM_MAX_PIXELS"] = str(args.max_pixels)
     if args.trust_remote_code:
         os.environ["MLX_TRUST_REMOTE_CODE"] = "true"
     if args.model:
@@ -859,6 +882,9 @@ def main():
     logger.info("Host: %s, Port: %s", args.host, args.port)
     logger.info("Model: %s, Adapter: %s", args.model, args.adapter_path)
 
+    # The runtime was imported before CLI flags populated the environment.
+    # Capture the final startup values for live settings and replace/reset.
+    runtime.config = RuntimeConfig.from_env()
     uvicorn.run(
         "mlx_vlm.server:app",
         host=args.host,

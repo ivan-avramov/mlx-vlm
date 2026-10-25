@@ -221,7 +221,15 @@ class Qwen3_5BatchInvariantForward:
 
     @staticmethod
     def _normalize_gated_delta_qk(layer, q, k):
-        del layer
+        # Fork: use the layer's own q/k normalization when it defines one, so
+        # verify matches decode bit for bit. Upstream #2541 changed
+        # Qwen3_5GatedDeltaNet._normalize_qk's epsilon (1e-6 -> 1e-6 / head
+        # width) but not this copy, which broke the fork's MTP stop-state and
+        # session exactness (docs/upstream-bugs.md item 12). The fallback below
+        # is upstream's body.
+        normalize = getattr(layer, "_normalize_qk", None)
+        if callable(normalize):
+            return normalize(q, k)
         inv_scale = k.shape[-1] ** -0.5
         q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)

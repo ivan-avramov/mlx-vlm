@@ -16,8 +16,8 @@ defect, and to explain the one divergence we carry *because* upstream is wrong
   `memory.md` ever proposed it. Don't re-propose it.
 * **Patched here only when something downstream needs it** (rule changed 2026-10-22 by
   the operator, Premisa P600). A local fix to upstream code is a new permanent conflict
-  site, so items 1-3, 5 and 9, which block nothing, stay byte-identical to upstream. Items
-  4, 6, 7 and 8 are deliberate divergences: each carries a `# Fork:` marker, a test, and an
+  site, so items 1-3, 5, 9, 10 and 11, which block nothing, stay byte-identical to upstream. Items
+  4, 6, 7, 8 and 12 are deliberate divergences: each carries a `# Fork:` marker, a test, and an
   entry below saying what upstream does wrong. A fix that a Premisa candidate or the
   stack needs goes in the same way, as ordinary fork work; it is not avoided as a
   one-off and never patched in a downstream repository.
@@ -414,3 +414,58 @@ well above the bf16 tolerance); with `True` it passes.
 nothing downstream needs the fix. Found during the 2026-10-25 staged sync (stage A
 review). The fix upstream could take is
 `if getattr(feed_forward, "norm_topk_prob", True):` around the division.
+
+## 10. Nemotron MTP sampled bf16 video generation drifts from plain decode
+
+`mlx_vlm/tests/test_speculative.py::test_nemotron_mtp_generation_matches_autoregressive`
+(upstream `b8bf04c6`, #2528), parametrization `[0.7-dtype1-video]` (temperature 0.7,
+`bfloat16`, video input): the MTP-speculative token stream differs from plain
+`generate_step` at token 1. The other eleven parametrizations, including bf16 text
+and image at 0.7 and every greedy case, pass.
+
+Reproduced on upstream's own tree (`git worktree add <dir> b8bf04c6`, run that
+test from `<dir>/mlx_vlm`, which imports the worktree's package) with mlx 0.32.4 on
+2026-10-25, so it is not fork code. Likely a bf16 numerics difference between the
+batched verify block and the singleton decode step under sampling; not investigated.
+
+**Not patched here** (P600): the stack serves Nemotron draft-OFF. The ported test is
+kept verbatim and marked strict-xfail through `tests/conftest.py`'s
+`KNOWN_UPSTREAM_FAILURES`, so it turns red when upstream fixes it.
+
+## 11. `nemotron_h_nano_omni`'s `output_hidden_states` disagrees with its layers' inputs
+
+`mlx_vlm/tests/test_models.py::test_model_contract[nemotron_bolt]` and
+`[nemotron_super_vl]` (both `nemotron_h_nano_omni`, #2528): the
+`language_hidden_states` check compares `output.hidden_states[:-1]` with the inputs
+each layer actually received, and every element differs by an almost constant
+per-position factor (about 0.64). That looks like a normalization or residual
+scaling applied to the returned states but not to the layer inputs.
+
+Reproduced on upstream's own trees (`b8bf04c6` and `e9af3766`, worktree, mlx 0.32.3
+and 0.32.4) on 2026-10-25, so it is not fork code. Not investigated further.
+
+**Not patched here** (P600): nothing downstream reads `output_hidden_states` from
+this model. Both parametrizations are strict-xfailed through
+`tests/conftest.py`'s `KNOWN_UPSTREAM_FAILURES`.
+
+## 12. The Qwen3.5 exact verifier's q/k normalization no longer matches decode
+
+`mlx_vlm/models/qwen3_5/language.py::Qwen3_5GatedDeltaNet._normalize_qk` changed its
+RMSNorm epsilon from `1e-6` to `1e-6 / head_width` (upstream `b8bf04c6`, #2541). That
+makes it the L2 normalization upstream intended. The verifier's copy,
+`speculative_verifier.py::Qwen3_5ExactSpeculativeVerifier._normalize_gated_delta_qk`,
+kept `1e-6`. Verify and plain decode therefore build slightly different gated-delta
+states. Greedy emission still matches, but the recurrent and KV state after an MTP
+round no longer equals the plain path's.
+
+Found by the fork's exact-MTP tests (`test_mtp_stop_state.py`,
+`test_mtp_session_cancel.py`, `test_mtp_thinking_budget.py`,
+`test_mtp_zero_budget.py`). Seven of them failed after the stage C merge and pass
+with the fix.
+
+**This fork diverges deliberately here**: the stack's MTP serving relies on
+verify == decode state (P369's session exactness). `_normalize_gated_delta_qk`
+delegates to the layer's own `_normalize_qk` when it has one (marked `# Fork:`),
+falling back to upstream's body otherwise, so any later change to the layer flows
+through. The fix upstream could take is the same delegation, or the same epsilon
+in both copies.

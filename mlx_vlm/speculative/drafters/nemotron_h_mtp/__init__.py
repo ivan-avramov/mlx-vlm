@@ -3,4 +3,4 @@ from .config import TextConfig
 from .nemotron_h_mtp import NemotronHMTPDraftModel
 from .nemotron_h_mtp import NemotronHMTPDraftModel as Model
 
-__all__ = ["NemotronHMTPDraftModel", "Model", "ModelConfig", "TextConfig"]
+__all__ = ["Model", "ModelConfig", "TextConfig", "NemotronHMTPDraftModel"]

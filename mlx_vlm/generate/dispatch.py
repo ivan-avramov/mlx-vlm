@@ -30,6 +30,7 @@ from ..utils import (
     prepare_inputs,
     should_add_special_tokens,
 )
+from ..vision_cache import processed_image_key
 from .audio import generate_audio
 from .common import (  # Fork: the snapshot-ring helpers (_capture/_restore_*, _rotating_rewind_safe, _has_non_trimmable) and _get_generation_stream are fork-only; they replace upstream's _prefix_cache_trim_amount/_cache_fully_retained
     DEFAULT_DIFFUSION_MAX_DENOISING_STEPS,
@@ -224,8 +225,8 @@ def parse_arguments():
         type=str,
         default=None,
         help=(
-            "Text model path or Hugging Face repo used to expand plain image "
-            "prompts into Ideogram 4 JSON captions."
+            "Prompt expansion model path or Hugging Face repo. Overrides the "
+            "Flux3 upsampler, or enables Ideogram 4 JSON caption expansion."
         ),
     )
     parser.add_argument(
@@ -608,7 +609,7 @@ def parse_arguments():
         "--draft-model",
         type=str,
         default=None,
-        help="Speculative drafter path or HF id. Qwen3.5/3.6/3.8 checkpoints "
+        help="Speculative drafter path or HF id. Qwen3.5/3.6/3.8 and Nemotron checkpoints "
         "with bundled MTP weights can use the same path as --model.",
     )
     parser.add_argument(
@@ -914,18 +915,19 @@ def stream_generate(
 
     # Vision feature caching: reuse cached image features across turns
     if vision_cache is not None and image is not None and pixel_values is not None:
-        cached = vision_cache.get(image)
+        image_key = processed_image_key(pixel_values, **kwargs)
+        cached = vision_cache.get(image_key)
         if cached is not None:
             kwargs["cached_image_features"] = cached
         elif hasattr(model, "encode_images"):
             features = model.encode_images(pixel_values, **kwargs)
             mx.eval(*features)
-            vision_cache.put(image, features)
+            vision_cache.put(image_key, features)
             kwargs["cached_image_features"] = features
         elif hasattr(model, "encode_image"):
             features = model.encode_image(pixel_values)
             mx.eval(features)
-            vision_cache.put(image, features)
+            vision_cache.put(image_key, features)
             kwargs["cached_image_features"] = features
 
     # Prompt cache reuse: skip common prefix from previous turn

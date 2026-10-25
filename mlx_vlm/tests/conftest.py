@@ -134,6 +134,44 @@ _HERE = pathlib.Path(__file__).parent
 collect_ignore = [name for name in UNPORTED_UPSTREAM_TESTS if (_HERE / name).exists()]
 
 
+# Fork: upstream tests (ported verbatim) that fail on UPSTREAM's own tree too.
+# node id -> reason. Applied as strict xfail, so the entry turns red the moment
+# upstream's fix lands and must then be removed. Each entry has a
+# docs/upstream-bugs.md item.
+KNOWN_UPSTREAM_FAILURES: dict[str, str] = {
+    "tests/test_speculative.py::test_nemotron_mtp_generation_matches_autoregressive"
+    "[0.7-dtype1-video]": (
+        "upstream b8bf04c6 fails it on its own tree with mlx 0.32.4: sampled "
+        "(temperature 0.7) bf16 video verify drifts from plain decode at token 1 "
+        "(docs/upstream-bugs.md item 10)"
+    ),
+    "tests/test_models.py::test_model_contract[nemotron_bolt]": (
+        "upstream b8bf04c6/e9af3766 fail it on their own trees: nemotron_h_nano_omni "
+        "output_hidden_states disagree with the layers' inputs (docs/upstream-bugs.md "
+        "item 11)"
+    ),
+    "tests/test_models.py::test_model_contract[nemotron_super_vl]": (
+        "upstream b8bf04c6/e9af3766 fail it on their own trees: nemotron_h_nano_omni "
+        "output_hidden_states disagree with the layers' inputs (docs/upstream-bugs.md "
+        "item 11)"
+    ),
+}
+
+
+def pytest_collection_modifyitems(config, items):  # Fork: see KNOWN_UPSTREAM_FAILURES
+    root = pathlib.Path(__file__).resolve().parent.parent
+    for item in items:
+        nodeid = item.nodeid
+        rel = pathlib.Path(item.path).resolve()
+        try:
+            nodeid = str(rel.relative_to(root)) + nodeid[nodeid.index("::") :]
+        except (ValueError, AttributeError):
+            pass
+        reason = KNOWN_UPSTREAM_FAILURES.get(nodeid)
+        if reason is not None:
+            item.add_marker(pytest.mark.xfail(reason=reason, strict=True))
+
+
 def pytest_report_collectionfinish() -> list[str]:
     """Say out loud what is being skipped, so it cannot rot silently."""
     if not collect_ignore:

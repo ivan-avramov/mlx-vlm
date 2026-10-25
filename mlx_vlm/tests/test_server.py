@@ -35,6 +35,7 @@ from transformers.utils.chat_parsing import ResponseParser, parse_response
 import mlx_vlm.reranker_loader as reranker_loader
 import mlx_vlm.server as server
 import mlx_vlm.server.anthropic as server_anthropic
+import mlx_vlm.server.anthropic as anthropic  # Fork: ported upstream tests
 import mlx_vlm.server.cli as cli
 import mlx_vlm.server.generation as server_generation
 import mlx_vlm.server.generation as generation
@@ -46,9 +47,12 @@ from mlx_vlm import apc as apc_module
 from mlx_vlm.apc import hash_image_payload
 from mlx_vlm.generate import GenerationResult
 from mlx_vlm.generate.image import ImageGenerationResult
+from mlx_vlm.models.cache import KVCache  # Fork: ported upstream tests
 from mlx_vlm.prompt_utils import (  # noqa: F401 -- kept: upstream's copy imports it (registry audit)
     apply_chat_template,
 )
+from mlx_vlm.server import GenerationArguments as Args  # Fork: ported upstream tests
+from mlx_vlm.server import ResponseGenerator as Generator  # Fork: ported upstream tests
 from mlx_vlm.server import compaction
 from mlx_vlm.server.model_discovery import discover_models, is_model_directory
 from mlx_vlm.server.responses_state import (
@@ -1663,6 +1667,36 @@ def _fake_image_result(*, seed: int, output_path=None) -> ImageGenerationResult:
     if output_path is not None:
         data.save(output_path)
     return data
+
+
+@pytest.mark.parametrize("method", ["generations", "edits"])
+def test_flux3_prompt_upsampling_options_and_revised_prompt(
+    client, monkeypatch, method
+):
+    options = {
+        "upsample_prompt": False,
+        "prompt_expansion_model": "local-flux3-pup",
+        "boxes": [{"id": "pot", "bbox": [0.1, 0.2, 0.8, 0.9]}],
+    }
+    result = _fake_image_result(seed=7)
+    result.metadata["revised_prompt"] = "A detailed scene caption."
+    generate = Mock(return_value=result)
+    edit = method == "edits"
+    monkeypatch.setattr(openai, "edit_image" if edit else "generate_image", generate)
+    with _endpoint(model_type="flux3"):
+        response = client.post(
+            f"/v1/images/{method}",
+            json={
+                "model": "flux3-klein",
+                "prompt": "a teapot",
+                "seed": 7,
+                **({"image": "reference.png"} if edit else {}),
+                **options,
+            },
+        )
+    assert response.status_code == 200
+    assert generate.call_args.args[1].extra == options
+    assert response.json()["data"][0]["revised_prompt"] == "A detailed scene caption."
 
 
 def test_images_generations_returns_b64_json(client, monkeypatch):
@@ -4494,6 +4528,7 @@ class TestResponseGenerator:
 
     # Ported from upstream (2026-09-27 sync): --model-discovery was removed upstream (53616323).
     def test_server_cli_sets_thinking_defaults(self, monkeypatch):
+        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
         flags = [
             ("model", "PRELOAD_MODEL", "demo"),
             ("image-model", "PRELOAD_IMAGE_MODEL", "image-demo"),
@@ -9842,6 +9877,185 @@ class _FakeAlignedResult:
     sentences: list
 
 
+def _chat_request(**options):
+    return server.ChatRequest(model="demo", messages=[_msg("hi")], **options)
+
+
+def _generator(**overrides):
+    gen = Generator.__new__(Generator)
+    gen.__dict__.update(
+        dict.fromkeys(
+            (
+                "adapter_path model processor config vision_cache draft_model draft_kind "
+                "draft_model_path draft_kind_override kv_bits apc_manager apc_mode tokenizer _load_error"
+            ).split()
+        )
+    )
+    gen.__dict__.update(
+        model_path="demo",
+        stop_tokens=set(),
+        kv_group_size=server.DEFAULT_KV_GROUP_SIZE,
+        kv_quant_scheme=server.DEFAULT_KV_QUANT_SCHEME,
+        quantized_kv_start=server.DEFAULT_QUANTIZED_KV_START,
+        top_logprobs_k=0,
+        requests=Queue(),
+        _stop=False,
+        _ready=Event(),
+        _cancelled=set(),
+        _cancel_lock=Lock(),
+    )
+    gen.__dict__.update(overrides)
+    return gen
+
+
+def _ready_generator(**kwargs):
+    defaults = dict(
+        wait_until_ready=lambda: None,
+        _cpu_preprocess=lambda prompt, images, audio: {"input_ids": [1, 2, 3]},
+        _cancel=lambda uid: None,
+    )
+    return _generator(**(defaults | kwargs))
+
+
+def _capture_requests(gen, *, prompt_tokens=1, uid=None):
+    queued = []
+
+    def put(request):
+        queued.append(request)
+        request.rqueue.put(
+            server.GenerationContext(
+                uid=uid or len(queued), prompt_tokens=prompt_tokens
+            )
+        )
+
+    gen.requests = NS(put=put)
+    return queued
+
+
+@pytest.fixture
+def settings_client(monkeypatch, tmp_path):
+    for name in list(os.environ):
+        if name.startswith("APC_"):
+            monkeypatch.delenv(name)
+    monkeypatch.delenv("MLX_VLM_SERVER_API_KEY", raising=False)
+    monkeypatch.setenv("MLX_VLM_CACHE_HOME", str(tmp_path / "cache"))
+    _reset_runtime(monkeypatch, config=RuntimeConfig.from_env())
+    monkeypatch.setattr(
+        server._app_module, "is_image_generation_model", lambda _: False
+    )
+
+    # Exercise the real cache factory / APC manager while avoiding model downloads.
+    generators = []
+
+    class FakeGenerator:
+        def __init__(self, **kwargs):
+            self.model = NS(make_cache=lambda: [KVCache()])
+            self.processor = NS()
+            self.config = NS(model_type="test")
+            self.apc_manager = kwargs["apc_manager"]
+            self.stopped = False
+            generators.append(self)
+
+        def wait_until_ready(self):
+            return self.model, self.processor, self.config
+
+        def stop_and_join(self):
+            self.stopped = True
+            if self.apc_manager is not None:
+                self.apc_manager.close()
+
+    monkeypatch.setattr(server._app_module, "ResponseGenerator", FakeGenerator)
+    client = TestClient(server.app)
+    yield client, generators
+    for generator in generators:
+        if not generator.stopped:
+            generator.stop_and_join()
+    client.close()
+
+
+def test_live_image_limits_preserve_loaded_model_and_request_snapshot(
+    settings_client, monkeypatch
+):
+    client, generators = settings_client
+    monkeypatch.setenv("MLX_VLM_MIN_PIXELS", "1048576")
+    monkeypatch.setenv("MLX_VLM_MAX_PIXELS", "4194304")
+    monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
+    before_env = dict(os.environ)
+    loaded = server.get_cached_model("demo")
+    before = client.get("/v1/settings").json()
+    for name in ("min_pixels", "max_pixels"):
+        knob = next(k for k in before["schema"] if k["name"] == name)
+        assert knob["reload_kinds"] == []
+    queued_args = server._build_gen_args(_chat_request())
+
+    low = dict(min_pixels=65536, max_pixels=262144)
+    body = client.patch("/v1/settings", json=low).json()
+    assert body["applied"] == low and body["rejected"] == []
+    assert body["reload_kinds"] == []
+    assert body["fingerprint"] == before["fingerprint"]
+    assert server.get_cached_model("demo") == loaded
+    assert len(generators) == 1 and not generators[0].stopped
+    assert server._build_gen_args(_chat_request()).preprocessing_kwargs() == low
+    assert queued_args.preprocessing_kwargs() == dict(
+        min_pixels=1048576, max_pixels=4194304
+    )
+    override = dict(min_pixels=32768, max_pixels=131072)
+    assert (
+        server._build_gen_args(_chat_request(**override)).preprocessing_kwargs()
+        == override
+    )
+
+    # Clearing runtime settings must not fall back to the startup environment.
+    client.patch("/v1/settings", json=dict(min_pixels=None, max_pixels=None))
+    assert server._build_gen_args(_chat_request()).preprocessing_kwargs() == {}
+    restored = client.patch("/v1/settings", json={"op": "replace", "values": {}}).json()
+    assert restored["current"] == before["current"]
+    assert restored["reload_kinds"] == []
+    assert dict(os.environ) == before_env
+
+
+@pytest.mark.parametrize("api", ["chat", "responses", "messages"])
+def test_live_image_defaults_reach_inference_endpoints(client, monkeypatch, api):
+    monkeypatch.setattr(server.runtime, "config", RuntimeConfig())
+    options = dict(min_pixels=1048576, max_pixels=4194304)
+    assert client.patch("/v1/settings", json=options).json()["applied"] == options
+    worker = _streaming([_token("done", finish_reason="stop")])
+    with _endpoint(generator=worker):
+        response = _post(client, api)
+    assert response.status_code == 200, response.text
+    call = worker.generate.call_args
+    args = call.kwargs.get("args") or call.args[3]
+    assert args.preprocessing_kwargs() == options
+
+
+@pytest.mark.parametrize("op", ["merge", "replace"])
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"min_pixels": 0},
+        {"max_pixels": -1},
+        {"min_pixels": True},
+        {"max_pixels": 1024.5},
+        {"min_pixels": "bad", "max_pixels": 2097152},
+        {"min_pixels": 8388608},
+        {"max_pixels": 262144},
+        {"min_pixels": 2097152, "max_pixels": 1048576},
+    ],
+)
+def test_invalid_live_image_limits_keep_pair(settings_client, monkeypatch, op, values):
+    client, _ = settings_client
+    monkeypatch.setenv("MLX_VLM_MIN_PIXELS", "1048576")
+    monkeypatch.setenv("MLX_VLM_MAX_PIXELS", "4194304")
+    monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
+    before = client.get("/v1/settings").json()
+    body = client.patch("/v1/settings", json={"op": op, "values": values}).json()
+    assert body["applied"] == {}
+    assert {r["name"] for r in body["rejected"]} == set(values)
+    assert body["current"] == before["current"]
+    assert body["fingerprint"] == before["fingerprint"]
+    assert body["reload_kinds"] == []
+
+
 @dataclass
 class _FakeSTTOutput:
     text: str
@@ -10026,6 +10240,176 @@ _JSON_TOOLS = NS(
 
 def _assert_fields(actual, **expected):
     assert {key: actual[key] for key in expected} == expected
+
+
+class TestImageProcessingOptions:
+    @pytest.mark.parametrize("api", ["chat", "responses", "messages"])
+    @pytest.mark.parametrize("stream", [False, True])
+    @pytest.mark.parametrize("batched", [False, True])
+    def test_endpoints_forward_options(self, client, api, stream, batched):
+        options = dict(min_pixels=1048576, max_pixels=4194304, resize_shape=[1024])
+        expected = dict(options, resize_shape=(1024, 1024))
+        worker = _streaming([_token("done", finish_reason="stop")]) if batched else None
+        with _endpoint(generator=worker) as fake:
+            response = _post(client, api, stream=stream, **options)
+        assert response.status_code == 200, response.text
+        if worker is not None:
+            call = worker.generate.call_args
+            args = call.kwargs.get("args") or call.args[3]
+            assert args.preprocessing_kwargs() == expected
+            if stream:
+                checked = worker.validate_context_budget.call_args.kwargs["args"]
+                assert checked.preprocessing_kwargs() == expected
+        else:
+            call = fake.stream if stream else fake.generate
+            _assert_fields(call.call_args.kwargs, **expected)
+
+    @pytest.mark.parametrize("api", ["chat", "responses", "messages"])
+    @pytest.mark.parametrize(
+        "options",
+        [dict(min_pixels=0), dict(max_pixels=-1), dict(min_pixels=100, max_pixels=50)],
+    )
+    def test_invalid_pixel_limits(self, client, api, options):
+        with _endpoint() as fake:
+            response = _post(client, api, **options)
+        assert response.status_code in (400, 422), response.text
+        fake.generate.assert_not_called()
+
+    def test_defaults_overrides_and_effective_validation(self, monkeypatch):
+        for key in ("MLX_VLM_MIN_PIXELS", "MLX_VLM_MAX_PIXELS"):
+            monkeypatch.delenv(key, raising=False)
+        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
+        assert server._build_gen_args(_chat_request()).preprocessing_kwargs() == {}
+        monkeypatch.setenv("MLX_VLM_MIN_PIXELS", "1048576")
+        monkeypatch.setenv("MLX_VLM_MAX_PIXELS", "4194304")
+        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
+        for options, expected in [
+            ({}, dict(min_pixels=1048576, max_pixels=4194304)),
+            (dict(min_pixels=None), dict(min_pixels=1048576, max_pixels=4194304)),
+            (dict(min_pixels=65536), dict(min_pixels=65536, max_pixels=4194304)),
+        ]:
+            args = server._build_gen_args(_chat_request(**options))
+            assert args.preprocessing_kwargs() == expected
+        with pytest.raises(ValueError, match="min_pixels must not exceed max_pixels"):
+            server._build_gen_args(_chat_request(max_pixels=65536))
+
+    @pytest.mark.parametrize(
+        "options,valid",
+        [
+            (["--min-pixels", "1048576", "--max-pixels", "4194304"], True),
+            (["--min-pixels", "0"], False),
+            (["--min-pixels", "100", "--max-pixels", "50"], False),
+        ],
+    )
+    def test_cli(self, monkeypatch, options, valid):
+        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
+        monkeypatch.setattr(sys, "argv", ["mlx_vlm.server", *options])
+        with patch.dict(os.environ), patch.object(cli.uvicorn, "run") as run:
+            for key in ("MLX_VLM_MIN_PIXELS", "MLX_VLM_MAX_PIXELS"):
+                os.environ.pop(key, None)
+            if valid:
+                cli.main()
+                assert os.environ["MLX_VLM_MIN_PIXELS"] == "1048576"
+                assert os.environ["MLX_VLM_MAX_PIXELS"] == "4194304"
+                assert server.runtime.config.image_pixel_limits() == dict(
+                    min_pixels=1048576, max_pixels=4194304
+                )
+                server.runtime.config.apply_changes(
+                    dict(min_pixels=None, max_pixels=None)
+                )
+                server.runtime.config.apply_changes({}, op="replace")
+                assert server.runtime.config.image_pixel_limits() == dict(
+                    min_pixels=1048576, max_pixels=4194304
+                )
+                run.assert_called_once()
+            else:
+                with pytest.raises(SystemExit):
+                    cli.main()
+                run.assert_not_called()
+
+    def test_worker_preprocessing_and_context_budget(self, monkeypatch):
+        prepare = Mock(return_value={"input_ids": np.zeros((1, 1024), np.int32)})
+        monkeypatch.setattr(generation, "prepare_inputs", prepare)
+        monkeypatch.setenv("MAX_KV_SIZE", "2048")
+        gen = _ready_generator(
+            model=NS(config=NS(model_type="qwen3_5")), processor=NS()
+        )
+        gen._cpu_preprocess = Generator._cpu_preprocess.__get__(gen)
+        queued = _capture_requests(gen)
+        options = dict(
+            min_pixels=1048576, max_pixels=4194304, resize_shape=(1024, 1024)
+        )
+        args = Args(max_tokens=1, **options)
+        gen.validate_context_budget("prompt", images=["same.png"], args=args)
+        _, tokens = gen.generate("prompt", images=["same.png"], args=args)
+        tokens.close()
+        assert queued[0].prompt_tokens == 1024
+        assert prepare.call_count == 2
+        for call in prepare.call_args_list:
+            _assert_fields(call.kwargs, **options)
+        monkeypatch.setenv("MAX_KV_SIZE", "512")
+        with pytest.raises(server.PromptTooLongError):
+            gen.validate_context_budget("prompt", images=["same.png"], args=args)
+
+    @pytest.mark.parametrize("api", ["responses/input_tokens", "messages/count_tokens"])
+    @pytest.mark.parametrize("batched", [False, True])
+    def test_token_count_options(self, client, api, batched):
+        options = dict(min_pixels=1048576, max_pixels=4194304)
+        prepare = Mock(return_value={"input_ids": np.zeros((1, 1024), np.int32)})
+        worker = NS(_cpu_preprocess=prepare) if batched else None
+        module = openai if api.startswith("responses") else anthropic
+        with (
+            _endpoint(generator=worker),
+            patch.object(module, "prepare_inputs", prepare),
+        ):
+            response = _post(client, "/v1/" + api, **options)
+        assert response.status_code == 200, response.text
+        assert response.json()["input_tokens"] == 1024
+        _assert_fields(prepare.call_args.kwargs, **options)
+
+    @pytest.mark.parametrize(
+        "geometry",
+        [
+            "pixel_values",
+            "image_grid_thw",
+            "image_position_ids",
+            "image_grid_hw",
+            "image_permutations",
+        ],
+    )
+    def test_worker_cache_separates_processed_resolutions(self, geometry):
+        from mlx_vlm.vision_cache import VisionFeatureCache
+
+        cache = VisionFeatureCache()
+        encoded = []
+
+        def embed(ids, pixels, **kwargs):
+            key = kwargs["_image_key"]
+            marker = (
+                pixels.shape[0]
+                if geometry == "pixel_values"
+                else kwargs[geometry].item()
+            )
+            features = cache.get(key)
+            if features is None:
+                features = mx.full((pixels.shape[0], 4), marker)
+                cache.put(key, features)
+                encoded.append(key)
+            assert features.shape[0] == pixels.shape[0]
+            assert features[0, 0].item() == marker
+            return NS(to_dict=lambda: {"inputs_embeds": features})
+
+        gen = _generator(model=NS(get_input_embeddings=embed), vision_cache=cache)
+        for size in (256, 1024, 256):
+            inputs = dict(input_ids=mx.array([[1]]), pixel_values=mx.zeros((256, 3)))
+            inputs[geometry] = (
+                mx.zeros((size, 3)) if geometry == "pixel_values" else mx.array([size])
+            )
+            gen._gpu_embed(
+                inputs,
+                images=["same.png"],
+            )
+        assert len(encoded) == len(cache) == 2
 
 
 def _sse_events_all(body):
@@ -10376,6 +10760,7 @@ class TestModelDiscovery:
 
     @pytest.mark.parametrize("use_cli_paths", [False, True])
     def test_cli_custom_model_paths(self, monkeypatch, tmp_path, use_cli_paths):
+        monkeypatch.setattr(server.runtime, "config", RuntimeConfig.from_env())
         monkeypatch.setattr(os, "environ", dict(os.environ))
         monkeypatch.setenv("MLX_VLM_MODEL_PATHS", "/existing/models")
         paths = [str(tmp_path / "model with spaces"), str(tmp_path / "other")]

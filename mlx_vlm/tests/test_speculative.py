@@ -11,7 +11,7 @@ import math  # Fork: for the one-ULP bound below
 import re
 from pathlib import Path
 from types import MethodType, SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch  # Fork: Mock for the ported upstream tests
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -32,7 +32,10 @@ import mlx_vlm.models.qwen3_5_moe.language as qwen_moe_language
 import mlx_vlm.speculative.cache_state as speculative_cache_state
 import mlx_vlm.speculative.mtp as mtp_utils
 import mlx_vlm.speculative.ops.linear as verifier_linear
-from mlx_vlm.generate.ar import _make_cache
+from mlx_vlm.generate.ar import _make_cache, generate_step
+from mlx_vlm.models import (
+    quantized_verifier as quantized,  # Fork: ported upstream tests
+)
 from mlx_vlm.models.base import kv_sequence_length
 from mlx_vlm.models.cache import (
     ArraysCache,
@@ -55,9 +58,13 @@ from mlx_vlm.models.quantized_verifier import (
     exact_quantized_switch_linear,
 )
 from mlx_vlm.models.switch_layers import QuantizedSwitchLinear, SwitchGLU
+from mlx_vlm.quantization.nvfp4 import (  # Fork: ported upstream tests
+    ScaledQuantizedLinear,
+)
 from mlx_vlm.quantization.one_bit import OneBitLinear
 from mlx_vlm.speculative.common import _SpeculativeSamplerRNG
 from mlx_vlm.speculative.dflash import _dflash_verify_greedy
+from mlx_vlm.speculative.drafters import load_drafter  # Fork: ported upstream tests
 from mlx_vlm.speculative.drafters import (
     DEFAULT_DRAFTER_KIND,
     DRAFTER_KIND_BY_MODEL_TYPE,
@@ -117,8 +124,17 @@ from mlx_vlm.speculative.utils import (
     speculative_prefill_kwargs,
 )
 from mlx_vlm.split_mtp import split_mtp
+from mlx_vlm.tests.test_models import (  # Fork: ported upstream tests
+    build_config,
+    model_case,
+)
 from mlx_vlm.turboquant import BatchTurboQuantKVCache
 from mlx_vlm.utils import get_model_and_args
+
+NS = SimpleNamespace  # Fork: upstream's alias, for the ported upstream tests
+parametrize = (
+    pytest.mark.parametrize
+)  # Fork: upstream's alias, for the ported upstream tests
 
 speculative_utils = importlib.import_module("mlx_vlm.speculative.utils")
 
@@ -1173,37 +1189,6 @@ def test_qwen3_5_fully_padded_prefill_row_survives_chunks():
     assert second.shape == (2, 3, text_config.hidden_size)
     assert cache[1].offset.tolist() == [1, 6]
     assert cache[1].left_padding.tolist() == [5, 0]
-
-
-# Fork: upstream #2273's two prefill-cancellation tests, ported onto this copy's
-# fixtures (upstream's `language("qwen")` / `NS` harness is not carried here).
-def test_speculative_prefill_filter_keeps_hidden_chunks_aligned():
-    drafter = SimpleNamespace(config=SimpleNamespace(target_layer_ids=[0]))
-    prefill = speculative_utils.SpeculativePrefill("dflash", drafter)
-    prefill.append(SimpleNamespace(hidden_states=[mx.array([[[1]], [[2]]])]))
-    prefill.filter([1])
-    output = prefill.finish(SimpleNamespace(hidden_states=[mx.array([[[3]]])]))
-    assert output.hidden_states[0].tolist() == [[[2], [3]]]
-    prefill.append(output)
-    prefill.filter([])
-    assert prefill.chunks == []
-
-
-def test_qwen3_5_cancelled_prefill_row_preserves_survivor_output():
-    model, _ = _qwen3_5_hybrid_batch_model()
-    cache = [ArraysCache(2, left_padding=[5, 0]), BatchKVCache([5, 0])]
-    model(mx.array([[0, 0, 0], [1, 2, 3]], dtype=mx.int32), cache=cache)
-    for layer_cache in cache:
-        layer_cache.filter(mx.array([0]))
-
-    singleton_cache = [ArraysCache(size=2), KVCache()]
-    actual = model(mx.array([[0, 0, 4]], dtype=mx.int32), cache=cache)
-    expected = model(mx.array([[4]], dtype=mx.int32), cache=singleton_cache)
-    assert mx.array_equal(actual[:, -1:], expected).item()
-
-    actual = model(mx.array([[5]], dtype=mx.int32), cache=cache)
-    expected = model(mx.array([[5]], dtype=mx.int32), cache=singleton_cache)
-    assert mx.array_equal(actual, expected).item()
 
 
 def test_qwen3_5_all_rows_fully_padded_prefill():
@@ -5622,3 +5607,349 @@ def test_laguna_dflash_config_derives_sliding_windows_when_absent():
     config = DFlashConfig.from_dict(params)
 
     assert config.sliding_windows == [512, 512]
+
+
+# ---------------------------------------------------------------------------
+# Fork: upstream test harness slice and tests ported byte-identically at the
+# 2026-10-25 sync (stage C, b8bf04c6). Draining C104: each name below is
+# upstream's own definition, so later upstream tests that need only this slice
+# can be carried verbatim.
+# ---------------------------------------------------------------------------
+
+
+def module(name):
+    return importlib.import_module("mlx_vlm." + name)
+
+
+def equal(actual, expected, **tolerance):
+    if isinstance(actual, dict):
+        assert actual.keys() == expected.keys()
+        for key in actual:
+            equal(actual[key], expected[key], **tolerance)
+    elif isinstance(actual, (list, tuple)):
+        assert len(actual) == len(expected)
+        for a, b in zip(actual, expected):
+            equal(a, b, **tolerance)
+    elif actual is None or expected is None:
+        assert actual is expected
+    else:
+        compare = mx.allclose if tolerance else mx.array_equal
+        assert compare(actual, expected, **tolerance).item()
+
+
+@parametrize("bits", [4, 5])
+@parametrize("dtype", [mx.bfloat16, mx.float16])
+@parametrize("projection", ["gate_up", "down"])
+def test_affine_switch_projection_parity(bits, dtype, projection):
+    mx.random.seed(2527)
+    linears = [QuantizedSwitchLinear(512, 32, 4, False, 64, bits) for _ in range(2)]
+    for linear in linears:
+        linear.scales = linear.scales.astype(dtype)
+        linear.biases = linear.biases.astype(dtype)
+    indices = mx.arange(6, dtype=mx.int32).reshape(1, 3, 2) % 4
+    if projection == "gate_up":
+        inputs = mx.random.normal((1, 3, 512)).astype(dtype)
+        expected = [
+            quantized.exact_quantized_switch_linear(linear, inputs, indices)
+            for linear in linears
+        ]
+        actual = fast_ops.exact_affine_switch_gate_up(
+            NS(up_proj=linears[0], gate_proj=linears[1]), inputs, indices
+        )
+    else:
+        inputs = mx.random.normal((1, 3, 2, 512)).astype(dtype)
+        weights = mx.softmax(mx.random.normal((1, 3, 2)), axis=-1)
+        shared = mx.random.normal((1, 3, 32)).astype(dtype)
+        routed = quantized.exact_quantized_selected_linear(linears[0], inputs, indices)
+        expected = SwitchGLU._combine(routed, weights, shared)
+        actual = fast_ops.exact_affine_moe_down(
+            linears[0], inputs, indices, weights, shared
+        )
+    assert actual is not None
+    equal(actual, expected)
+
+
+@parametrize("bits", [4, 5, 8])
+@parametrize("dtype", [mx.bfloat16, mx.float16])
+@parametrize("batch", [1, 2])
+def test_glm_quantized_head_parity(bits, dtype, batch):
+    mx.random.seed(2527)
+    head = nn.QuantizedLinear(512, 32, bias=False, group_size=64, bits=bits)
+    head.scales = head.scales.astype(dtype)
+    head.biases = head.biases.astype(dtype)
+    inputs = mx.random.normal((batch, 3, 512)).astype(dtype)
+    expected = verifier_linear._target_verify_singletons(head, inputs)
+    actual = module("models.glm_moe_dsa.speculative_verifier")._quantized_head_logits(
+        head, inputs
+    )
+    assert actual is not None
+    equal(actual, expected)
+
+
+def nemotron_target_and_drafter():
+    config = model_case("nemotron_super_vl")["config"]
+    target = module("models.nemotron_h_nano_omni")
+    draft = module("speculative.drafters.nemotron_h_mtp")
+    return (
+        config,
+        target.Model(target.ModelConfig.from_dict(config)),
+        draft.Model(draft.ModelConfig(text_config=config["llm_config"])),
+    )
+
+
+@parametrize("case_name", ["nemotron_super_vl", "nemotron_bolt"])
+def test_hidden_state_output_preserves_speculative_flags(case_name):
+    case = model_case(case_name)
+    arch = module("models." + case["module"])
+    model = arch.Model(build_config(arch, case["config"])).language_model
+    ids = mx.array([[1, 2, 3]])
+    output = model(
+        ids,
+        cache=model.make_cache(),
+        output_hidden_states=True,
+        speculative_verify=True,
+        skip_logits=True,
+        return_shared_kv=True,
+    )
+    assert output.logits is None
+    assert output.shared_kv_states == {}
+    assert output.gdn_states
+    assert len(output.hidden_states) == len(model.layers) + 1
+    equal(output.hidden_states[0], model.get_input_embeddings(ids))
+
+
+@parametrize("quantized", [False, True])
+def test_nemotron_native_mtp_load_split_and_forward(tmp_path, quantized):
+    mx.random.seed(42)
+    config, target, reference = nemotron_target_and_drafter()
+    expected = dict(tree_flatten(reference.parameters()))
+    source = {}
+    for key, weight in expected.items():
+        if ".switch_mlp." not in key:
+            source["language_model.mtp." + key] = weight
+            continue
+        prefix, projection = key.split(".switch_mlp.")
+        projection = projection.replace("fc1", "up_proj").replace("fc2", "down_proj")
+        decoded = []
+        for expert, value in enumerate(weight):
+            path = f"language_model.mtp.{prefix}.experts.{expert}.{projection}"
+            if quantized:
+                scale = 0.137 * (expert + 1)
+                packed, scales = mx.quantize(value / scale, mode="nvfp4")
+                source[path] = packed.view(mx.uint8)
+                source[path.removesuffix("weight") + "weight_scale"] = scales
+                source[path.removesuffix("weight") + "weight_scale_2"] = mx.array(scale)
+                source[path.removesuffix("weight") + "input_scale"] = mx.array(1.0)
+                value = (
+                    mx.dequantize(packed, scales, mode="nvfp4", dtype=mx.float32)
+                    * scale
+                )
+            else:
+                source[path] = value
+            decoded.append(value)
+        expected[key] = mx.stack(decoded)
+    if quantized:
+        config["quantization_config"] = {
+            "quant_method": "modelopt_mixed",
+            "quant_algo": "MIXED_PRECISION",
+        }
+        source["language_model.mtp.layers.0.mixer.k_proj.k_scale"] = mx.array(1.0)
+    reference.load_weights(list(expected.items()))
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(str(tmp_path / "mtp.safetensors"), source)
+    weight_map = dict.fromkeys(source, "mtp.safetensors")
+    # Loading the drafter must not open the much larger target shards.
+    weight_map["language_model.backbone.embeddings.weight"] = "absent.safetensors"
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weight_map})
+    )
+    draft, kind = load_drafter(str(tmp_path))
+    assert kind == "mtp"
+    ids = mx.array([[1, 2, 3]])
+    hidden = target.language_model(ids, return_hidden=True).hidden_states[-1]
+    reference.reset(target)
+    expected_hidden, _ = reference._forward_tokens(ids, hidden, mx.int32)
+    draft.reset(target)
+    actual_hidden, _ = draft._forward_tokens(ids, hidden, mx.int32)
+    equal(actual_hidden, expected_hidden, atol=1e-4, rtol=1e-4)
+    # Cached singleton forwards must match a causal block.
+    draft.reset(target)
+    steps = [
+        draft._forward_tokens(ids[:, i : i + 1], hidden[:, i : i + 1], mx.int32)[0]
+        for i in range(ids.shape[1])
+    ]
+    equal(mx.concatenate(steps, axis=1), actual_hidden, atol=1e-4, rtol=1e-7)
+    output = split_mtp(str(tmp_path), str(tmp_path / "draft"))
+    reloaded, kind = load_drafter(str(output))
+    reloaded.reset(target)
+    roundtrip, _ = reloaded._forward_tokens(ids, hidden, mx.int32)
+    equal(roundtrip, actual_hidden)
+    source.pop("language_model.mtp.layers.0.eh_proj.weight")
+    mx.save_safetensors(str(tmp_path / "mtp.safetensors"), source)
+    weight_map.pop("language_model.mtp.layers.0.eh_proj.weight")
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weight_map})
+    )
+    with pytest.raises(ValueError, match="Missing"):
+        load_drafter(str(tmp_path))
+
+
+@parametrize("media", ["text", "image", "video"])
+@parametrize("dtype", [mx.float32, mx.bfloat16])
+@parametrize("temperature", [0, 0.7])
+def test_nemotron_mtp_generation_matches_autoregressive(
+    media, dtype, temperature, monkeypatch
+):
+    mx.random.seed(19)
+    config, model, draft = nemotron_target_and_drafter()
+    model.set_dtype(dtype)
+    draft.set_dtype(dtype)
+    model.eval()
+    draft.eval()
+    prefill = Mock(wraps=draft.prefill_from_target_hidden)
+    monkeypatch.setattr(draft, "prefill_from_target_hidden", prefill)
+    ids = mx.array([[1, 2, 3]])
+    pixels = None
+    kwargs = {}
+    if media == "image":
+        ids = mx.array([[1, 18, 3]])
+        pixels = mx.random.normal((1, 3, 32, 32))
+    elif media == "video":
+        ids = mx.array([[1, 18, 18, 18, 3]])
+        kwargs["pixel_values_videos"] = mx.random.normal((6, 3, 32, 32))
+        kwargs["video_pruning_rate"] = 0
+        embeds = model.get_input_embeddings(ids, **kwargs)
+        assert embeds.inputs_embeds.shape[1] == ids.shape[1]
+    common = dict(
+        max_tokens=12, temperature=temperature, seed=19, prefill_step_size=2, **kwargs
+    )
+    expected = [t for t, _ in generate_step(ids, model, pixels, None, **common)]
+    actual = [
+        t
+        for t, _ in generate_step(
+            ids,
+            model,
+            pixels,
+            None,
+            draft_model=draft,
+            draft_kind="mtp",
+            draft_block_size=4,
+            **common,
+        )
+    ]
+    assert actual == expected
+    assert draft.draft_lens and any(
+        a < d for a, d in zip(draft.accept_lens, draft.draft_lens)
+    )
+    prompt_ids, prompt_hidden = prefill.call_args.args[:2]
+    assert prompt_ids.tolist() == ids.tolist()
+    assert prompt_hidden.shape[1] == ids.shape[1]
+
+
+def test_nemotron_mtp_rejects_pruned_video():
+    config, model, draft = nemotron_target_and_drafter()
+    with pytest.raises(ValueError, match="video_pruning_rate=0"):
+        list(
+            generate_step(
+                mx.array([[1, 18, 18, 18, 3]]),
+                model,
+                None,
+                None,
+                pixel_values_videos=mx.zeros((6, 3, 32, 32)),
+                draft_model=draft,
+                draft_kind="mtp",
+                max_tokens=3,
+                temperature=0,
+            )
+        )
+
+
+@parametrize("accepted", [0, 1, 3])
+def test_nemotron_mtp_mamba_rollback_matches_accepted_prefix(accepted):
+    mx.random.seed(71)
+    config = model_case("nemotron_super_vl")["config"]
+    arch = module("models.nemotron_h_nano_omni")
+    # Exercise the same Metal state replay used by the released model.
+    config["llm_config"]["ssm_state_size"] = 32
+    model = arch.Model(arch.ModelConfig.from_dict(config)).language_model
+    model.eval()
+    ordinary, speculative = model.make_cache(), model.make_cache()
+    prompt = mx.array([[1, 2, 3]])
+    model(prompt, cache=ordinary)
+    model(prompt, cache=speculative)
+    block = mx.array([[4, 5, 6, 7]])
+    hidden, _, states = model.speculative_verify_hidden(block, speculative)
+    mx.eval(hidden)
+    model.rollback_speculative_cache(speculative, states, accepted, 4)
+    for i in range(accepted + 1):
+        model(block[:, i : i + 1], cache=ordinary)
+    equal(
+        [c.state for c in speculative],
+        [c.state for c in ordinary],
+        atol=1e-5,
+        rtol=1e-5,
+    )
+    probe = mx.array([[8]])
+    equal(
+        model(probe, cache=speculative).logits,
+        model(probe, cache=ordinary).logits,
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+
+# Fork: upstream #2273's two prefill-cancellation tests, ported onto this copy's
+# fixtures (upstream's `language("qwen")` / `NS` harness is not carried here).
+def test_speculative_prefill_filter_keeps_hidden_chunks_aligned():
+    drafter = SimpleNamespace(config=SimpleNamespace(target_layer_ids=[0]))
+    prefill = speculative_utils.SpeculativePrefill("dflash", drafter)
+    prefill.append(SimpleNamespace(hidden_states=[mx.array([[[1]], [[2]]])]))
+    prefill.filter([1])
+    output = prefill.finish(SimpleNamespace(hidden_states=[mx.array([[[3]]])]))
+    assert output.hidden_states[0].tolist() == [[[2], [3]]]
+    prefill.append(output)
+    prefill.filter([])
+    assert prefill.chunks == []
+
+
+def test_qwen3_5_cancelled_prefill_row_preserves_survivor_output():
+    model, _ = _qwen3_5_hybrid_batch_model()
+    cache = [ArraysCache(2, left_padding=[5, 0]), BatchKVCache([5, 0])]
+    model(mx.array([[0, 0, 0], [1, 2, 3]], dtype=mx.int32), cache=cache)
+    for layer_cache in cache:
+        layer_cache.filter(mx.array([0]))
+
+    singleton_cache = [ArraysCache(size=2), KVCache()]
+    actual = model(mx.array([[0, 0, 4]], dtype=mx.int32), cache=cache)
+    expected = model(mx.array([[4]], dtype=mx.int32), cache=singleton_cache)
+    assert mx.array_equal(actual[:, -1:], expected).item()
+
+    actual = model(mx.array([[5]], dtype=mx.int32), cache=cache)
+    expected = model(mx.array([[5]], dtype=mx.int32), cache=singleton_cache)
+    assert mx.array_equal(actual, expected).item()
+
+
+@parametrize("batch,length", [(1, 1), (1, 3), (2, 3)])
+@parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+def test_scaled_quantized_verifier(batch, length, dtype):
+    mx.random.seed(43)
+    linears = [
+        ScaledQuantizedLinear(
+            nn.QuantizedLinear.from_linear(
+                nn.Linear(512, 128, bias=bias), group_size=16, bits=4, mode="nvfp4"
+            ),
+            mx.array(0.37),
+            scale_name,
+        )
+        for bias, scale_name in [
+            (False, "weight_scale_2"),
+            (True, "weight_global_scale"),
+        ]
+    ]
+    inputs = mx.random.normal((batch, length, 512)).astype(dtype)
+    expected = [
+        verifier_linear._target_verify_singletons(linear, inputs) for linear in linears
+    ]
+    for linear, reference in zip(linears, expected):
+        equal(verifier_linear._target_verify_linear(linear, inputs), reference)
+    equal(verifier_linear._target_verify_linears(linears, inputs), expected)

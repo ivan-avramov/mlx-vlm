@@ -949,6 +949,9 @@ async def images_generations_endpoint(request: Request):
                         extra["prompt_expansion_model"] = (
                             image_request.prompt_expansion_model
                         )
+                    for key in ("upsample_prompt", "boxes"):
+                        if (value := getattr(image_request, key)) is not None:
+                            extra[key] = value
                     core_request = CoreImageGenerationRequest(
                         prompt=image_request.prompt,
                         seed=seed,
@@ -1088,6 +1091,9 @@ async def images_edits_endpoint(request: Request):
                                 "negative_prompt",
                                 "output_resolution",
                                 "use_kv_cache",
+                                "prompt_expansion_model",
+                                "upsample_prompt",
+                                "boxes",
                             )
                             if (value := getattr(image_request, key)) is not None
                         },
@@ -1108,6 +1114,7 @@ async def images_edits_endpoint(request: Request):
                 height=result.height,
                 seed=result.seed,
                 path=str(result.path) if result.path is not None else None,
+                revised_prompt=result.metadata.get("revised_prompt"),
             )
             if image_request.response_format == "b64_json":
                 item.b64_json = result.to_b64_json()
@@ -1212,6 +1219,7 @@ async def responses_input_tokens_endpoint(request: Request):
                 formatted_prompt,
                 images if images else None,
                 None,
+                **gen_args.preprocessing_kwargs(),
             )
         else:
             image_token_index = getattr(config, "image_token_index", None)
@@ -1220,6 +1228,7 @@ async def responses_input_tokens_endpoint(request: Request):
                 images=images if images else None,
                 prompts=formatted_prompt,
                 image_token_index=image_token_index,
+                **gen_args.preprocessing_kwargs(),
             )
         return {"input_tokens": _count_prompt_tokens(raw_inputs)}
     except HTTPException:
@@ -2481,18 +2490,6 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                 )
 
         kwargs = {}
-
-        if request.resize_shape is not None:
-            if len(request.resize_shape) not in [1, 2]:
-                raise HTTPException(
-                    status_code=400,
-                    detail="resize_shape must contain exactly two integers (height, width)",
-                )
-            kwargs["resize_shape"] = (
-                (request.resize_shape[0],) * 2
-                if len(request.resize_shape) == 1
-                else tuple(request.resize_shape)
-            )
 
         images = []
         audio = []

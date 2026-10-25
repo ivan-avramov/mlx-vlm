@@ -1,9 +1,9 @@
-"""Env-gated MTP round/head profiler (M29 H1, 2026-08-31; fix round 2026-09-01).
+"""Env-gated MTP round profiler (M29 H1, 2026-08-31; fix round 2026-09-01).
 
 CPU-pinned (no GPU, no real model): the round-loop tests use the same fakes
 as ``test_mtp_thinking_budget.py`` (patched ``_mtp_verify_target`` /
-``_mtp_acceptance_walk``); the head-loop tests reuse
-``test_nemotron_h_mtp.py``'s tiny synthetic drafter/target helpers.
+``_mtp_acceptance_walk``). The head-loop profiler and its tests were retired
+with the fork's own nemotron_h_mtp drafter at the 2026-10-25 sync.
 
 Fix round (verifier verdict FIX-FIRST on commit 7a1e6d48):
 F1 two new phases (``yield``, ``accept``) so consumer/attribution time
@@ -12,12 +12,13 @@ F2 the early-return path (yield loop hits ``max_tokens`` mid-round) now
     marks ``yield`` and calls ``end_unit`` before returning, so that
     round's own draft/verify/walk time is no longer counted in totals
     without a matching unit in the per-round means.
-F3 ``round_profiler_from_env`` resets the head singleton so per-request
-    head lines are not cumulative across a multi-request server session.
+F3 ``round_profiler_from_env`` reset the head singleton (retired 2026-10-25
+    with the head profiler).
 F4 this file gained: an exact-count synchronize assertion (a), a direct
     fence-order unit test of ``_PhaseTimer.mark`` (b), accepted/rd and
     n_draft/rd + yield/accept-field assertions (c), a two-generation
-    head-not-cumulative test (d), and a rollback-mark-actually-fires
+    head-not-cumulative test (d; retired with the head profiler), and a
+    rollback-mark-actually-fires
     comparison against an accept-all run (e).
 """
 
@@ -34,15 +35,8 @@ from mlx_vlm.speculative.mtp_profile import (
     MTPRoundProfiler,
     _PhaseTimer,
     cache_state_arrays,
-    reset_head_profiler,
 )
 from mlx_vlm.speculative.utils import _mtp_rounds
-from mlx_vlm.tests.test_nemotron_h_mtp import (
-    HIDDEN_SIZE,
-    NemotronHMTPDraftModel,
-    _drafter_config,
-    _target_model,
-)
 
 ROUND_LINE_RE = re.compile(
     r"^\[mtp_profile\] rounds=(?P<rounds>\d+) draft=(?P<draft>[-\d.]+) "
@@ -51,12 +45,6 @@ ROUND_LINE_RE = re.compile(
     r"rollback=(?P<rollback>[-\d.]+) other=(?P<other>[-\d.]+) "
     r"emitted/rd=(?P<emitted_rd>[-\d.]+) accepted/rd=(?P<accepted_rd>[-\d.]+) "
     r"n_draft/rd=(?P<n_draft_rd>[-\d.]+) round_ms=(?P<round_ms>[-\d.]+) "
-    r"final=(?P<final>[01])$"
-)
-HEAD_LINE_RE = re.compile(
-    r"^\[mtp_profile_head\] draft_tokens=(?P<draft_tokens>\d+) "
-    r"proj_layers=(?P<proj_layers>[-\d.]+) lm_head=(?P<lm_head>[-\d.]+) "
-    r"sampler=(?P<sampler>[-\d.]+) eval=(?P<eval>[-\d.]+) "
     r"final=(?P<final>[01])$"
 )
 
@@ -154,13 +142,6 @@ def _run_rounds(
             )
         ]
     return toks, draft
-
-
-@pytest.fixture(autouse=True)
-def _reset_head():
-    reset_head_profiler()
-    yield
-    reset_head_profiler()
 
 
 class TestCollect:
@@ -363,142 +344,3 @@ class TestRoundProfilerEnv:
             # Two drafts plus a bonus per round: six emitted tokens in two rounds.
             _run_rounds(walk_return=(2, [9, 10, 11]))
             assert calls == {"collect": 2, "rollback": 0}
-
-
-class TestHeadProfilerEnv:
-    def _draft_block_smoke(self):
-        drafter = NemotronHMTPDraftModel(_drafter_config(block_size=3))
-        target = _target_model()
-        drafter.reset(target)
-        drafter.set_shared_kv({}, kv_offset=4, position=3, kv_valid_len=4)
-
-        hidden = mx.zeros((1, 1, HIDDEN_SIZE), dtype=mx.float32)
-        tokens = drafter.draft_block(
-            7,
-            hidden,
-            None,
-            3,
-            lambda logits: mx.argmax(logits, axis=-1),
-            mx.int32,
-            greedy=True,
-        )
-        mx.eval(tokens)
-        return tokens
-
-    def test_env_set_emits_head_summary_line(self, monkeypatch, capsys):
-        monkeypatch.setenv(mtp_profile.ENV_HEAD, "1")
-        self._draft_block_smoke()
-        mtp_profile.head_profiler_from_env().report(final=True)
-
-        err = capsys.readouterr().err
-        lines = [l for l in err.splitlines() if l.startswith("[mtp_profile_head] ")]
-        assert lines, f"no [mtp_profile_head] line in stderr: {err!r}"
-        m = HEAD_LINE_RE.match(lines[-1])
-        assert m is not None, lines[-1]
-        fields = m.groupdict()
-        assert fields["draft_tokens"] == "2"
-        for key in ("proj_layers", "lm_head", "sampler", "eval"):
-            value = float(fields[key])
-            assert value == value
-            assert value >= 0.0
-
-    def test_env_unset_zero_extra_synchronize_calls(self, monkeypatch, capsys):
-        monkeypatch.delenv(mtp_profile.ENV_HEAD, raising=False)
-        real_sync = mx.synchronize
-        calls = {"n": 0}
-
-        def counting_sync(*args, **kwargs):
-            calls["n"] += 1
-            return real_sync(*args, **kwargs)
-
-        monkeypatch.setattr(mx, "synchronize", counting_sync)
-        self._draft_block_smoke()
-        assert calls["n"] == 0
-        assert mtp_profile.head_profiler_from_env() is None
-
-
-class TestRoundFinalFlushesHead:
-    def test_head_singleton_created_gets_final_flush_from_round_report(
-        self, monkeypatch, capsys
-    ):
-        monkeypatch.setenv(mtp_profile.ENV_ROUNDS, "1")
-        monkeypatch.setenv(mtp_profile.ENV_HEAD, "1")
-
-        # round_profiler_from_env() resets the head singleton (F3), so the
-        # head singleton must be created AFTER it, the way draft_block
-        # creates it mid-round in the real flow.
-        prof = mtp_profile.round_profiler_from_env()
-        prof.begin()
-        head = mtp_profile.head_profiler_from_env()
-        head.begin()
-        head.mark("eval", mx.zeros((1,)))
-        head.end_unit()
-
-        prof.report(final=True)
-
-        err = capsys.readouterr().err
-        round_final = [
-            l
-            for l in err.splitlines()
-            if l.startswith("[mtp_profile] ") and l.endswith("final=1")
-        ]
-        head_final = [
-            l
-            for l in err.splitlines()
-            if l.startswith("[mtp_profile_head] ") and l.endswith("final=1")
-        ]
-        assert round_final and head_final
-        assert err.index(round_final[0]) < err.index(head_final[0])
-
-    def test_no_head_singleton_does_not_crash(self, monkeypatch, capsys):
-        monkeypatch.setenv(mtp_profile.ENV_ROUNDS, "1")
-        monkeypatch.delenv(mtp_profile.ENV_HEAD, raising=False)
-        reset_head_profiler()
-        _run_rounds()  # must not raise
-        err = capsys.readouterr().err
-        assert "[mtp_profile_head]" not in err
-
-
-class TestHeadNotCumulativeAcrossGenerations:
-    def test_second_generation_head_line_counts_only_its_own_draft_tokens(
-        self, monkeypatch, capsys
-    ):
-        """F3/F4d: two consecutive fake generations under both env vars --
-        the second head final line must start from draft_tokens counted for
-        that generation only, not carry generation 1's count forward."""
-        monkeypatch.setenv(mtp_profile.ENV_ROUNDS, "1")
-        monkeypatch.setenv(mtp_profile.ENV_HEAD, "1")
-
-        # Generation 1: 3 simulated draft tokens.
-        round1 = mtp_profile.round_profiler_from_env()
-        round1.begin()
-        head1 = mtp_profile.head_profiler_from_env()
-        for _ in range(3):
-            head1.begin()
-            head1.mark("eval", mx.zeros((1,)))
-            head1.end_unit()
-        round1.report(final=True)
-        capsys.readouterr()  # discard generation 1's lines
-
-        # Generation 2: 2 simulated draft tokens. round_profiler_from_env()
-        # must give generation 2 a fresh head singleton.
-        round2 = mtp_profile.round_profiler_from_env()
-        round2.begin()
-        head2 = mtp_profile.head_profiler_from_env()
-        assert head2 is not head1
-        for _ in range(2):
-            head2.begin()
-            head2.mark("eval", mx.zeros((1,)))
-            head2.end_unit()
-        round2.report(final=True)
-
-        err = capsys.readouterr().err
-        head_final = [
-            l
-            for l in err.splitlines()
-            if l.startswith("[mtp_profile_head] ") and l.endswith("final=1")
-        ]
-        assert len(head_final) == 1
-        m = HEAD_LINE_RE.match(head_final[0])
-        assert m is not None, head_final[0]
-        assert m.group("draft_tokens") == "2"

@@ -1,14 +1,18 @@
-"""Env-gated MTP round/head-loop profiler (M29 H1, 2026-08-31).
+"""Env-gated MTP round profiler (M29 H1, 2026-08-31).
 
 MLX is lazy: a phase boundary must ``mx.eval`` that phase's outputs THEN
 ``mx.synchronize()``, or all compute collapses into whichever call evals
 first downstream (typically verify's ``mx.eval(target_tokens)``). The eval
 fences that make per-phase timing possible also kill async overlap between
 phases -- an accepted observer effect, which is why this only runs behind
-``MLX_VLM_MTP_PROFILE`` / ``MLX_VLM_MTP_PROFILE_HEAD`` and is a strict no-op
-otherwise (see ``round_profiler_from_env`` / ``head_profiler_from_env``: with
-the env unset, callers see ``None`` and skip every profiler call -- no
-``mx.synchronize``, no timers, one ``os.environ`` lookup per generation).
+``MLX_VLM_MTP_PROFILE`` and is a strict no-op otherwise (see
+``round_profiler_from_env``: with the env unset, callers see ``None`` and skip
+every profiler call -- no ``mx.synchronize``, no timers, one ``os.environ``
+lookup per generation).
+
+The per-draft-token head profiler (``MLX_VLM_MTP_PROFILE_HEAD``) was retired
+with the fork's own ``nemotron_h_mtp`` drafter at the 2026-10-25 sync, when the
+fork converged on upstream's drafter (docs/proposals/nemotron-h-mtp-convergence.md).
 """
 
 import dataclasses
@@ -20,7 +24,6 @@ from typing import Any, Dict, Iterable, List, Optional
 import mlx.core as mx
 
 ENV_ROUNDS = "MLX_VLM_MTP_PROFILE"
-ENV_HEAD = "MLX_VLM_MTP_PROFILE_HEAD"
 
 
 def _collect(value: Any, out: List[mx.array]) -> None:
@@ -49,7 +52,7 @@ def cache_state_arrays(prompt_cache: Iterable[Any]) -> List[mx.array]:
 
 
 class _PhaseTimer:
-    """Shared accumulate-and-report machinery for the round/head profilers."""
+    """Accumulate-and-report machinery for the round profiler."""
 
     every = 200
 
@@ -100,16 +103,9 @@ class _PhaseTimer:
             print(line, file=sys.stderr, flush=True)
         except Exception:
             pass
-        try:
-            self._after_report(final)
-        except Exception:
-            pass
 
     def _format_line(self, final: bool) -> str:  # pragma: no cover - abstract
         raise NotImplementedError
-
-    def _after_report(self, final: bool) -> None:
-        pass
 
 
 class MTPRoundProfiler(_PhaseTimer):
@@ -153,68 +149,9 @@ class MTPRoundProfiler(_PhaseTimer):
             f"final={1 if final else 0}"
         )
 
-    def _after_report(self, final: bool) -> None:
-        if final and _head_profiler_instance is not None:
-            _head_profiler_instance.report(final=True)
-
-
-class MTPHeadProfiler(_PhaseTimer):
-    """Per-draft-token phase timing for ``NemotronHMTPDraftModel.draft_block``.
-
-    ``sampler`` = graph-build time only; the argmax/sampler kernel itself
-    executes (and is timed) under ``eval``.
-    """
-
-    def __init__(self) -> None:
-        super().__init__(
-            "mtp_profile_head",
-            ["proj_layers", "lm_head", "sampler", "eval"],
-            "draft_token",
-        )
-
-    def _format_line(self, final: bool) -> str:
-        proj_layers = self._per_unit_ms("proj_layers")
-        lm_head = self._per_unit_ms("lm_head")
-        sampler = self._per_unit_ms("sampler")
-        eval_ms = self._per_unit_ms("eval")
-        return (
-            f"[mtp_profile_head] draft_tokens={self.units} "
-            f"proj_layers={proj_layers:.2f} lm_head={lm_head:.2f} "
-            f"sampler={sampler:.2f} eval={eval_ms:.2f} final={1 if final else 0}"
-        )
-
-
-_head_profiler_instance: Optional[MTPHeadProfiler] = None
-
 
 def round_profiler_from_env() -> Optional[MTPRoundProfiler]:
-    """New profiler per generation, or ``None`` if unset (the hot-path guard).
-
-    Also resets the head singleton: the head profiler has no
-    end-of-generation signal of its own (``draft_block`` doesn't know when a
-    request ends), so without this a multi-request server session would mix
-    every request's draft-token timings into one running head profiler. Each
-    generation gets a fresh singleton, created lazily by that generation's
-    first ``draft_block`` call; the round-final report still flushes it.
-    """
+    """New profiler per generation, or ``None`` if unset (the hot-path guard)."""
     if os.environ.get(ENV_ROUNDS, "") != "1":
         return None
-    reset_head_profiler()
     return MTPRoundProfiler()
-
-
-def head_profiler_from_env() -> Optional[MTPHeadProfiler]:
-    """Module singleton (``draft_block`` has no end-of-generation signal to
-    report from), or ``None`` if unset."""
-    global _head_profiler_instance
-    if os.environ.get(ENV_HEAD, "") != "1":
-        return None
-    if _head_profiler_instance is None:
-        _head_profiler_instance = MTPHeadProfiler()
-    return _head_profiler_instance
-
-
-def reset_head_profiler() -> None:
-    """Test-only: clear the head singleton between test cases."""
-    global _head_profiler_instance
-    _head_profiler_instance = None
