@@ -1,0 +1,3 @@
+# The upstream ref the fork last merged. dev/ci.py audits against it.
+# Bump it in the same commit as every upstream sync (AGENTS.md "Fork & branches").
+e9af3766

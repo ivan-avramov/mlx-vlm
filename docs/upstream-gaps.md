@@ -32,10 +32,10 @@ missing** while all 21 genuinely-new upstream files arrived normally.
 
 ## Tooling that now guards this
 
-**Ten** checks. Eight are wired into `.github/workflows/upstream-parity.yml`
-(which runs on pushes to `main` too, not just PRs, since this fork is usually
-committed to directly); `find_dropped_hunks.py` and `find_untested_fork_code.py`
-stay manual because they are ranked reports rather than pass/fail gates.
+**Ten** checks. Eight gate, run by `dev/ci.py audits` (the fork's local stand-in
+for CI since 2026-10-25; before that, `.github/workflows/upstream-parity.yml`);
+`find_dropped_hunks.py` and `find_untested_fork_code.py` are ranked reports rather
+than pass/fail gates, run by the non-gating `dev/ci.py leads`.
 
 **AGENTS.md is authoritative for the current baselines**; the numbers in this
 section have gone stale twice. Read them as history.

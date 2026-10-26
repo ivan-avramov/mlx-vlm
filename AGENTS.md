@@ -17,16 +17,11 @@ git status --short                                           # expect clean
 git rev-parse origin/main                                    # expect == HEAD
 git fetch upstream && git log --oneline HEAD..upstream/main   # MUST be empty; merge if not
 
-(cd mlx_vlm && ../.venv/bin/python -m pytest -q ./tests --ignore=tests/test_smoke.py)
+cat handoff-*.md 2>/dev/null                                 # open tasks, if any
 
-.venv/bin/python dev/check_upstream_parity.py
-.venv/bin/python dev/check_upstream_symbols.py
-.venv/bin/python dev/check_upstream_deletions.py     # ~70s
-.venv/bin/python dev/check_dead_helpers.py
-.venv/bin/python dev/check_fork_markers.py
-.venv/bin/python dev/check_body_divergence.py        # ~3s
-.venv/bin/python dev/check_upstream_registries.py    # ~13s
-.venv/bin/python dev/check_call_arguments.py         # ~30s
+.venv/bin/python dev/ci.py          # the gate: pre-commit, the eight audits vs
+                                    # .upstream-sync-ref, the full suite (~5 min)
+.venv/bin/python dev/ci.py drift    # information: the same audits vs upstream/main
 
 grep -cE '^mlx_vlm' .symbol-exclusions .deletion-exclusions .fork-marker-allowlist \
     .dead-helper-exclusions .body-divergence-exclusions .registry-exclusions \
@@ -36,8 +31,10 @@ grep -cE '^mlx_vlm.*# baseline: pre-existing divergence, unreviewed' .symbol-exc
 # expect 0 — every remaining exclusion carries a real reason
 ```
 
-The pytest `cd` **must** be in a subshell as written. After any bare `cd mlx_vlm`,
-`.venv/bin/python` is *not found* — come back to the repo root.
+**There is no hosted CI** (a free account's Actions minutes; disable Actions on the
+fork). `dev/ci.py` is the gate — see "CI". Running pytest by hand: `cd` into `mlx_vlm`
+in a subshell, `(cd mlx_vlm && ../.venv/bin/python -m pytest -q ./tests)`. After any bare
+`cd mlx_vlm`, `.venv/bin/python` is *not found* — come back to the repo root.
 
 ### Exclusion baselines
 
@@ -126,16 +123,20 @@ python dev/check_call_arguments.py      # no call passing fewer args than upstre
 python dev/check_body_divergence.py --summary   # then size what conflicted
 python dev/check_body_divergence.py --sweep     # then re-review the markers
 python dev/find_untested_fork_code.py   # fork-only code no test mentions (non-gating)
-cd mlx_vlm/ && pytest ./tests --ignore=tests/test_smoke.py
+python dev/ci.py                        # all of the gating ones above, plus the suite
 ```
 
-**Bump the CI sync ref in the same commit as the merge.** `.github/workflows/upstream-parity.yml`
-gates on `env: UPSTREAM_SYNC_REF` -- the upstream ref the fork last merged -- not on the moving
-`upstream/main` (which made the workflow red on every upstream commit, whatever the fork's
-health). After merging ref X (a release tag such as `v0.7.6`, or the merged sha if you merged
-an untagged `upstream/main`), set `UPSTREAM_SYNC_REF: X`, run the checks above with
-`--upstream-ref X`, and push both together. The workflow's non-gating `drift` job reports the
-same checks against `upstream/main` as information about the next sync.
+`dev/ci.py audits` and `dev/ci.py leads` run the audit and lead-generator lists above
+against `.upstream-sync-ref`; pass `--sync-ref X` to audit a merge before bumping it.
+
+**Bump the sync ref in the same commit as the merge.** `dev/ci.py` audits against
+`.upstream-sync-ref` -- the upstream ref the fork last merged -- not the moving `upstream/main`
+(which would go red on every upstream commit, whatever the fork's health). After merging ref
+X (a release tag such as `v0.7.6`, or the merged sha if you merged an untagged
+`upstream/main`), write X into `.upstream-sync-ref`, run `python dev/ci.py`, and commit both
+together. `python dev/ci.py drift` reports the same checks against `upstream/main` as
+information about the next sync. (`.github/workflows/upstream-parity.yml` held this until
+2026-10-25; it is gone with hosted CI.)
 
 **`find_dropped_hunks.py` has THREE floors and the bare invocation is decoration.**
 `--min-lines 3`, `--min-share 0.5` and `--max-commits 80` are all defaults, and each
@@ -767,9 +768,9 @@ order that mattered:
    is indistinguishable from one that cannot.
 7. **Write its test in `mlx_vlm/tests/`**, covering both directions plus the exclusions
    contract. Not optional: a permissive bug here fails nothing and still prints OK.
-8. **Wire it into `.github/workflows/upstream-parity.yml`** and add its baseline to the
-   table above, the cold-start block, and the post-merge block. Three places, all of
-   which have gone stale before.
+8. **Add it to `dev/ci.py`'s `AUDITS`** (`tests/test_local_ci.py` fails if a
+   `dev/check_*.py` is missing there) and add its baseline to the table above and the
+   cold-start block. Both have gone stale before.
 
 The exclusions file wants a **written reason per entry and a hard error when one is
 missing** — every one of these scripts enforces that, and it is the only thing that
@@ -887,7 +888,11 @@ cd mlx_vlm/ && pytest -s ./tests/test_generate.py::TestClassName::test_method_na
 pip install -e .
 # local venv with test deps (used by the commands above):
 uv venv --python 3.12 .venv
-uv pip install --python .venv/bin/python -e . pytest pytest-asyncio
+uv pip install --python .venv/bin/python -e . pytest pytest-asyncio pytest-xdist \
+    "cryptography>=43.0.0" "huggingface-hub<2.0"
+# cryptography: optional at runtime (compaction capsules), needed by their tests.
+# huggingface-hub<2.0 only matters when adding packages to an existing env: transformers
+# 5.14 rejects 2.x, and a lone `uv pip install datasets` upgrades it.
 # only for dev/fork_coverage_report.py; not a package dependency:
 uv pip install --python .venv/bin/python coverage
 ```
@@ -1095,17 +1100,25 @@ top of `reranking.py`. **Re-check this after every merge that adds a server modu
 
 ## CI
 
-- `tests.yml` — upstream's sharded workflow (#2567, taken at the 2026-10-25 sync):
-  runs on **pushes to `main` and PRs**. A lint job runs `pre-commit` and a "Validate
-  test groups" step that fails unless every `tests/**/test_*.py` is assigned to exactly
-  one matrix group; tests run per group with `pytest -n 3` (xdist). The fork adds two
-  groups, `fork-a` / `fork-b` (marked), holding every fork-only test file. **A new fork
-  test file must be added to one of them**, or the lint job goes red. Fork addition: the
-  optional `cryptography` install, for the capsule contract tests.
-- `upstream-parity.yml` — runs on pushes to `main` as well as PRs, since this fork
-  is usually committed to directly. Runs the eight gating audit scripts against
-  `UPSTREAM_SYNC_REF` (the last merged upstream ref, bumped at every sync -- see "Fork &
-  branches"), plus a non-gating `drift` job against `upstream/main`.
+**No hosted CI.** The fork runs nothing on GitHub Actions (free-account minutes; Actions
+are disabled on the fork). Everything that used to be CI runs locally:
+
+```bash
+.venv/bin/python dev/ci.py                 # gate: style + audits + suite, exit 1 on failure
+.venv/bin/python dev/ci.py audits          # any subset: style | audits | suite
+.venv/bin/python dev/ci.py drift leads     # information only: never fails
+.venv/bin/python dev/ci.py suite -- -n 3   # args after `--` go to pytest (xdist installed)
+```
+
+- `style` = `pre-commit run --all-files` (`uvx pre-commit` if it is not on PATH).
+- `audits` = the eight gating audits against `.upstream-sync-ref`, deletions `--strict`.
+- `suite` = the full pytest suite. `drift` = the audits against `upstream/main`.
+  `leads` = `find_dropped_hunks.py` (the wide pass) and `find_untested_fork_code.py`.
+- `tests/test_local_ci.py` pins the runner: every `dev/check_*.py` and `dev/find_*.py`
+  must be wired in, and only a gating failure may fail the run.
+- `.github/workflows/` is byte-identical to upstream's so merges stay conflict-free. Its
+  `tests.yml` matrix groups list upstream's test files only, and that is fine: it never
+  runs here. Do not add fork test files to it.
 
 ## Key dependencies
 
@@ -1166,7 +1179,11 @@ Collected from the retired handoff files (`handoff-2026-08-10.md`, then
 `handoff-2026-08-11.md`), each deleted per its own "delete this when §2 is empty"
 instruction once its task list was drained. Ordered roughly by how often they bite.
 
-**There is no handoff file now, deliberately.** Both were task lists, and a task list
+**Open handoff: `handoff-2026-10-25.md`** (the mlx 0.32.4 exactness failures, the
+upstream-copy audit, notes for the stack bump). Delete it, and this paragraph's first
+sentence, when its task list is empty. The rule below still holds.
+
+**A handoff file exists only while it holds tasks.** Both earlier ones were task lists, and a task list
 holding no tasks is the document most likely to go stale next — the last one needed four
 separate correction commits for numbers that restated themselves, including three
 consecutive revisions of a single unpushed-commit count. Standing work lives in this
