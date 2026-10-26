@@ -825,7 +825,7 @@ positives. Every hit still needs `git log -S` and a read.
 cd mlx_vlm/ && pytest -s ./tests --ignore=tests/test_smoke.py
 ```
 
-The suite is **green on mlx 0.32.3 and has 5 known failures on 0.32.4** (2026-10-25: ~8800 collected; the five are fork-only quantized exact-verify tests listed in `memory.md`'s 2026-10-25 block). Upstream tests that fail on upstream's own tree, or assert behaviour the fork changes on purpose, are strict-xfailed through `tests/conftest.py`'s `KNOWN_UPSTREAM_FAILURES` / `FORK_DIVERGENT_UPSTREAM_TESTS`; each entry names its reason. Scope CPU-only test device changes to restoring fixtures; do not change the default device during collection. Keep it that
+The suite is **green on mlx 0.32.4** (2026-10-26: ~9050 collected). mlx 0.32.3 is unsupported: since upstream #2527 the exact verifier kernels match only 0.32.4's qmv, and ~190 tests fail there. Upstream tests that fail on upstream's own tree, or assert behaviour the fork changes on purpose, are strict-xfailed through `tests/conftest.py`'s `KNOWN_UPSTREAM_FAILURES` / `FORK_DIVERGENT_UPSTREAM_TESTS`; each entry names its reason. Scope CPU-only test device changes to restoring fixtures; do not change the default device during collection. Keep it that
 way. (This
 line goes stale on every restore that adds a guard — trust the run, not the number.)
 
@@ -1123,8 +1123,8 @@ are disabled on the fork). Everything that used to be CI runs locally:
 ## Key dependencies
 
 - `mlx` >= 0.32.4 — core framework (upstream's floor since the 2026-10-25 sync).
-  Five fork-only quantized exact-verify tests fail on 0.32.4 and pass on 0.32.3;
-  see `memory.md`'s 2026-10-25 row before moving the stack off 0.32.3
+  0.32.3 is unsupported (exact verifier kernels are 0.32.4-only since #2527); a
+  consumer on 0.32.3 must move to 0.32.4 in the same step it takes this fork
 - `mlx-audio` >= 0.5.2 — same floor as upstream (the old 0.4.8 fork bump is moot)
 - `transformers` >= 5.14.0 — configs, tokenizers, processors; keep
   `huggingface-hub` < 2.0 when installing extras into an existing env (5.14 rejects 2.x)
@@ -1179,8 +1179,7 @@ Collected from the retired handoff files (`handoff-2026-08-10.md`, then
 `handoff-2026-08-11.md`), each deleted per its own "delete this when §2 is empty"
 instruction once its task list was drained. Ordered roughly by how often they bite.
 
-**Open handoff: `handoff.md`** (the mlx 0.32.4 exactness failures, the upstream-copy
-audit, notes for the stack bump). Delete it, and this paragraph, when its task list is
+**Open handoff: `handoff.md`** (the upstream-copy audit, notes for the stack bump). Delete it, and this paragraph, when its task list is
 empty.
 
 **There is at most one handoff, always `handoff.md`.** Update it in place; never start a
