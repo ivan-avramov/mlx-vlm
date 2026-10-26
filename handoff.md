@@ -15,8 +15,12 @@ Last updated 2026-10-26, by the session that closed T1 (the mlx 0.32.4 exactness
   Push only when the operator says so. Rules live in `AGENTS.md`, history in
   `memory.md` (see the 2026-10-25 block for this sync), and upstream defects found here
   in `docs/upstream-bugs.md` (items 9–14 are new).
-- **State:** `main` contains `upstream/main` (`e9af3766`); `git log HEAD..upstream/main`
-  was empty on 2026-10-25, and the sync was pushed (`origin/main` at `1669ee72` or later).
+- **State (2026-10-26):** `main` contains `e9af3766` (the 2026-10-25 sync, pushed;
+  `origin/main` at `1669ee72`). Unpushed: `142f8f69`, `98cfb0b6` (T1), `566691b9` and
+  this handoff update; push only when the operator says so.
+- **Upstream has moved:** `upstream/main` is 14 commits ahead, all #2558 (native MTP in
+  the SFT/ORPO trainers, `6d9ba328`). Under AGENTS.md's weekly-merge rule the next sync
+  is due by 2026-11-01; it can wait for T2, not longer.
 - **No hosted CI.** GitHub Actions are disabled on the fork (free-account minutes), and
   `.github/workflows/` is byte-identical to upstream's. The gate is local:
   `.venv/bin/python dev/ci.py` (pre-commit, the eight audits vs `.upstream-sync-ref`,
@@ -27,6 +31,20 @@ Last updated 2026-10-26, by the session that closed T1 (the mlx 0.32.4 exactness
 - **mlx 0.32.3 is unsupported.** Since upstream #2527 the exact verifier kernels match
   only 0.32.4's qmv; the suite fails ~190 tests on 0.32.3 (measured 2026-10-26). The
   earlier claim here that T1's five tests passed on 0.32.3 was wrong for this tree.
+- **Checking another mlx version without touching `.venv`:** build a throwaway venv
+  from `uv pip freeze --python .venv/bin/python` minus `mlx`/`mlx-metal`/`mlx-vlm`, add
+  the other mlx, then run tests with `PYTHONPATH=<checkout>` (it takes precedence over
+  the editable install). Diff the two freezes first; only mlx may differ. Never
+  reinstall mlx in `.venv`.
+- **Verify == decode depends on MLX's private dispatch.** `singleton_quantized_linear`
+  is exact only where MLX's plain singleton qmv and `gather_qmv` pick the same kernel
+  (`mlx/backend/metal/quantized.cpp`, `dispatch_qmv` vs `gather_qmv`). Known
+  divergences: K <= 128 (`qmv_quad`) and, from 0.32.4, N % 8 != 0 (`qmv_fast` partial
+  rows); both now take a per-row path (`docs/upstream-bugs.md` 14). On every MLX bump,
+  diff that dispatch between the two versions: the tests pin only the known geometries.
+- **Four-eyes helpers:** the codex CLI sandbox has no Metal device, so codex cannot run
+  GPU tests; the designer runs them and relays the output. T1's run is recorded in
+  `98cfb0b6`'s message.
 - **Venv** (`.venv`, Python 3.12): mlx 0.32.4,
   transformers 5.14.1, huggingface-hub 1.33.0 (keep it below 2.0), plus datasets,
   pytest-xdist, cryptography and pyflakes. `requirements.txt` needs `mlx>=0.32.4`.
