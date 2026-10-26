@@ -17,7 +17,7 @@ git status --short                                           # expect clean
 git rev-parse origin/main                                    # expect == HEAD
 git fetch upstream && git log --oneline HEAD..upstream/main   # MUST be empty; merge if not
 
-cat handoff-*.md 2>/dev/null                                 # open tasks, if any
+cat handoff.md 2>/dev/null                                   # the one handoff, if open
 
 .venv/bin/python dev/ci.py          # the gate: pre-commit, the eight audits vs
                                     # .upstream-sync-ref, the full suite (~5 min)
@@ -1179,11 +1179,14 @@ Collected from the retired handoff files (`handoff-2026-08-10.md`, then
 `handoff-2026-08-11.md`), each deleted per its own "delete this when §2 is empty"
 instruction once its task list was drained. Ordered roughly by how often they bite.
 
-**Open handoff: `handoff-2026-10-25.md`** (the mlx 0.32.4 exactness failures, the
-upstream-copy audit, notes for the stack bump). Delete it, and this paragraph's first
-sentence, when its task list is empty. The rule below still holds.
+**Open handoff: `handoff.md`** (the mlx 0.32.4 exactness failures, the upstream-copy
+audit, notes for the stack bump). Delete it, and this paragraph, when its task list is
+empty.
 
-**A handoff file exists only while it holds tasks.** Both earlier ones were task lists, and a task list
+**There is at most one handoff, always `handoff.md`.** Update it in place; never start a
+second or a dated one. It carries all the context a cold session needs, and the
+next-session prompt is one line: "Read handoff.md and do the next open task." **A
+handoff exists only while it holds tasks.** Both earlier ones were task lists, and a task list
 holding no tasks is the document most likely to go stale next — the last one needed four
 separate correction commits for numbers that restated themselves, including three
 consecutive revisions of a single unpushed-commit count. Standing work lives in this
