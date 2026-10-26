@@ -134,6 +134,34 @@ def stop_position(free, where):
     return None
 
 
+def budget_trip(free, where):
+    """``(budget, n)`` so the first over-budget token of ``free`` sits at a ``where`` position.
+
+    ``<think>`` is not counted, ``</think>`` ends thinking and the newline is counted (it does not end
+    thinking). The first round whose head (``free[:p + 1]``) holds two or more counted tokens and does not
+    end in ``<think>`` fixes the budget at ``counted - 1``: ``p`` is then the first over-budget token and
+    the forced newline lands at ``p + 1``. ``n = p + 4`` keeps the pre-fix closer in the emission but
+    leaves no room for a re-opened span to trip again. ``None`` when no round qualifies, or when a closer
+    or newline occurs in the head or in the rest of round ``r`` (which the pre-fix tree emits verbatim).
+    """
+    r = 1
+    while True:
+        p = WHERE[where](r)
+        if p + 1 > len(free):
+            return None
+        head = free[: p + 1]
+        if CLOSE in head or NEWLINE in head:
+            return None
+        if head[-1] != THINK:
+            rest = free[p + 1 : WHERE["bonus"](r) + 1]
+            if CLOSE in rest or NEWLINE in rest:
+                return None
+            counted = sum(1 for t in head if t != THINK)
+            if counted >= 2:
+                return counted - 1, p + 4
+        r += 1
+
+
 def run_cases(cases, observer=None):
     from test_mtp_exactness import PROMPT, fake_model, hybrid_lm, mtp_drafter, scripted
 
@@ -143,16 +171,28 @@ def run_cases(cases, observer=None):
     model = fake_model(lm)
     out = []
     for case in cases:
-        budget = case.get("budget")
-        ids = list(PROMPT) + ([THINK] if budget is not None else [])
-        n = int(case["n"])
-        free, _ = _run(model, ids, PromptCacheState(), n=n + BLOCK + 1)
+        budget, trip = None, None
+        ids = list(PROMPT)
+        if case.get("budget_at"):
+            ids = ids + [THINK]
+            free, _ = _run(model, ids, PromptCacheState(), n=16)
+            tripped = budget_trip(free, case["budget_at"])
+            if tripped is None:
+                out.append(dict(name=case["name"], error="no usable budget trip"))
+                continue
+            budget, n = tripped
+            trip = n - 4
+        else:
+            n = int(case["n"])
+            free, _ = _run(model, ids, PromptCacheState(), n=n + BLOCK + 1)
         position = stop_position(free, case["where"]) if case.get("where") else None
         if case.get("where") and position is None:
             out.append(dict(name=case["name"], error="no usable stop position"))
             continue
         stop_ids = [free[position]] if position is not None else []
         result = dict(name=case["name"], free=free, stop_position=position)
+        if budget is not None:
+            result.update(budget=budget, n=n, trip_position=trip)
         for arm in ("off", "on"):
             state, drafter = PromptCacheState(), None
             if arm == "on":

@@ -1,9 +1,9 @@
 """P369 phase 2 E7 (Q23 / Q30): the M3 / M4 classes, validated against genuinely pre-fix execution.
 
 Fork-only file. The same scripted cases (tiny dense hybrid target, full-accept scripted MTP drafter, a stop
-placed on the first draft / second draft / bonus / first token, a length cut, thinking budgets that trip
-inside a block) run in two ISOLATED checkouts, each in a fresh ``python -I`` interpreter with only its own
-``mlx_vlm`` on ``sys.path``: ``88724023`` (pre-fix, = ``0b43dae4^``) must show each precise defect,
+placed on the first draft / second draft / bonus / first token, a length cut, thinking budgets (derived
+from the free trajectory) that trip inside a block) run in two ISOLATED checkouts, each in a fresh
+``python -I`` interpreter with only its own ``mlx_vlm`` on ``sys.path``: ``88724023`` (pre-fix, = ``0b43dae4^``) must show each precise defect,
 ``0b43dae4`` (the M4 + M3 fix) none. The live ``Observer`` on the CURRENT code must then classify exactly
 the pre-fix defects of each case (class, M4a's committed-past count, M3's overshoot).
 """
@@ -56,9 +56,9 @@ EXPECT_PRE_FIX = {
         committed_past_stop=0, terminal_missing=1, next_turn_diverged=True
     ),
     "length": dict(committed_past_stop=0, terminal_missing=1, next_turn_diverged=True),
-    "budget2": dict(overshoot=2, forced_sequence_cut=True),
-    "budget3": dict(overshoot=1, forced_sequence_cut=True),
-    "budget4": dict(overshoot=0, forced_sequence_cut=True),
+    "budget_first_draft": dict(overshoot=2, forced_sequence_cut=True),
+    "budget_second_draft": dict(overshoot=1, forced_sequence_cut=True),
+    "budget_bonus": dict(overshoot=0, forced_sequence_cut=True),
 }
 
 

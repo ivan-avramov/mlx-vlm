@@ -485,3 +485,34 @@ Found by the stage A change review (codex) of the 2026-10-25 sync. Confirmed by
 reading `trainer/peft/`, which is byte-identical to upstream `e9af3766`.
 
 **Not patched here** (P600): the stack does not fine-tune NVFP4 checkpoints.
+
+## 14. `singleton_quantized_linear` is not bitwise equal to decode for K <= 128
+
+`models/quantized_verifier.py::singleton_quantized_linear` (#2127) computes a
+`[B, T, K]` block with one `mx.gather_qmm` so each row gets "singleton qmv
+arithmetic". MLX's `dispatch_qmv` (`mlx/backend/metal/quantized.cpp`, identical in
+v0.32.3 and v0.32.4) routes a plain `quantized_matmul` with `K == 128 || (K == 64 &&
+bits >= 2)`, power-of-two bits and no global scale to `qmv_quad` (quad-group
+reduction); `gather_qmv` never does (simd reduction). The reduction trees differ, so
+for K <= 128 verify differs from decode by one output ulp on some inputs.
+
+Measured over 40 seeds per configuration, `[1, 2, K]` bf16: on mlx 0.32.3 only 8-bit
+K in {64, 128} mismatch; on 0.32.4 the 2- and 4-bit cases do too. Every other K and
+bit width matched. In the fork's E1a mixed fixture the 8-bit `linear_attn.out_proj`
+(K = 128) reaches it through `speculative/ops/linear.py::_target_verify_quantized_linear`,
+which is upstream-identical; the fork's exact affine kernel does not apply because
+`supports_optimized_affine_head` rejects K % 512 != 0.
+
+A second geometry, **mlx 0.32.4 only**: when the output width `N` is not a multiple
+of 8 the plain call takes `qmv_fast` with partial rows, while `gather_qmv` is still
+gated on `N % 8 == 0` and never does. Confirmed for bf16 and fp16, 4- and 8-bit,
+K in {512, 1024}, N in {7, 12, 100}; none on 0.32.3.
+
+Upstream already knows the shape: `models/linear.py::native_batch_linear` guards its
+own call with `K % 512 == 0`; the speculative path has no such guard.
+
+**This fork diverges deliberately here**: for `x.shape[-1] <= 128` or `N % 8 != 0` the function runs
+each `[b, t]` row as the decode call itself and concatenates (marked `# Fork:`), exact
+by construction; the `gather_qmm` path is kept only when K > 128 and N % 8 == 0. Pinned by
+`tests/test_singleton_quantized_narrow.py`. The fix upstream could take is the same
+per-row path, or a guard at the speculative caller requiring both `K % 512 == 0` and `N % 8 == 0` (the K guard alone does not cover the odd-N geometry).

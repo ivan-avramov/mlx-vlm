@@ -6,8 +6,8 @@ and runs ``oracle_cases.py`` on it in a fresh ``python -I`` interpreter (only th
 
 - ``committed_past_stop``: ON cache offset − OFF cache offset when positive (M4a);
 - ``terminal_missing``: OFF − ON when positive (M4b: the terminal token is not in ON's cache);
-- ``overshoot``: index of ON's first forced token − OFF's (M3), and ``forced_sequence_cut`` when ON emitted
-  fewer forced tokens than OFF;
+- ``overshoot``: index of ON's first forced token − OFF's (M3), and ``forced_sequence_cut`` when ON's
+  window of ``len(FORCED)`` tokens from its first forced token differs from OFF's (or ON has none);
 - ``next_turn_diverged``, ``emission_differs``.
 
 Digests are informational: on the dense float32 fixture MTP and plain state are not bit-identical (P390).
@@ -24,9 +24,9 @@ CASES = [
     dict(name="bonus", where="bonus", n=12),
     dict(name="first_token", where="first_token", n=12),
     dict(name="length", n=7),
-    dict(name="budget2", budget=2, n=12),
-    dict(name="budget3", budget=3, n=12),
-    dict(name="budget4", budget=4, n=12),
+    dict(name="budget_first_draft", budget_at="first_draft"),
+    dict(name="budget_second_draft", budget_at="second_draft"),
+    dict(name="budget_bonus", budget_at="bonus"),
 ]
 FORCED = (63, 62)  # the scripted fixtures' newline and closer ids (oracle_cases.py)
 PRE_FIX = "88724023"  # = 0b43dae4^ (tests only on top of the base)
@@ -89,6 +89,8 @@ def defects(result):
     a, b = _first_forced(on["emitted"]), _first_forced(off["emitted"])
     if b is not None:
         out["overshoot"] = None if a is None else a - b
-        count = lambda e: sum(1 for t in e if t in FORCED)  # noqa: E731
-        out["forced_sequence_cut"] = count(on["emitted"]) < count(off["emitted"])
+        width = len(FORCED)
+        out["forced_sequence_cut"] = (
+            a is None or on["emitted"][a : a + width] != off["emitted"][b : b + width]
+        )
     return out

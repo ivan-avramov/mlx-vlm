@@ -318,7 +318,25 @@ def test_quantized_e1c_detects_an_in_support_change_of_one_verifier_row():
     lm, model, params, on, emitted, offsets = _e1c(PICKS[0])
     with observe.Recorder(mode="off", force_tokens=emitted) as off:
         turn(model, PROMPT, PromptCacheState(), n=len(emitted), seed=5, params=params)
-    position = 3
+
+    # The sampled trajectory depends on the installed MLX's numerics: pick a position whose
+    # canonical distribution has two or more tokens in support and changes under the bump (in
+    # bf16 a +0.01 bump can round away), so the comparator has something to detect.
+    def _bumped(record):
+        r = compare.from_record(record)
+        top = int(mx.argmax(r).item())
+        bumped = mx.where(mx.arange(r.size) == top, r + 0.01, r).astype(r.dtype)
+        return compare.as_record(bumped)
+
+    def _changes(record):
+        before = compare.canonical(record, params)
+        after = compare.canonical(_bumped(record), params)
+        return int((before > 0).sum()) >= 2 and not np.array_equal(before, after)
+
+    latest, _ = compare.latest_rows(on.rows, len(emitted))
+    candidates = sorted(p for p, r in latest.items() if p >= 1 and _changes(r))
+    assert candidates, "no emitted position with an in-support choice"
+    position = candidates[0]
     index = max(i for i, (p, _) in enumerate(on.rows) if p == position)
     row = compare.from_record(on.rows[index][1])
     top = int(mx.argmax(row).item())

@@ -390,7 +390,12 @@ def exact_quantized_linear(linear, x: mx.array) -> Optional[mx.array]:
 
 
 def singleton_quantized_linear(linear, x: mx.array) -> Optional[mx.array]:
-    """Fuse a runtime-sized batch while retaining singleton qmv arithmetic."""
+    """Project a runtime-sized batch with singleton (decode-call) qmv arithmetic.
+
+    Wide inputs (K > 128 and an output width that is a multiple of 8) are fused into one
+    ``mx.gather_qmm``. Narrow inputs (K <= 128) or an output width that is not a multiple of 8
+    run each ``[b, t]`` row as the decode call itself and concatenate the rows.
+    """
     if (
         not supports_quantization(linear)
         or not isinstance(linear, nn.QuantizedLinear)
@@ -398,6 +403,25 @@ def singleton_quantized_linear(linear, x: mx.array) -> Optional[mx.array]:
         or x.shape[-1] != _input_dims(linear)
     ):
         return None
+
+    if (x.shape[-1] <= 128 or linear.weight.shape[0] % 8 != 0) and (
+        x.shape[0] * x.shape[1] > 0
+    ):
+        # Fork: two geometries where the gather path below differs from the decode call by one
+        # ulp on some inputs. (1) MLX's plain quantized_matmul routes K == 128 (or K == 64 with
+        # bits >= 2) to qmv_quad, a quad-group reduction gather_qmm never uses; the K <= 128
+        # bound is wider than that exact condition on purpose. (2) On mlx 0.32.4 the plain call
+        # takes qmv_fast with partial rows when the output width N is not a multiple of 8,
+        # while gather_qmv is still gated on N % 8 == 0. Run each [b, t] row as the decode call
+        # itself: exact by construction. For K <= 128 the rows are cheap. An odd-width
+        # projection (e.g. an LM head with an odd vocabulary such as 32001 or 50257) runs B*T
+        # decode calls instead of one gather: the same arithmetic at more launches.
+        rows = [
+            linear(x[b : b + 1, t : t + 1])
+            for b in range(x.shape[0])
+            for t in range(x.shape[1])
+        ]
+        return mx.concatenate(rows, axis=0).reshape(x.shape[0], x.shape[1], -1)
 
     indices = mx.zeros((*x.shape[:2], 1), dtype=mx.int32)
     projected = mx.expand_dims(mx.contiguous(x), (-2, -3))
