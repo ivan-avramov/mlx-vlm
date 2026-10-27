@@ -5,7 +5,7 @@ The fork runs no hosted CI. This script is the gate. A stage exits non-zero only
 for the gating stages; `drift` and `leads` are information.
 
     python dev/ci.py                    # style, audits, suite (the full gate)
-    python dev/ci.py audits             # the eight audits vs the last-merged ref
+    python dev/ci.py audits             # the nine audits vs the last-merged ref
     python dev/ci.py audits suite       # any subset, in the order given
     python dev/ci.py drift              # the same audits vs the moving upstream/main
     python dev/ci.py leads              # find_dropped_hunks (wide) + find_untested_fork_code
@@ -13,7 +13,7 @@ for the gating stages; `drift` and `leads` are information.
 
 Stages:
   style   pre-commit run --all-files (pre-commit on PATH, else `uvx pre-commit`)
-  audits  the eight gating dev/check_*.py audits against .upstream-sync-ref
+  audits  the nine gating dev/check_*.py audits against .upstream-sync-ref
   suite   the full pytest suite, run from mlx_vlm/ with this interpreter
   drift   the audits against upstream/main; reports, never fails
   leads   the two lead generators; reports, never fails
@@ -50,6 +50,7 @@ AUDITS: List[tuple] = [
     ("check_body_divergence.py", ()),
     ("check_upstream_registries.py", ()),
     ("check_call_arguments.py", ()),
+    ("check_upstream_test_copies.py", ()),
 ]
 
 # (script, the flag that takes the sync ref, extra arguments).

@@ -1,0 +1,73 @@
+# Baseline for dev/check_upstream_test_copies.py — the upstream-test-copy differential.
+#
+# Format: `<node id pattern>  # reason`, one per line. Every entry MUST carry a reason;
+# the script refuses to run otherwise (so does a duplicate pattern, or a pattern that
+# does not start with one of the three owned test files). The pattern is a repo-relative
+# node id of the ORIGINAL file, e.g.
+#
+#     mlx_vlm/tests/test_server.py::TestCompaction::test_max_output_is_a_ceiling[*-chat-*]
+#
+# `*` is the only wildcard (any run of characters, including none); brackets are
+# literal; the whole id must match. A pattern with no `[` also matches every
+# parametrization of that test. Prefer the exact parameters that fail: a bare
+# test name also excuses a future regression in the parameters that pass today.
+# A whole copy that fails to import is the id `mlx_vlm/tests/<file>.py` (no `::`).
+#
+# What this audit catches: the fork OWNS test_speculative.py, test_server.py and
+# test_generate.py (C104), so upstream's own assertions in them never run against the
+# fork's library. The audit runs upstream's copies (at --upstream-ref) against this
+# tree and fails on any failing test this file does not excuse. It found a real bug
+# the first time it was run by hand: a standalone `glm_moe_dsa_mtp` drafter loaded
+# with every weight silently dropped. `dev/ci.py` passes it `.upstream-sync-ref`.
+#
+# THE TRAP, the same one as .call-argument-exclusions and .body-divergence-exclusions:
+# do not excuse a failure by asserting that the fork changed the behaviour on purpose.
+# Establish provenance first — `git log -S'<the asserted literal>'` and the test's own
+# commit — and say what you established: either upstream's test is stale/wrong, or the
+# fork deliberately diverges (name where it is recorded). An excused failure is
+# invisible to every later run; "fails on upstream's tree too" is a valid reason only
+# if you ran it there.
+#
+# A stale entry (matches no failing test) is reported under `warning:` and does not
+# gate; prune it in the same commit that fixed the cause.
+#
+# Validate that the audit FIRES (an audit never seen to fail cannot be trusted green):
+#   1. delete one entry below (or, with the baseline complete, revert a fork fix that an
+#      upstream assertion covers);
+#   2. run `python dev/check_upstream_test_copies.py --upstream-ref <sync-ref>`;
+#   3. expect exit 1 naming exactly the uncovered ids; restore the entry;
+#   4. `git status --porcelain --ignored mlx_vlm/tests` must show no `test_zz_up_` path.
+# `--list` prints every failing id, ready to paste here without its reason.
+#
+# Validated 2026-10-26 against e9af3766: reverting the founding fix (mlx_vlm/utils.py stripping
+# `mtp.*` unconditionally) made it exit 1 naming 3 NEW
+# test_load_registered_native_drafter[...glm_moe_dsa...] ids; restored, exit 0. That instance is
+# also covered by the fork's own tests/test_load_model_mtp_weights.py since the sync.
+#
+# Seeded 2026-10-26 from a run against e9af3766: 49 failing ids in 16 test functions, every
+# one fork divergence or a recorded upstream bug. No new gap.
+
+# --- tests/test_speculative.py ---------------------------------------------------
+mlx_vlm/tests/test_speculative.py::test_round_commit_close_and_abort[*-2-mtp]  # FORK, reviewed 2026-10-26: batched MTP decoding is refused by design since P369 F12 (69212732, speculative/utils.py:99: it cannot match plain decoding's per-row stop state). Only the batch=2 mtp cases; batch=1 and every dflash/eagle3 case pass. Same disposition as .symbol-exclusions:373.
+mlx_vlm/tests/test_speculative.py::test_nemotron_mtp_generation_matches_autoregressive[0.7-dtype1-video]  # UPSTREAM BUG, reviewed 2026-10-26: fails on upstream's own tree with mlx 0.32.4 (sampled bf16 video verify drifts from plain decode at token 1); docs/upstream-bugs.md item 10, KNOWN_UPSTREAM_FAILURES in tests/conftest.py. Prune when upstream fixes it.
+
+# --- tests/test_server.py --------------------------------------------------------
+mlx_vlm/tests/test_server.py::test_server_serves_ar_requests_after_drafter_mismatch  # FORK, reviewed 2026-10-26: O40 (715b06be) refuses an incompatible drafter at startup unless MLX_VLM_DRAFT_ALLOW_FALLBACK=1; upstream silently degrades to plain decode. The fork's copy of this test sets the gate and asserts the same degraded serving (tests/test_server.py); test_server_refuses_incompatible_mtp_drafter_by_default pins the refusal.
+mlx_vlm/tests/test_server.py::TestResponseGenerator::test_context_limit_precedes_image_hashing  # FORK, reviewed 2026-10-26: the fork clamps the budget and rejects with its own MIN_OUTPUT_TOKENS message (02e8046d), so only the `match="MAX_KV_SIZE is 8"` regex fails. Verified: with the fork's message substituted the test passes, so the ordering it exists for (reject before image hashing) holds. Same disposition as .symbol-exclusions:256.
+mlx_vlm/tests/test_server.py::TestCompaction::test_max_output_is_a_ceiling_for_short_prompts[128000-*-chat-*]  # FORK, reviewed 2026-10-26: Chat Completions compaction is opt-in in the fork (ebdbfbbc, MLX_VLM_CHAT_COMPACTION, default off; the audit strips MLX_VLM_* from the child env). Only the chat cases with a context large enough to need compaction fail; every responses case and the 64-token chat cases pass.
+mlx_vlm/tests/test_server.py::TestCompaction::test_max_output_is_a_ceiling_for_short_prompts[256000-*-chat-*]  # FORK, reviewed 2026-10-26: opt-in Chat Completions compaction (ebdbfbbc), as the 128000 entry above.
+mlx_vlm/tests/test_server.py::TestCompaction::test_actual_input_triggers_compaction_and_output_uses_compacted_size[*-chat-*]  # FORK, reviewed 2026-10-26: opt-in Chat Completions compaction (ebdbfbbc); every responses case passes.
+mlx_vlm/tests/test_server.py::TestCompaction::test_required_input_must_leave_room_for_generation[chat]  # FORK, reviewed 2026-10-26: opt-in Chat Completions compaction (ebdbfbbc); the responses case passes.
+mlx_vlm/tests/test_server.py::TestCompaction::test_unused_output_does_not_override_compaction_threshold[chat-*]  # FORK, reviewed 2026-10-26: opt-in Chat Completions compaction (ebdbfbbc); the responses cases pass.
+mlx_vlm/tests/test_server.py::TestCompaction::test_oversized_history_uses_bounded_summary_calls[chat-*]  # FORK, reviewed 2026-10-26: opt-in Chat Completions compaction (ebdbfbbc); the automatic and trigger cases pass.
+mlx_vlm/tests/test_server.py::TestCompaction::test_chat_overflow_preserves_tools_and_only_generates_after_recovery[recover-*]  # FORK, reviewed 2026-10-26: opt-in Chat Completions compaction (ebdbfbbc); the `disabled` cases pass, which is the fork's default.
+mlx_vlm/tests/test_server.py::TestCompaction::test_chat_overflow_preserves_tools_and_only_generates_after_recovery[summary-fails-*]  # FORK, reviewed 2026-10-26: opt-in Chat Completions compaction (ebdbfbbc), as the `recover` entry above.
+mlx_vlm/tests/test_server.py::TestCompaction::test_chat_overflow_preserves_tools_and_only_generates_after_recovery[protected-too-large-*]  # FORK, reviewed 2026-10-26: opt-in Chat Completions compaction (ebdbfbbc), as the `recover` entry above.
+
+# --- tests/test_generate.py ------------------------------------------------------
+mlx_vlm/tests/test_generate.py::TestPrefixCacheReuseTrim::test_mixed_flat_and_wrapped_rotating_is_not_reusable  # FORK, reviewed 2026-10-26: c503fa7b's half of TestPrefixCacheReuseTrim tests upstream's _prefix_cache_trim_amount, which the fork replaced with _rotating_rewind_safe + the snapshot ring (AttributeError on the missing helper). .symbol-exclusions:41 and :103.
+mlx_vlm/tests/test_generate.py::TestPrefixCacheReuseTrim::test_unwrapped_rotating_trims_and_stays_usable  # FORK, reviewed 2026-10-26: as the entry above; .symbol-exclusions:104.
+mlx_vlm/tests/test_generate.py::TestPrefixCacheReuseTrim::test_wrapped_buffered_rotating_declined_and_survives_next_step  # FORK, reviewed 2026-10-26: as the entry above; .symbol-exclusions:105.
+mlx_vlm/tests/test_generate.py::test_precomputed_semantic_hash_reuses_actual_growing_apc_prefix  # FORK, reviewed 2026-10-26: the BatchGenerator request tuple carries a 7th per-request `seed` element (O30, ab5273f8), so upstream's 6-tuple fails to unpack. The fork's copy differs from upstream only by that trailing None (AST-diffed).
+mlx_vlm/tests/test_generate.py::test_apc_pick_rejects_image_tokens_and_releases_blocks  # FORK, reviewed 2026-10-26: O30's 7-tuple, as the entry above; the fork's copy differs only by the trailing None (AST-diffed).
+mlx_vlm/tests/test_generate.py::test_load_processor_preserves_additional_eos_tokens_on_reset  # FORK, reviewed 2026-10-26: the fork's load_processor reads the config first, and upstream's copy does not patch load_config, so it reaches the HF Hub for "unused-model-path" (404 online, a connection error offline; fails either way). The fork's adapted copy lives in tests/test_utils.py:698. Same disposition as .symbol-exclusions:171.

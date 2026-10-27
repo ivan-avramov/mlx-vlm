@@ -5,8 +5,8 @@ next open task."** Keep exactly one `handoff.md`: update this file in place, nev
 second one. When every task is done, delete it, along with the "Open handoff" paragraph
 in AGENTS.md's "Traps" section, in the same commit.
 
-Last updated 2026-10-26, by the session that closed T1 (the mlx 0.32.4 exactness failures,
-`98cfb0b6`). Open: T2, T3.
+Last updated 2026-10-26, by the session that closed T2 (`dev/check_upstream_test_copies.py`,
+the ninth gating audit). T1 closed in `98cfb0b6`. Open: T3.
 
 ## Context (read first)
 
@@ -16,18 +16,20 @@ Last updated 2026-10-26, by the session that closed T1 (the mlx 0.32.4 exactness
   `memory.md` (see the 2026-10-25 block for this sync), and upstream defects found here
   in `docs/upstream-bugs.md` (items 9–14 are new).
 - **State (2026-10-26):** `main` contains `e9af3766` (the 2026-10-25 sync, pushed;
-  `origin/main` at `1669ee72`). Unpushed: `142f8f69`, `98cfb0b6` (T1), `566691b9` and
-  this handoff update; push only when the operator says so.
-- **Upstream has moved:** `upstream/main` is 14 commits ahead, all #2558 (native MTP in
-  the SFT/ORPO trainers, `6d9ba328`). Under AGENTS.md's weekly-merge rule the next sync
-  is due by 2026-11-01; it can wait for T2, not longer.
+  `origin/main` at `1669ee72`). Unpushed: `142f8f69`, `98cfb0b6` (T1), `566691b9`,
+  `0911ff9b` and the T2 commit; push only when the operator says so.
+- **Upstream has moved:** `upstream/main` is 16 commits ahead: #2558 (native MTP in the
+  SFT/ORPO trainers), #2600 (diarized transcriptions) and the 0.7.11 bump (`6848fd9f`).
+  Under AGENTS.md's weekly-merge rule the next sync is due by 2026-11-01. It is the next
+  work in this repo. Run `dev/check_upstream_test_copies.py --upstream-ref <merged ref>`
+  at each stage; it replaces the manual differential.
 - **No hosted CI.** GitHub Actions are disabled on the fork (free-account minutes), and
   `.github/workflows/` is byte-identical to upstream's. The gate is local:
-  `.venv/bin/python dev/ci.py` (pre-commit, the eight audits vs `.upstream-sync-ref`,
+  `.venv/bin/python dev/ci.py` (pre-commit, the nine audits vs `.upstream-sync-ref`,
   the full suite; exit 1 on failure). `dev/ci.py drift` and `dev/ci.py leads` are
   information only.
-- **Current gate result (mlx 0.32.4, 2026-10-26, `98cfb0b6`):** style ok, all eight
-  audits ok, suite 9012 passed / 0 failed.
+- **Current gate result (mlx 0.32.4, 2026-10-26, the T2 commit):** style ok, all nine
+  audits ok, suite 9096 passed / 0 failed.
 - **mlx 0.32.3 is unsupported.** Since upstream #2527 the exact verifier kernels match
   only 0.32.4's qmv; the suite fails ~190 tests on 0.32.3 (measured 2026-10-26). The
   earlier claim here that T1's five tests passed on 0.32.3 was wrong for this tree.
@@ -55,31 +57,6 @@ Last updated 2026-10-26, by the session that closed T1 (the mlx 0.32.4 exactness
   failing. The three fork-owned test copies (C104: `tests/test_speculative.py`,
   `test_server.py`, `test_generate.py`) now carry slices of upstream's test harness
   verbatim, so most new upstream tests can be ported unchanged.
-
-## T2 — make the upstream-copy differential a `dev/` audit
-
-At each stage of the sync, upstream's own copies of the three C104 test files were
-run against the merged tree, and only *new* failures were judged. That check found a
-real bug (a standalone `glm_moe_dsa_mtp` drafter loaded with every weight silently
-dropped). It is not yet in the repo. Make it permanent:
-
-1. `dev/check_upstream_test_copies.py`: for each C104 file, write
-   `git show <ref>:<path>` to a temporary `mlx_vlm/tests/test_zz_up_*.py`, run pytest on
-   those files from `mlx_vlm/`, and compare the failing node ids (parametrization
-   stripped) with a reviewed baseline file, `.upstream-test-copy-failures`: one id per
-   line with a reason, and a hard error on a missing reason, like the other exclusion
-   files. Always remove the temporary files.
-2. Gate on **new** failures only; report baseline entries that now pass, so they can be
-   pruned.
-3. Seed the baseline from a run against `.upstream-sync-ref`. Expect the fork's
-   deliberate divergences: batched-MTP refusal, opt-in chat compaction (upstream's
-   copies run without `MLX_VLM_CHAT_COMPACTION=1`), the prefix-cache trim policy, and
-   the `KNOWN_UPSTREAM_FAILURES` items. Counts for reference: 31 failures on the
-   pre-sync tree, about 49 at `e9af3766`.
-4. The `check_*.py` name makes `tests/test_local_ci.py` require it in `dev/ci.py`'s
-   `AUDITS`. Give it a test in `mlx_vlm/tests/` covering both directions plus the
-   reason contract, validate that it fires, and add its baseline count to AGENTS.md's
-   table and cold-start block.
 
 ## T3 — notes for the stack bump (done in the `mlx_local_stack` session, not here)
 

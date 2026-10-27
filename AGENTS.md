@@ -19,14 +19,14 @@ git fetch upstream && git log --oneline HEAD..upstream/main   # MUST be empty; m
 
 cat handoff.md 2>/dev/null                                   # the one handoff, if open
 
-.venv/bin/python dev/ci.py          # the gate: pre-commit, the eight audits vs
+.venv/bin/python dev/ci.py          # the gate: pre-commit, the nine audits vs
                                     # .upstream-sync-ref, the full suite (~5 min)
 .venv/bin/python dev/ci.py drift    # information: the same audits vs upstream/main
 
 grep -cE '^mlx_vlm' .symbol-exclusions .deletion-exclusions .fork-marker-allowlist \
     .dead-helper-exclusions .body-divergence-exclusions .registry-exclusions \
-    .call-argument-exclusions
-# expect 265, 674, 3, 0, 49, 43, 16 (2026-10-25, sync e9af3766) — see "Exclusion baselines" below
+    .call-argument-exclusions .upstream-test-copy-failures
+# expect 265, 674, 3, 0, 49, 43, 16, 19 (2026-10-26, sync e9af3766) — see "Exclusion baselines" below
 grep -cE '^mlx_vlm.*# baseline: pre-existing divergence, unreviewed' .symbol-exclusions
 # expect 0 — every remaining exclusion carries a real reason
 ```
@@ -38,7 +38,7 @@ in a subshell, `(cd mlx_vlm && ../.venv/bin/python -m pytest -q ./tests)`. After
 
 ### Exclusion baselines
 
-Eight gating audits, each with its own reviewed baseline. **These are the progress
+Nine gating audits, each with its own reviewed baseline. **These are the progress
 signal, not any report's count.** Counts below are entry lines (`grep -cE '^mlx_vlm'`)
 as of the 2026-10-25 sync to upstream `e9af3766`; every entry carries a reviewed reason
 and zero carry the "pre-existing divergence, unreviewed" tag. Re-count after every merge
@@ -53,6 +53,7 @@ and update this table in the merge commit when a number moves.
 | `.body-divergence-exclusions` | **49** | misalignments claimed deliberate, each reviewed |
 | `.registry-exclusions` | **43** | API replacements, re-exports and retired fields, all reviewed |
 | `.call-argument-exclusions` | **16** | calls passing fewer args, reviewed (`[**]` / `[arity]` tagged) |
+| `.upstream-test-copy-failures` | **19** | upstream's copies of the C104 test files: failures that are fork divergence or upstream bugs (49 parametrized ids) |
 
 An empty file is **not** a reason to delete it — each keeps its header and RESOLVED
 notes, and the next merge that adds a fork hunk to a shared file will need an entry.
@@ -97,7 +98,7 @@ silently dropped content — came out of resolving large accumulations, because:
 
 - A 90-commit merge produces a resolution nobody can review hunk by hunk, and an
   unreviewable resolution is where content gets dropped without a conflict.
-- The eight audits below only work **if they run**. They are cheap after a
+- The nine audits below only work **if they run**. They are cheap after a
   five-commit merge and psychologically skippable after a ninety-commit one.
 - A dropped hunk is unrecoverable by any later merge (see the failure mode
   below), so the cost of a bad resolution is permanent, while the cost of merging
@@ -120,6 +121,7 @@ python dev/check_dead_helpers.py        # no upstream-called helper left unreach
 python dev/check_body_divergence.py     # no divergence that is only ALIGNMENT
 python dev/check_upstream_registries.py # no registry entry / re-export / field dropped
 python dev/check_call_arguments.py      # no call passing fewer args than upstream
+python dev/check_upstream_test_copies.py --upstream-ref X  # upstream's C104 test copies vs this tree
 python dev/check_body_divergence.py --summary   # then size what conflicted
 python dev/check_body_divergence.py --sweep     # then re-review the markers
 python dev/find_untested_fork_code.py   # fork-only code no test mentions (non-gating)
@@ -152,7 +154,7 @@ commit that mostly removes code (`29b6c00b`) shows only its insertions and
 closed while still listed**, because attribution is by line content — the exclusion
 baselines, not the commit count, are the progress signal.
 
-**Run all ten checks after every merge — this is not optional.** Eight of them gate
+**Run all eleven checks after every merge — this is not optional.** Nine of them gate
 (they exit non-zero and CI runs them); `find_dropped_hunks.py` and
 `find_untested_fork_code.py` are lead generators and do not. When a merge
 resolution drops content from a commit that upstream already merged, that commit
@@ -608,7 +610,7 @@ look covered while nothing covered it.
 ### The seventh direction: who protects the FORK's own code?
 
 Every direction above compares against `upstream/main`. That means **fork-only code is
-invisible to all eight gating checks by construction** — no upstream copy to diff, no
+invisible to the eight source-comparing gating checks by construction** — no upstream copy to diff, no
 upstream symbol to miss, no upstream hunk to drop, no marker to demand. The whole
 apparatus protects the upstream content this fork carries. Nothing protected the fork's
 own ~800 commits.
@@ -741,9 +743,38 @@ file cannot have this defect — which is what keeps it at ~30s instead of >5min
 gating script needs one**: a bug making one of these checks *more permissive* fails
 nothing and still prints OK.
 
-### Adding a ninth direction — what the eighth cost, as a checklist
+### The ninth direction: do upstream's own assertions hold here?
 
-There will be a ninth: each of the eight was found by hand first, and the pattern is
+The eight above compare *source*. None runs upstream's tests. The three C104 test files
+(`test_speculative.py`, `test_server.py`, `test_generate.py`) are fork-owned copies, so
+upstream's assertions in them never run against the fork's library. A merge that keeps a
+test's fork copy and drops the library half of the same commit fails nothing.
+
+`dev/check_upstream_test_copies.py` writes upstream's three copies (at `--upstream-ref`) to
+`mlx_vlm/tests/test_zz_up_*.py`, runs them against the working tree, removes them, and gates on
+any failure `.upstream-test-copy-failures` does not excuse. ~20s.
+
+```bash
+python dev/check_upstream_test_copies.py --upstream-ref e9af3766   # the gate (dev/ci.py passes the sync ref)
+python dev/check_upstream_test_copies.py --upstream-ref X --list   # every failing id, for review
+```
+
+- It runs code, so it reads the **working tree**, not the index — unlike the other eight.
+- Entries are exact node ids or `*`-only patterns (brackets literal). Name the failing
+  parameters, never a bare test name, when only some parametrizations fail.
+- It exits 2 when it could not run cleanly: an unknown ref, a pytest exit other than 0/1,
+  deselection or `--collect-only` or an early stop (`PYTEST_ADDOPTS` and `MLX_VLM_*` are
+  stripped from the child), a copy that collected nothing or skipped everything, a
+  destination that is not a regular file, a concurrent run, or a cleanup failure.
+- Founding instance: the 2026-10-25 sync's manual run found a standalone `glm_moe_dsa_mtp`
+  drafter loading with every weight dropped. Reverting that fix makes the audit name 3 tests;
+  `tests/test_load_model_mtp_weights.py` now covers that instance too.
+- After a sync, a new hit is a lead like any other: establish provenance before excusing it.
+  `mlx_vlm/tests/test_upstream_test_copy_check.py` pins the script.
+
+### Adding a tenth direction — what the eighth cost, as a checklist
+
+There will be a tenth: each of the nine was found by hand first, and the pattern is
 always "a category of thing no existing check keys on". What the eighth needed, in the
 order that mattered:
 
@@ -1111,7 +1142,7 @@ are disabled on the fork). Everything that used to be CI runs locally:
 ```
 
 - `style` = `pre-commit run --all-files` (`uvx pre-commit` if it is not on PATH).
-- `audits` = the eight gating audits against `.upstream-sync-ref`, deletions `--strict`.
+- `audits` = the nine gating audits against `.upstream-sync-ref`, deletions `--strict`.
 - `suite` = the full pytest suite. `drift` = the audits against `upstream/main`.
   `leads` = `find_dropped_hunks.py` (the wide pass) and `find_untested_fork_code.py`.
 - `tests/test_local_ci.py` pins the runner: every `dev/check_*.py` and `dev/find_*.py`
