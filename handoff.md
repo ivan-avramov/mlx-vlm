@@ -17,7 +17,7 @@ the ninth gating audit). T1 closed in `98cfb0b6`. Open: T3.
   in `docs/upstream-bugs.md` (items 9–14 are new).
 - **State (2026-10-26):** `main` contains `e9af3766` (the 2026-10-25 sync, pushed;
   `origin/main` at `1669ee72`). Unpushed: `142f8f69`, `98cfb0b6` (T1), `566691b9`,
-  `0911ff9b` and the T2 commit; push only when the operator says so.
+  `0911ff9b`, `069fab9c` (T2) and this hash fill-in; push only when the operator says so.
 - **Upstream has moved:** `upstream/main` is 16 commits ahead: #2558 (native MTP in the
   SFT/ORPO trainers), #2600 (diarized transcriptions) and the 0.7.11 bump (`6848fd9f`).
   Under AGENTS.md's weekly-merge rule the next sync is due by 2026-11-01. It is the next
@@ -28,7 +28,7 @@ the ninth gating audit). T1 closed in `98cfb0b6`. Open: T3.
   `.venv/bin/python dev/ci.py` (pre-commit, the nine audits vs `.upstream-sync-ref`,
   the full suite; exit 1 on failure). `dev/ci.py drift` and `dev/ci.py leads` are
   information only.
-- **Current gate result (mlx 0.32.4, 2026-10-26, the T2 commit):** style ok, all nine
+- **Current gate result (mlx 0.32.4, 2026-10-26, `069fab9c`):** style ok, all nine
   audits ok, suite 9096 passed / 0 failed.
 - **mlx 0.32.3 is unsupported.** Since upstream #2527 the exact verifier kernels match
   only 0.32.4's qmv; the suite fails ~190 tests on 0.32.3 (measured 2026-10-26). The
