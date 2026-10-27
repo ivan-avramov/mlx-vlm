@@ -5,8 +5,8 @@ next open task."** Keep exactly one `handoff.md`: update this file in place, nev
 second one. When every task is done, delete it, along with the "Open handoff" paragraph
 in AGENTS.md's "Traps" section, in the same commit.
 
-Last updated 2026-10-26, by the session that closed T2 (`dev/check_upstream_test_copies.py`,
-the ninth gating audit). T1 closed in `98cfb0b6`. Open: T3.
+Last updated 2026-10-26, by the session that merged upstream `2ceff4c1` (0.7.11). T1
+closed in `98cfb0b6`, T2 in `069fab9c`. Open: T3.
 
 ## Context (read first)
 
@@ -15,21 +15,18 @@ the ninth gating audit). T1 closed in `98cfb0b6`. Open: T3.
   Push only when the operator says so. Rules live in `AGENTS.md`, history in
   `memory.md` (see the 2026-10-25 block for this sync), and upstream defects found here
   in `docs/upstream-bugs.md` (items 9–14 are new).
-- **State (2026-10-26):** `main` contains `e9af3766` (the 2026-10-25 sync, pushed;
-  `origin/main` at `1669ee72`). Unpushed: `142f8f69`, `98cfb0b6` (T1), `566691b9`,
-  `0911ff9b`, `069fab9c` (T2) and this hash fill-in; push only when the operator says so.
-- **Upstream has moved:** `upstream/main` is 16 commits ahead: #2558 (native MTP in the
-  SFT/ORPO trainers), #2600 (diarized transcriptions) and the 0.7.11 bump (`6848fd9f`).
-  Under AGENTS.md's weekly-merge rule the next sync is due by 2026-11-01. It is the next
-  work in this repo. Run `dev/check_upstream_test_copies.py --upstream-ref <merged ref>`
-  at each stage; it replaces the manual differential.
+- **State (2026-10-26):** `main` contains upstream `2ceff4c1` (0.7.11: #2558 native MTP
+  in the SFT/ORPO trainers, #2600 diarization and speaker-embedding endpoints; see
+  `memory.md`). `origin/main` is at `1669ee72`; everything after it, T1, T2 and the
+  `2ceff4c1` merge, is unpushed. Push only when the operator says so. Next weekly sync is
+  due by 2026-11-02.
 - **No hosted CI.** GitHub Actions are disabled on the fork (free-account minutes), and
   `.github/workflows/` is byte-identical to upstream's. The gate is local:
   `.venv/bin/python dev/ci.py` (pre-commit, the nine audits vs `.upstream-sync-ref`,
   the full suite; exit 1 on failure). `dev/ci.py drift` and `dev/ci.py leads` are
   information only.
-- **Current gate result (mlx 0.32.4, 2026-10-26, `069fab9c`):** style ok, all nine
-  audits ok, suite 9096 passed / 0 failed.
+- **Current gate result (mlx 0.32.4, 2026-10-26, the `2ceff4c1` merge):** style ok, all
+  nine audits ok, suite 9192 passed / 0 failed.
 - **mlx 0.32.3 is unsupported.** Since upstream #2527 the exact verifier kernels match
   only 0.32.4's qmv; the suite fails ~190 tests on 0.32.3 (measured 2026-10-26). The
   earlier claim here that T1's five tests passed on 0.32.3 was wrong for this tree.
@@ -47,7 +44,7 @@ the ninth gating audit). T1 closed in `98cfb0b6`. Open: T3.
 - **Four-eyes helpers:** the codex CLI sandbox has no Metal device, so codex cannot run
   GPU tests; the designer runs them and relays the output. T1's run is recorded in
   `98cfb0b6`'s message.
-- **Venv** (`.venv`, Python 3.12): mlx 0.32.4,
+- **Venv** (`.venv`, Python 3.12): mlx 0.32.4, mlx-audio 0.6.2,
   transformers 5.14.1, huggingface-hub 1.33.0 (keep it below 2.0), plus datasets,
   pytest-xdist, cryptography and pyflakes. `requirements.txt` needs `mlx>=0.32.4`.
 - **Test-suite conventions added this sync:** `tests/conftest.py` has
@@ -67,7 +64,9 @@ the ninth gating audit). T1 closed in `98cfb0b6`. Open: T3.
 - **Dependencies:** `datasets>=4.0.0` is new. A full `uv lock` resolves consistently,
   but installing `datasets` on its own into an existing env upgrades `huggingface-hub`
   to 2.x, which `transformers` 5.14 rejects. Expect `transformers`/`huggingface-hub`
-  bumps in the lock; run the stack's own tests on them.
+  bumps in the lock; run the stack's own tests on them. From the `2ceff4c1` merge on,
+  `mlx-audio>=0.6.2` (#2600; was 0.5.2). In `.venv` the 0.5.6 -> 0.6.2 upgrade moved only
+  `miniaudio` (1.61 -> 1.71).
 - **Renamed runtime knobs:** `spec_draft_model` / `spec_draft_kind` are now
   `draft_model` / `draft_kind` (#2457). CLI flags and `MLX_VLM_DRAFT_*` env vars are
   unchanged; an old-name settings PATCH comes back as `rejected: unknown knob`. The

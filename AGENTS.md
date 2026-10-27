@@ -26,7 +26,7 @@ cat handoff.md 2>/dev/null                                   # the one handoff, 
 grep -cE '^mlx_vlm' .symbol-exclusions .deletion-exclusions .fork-marker-allowlist \
     .dead-helper-exclusions .body-divergence-exclusions .registry-exclusions \
     .call-argument-exclusions .upstream-test-copy-failures
-# expect 265, 674, 3, 0, 49, 43, 16, 19 (2026-10-26, sync e9af3766) — see "Exclusion baselines" below
+# expect 265, 674, 3, 0, 49, 42, 16, 19 (2026-10-26, sync 2ceff4c1) — see "Exclusion baselines" below
 grep -cE '^mlx_vlm.*# baseline: pre-existing divergence, unreviewed' .symbol-exclusions
 # expect 0 — every remaining exclusion carries a real reason
 ```
@@ -40,7 +40,7 @@ in a subshell, `(cd mlx_vlm && ../.venv/bin/python -m pytest -q ./tests)`. After
 
 Nine gating audits, each with its own reviewed baseline. **These are the progress
 signal, not any report's count.** Counts below are entry lines (`grep -cE '^mlx_vlm'`)
-as of the 2026-10-25 sync to upstream `e9af3766`; every entry carries a reviewed reason
+as of the 2026-10-26 sync to upstream `2ceff4c1`; every entry carries a reviewed reason
 and zero carry the "pre-existing divergence, unreviewed" tag. Re-count after every merge
 and update this table in the merge commit when a number moves.
 
@@ -51,7 +51,7 @@ and update this table in the merge commit when a number moves.
 | `.fork-marker-allowlist` | **3** | fork-owned test copies pinned by blob (`test_generate.py`, `test_server.py`, `test_speculative.py`; C104) |
 | `.dead-helper-exclusions` | **0** | upstream-called helpers unreachable here |
 | `.body-divergence-exclusions` | **49** | misalignments claimed deliberate, each reviewed |
-| `.registry-exclusions` | **43** | API replacements, re-exports and retired fields, all reviewed |
+| `.registry-exclusions` | **42** | API replacements, re-exports and retired fields, all reviewed |
 | `.call-argument-exclusions` | **16** | calls passing fewer args, reviewed (`[**]` / `[arity]` tagged) |
 | `.upstream-test-copy-failures` | **19** | upstream's copies of the C104 test files: failures that are fork divergence or upstream bugs (49 parametrized ids) |
 
@@ -594,7 +594,7 @@ is deliberate — values diverge legitimately across this fork (every tuned cons
 while keys almost never do. A wrong value is `check_body_divergence.py --file`'s job;
 that is the shape of #1402's test-certified cache-key bug.
 
-Reviewed hits go in `.registry-exclusions` (**43** at the 2026-10-25 sync); the founding
+Reviewed hits go in `.registry-exclusions` (**42** at the 2026-10-26 sync); the founding
 entries were re-exports the fork replaced (`generation_stream` ×3 for the lazy per-thread stream,
 `_check_configured_context_budget` for the clamp-instead-of-reject budget,
 `top_p_sampling` for the `_filter` that also applies min_p and top_k). Runs in ~13s.
@@ -755,7 +755,7 @@ test's fork copy and drops the library half of the same commit fails nothing.
 any failure `.upstream-test-copy-failures` does not excuse. ~20s.
 
 ```bash
-python dev/check_upstream_test_copies.py --upstream-ref e9af3766   # the gate (dev/ci.py passes the sync ref)
+python dev/check_upstream_test_copies.py --upstream-ref 2ceff4c1   # the gate (dev/ci.py passes the sync ref)
 python dev/check_upstream_test_copies.py --upstream-ref X --list   # every failing id, for review
 ```
 
@@ -856,11 +856,11 @@ positives. Every hit still needs `git log -S` and a read.
 cd mlx_vlm/ && pytest -s ./tests --ignore=tests/test_smoke.py
 ```
 
-The suite is **green on mlx 0.32.4** (2026-10-26: ~9050 collected). mlx 0.32.3 is unsupported: since upstream #2527 the exact verifier kernels match only 0.32.4's qmv, and ~190 tests fail there. Upstream tests that fail on upstream's own tree, or assert behaviour the fork changes on purpose, are strict-xfailed through `tests/conftest.py`'s `KNOWN_UPSTREAM_FAILURES` / `FORK_DIVERGENT_UPSTREAM_TESTS`; each entry names its reason. Scope CPU-only test device changes to restoring fixtures; do not change the default device during collection. Keep it that
+The suite is **green on mlx 0.32.4** (2026-10-26: ~9230 collected). mlx 0.32.3 is unsupported: since upstream #2527 the exact verifier kernels match only 0.32.4's qmv, and ~190 tests fail there. Upstream tests that fail on upstream's own tree, or assert behaviour the fork changes on purpose, are strict-xfailed through `tests/conftest.py`'s `KNOWN_UPSTREAM_FAILURES` / `FORK_DIVERGENT_UPSTREAM_TESTS`; each entry names its reason. Scope CPU-only test device changes to restoring fixtures; do not change the default device during collection. Keep it that
 way. (This
 line goes stale on every restore that adds a guard — trust the run, not the number.)
 
-**Dependency floors are upstream's now** (`mlx>=0.32.4`, `mlx-audio>=0.5.2`,
+**Dependency floors are upstream's now** (`mlx>=0.32.4`, `mlx-audio>=0.6.2`,
 `transformers>=5.14.0`, `datasets>=4.0.0`). The lesson from the old `mlx-audio` 0.4.8 fork
 bump still holds: a missing floor makes test files fail *at collection*, which pytest
 reports as `Interrupted` — the whole suite does not run, and a `| tail` of that output
@@ -1156,7 +1156,7 @@ are disabled on the fork). Everything that used to be CI runs locally:
 - `mlx` >= 0.32.4 — core framework (upstream's floor since the 2026-10-25 sync).
   0.32.3 is unsupported (exact verifier kernels are 0.32.4-only since #2527); a
   consumer on 0.32.3 must move to 0.32.4 in the same step it takes this fork
-- `mlx-audio` >= 0.5.2 — same floor as upstream (the old 0.4.8 fork bump is moot)
+- `mlx-audio` >= 0.6.2 — same floor as upstream (#2600, 2026-10-26 sync) (the old 0.4.8 fork bump is moot)
 - `transformers` >= 5.14.0 — configs, tokenizers, processors; keep
   `huggingface-hub` < 2.0 when installing extras into an existing env (5.14 rejects 2.x)
 - `huggingface-hub` — model downloads
