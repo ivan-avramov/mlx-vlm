@@ -54,7 +54,7 @@ from mlx_vlm.prompt_utils import (  # noqa: F401 -- kept: upstream's copy import
 )
 from mlx_vlm.server import GenerationArguments as Args  # Fork: ported upstream tests
 from mlx_vlm.server import ResponseGenerator as Generator  # Fork: ported upstream tests
-from mlx_vlm.server import compaction
+from mlx_vlm.server import compaction, realtime
 from mlx_vlm.server.model_discovery import discover_models, is_model_directory
 from mlx_vlm.server.responses_state import (
     ToolCallStreamState,
@@ -1081,6 +1081,63 @@ def test_unsupported_model_request_does_not_crash_server(client, monkeypatch):
         "Failed to load model: Model type bert not supported."
     )
     assert client.get("/health").status_code == 200
+
+
+@pytest.fixture
+def _audio_config(tmp_path, monkeypatch):
+    import mlx_vlm.utils as mlx_utils
+
+    def _make(model_type):
+        (tmp_path / "config.json").write_text(json.dumps({"model_type": model_type}))
+        monkeypatch.setattr(mlx_utils, "get_model_path", lambda *a, **k: tmp_path)
+        return str(tmp_path)
+
+    return _make
+
+
+def test_audio_endpoint_rejects_native_chat_model(_audio_config, monkeypatch):
+    import mlx_audio.utils as mlx_audio_utils
+
+    monkeypatch.setattr(mlx_audio_utils, "get_model_category", lambda *a, **k: None)
+    path = _audio_config("qwen3_omni_moe")
+
+    with pytest.raises(ValueError, match="/v1/chat/completions"):
+        server._app_module.load_audio_model(path)
+
+
+def test_audio_endpoint_loads_dedicated_stt_model(_audio_config, monkeypatch):
+    import mlx_audio.utils as mlx_audio_utils
+
+    sentinel = object()
+    monkeypatch.setattr(mlx_audio_utils, "load_model", lambda *a, **k: sentinel)
+    path = _audio_config("whisper")
+
+    assert server._app_module.load_audio_model(path) is sentinel
+
+
+def test_audio_endpoint_loads_audio_capable_native_model(_audio_config, monkeypatch):
+    import mlx_audio.utils as mlx_audio_utils
+
+    sentinel = object()
+    monkeypatch.setattr(mlx_audio_utils, "get_model_category", lambda *a, **k: "sts")
+    monkeypatch.setattr(mlx_audio_utils, "load_model", lambda *a, **k: sentinel)
+    path = _audio_config("nemotron_voicechat")
+
+    assert server._app_module.load_audio_model(path) is sentinel
+
+
+def test_audio_stt_request_maps_native_chat_model_to_400(_audio_config, monkeypatch):
+    import mlx_audio.utils as mlx_audio_utils
+
+    monkeypatch.setattr(mlx_audio_utils, "get_model_category", lambda *a, **k: None)
+    _reset_runtime(monkeypatch, model_cache={})
+    path = _audio_config("qwen3_omni_moe")
+
+    with pytest.raises(HTTPException) as exc_info:
+        server.get_cached_model(path, model_kind="audio_stt")
+
+    assert exc_info.value.status_code == 400
+    assert "/v1/chat/completions" in exc_info.value.detail
 
 
 def _unstarted_response_generator():
@@ -9893,36 +9950,6 @@ def test_inference_routes_are_served_not_just_registered(client):
     assert client.get("/v1/models").status_code != 404
 
 
-@dataclass
-class _FakeAlignedToken:
-    id: int
-    text: str
-    start: float
-    duration: float
-    end: float = 0.0
-
-    def __post_init__(self):
-        self.end = self.start + self.duration
-
-
-@dataclass
-class _FakeAlignedSentence:
-    text: str
-    tokens: list
-    start: float = 0.0
-    end: float = 0.0
-
-    def __post_init__(self):
-        self.start = self.tokens[0].start
-        self.end = self.tokens[-1].end
-
-
-@dataclass
-class _FakeAlignedResult:
-    text: str
-    sentences: list
-
-
 def _chat_request(**options):
     return server.ChatRequest(model="demo", messages=[_msg("hi")], **options)
 
@@ -9976,19 +10003,6 @@ def _capture_requests(gen, *, prompt_tokens=1, uid=None):
 
     gen.requests = NS(put=put)
     return queued
-
-
-@pytest.fixture
-def reset_audio_runtime(monkeypatch):
-    if server.runtime.audio_queue is not None:
-        server.runtime.audio_queue.stop_and_join()
-    for kind in ("MODEL", "ADAPTER", "IMAGE_MODEL", "TTS_MODEL", "STT_MODEL"):
-        monkeypatch.delenv("MLX_VLM_PRELOAD_" + kind, raising=False)
-    _reset_runtime(monkeypatch, audio_queue=None, metrics=server.ServerMetricsStore())
-    yield
-    if server.runtime.audio_queue is not None:
-        server.runtime.audio_queue.stop_and_join()
-        server.runtime.audio_queue = None
 
 
 @pytest.fixture
@@ -10113,126 +10127,6 @@ def test_invalid_live_image_limits_keep_pair(settings_client, monkeypatch, op, v
     assert body["current"] == before["current"]
     assert body["fingerprint"] == before["fingerprint"]
     assert body["reload_kinds"] == []
-
-
-@dataclass
-class _FakeSTTOutput:
-    text: str
-    segments: list = None
-    language: str = None
-
-
-@dataclass
-class _FakeStreamingResult:
-    text: str
-    tokens: list
-    is_final: bool
-    start_time: float
-    end_time: float
-
-
-def _fake_parakeet_result():
-    first = _FakeAlignedSentence(
-        "Hello world.",
-        [
-            _FakeAlignedToken(1, "Hello", 0.0, 0.4),
-            _FakeAlignedToken(2, " world.", 0.4, 0.5),
-        ],
-    )
-    second = _FakeAlignedSentence("Bye.", [_FakeAlignedToken(3, "Bye.", 1.0, 0.3)])
-    return _FakeAlignedResult("Hello world. Bye.", [first, second])
-
-
-class TestSTTSegmentSerialization:
-    """Serialization of STT results into OpenAI-style transcription payloads.
-
-    Regression coverage for NeMo-alignment models (Parakeet/Canary) whose
-    ``AlignedResult`` exposes ``sentences`` rather than ``segments`` (issue 2183).
-    """
-
-    def test_derives_segments_from_nemo_sentences(self):
-        from mlx_vlm.server.audio import _stt_item_to_dict
-
-        data = _stt_item_to_dict(_fake_parakeet_result())
-
-        assert "segments" in data
-        segments = data["segments"]
-        assert [s["text"] for s in segments] == ["Hello world.", "Bye."]
-        assert segments[0]["start"] == 0.0
-        assert abs(segments[0]["end"] - 0.9) < 1e-6
-        assert segments[1]["start"] == 1.0
-        assert abs(segments[1]["end"] - 1.3) < 1e-6
-
-    def test_pipeline_preserves_nemo_segments(self):
-        from mlx_vlm.server.audio import (
-            _iter_stt_items,
-            _sanitize_for_json,
-            _stt_item_to_dict,
-            _transcription_result_from_chunks,
-        )
-
-        chunks = [
-            json.dumps(_sanitize_for_json(_stt_item_to_dict(item))) + "\n"
-            for item in _iter_stt_items(_fake_parakeet_result())
-        ]
-        result = _transcription_result_from_chunks(chunks)
-
-        assert result["text"].startswith("Hello world.")
-        assert len(result.get("segments") or []) == 2
-
-    def test_whisper_segments_unchanged(self):
-        from mlx_vlm.server.audio import _stt_item_to_dict
-
-        whisper = _FakeSTTOutput(
-            "hi", segments=[{"start": 0.0, "end": 1.0, "text": "hi"}], language="en"
-        )
-        data = _stt_item_to_dict(whisper)
-
-        assert data["segments"] == [{"start": 0.0, "end": 1.0, "text": "hi"}]
-        assert data["language"] == "en"
-        assert "sentences" not in data
-
-    def test_plain_text_item_unchanged(self):
-        from mlx_vlm.server.audio import _stt_item_to_dict
-
-        assert _stt_item_to_dict("just text") == {"text": "just text"}
-
-    def test_streaming_result_gets_no_segments(self):
-        from mlx_vlm.server.audio import _stt_item_to_dict
-
-        data = _stt_item_to_dict(
-            _FakeStreamingResult("partial", [1, 2], False, 0.0, 0.5)
-        )
-
-        assert "segments" not in data
-        assert data["is_final"] is False
-
-    def test_real_aligned_result_if_available(self):
-        pytest.importorskip("mlx_audio.stt.models.nemo.alignment")
-        from mlx_audio.stt.models.nemo.alignment import (
-            AlignedSentence,
-            AlignedToken,
-            sentences_to_result,
-        )
-
-        from mlx_vlm.server.audio import _stt_item_to_dict
-
-        result = sentences_to_result(
-            [
-                AlignedSentence(
-                    "hello",
-                    [
-                        AlignedToken(id=1, text="hel", start=0.0, duration=0.2),
-                        AlignedToken(id=2, text="lo", start=0.2, duration=0.3),
-                    ],
-                )
-            ]
-        )
-        data = _stt_item_to_dict(result)
-
-        assert data["segments"] == [
-            {"id": 0, "start": 0.0, "end": 0.5, "text": "hello"}
-        ]
 
 
 # Ported from upstream c36708d3 (2026-09-27 sync): the newlines that follow the
@@ -12971,10 +12865,240 @@ class TestCompaction:
             _assert_recalled(restored["output_text"])
 
 
+@dataclass
+class _FakeAlignedResult:
+    text: str
+    sentences: list
+
+
+@pytest.mark.parametrize(
+    "item,expected",
+    [
+        ("just text", {"text": "just text"}),
+        (
+            _FakeAlignedResult(
+                "Hello world. Bye.",
+                [
+                    dict(
+                        text="Hello world.",
+                        start=0.0,
+                        end=0.9,
+                        tokens=[
+                            dict(id=1, text="Hello", start=0.0, duration=0.4, end=0.4)
+                        ],
+                    ),
+                    dict(text="Bye.", start=1.0, end=1.3),
+                ],
+            ),
+            dict(
+                text="Hello world. Bye.",
+                segments=[
+                    dict(id=0, text="Hello world.", start=0.0, end=0.9),
+                    dict(id=1, text="Bye.", start=1.0, end=1.3),
+                ],
+            ),
+        ),
+    ],
+    ids=["plain-text", "aligned-sentences"],
+)
+def test_audio_result_serialization(item, expected):
+    chunks = [
+        json.dumps(
+            server_audio._sanitize_for_json(server_audio._stt_item_to_dict(part))
+        )
+        + "\n"
+        for part in server_audio._iter_stt_items(item)
+    ]
+    result = server_audio._transcription_result_from_chunks(chunks)
+    _assert_fields(result, **expected)
+
+
+# HTTP audio endpoints
+
+
 @pytest.fixture
 def audio_client(reset_audio_runtime):
     with TestClient(server.app) as test_client:
         yield test_client
+
+
+@pytest.fixture
+def reset_audio_runtime(monkeypatch):
+    if server.runtime.audio_queue is not None:
+        server.runtime.audio_queue.stop_and_join()
+    for kind in ("MODEL", "ADAPTER", "IMAGE_MODEL", "TTS_MODEL", "STT_MODEL"):
+        monkeypatch.delenv("MLX_VLM_PRELOAD_" + kind, raising=False)
+    _reset_runtime(monkeypatch, audio_queue=None, metrics=server.ServerMetricsStore())
+    yield
+    if server.runtime.audio_queue is not None:
+        server.runtime.audio_queue.stop_and_join()
+        server.runtime.audio_queue = None
+
+
+def _fake_audio_write(target, audio, sample_rate, format="wav"):
+    payload = f"{format}:{sample_rate}:{np.array(audio).shape[0]}".encode()
+    if hasattr(target, "write"):
+        target.write(payload)
+    else:
+        Path(target).write_bytes(payload)
+
+
+class _AudioModel:
+    sample_rate = 16000
+
+    def __init__(self, result=None):
+        self.result, self.calls = result, []
+
+    def generate(self, value, **kwargs):
+        key = "text" if self.result is None else "path"
+        self.calls.append({key: value, **kwargs})
+        if self.result is not None:
+            assert Path(value).exists()
+            return self.result
+        return iter(
+            [
+                NS(
+                    audio=np.array([0.1, 0.2, 0.3], dtype=np.float32),
+                    sample_rate=self.sample_rate,
+                )
+            ]
+        )
+
+
+def _audio_backend(monkeypatch, result=None):
+    model = _AudioModel(result)
+    loader = Mock(return_value=(model, None, NS(model_type="audio")))
+    monkeypatch.setattr(server, "get_cached_model", loader)
+    monkeypatch.setattr(server_audio, "audio_write", _fake_audio_write)
+    return model, loader
+
+
+def _upload(client, endpoint="transcriptions", **options):
+    return client.post(
+        "/v1/audio/" + endpoint,
+        files={"file": ("test.wav", b"audio-bytes", "audio/wav")},
+        data={"model": "fake-stt", **options},
+    )
+
+
+def test_audio_speech_returns_audio_bytes(audio_client, monkeypatch):
+    fake_model, loader = _audio_backend(monkeypatch)
+
+    response = audio_client.post(
+        "/v1/audio/speech",
+        json={
+            "model": "fake-tts",
+            "input": "Hello world",
+            "voice": "alloy",
+            "speed": 1.25,
+            "response_format": "wav",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].lower() == "audio/wav"
+    assert (
+        response.headers["content-disposition"].lower()
+        == "attachment; filename=speech.wav"
+    )
+    assert response.content == b"wav:16000:3"
+    _assert_fields(fake_model.calls[0], text="Hello world", voice="alloy", speed=1.25)
+    loader.assert_called_once_with("fake-tts", model_kind="audio_tts")
+
+    metrics = audio_client.get("/metrics").json()
+    assert metrics["latest"]["endpoint"] == "/v1/audio/speech"
+    assert metrics["latest"]["backend"] == "audio_queue"
+
+
+def test_audio_speech_stream_bad_model_returns_error_before_headers(
+    audio_client, monkeypatch
+):
+    def raise_not_found(model, **kwargs):
+        raise HTTPException(status_code=404, detail=f"missing {model}")
+
+    monkeypatch.setattr(server, "get_cached_model", raise_not_found)
+
+    response = audio_client.post(
+        "/v1/audio/speech",
+        json={"model": "missing-model", "input": "hi", "stream": True},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "missing missing-model"
+
+
+@pytest.mark.parametrize(
+    "endpoint, options, text, forwarded",
+    [
+        (
+            "transcriptions",
+            {"prompt": "prior context", "language": "en"},
+            "This is a test transcription.",
+            {"context": "prior context", "language": "en"},
+        ),
+        ("transcriptions", {"response_format": "text"}, "Plain text transcript.", {}),
+        ("translations", {}, "Translated transcript.", {"task": "translate"}),
+    ],
+    ids=["transcription-json", "transcription-text", "translation"],
+)
+def test_audio_transcription_request(
+    audio_client, monkeypatch, endpoint, options, text, forwarded
+):
+    fake, loader = _audio_backend(monkeypatch, {"text": text})
+    monkeypatch.setattr(
+        server_audio,
+        "audio_read",
+        lambda buffer, always_2d=False: (np.zeros(160, dtype=np.float32), 16000),
+    )
+    response = _upload(audio_client, endpoint, **options)
+    assert response.status_code == 200
+    if options.get("response_format") == "text":
+        assert response.headers["content-type"].startswith("text/plain")
+        assert response.text == text
+    else:
+        assert response.json() == {"text": text}
+    assert {key: fake.calls[0][key] for key in forwarded} == forwarded
+    loader.assert_called_once_with("fake-stt", model_kind="audio_stt")
+
+
+@pytest.mark.usefixtures("reset_audio_runtime")
+def test_audio_tts_and_stt_caches_are_independent(monkeypatch):
+    fake_tts = NS(model_type="fake_tts")
+    fake_stt = NS(model_type="fake_stt")
+
+    def fake_load_audio_model(model_path):
+        return {"fake-tts": fake_tts, "fake-stt": fake_stt}[model_path]
+
+    monkeypatch.setattr(server, "load_audio_model", fake_load_audio_model)
+
+    tts_model, _, _ = server.get_cached_model("fake-tts", model_kind="audio_tts")
+    stt_model, _, _ = server.get_cached_model("fake-stt", model_kind="audio_stt")
+
+    assert tts_model is fake_tts
+    assert stt_model is fake_stt
+    assert server.runtime.model_cache.for_kind("tts")["model"] is fake_tts
+    assert server.runtime.model_cache.for_kind("stt")["model"] is fake_stt
+
+    cached_tts_model, _, _ = server.get_cached_model("fake-tts", model_kind="audio_tts")
+
+    assert cached_tts_model is fake_tts
+
+
+def test_audio_transcriptions_undecodable_upload_returns_400(audio_client, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "get_cached_model",
+        lambda model, **kwargs: pytest.fail("model must not load for a bad upload"),
+    )
+
+    response = audio_client.post(
+        "/v1/audio/transcriptions",
+        files={"file": ("broken.m4a", b"not-audio", "audio/mp4")},
+        data={"model": "fake-stt"},
+    )
+
+    assert response.status_code == 400
+    assert "Invalid audio file" in response.json()["detail"]
 
 
 # Speaker analysis uses the same queue and model registry as other audio work.
@@ -13399,6 +13523,185 @@ def test_speaker_encoder_rejects_invalid_vectors(value):
 
     with pytest.raises(ValueError):
         normalized(value)
+
+
+# Realtime voice sessions
+
+
+class _FakeStreamingSession:
+    input_sample_rate = 16000
+    output_sample_rate = 22050
+    frame_samples = 1280
+
+    def __init__(self):
+        self.closed = False
+        self.push_threads = []
+
+    def push_audio(self, samples, sample_rate):
+        import threading
+
+        self.push_threads.append(threading.current_thread().name)
+        assert sample_rate == 16000
+        assert samples.shape == (1280,)
+        return [
+            NS(
+                kind="assistant_text_delta",
+                frame_index=0,
+                token_id=42,
+                delta="hello",
+                text="hello",
+            ),
+            NS(kind="function_delta", frame_index=0, token_id=43, delta="{", text="{"),
+            NS(
+                kind="audio",
+                frame_index=0,
+                samples=mx.zeros((1764,)),
+                sample_rate=22050,
+                audio_codes=mx.zeros((31,), dtype=mx.int32),
+            ),
+        ]
+
+    def flush(self, pad_partial=True):
+        self.closed = True
+        return [NS(kind="done", frame_index=1)]
+
+    def cancel(self):
+        self.closed = True
+        return [NS(kind="cancelled", frame_index=0)]
+
+
+class _FakeLoadedModel:
+    def __init__(self):
+        self.session = None
+        self.configs = []
+
+    def create_streaming_session(self, **kwargs):
+        self.configs.append(kwargs)
+        self.session = _FakeStreamingSession()
+        return self.session
+
+
+def test_realtime_loader_uses_generic_load_and_model_session(monkeypatch):
+    calls = []
+    created = object()
+    processor = object()
+
+    class Model:
+        def create_session(self, value):
+            calls.append(("create_session", value))
+            return created
+
+    def fake_load(model_name, **kwargs):
+        calls.append(("load", model_name, kwargs))
+        return Model(), processor
+
+    monkeypatch.setattr("mlx_vlm.utils.load", fake_load)
+
+    assert realtime.load_realtime_voicechat("mlx-community/model") is created
+    assert calls == [
+        (
+            "load",
+            "mlx-community/model",
+            {"lazy": True, "strict": True, "trust_remote_code": False},
+        ),
+        ("create_session", processor),
+    ]
+
+
+@pytest.fixture
+def realtime_client(monkeypatch):
+    monkeypatch.delenv("MLX_VLM_SERVER_API_KEY", raising=False)
+    if server.runtime.realtime_engine is not None:
+        server.runtime.realtime_engine.stop_and_join()
+    loaded = _FakeLoadedModel()
+    engine = realtime.RealtimeVoiceChatEngine(loader=lambda _: loaded)
+    monkeypatch.setattr(server.runtime, "realtime_engine", engine)
+    with TestClient(server.app) as client:
+        yield client, loaded, engine
+    if server.runtime.realtime_engine is not None:
+        server.runtime.realtime_engine.stop_and_join()
+        server.runtime.realtime_engine = None
+
+
+@contextmanager
+def _voice_session(client, **settings):
+    with client.websocket_connect("/v1/realtime") as websocket:
+        assert websocket.receive_json()["type"] == "session.created"
+        websocket.send_json(
+            dict(
+                type="session.update", session=dict(model="fake-voicechat", **settings)
+            )
+        )
+        updated = websocket.receive_json()
+        assert updated["type"] == "session.updated"
+        assert updated["session"]["state"] == "ready"
+        yield websocket
+
+
+def _send_pcm(websocket, rate=16000):
+    pcm = np.zeros(1280, dtype="<i2").tobytes()
+    websocket.send_json(
+        dict(
+            type="input_audio_buffer.append",
+            audio=base64.b64encode(pcm).decode(),
+            sample_rate=rate,
+        )
+    )
+
+
+def test_realtime_websocket_streams_json_events(realtime_client):
+    client, loaded, _ = realtime_client
+    with _voice_session(client, system_prompt="Be brief.", seed=7) as websocket:
+        _send_pcm(websocket)
+        text = websocket.receive_json()
+        function = websocket.receive_json()
+        audio = websocket.receive_json()
+        assert text["type"] == "response.text.delta"
+        assert text["delta"] == "hello"
+        assert function["type"] == "response.function.delta"
+        assert function["delta"] == "{"
+        assert audio["type"] == "response.audio.delta"
+        assert len(base64.b64decode(audio["delta"])) == 1764 * 2
+
+        websocket.send_json({"type": "input_audio_buffer.commit"})
+        assert websocket.receive_json()["type"] == "input_audio_buffer.committed"
+        assert websocket.receive_json()["type"] == "response.done"
+
+    assert loaded.configs[0]["system_prompt"] == "Be brief."
+    assert loaded.configs[0]["seed"] == 7
+    assert loaded.configs[0]["max_streaming_seconds"] is None
+    assert loaded.session.push_threads == ["mlx-vlm-realtime"]
+
+
+@pytest.mark.parametrize(("value", "expected"), [(None, None), (30, 30.0)])
+def test_realtime_websocket_accepts_explicit_session_limit(
+    realtime_client, value, expected
+):
+    client, loaded, _ = realtime_client
+    with _voice_session(client, max_streaming_seconds=value) as websocket:
+        websocket.send_json({"type": "response.cancel"})
+        assert websocket.receive_json()["type"] == "response.cancelled"
+
+    assert loaded.configs[0]["max_streaming_seconds"] == expected
+
+
+def test_realtime_websocket_rejects_second_active_session(realtime_client):
+    client, _, _ = realtime_client
+    with client.websocket_connect("/v1/realtime") as first:
+        assert first.receive_json()["type"] == "session.created"
+        with client.websocket_connect("/v1/realtime") as second:
+            error = second.receive_json()
+            assert error["type"] == "error"
+            assert error["error"]["code"] == "server_busy"
+
+
+def test_realtime_websocket_requires_native_pcm_rate(realtime_client):
+    client, _, _ = realtime_client
+    with _voice_session(client) as websocket:
+        _send_pcm(websocket, rate=24000)
+        event = websocket.receive_json()
+        assert event["type"] == "error"
+        assert event["error"]["code"] == "inference_error"
 
 
 @pytest.mark.parametrize("kind", ["choice", "score", "bool", "multi_label"])

@@ -26,7 +26,7 @@ cat handoff.md 2>/dev/null                                   # the one handoff, 
 grep -cE '^mlx_vlm' .symbol-exclusions .deletion-exclusions .fork-marker-allowlist \
     .dead-helper-exclusions .body-divergence-exclusions .registry-exclusions \
     .call-argument-exclusions .upstream-test-copy-failures
-# expect 265, 674, 3, 0, 49, 42, 16, 19 (2026-10-26, sync 2ceff4c1) — see "Exclusion baselines" below
+# expect 230, 668, 3, 0, 47, 39, 16, 19 (2026-10-26, sync 2ceff4c1) — see "Exclusion baselines" below
 grep -cE '^mlx_vlm.*# baseline: pre-existing divergence, unreviewed' .symbol-exclusions
 # expect 0 — every remaining exclusion carries a real reason
 ```
@@ -46,12 +46,12 @@ and update this table in the merge commit when a number moves.
 
 | file | baseline | meaning |
 |---|---|---|
-| `.symbol-exclusions` | **265** | upstream symbols we deliberately lack; zero unreviewed |
-| `.deletion-exclusions` | **674** | upstream deletions we deliberately kept (fork-owned copies and their helpers) |
+| `.symbol-exclusions` | **230** | upstream symbols we deliberately lack; zero unreviewed |
+| `.deletion-exclusions` | **668** | upstream deletions we deliberately kept (fork-owned copies and their helpers) |
 | `.fork-marker-allowlist` | **3** | fork-owned test copies pinned by blob (`test_generate.py`, `test_server.py`, `test_speculative.py`; C104) |
 | `.dead-helper-exclusions` | **0** | upstream-called helpers unreachable here |
-| `.body-divergence-exclusions` | **49** | misalignments claimed deliberate, each reviewed |
-| `.registry-exclusions` | **42** | API replacements, re-exports and retired fields, all reviewed |
+| `.body-divergence-exclusions` | **47** | misalignments claimed deliberate, each reviewed |
+| `.registry-exclusions` | **39** | API replacements, re-exports and retired fields, all reviewed |
 | `.call-argument-exclusions` | **16** | calls passing fewer args, reviewed (`[**]` / `[arity]` tagged) |
 | `.upstream-test-copy-failures` | **19** | upstream's copies of the C104 test files: failures that are fork divergence or upstream bugs (49 parametrized ids) |
 
@@ -59,7 +59,7 @@ An empty file is **not** a reason to delete it — each keeps its header and RES
 notes, and the next merge that adds a fork hunk to a shared file will need an entry.
 
 Two non-gating lead generators, which are read rather than gated on:
-`find_dropped_hunks.py` (**22** commits, all closed by review — see `upstream-gaps.md`,
+`find_dropped_hunks.py` (**57** commits as of 2026-10-26, all closed by review — see `upstream-gaps.md`,
 "the dropped-hunk report has bottomed out"; that count will never reach zero) and
 `find_untested_fork_code.py` (**17** with zero test mentions as of 2026-08-22 — the
 2026-08-10 coverage run confirmed the then-9; the growth since is recent fork work
@@ -594,7 +594,7 @@ is deliberate — values diverge legitimately across this fork (every tuned cons
 while keys almost never do. A wrong value is `check_body_divergence.py --file`'s job;
 that is the shape of #1402's test-certified cache-key bug.
 
-Reviewed hits go in `.registry-exclusions` (**42** at the 2026-10-26 sync); the founding
+Reviewed hits go in `.registry-exclusions` (**39** at the 2026-10-26 sync); the founding
 entries were re-exports the fork replaced (`generation_stream` ×3 for the lazy per-thread stream,
 `_check_configured_context_budget` for the clamp-instead-of-reject budget,
 `top_p_sampling` for the `_filter` that also applies min_p and top_k). Runs in ~13s.

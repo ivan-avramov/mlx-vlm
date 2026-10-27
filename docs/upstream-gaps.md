@@ -328,8 +328,8 @@ line count as a single feature is what made this look smaller than it was:
 | Missing piece | Owning upstream commit | Status |
 |---|---|---|
 | `_get_video_token()`, video markers + `("video","input_video","video_url")` in `_flatten_content`, `_messages_to_plain_prompt` wiring | `4d468e85` (#1492) | **restored** |
-| `_format_video_message` audio preservation + its positional call site | `ff2a6daa` | still open, see below |
-| `_template_references_kw` + the `thinking_mode="enabled"` block | `ecc457b2` (#1374) | still open, see below |
+| `_format_video_message` audio preservation + its positional call site | `ff2a6daa` | **fixed** — see "Fixed already" below |
+| `_template_references_kw` + the `thinking_mode="enabled"` block | `ecc457b2` (#1374) | **fixed** `c8609a0c` — see the fix table below |
 
 `server/schemas.py`'s four TypedDicts (`VideoUrl`, `ResponseInputVideoParam`,
 `ResponseVideoUrlParam`, `ResponseVideoParam`) plus the
@@ -639,7 +639,7 @@ Fixed, with the repro failing before and passing after, and guarded at runtime b
 — which was verified to fail against pre-fix `dispatch.py`, not merely to pass against
 the fix (trap #13).
 
-## The dropped-hunk report has bottomed out — 22 commits, all closed by review
+## The dropped-hunk report has bottomed out — 57 commits, all closed by review
 
 **Settled 2026-08-10, and this is the section to read before re-investigating any
 `find_dropped_hunks.py` hit.** The wide pass
@@ -691,6 +691,47 @@ per line.
   ancestor, so nothing was dropped; its 1 dispatch.py line matches upstream's
   `thinking_start_token_id` detection that the fork replaced with the format-aware
   `prompt_is_inside_thinking` (THINKING_FORMATS registry, marked `# Fork:` at the site).
+
+**[update 2026-10-26] 22 -> 57, reviewed at the `2ceff4c1` merge; none is a gap.** The
+count had grown unrecorded across the 2026-09/10 syncs; the `2ceff4c1` merge itself
+added nothing (58 on a pre-merge worktree and after), and converging `test_server.py`'s
+audio section took it to 57 (`1ab87fc7` #2320, the 400 for a chat/omni model sent to `/v1/audio/*`, left
+the report). 29 of the 57 were already dispositioned above, in the 2026-09-13 table, or
+under "Fixed already"; the other 28 split as follows. Method: the commit's added lines,
+minus those absent from `upstream/main`, minus those present here (`comm` over sorted
+stripped lines), read per file.
+
+* **13 touch only the three C104 test copies** (`4925a41c` #2276, `5e1aa686` #2339,
+  `313a4bf5`, `a963bdb4` #2329, `67599f2e` #2362, `70f316e9`, `bd102630`, `0602e658`
+  #2273, `0dbc3176`, `abd3b2d7` #2567, `ece7a9dd` #2271, `73d366ec` #2545, `f41a848b`
+  #1864). Upstream's assertions in those files run against this tree as the ninth audit
+  (`check_upstream_test_copies.py`), so a dropped library half would gate there.
+* **15 have library or doc residue, all recorded fork work:**
+  * `2424c7f1` (sampling) — `top_p_sampling(...)` returns are superseded by C26/O30's
+    `_filter` in the shared `ar._PositionedTargetSampler` (`.symbol-exclusions`); the
+    `clamp_temperature(float(temperature))` line lives there (`ar.py:138`), and
+    `server/generation.py` imports that class.
+  * `bf4b8612` #2127, `e82d557d` #2040 (`qwen3_5/speculative_verifier.py`) — P400
+    (`da27f0ef`) replaced the length-2 batched-SDPA shortcut with the per-query loop
+    (not bit-identical under TurboQuant); `del layer` went with the fork's q/k-norm use
+    of `layer`. Marked `# Fork (P400)` / `# Fork (M58)`.
+  * `9c788e45` #1288, `6bf5f29d` #1813 (`ar.py`) — draft kwargs now flow through
+    `_effective_prefill_draft` (P369 F7, marked).
+  * `91072268` (`ar.py`) — the `tqdm(..., disable=not verbose)` call is present inside
+    M57's combined `with (tqdm(...) as pbar, prefill_profile.finalizing(_pp))`.
+  * `4319ef2c` #2562 (`ar.py`) — `mx.stream(generation_stream)` is the fork's
+    `_get_generation_stream()` (`5e9b9503`, `.registry-exclusions`).
+  * `ecc457b2` #1374 (`ar.py`) — fixed by `c8609a0c`; the residue is
+    `return c.to_batch(left_padding)`, spelled `batch_cache = c.to_batch(left_padding)`.
+  * `2b93e778` #2458, `86d07d14` #2418 (`docs/usage.md`), `6ecadd76` #2408
+    (`requirements.txt` `cryptography`) — `ebdbfbbc` made chat compaction opt-in and
+    `cryptography` optional; `usage.md` states the fork behaviour in place of upstream's.
+  * `65709b34` (`server/app.py` `load_processor`) — `07228726`'s
+    `load_embedding_processor` (`.registry-exclusions`).
+  * Extended lines, nothing missing: `c32e07b8` #2457 (help text lists a fourth
+    drafter), `b1a85530` #2260 and `6ecadd76` (imports merged with more names),
+    `250afd92` #2360 (`load_config, load_processor`), `63fc9795` #2528
+    (`NemotronHBlock(..., layer_idx=index)`).
 
 Closed because the fork deliberately supersedes them — see each file's `# Fork:`
 markers, which name the commit:

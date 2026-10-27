@@ -183,50 +183,30 @@ mlx_vlm/tests/test_generate.py::test_top_p_preserves_tied_maxima_and_dtype  # C1
 mlx_vlm/tests/test_generate.py::test_top_p_sampling_shape  # C104 unported: upstream test PASSES against fork 664c2ead (run 2026-10-06)
 mlx_vlm/tests/test_generate.py::test_video_sampling_options_are_row_safe_and_not_generation_kwargs  # C104 unported: upstream test PASSES against fork 664c2ead (run 2026-10-06)
 mlx_vlm/tests/test_generate.py::thinking_processor  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
-mlx_vlm/tests/test_server.py::_AudioModel  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
 mlx_vlm/tests/test_server.py::_Batch  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
 mlx_vlm/tests/test_server.py::_Detokenizer  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy (same name also defined in mlx_vlm/tests/test_diffusion_models.py)
-mlx_vlm/tests/test_server.py::_FakeLoadedModel  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
-mlx_vlm/tests/test_server.py::_FakeStreamingSession  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
 mlx_vlm/tests/test_server.py::_HarmonyResponseTemplateTokenizer  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
 mlx_vlm/tests/test_server.py::_IdleBatch  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
 mlx_vlm/tests/test_server.py::_apc_budget  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
 mlx_vlm/tests/test_server.py::_assert_chat_and_responses_messages  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
-mlx_vlm/tests/test_server.py::_audio_backend  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
-mlx_vlm/tests/test_server.py::_audio_config  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
 mlx_vlm/tests/test_server.py::_chat_events  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
 mlx_vlm/tests/test_server.py::_drain  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
 mlx_vlm/tests/test_server.py::_enqueue  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
-mlx_vlm/tests/test_server.py::_fake_audio_write  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
 mlx_vlm/tests/test_server.py::_harmony_processor  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
-mlx_vlm/tests/test_server.py::_make  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
 mlx_vlm/tests/test_server.py::_normalized  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
 mlx_vlm/tests/test_server.py::_running  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
-mlx_vlm/tests/test_server.py::_send_pcm  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
 mlx_vlm/tests/test_server.py::_step_tokens  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
 mlx_vlm/tests/test_server.py::_thinking_text  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
-mlx_vlm/tests/test_server.py::_upload  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
-mlx_vlm/tests/test_server.py::_voice_session  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
 mlx_vlm/tests/test_server.py::_worker_setup  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
-mlx_vlm/tests/test_server.py::audio_client  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
-mlx_vlm/tests/test_server.py::create_session  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy (same name also defined in mlx_vlm/models/nemotron_voicechat/model.py)
-mlx_vlm/tests/test_server.py::create_streaming_session  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy (same name also defined in mlx_vlm/models/nemotron_voicechat/session.py)
 mlx_vlm/tests/test_server.py::TestResponseGenerator.test_tokenizer_and_budget_criteria_share_lock.criteria  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy [scope-qualified at the v0.7.6 sync]
 mlx_vlm/tests/test_server.py::endpoint_options  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
 mlx_vlm/tests/test_server.py::fake_initialize  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
-mlx_vlm/tests/test_server.py::fake_load  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy (same name also defined in mlx_vlm/tests/test_models.py)
-mlx_vlm/tests/test_server.py::fake_load_audio_model  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
 mlx_vlm/tests/test_server.py::finish_request  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy (same name also defined in mlx_vlm/tests/test_apc_settings.py)
-mlx_vlm/tests/test_server.py::flush  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy (same name also defined in mlx_vlm/apc.py,mlx_vlm/models/nemotron_voicechat/streaming.py,mlx_vlm/server/realtime.py,mlx_vlm/utils.py)
 mlx_vlm/tests/test_server.py::test_anthropic_tool_image_payloads_follow_normalized_message_order.image  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy (same name also defined in mlx_vlm/generate/image.py) [scope-qualified at the v0.7.6 sync]
 mlx_vlm/tests/test_server.py::image_part  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
 mlx_vlm/tests/test_server.py::make_batch  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy (same name also defined in mlx_vlm/tests/test_generate.py)
-mlx_vlm/tests/test_server.py::push_audio  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy (same name also defined in mlx_vlm/models/nemotron_voicechat/streaming.py)
-mlx_vlm/tests/test_server.py::raise_not_found  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
-mlx_vlm/tests/test_server.py::realtime_client  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy
 mlx_vlm/tests/test_server.py::run_worker  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy (same name also defined in mlx_vlm/tests/test_apc_settings.py)
 mlx_vlm/tests/test_server.py::score  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy (same name also defined in mlx_vlm/turboquant.py)
-mlx_vlm/tests/test_server.py::stream  # C104 unported: helper/fixture of upstream tests not carried in the fork-owned copy (same name also defined in mlx_vlm/generate/ar.py,mlx_vlm/models/sam3d_objects/pipeline.py,mlx_vlm/models/sapiens2/generate.py)
 mlx_vlm/tests/test_server.py::test_anthropic_image_normalization  # C104 unported: upstream test PASSES against fork 664c2ead (run 2026-10-06)
 mlx_vlm/tests/test_server.py::test_anthropic_stream_without_tools_keeps_literal_call_markup  # C104 unported: upstream test PASSES against fork 664c2ead (run 2026-10-06)
 mlx_vlm/tests/test_server.py::test_anthropic_system_normalization  # C104 unported: upstream test PASSES against fork 664c2ead (run 2026-10-06)
@@ -238,16 +218,6 @@ mlx_vlm/tests/test_server.py::test_apc_zero_null_and_replace_override_environmen
 mlx_vlm/tests/test_server.py::test_assistant_reasoning_normalization  # C104 unported: upstream test PASSES against fork 664c2ead (run 2026-10-06)
 mlx_vlm/tests/test_server.py::test_attach_harmony_template  # C104 unported: upstream test PASSES against fork 664c2ead (run 2026-10-06)
 mlx_vlm/tests/test_server.py::test_attention_and_pooling  # C104 unported: upstream test PASSES against fork 664c2ead (run 2026-10-06)
-mlx_vlm/tests/test_server.py::test_audio_endpoint_loads_audio_capable_native_model  # C104 unported: upstream test PASSES against fork 664c2ead (run 2026-10-06)
-mlx_vlm/tests/test_server.py::test_audio_endpoint_loads_dedicated_stt_model  # C104 unported: upstream test PASSES against fork 664c2ead (run 2026-10-06)
-mlx_vlm/tests/test_server.py::test_audio_endpoint_rejects_native_chat_model  # C104 unported: upstream test PASSES against fork 664c2ead (run 2026-10-06)
-mlx_vlm/tests/test_server.py::test_audio_result_serialization  # C104 unported: upstream test PASSES against fork 664c2ead (run 2026-10-06)
-mlx_vlm/tests/test_server.py::test_audio_speech_returns_audio_bytes  # C104 unported: upstream test PASSES against fork 664c2ead (run 2026-10-06)
-mlx_vlm/tests/test_server.py::test_audio_speech_stream_bad_model_returns_error_before_headers  # C104 unported: upstream test PASSES against fork 664c2ead (run 2026-10-06)
-mlx_vlm/tests/test_server.py::test_audio_stt_request_maps_native_chat_model_to_400  # C104 unported: upstream test PASSES against fork 664c2ead (run 2026-10-06)
-mlx_vlm/tests/test_server.py::test_audio_transcription_request  # C104 unported: upstream test PASSES against fork 664c2ead (run 2026-10-06)
-mlx_vlm/tests/test_server.py::test_audio_transcriptions_undecodable_upload_returns_400  # C104 unported: upstream test PASSES against fork 664c2ead (run 2026-10-06)
-mlx_vlm/tests/test_server.py::test_audio_tts_and_stt_caches_are_independent  # C104 unported: upstream test PASSES against fork 664c2ead (run 2026-10-06)
 mlx_vlm/tests/test_server.py::test_batch_order  # C104 unported: upstream test PASSES against fork 664c2ead (run 2026-10-06)
 mlx_vlm/tests/test_server.py::test_build_generation_arguments  # C104 unported: upstream test PASSES against fork 664c2ead (run 2026-10-06)
 mlx_vlm/tests/test_server.py::test_chat_and_responses_merge_instruction_messages_identically  # C104 unported: upstream test PASSES against fork 664c2ead (run 2026-10-06)
@@ -285,11 +255,6 @@ mlx_vlm/tests/test_server.py::test_normalization  # C104 unported: upstream test
 mlx_vlm/tests/test_server.py::test_packaged_template  # C104 unported: upstream test PASSES against fork 664c2ead (run 2026-10-06)
 mlx_vlm/tests/test_server.py::test_prefill_progress_logging  # C104 unported: upstream test PASSES against fork 664c2ead (run 2026-10-06)
 mlx_vlm/tests/test_server.py::test_queue_timeout_settings  # C104 unported: upstream test PASSES against fork 664c2ead (run 2026-10-06)
-mlx_vlm/tests/test_server.py::test_realtime_loader_uses_generic_load_and_model_session  # C104 unported: upstream test PASSES against fork 664c2ead (run 2026-10-06)
-mlx_vlm/tests/test_server.py::test_realtime_websocket_accepts_explicit_session_limit  # C104 unported: upstream test PASSES against fork 664c2ead (run 2026-10-06)
-mlx_vlm/tests/test_server.py::test_realtime_websocket_rejects_second_active_session  # C104 unported: upstream test PASSES against fork 664c2ead (run 2026-10-06)
-mlx_vlm/tests/test_server.py::test_realtime_websocket_requires_native_pcm_rate  # C104 unported: upstream test PASSES against fork 664c2ead (run 2026-10-06)
-mlx_vlm/tests/test_server.py::test_realtime_websocket_streams_json_events  # C104 unported: upstream test PASSES against fork 664c2ead (run 2026-10-06)
 mlx_vlm/tests/test_server.py::test_response_format_schema  # C104 unported: upstream test PASSES against fork 664c2ead (run 2026-10-06)
 mlx_vlm/tests/test_server.py::test_response_template_thinking_stream  # C104 unported: upstream test PASSES against fork 664c2ead (run 2026-10-06)
 mlx_vlm/tests/test_server.py::test_response_template_tool_calls  # C104 unported: upstream test PASSES against fork 664c2ead (run 2026-10-06)

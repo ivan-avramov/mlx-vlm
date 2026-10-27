@@ -25,8 +25,8 @@ closed in `98cfb0b6`, T2 in `069fab9c`. Open: T3.
   `.venv/bin/python dev/ci.py` (pre-commit, the nine audits vs `.upstream-sync-ref`,
   the full suite; exit 1 on failure). `dev/ci.py drift` and `dev/ci.py leads` are
   information only.
-- **Current gate result (mlx 0.32.4, 2026-10-26, the `2ceff4c1` merge):** style ok, all
-  nine audits ok, suite 9192 passed / 0 failed.
+- **Current gate result (mlx 0.32.4, 2026-10-26, after the `2ceff4c1` merge and the audio convergence):** style ok, all
+  nine audits ok, suite 9205 passed / 0 failed.
 - **mlx 0.32.3 is unsupported.** Since upstream #2527 the exact verifier kernels match
   only 0.32.4's qmv; the suite fails ~190 tests on 0.32.3 (measured 2026-10-26). The
   earlier claim here that T1's five tests passed on 0.32.3 was wrong for this tree.

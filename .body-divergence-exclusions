@@ -74,7 +74,6 @@ mlx_vlm/tests/test_server.py::test_thinking_stream_strips_newlines_after_close  
 
 # --- v0.7.6 sync (2026-10-06): same C104(c) situation after the merge; upstream tests ported
 # byte-identically, plus definitions whose relative order changed around them.
-mlx_vlm/tests/test_server.py::_FakeAlignedResult  # C104(c) port @1dcc142d: byte-identical to upstream v0.7.6; placed in the fork-owned copy's layout, not upstream's order
 mlx_vlm/tests/test_server.py::_completed_response  # C104(c) port @4623cf9d: byte-identical to upstream 4623cf9d (re-pinned at the stage-B sync, which took upstream #2458's body); placed in the fork-owned copy's layout, not upstream's order
 mlx_vlm/tests/test_server.py::_function_result  # C104(c) port @1dcc142d: byte-identical to upstream v0.7.6; placed in the fork-owned copy's layout, not upstream's order
 mlx_vlm/tests/test_server.py::_input_image  # C104(c) port @1dcc142d: byte-identical to upstream v0.7.6; placed in the fork-owned copy's layout, not upstream's order
@@ -104,4 +103,3 @@ mlx_vlm/tests/test_generate.py::test_generate_step_preserves_history_across_pref
 mlx_vlm/tests/test_generate.py::test_nemotron_visual_prefix_chunked_generation  # C104(c) port @e9af3766: byte-identical to upstream e9af3766 (#2562/#2552, stage-D sync); placed in the fork-owned copy's layout, not upstream's order
 mlx_vlm/tests/test_generate.py::test_penalties_ignore_non_vocabulary_ids  # C104(c) port @e9af3766: byte-identical to upstream e9af3766 (#2562/#2552, stage-D sync); placed in the fork-owned copy's layout, not upstream's order
 mlx_vlm/tests/test_generate.py::test_penalties_preserve_token_container_support  # C104(c) port @e9af3766: byte-identical to upstream e9af3766 (#2562/#2552, stage-D sync); placed in the fork-owned copy's layout, not upstream's order
-mlx_vlm/tests/test_server.py::reset_audio_runtime  # C104(c) port @e9af3766: byte-identical to upstream e9af3766 (fixture imported by upstream's test_server_stt_realtime.py, #2167; stage-D sync); placed in the fork-owned copy's layout, not upstream's order
