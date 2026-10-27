@@ -17,9 +17,9 @@ closed in `98cfb0b6`, T2 in `069fab9c`. Open: T3.
   in `docs/upstream-bugs.md` (items 9–14 are new).
 - **State (2026-10-26):** `main` contains upstream `2ceff4c1` (0.7.11: #2558 native MTP
   in the SFT/ORPO trainers, #2600 diarization and speaker-embedding endpoints; see
-  `memory.md`). `origin/main` is at `1669ee72`; everything after it, T1, T2 and the
-  `2ceff4c1` merge, is unpushed. Push only when the operator says so. Next weekly sync is
-  due by 2026-11-02.
+  `memory.md`) and the audio-section convergence (`0d80513f`). All of it, T1 and T2
+  included, is pushed (`origin/main` = `main`, 2026-10-26). Push only when the operator
+  says so. Next weekly sync is due by 2026-11-02.
 - **No hosted CI.** GitHub Actions are disabled on the fork (free-account minutes), and
   `.github/workflows/` is byte-identical to upstream's. The gate is local:
   `.venv/bin/python dev/ci.py` (pre-commit, the nine audits vs `.upstream-sync-ref`,
