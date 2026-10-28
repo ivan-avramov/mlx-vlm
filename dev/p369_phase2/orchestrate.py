@@ -30,7 +30,7 @@ except ImportError:  # run as a script: this directory is sys.path[0]
     import registry_states
     import telemetry  # code round 2 M2: stdlib-only at import
 
-PRODUCTION = "7207179b"  # P400 + P401 (C188) + P405 F1 / F2 + K6 (C189 / C192); was 3395cef3, da27f0ef, 4e6d0e03
+PRODUCTION = "b26fa7c9"  # S′ (C236 / C242): the fork at c688e722 / 1c7c8fa1, production tree = b26fa7c9; was 7207179b, 3395cef3, da27f0ef, 4e6d0e03
 _DENSE = dict(
     layer="Qwen3_5DecoderLayer",
     depth=1,
