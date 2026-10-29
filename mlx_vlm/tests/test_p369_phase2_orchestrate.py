@@ -1886,13 +1886,16 @@ def test_e1c_keeps_the_neutrality_of_an_attempt_rejected_for_validity(tmp_path):
 def test_e1c_cells_invalid_on_every_seed_keep_their_attempts_evidence(
     tmp_path, neutral, c1, want
 ):
-    """Round 3 E7: when every pre-registered seed is invalid the cell is not a harness error — its attempts
-    still decide (any C1 failure ABORTs, any neutrality failure FAILs, else INCOMPLETE).
+    """Round 3 E7: when every pre-registered attempt (each offset × each seed, P537) is invalid the cell is not
+    a harness error — its attempts still decide (any C1 failure ABORTs, any neutrality failure FAILs, else
+    INCOMPLETE).
     """
     camp = _e1c_camp(tmp_path)
+    camp.size = lambda pick, thresholds, offset=64: {t: "x" for t in thresholds}
     entry = json.loads((tmp_path / FABLE / "e1c-pair-a0" / "req-0.json").read_text())
     entry["straddle"] = False
-    for k in range(len(orchestrate.SEEDS)):
+    n = len(orchestrate.SEEDS) * len(orchestrate.STRADDLE_OFFSETS)
+    for k in range(n):
         attempt = dict(entry)
         if k == 2:
             attempt["pair"] = dict(
@@ -1904,7 +1907,7 @@ def test_e1c_cells_invalid_on_every_seed_keep_their_attempts_evidence(
         (d / "req-0.json").write_text(json.dumps(attempt))
     got = camp.e1c(FABLE, {1024: "x"}, smoke=True)
     assert got["T1024"]["pass_"] is False
-    assert len(got["T1024"]["rejected"]) == len(orchestrate.SEEDS)
+    assert len(got["T1024"]["rejected"]) == n
     assert orchestrate.pick_outcome(got)["e1c"] == want
 
 
@@ -2652,3 +2655,85 @@ def test_m2r2_each_draft_invocation_is_well_formed(kind, invocation):
     except orchestrate.MalformedEvidence:
         return
     assert not gate["pass_"], (kind, gate)
+
+
+# ------------------------------------------------------------------ P537 / P527 (stack C252)
+P537_PICK, P537_PICK_B = list(orchestrate.PICKS)[:2]  # the first two P369 picks, by position
+
+def _offset_camp(tmp_path, *, valid_at=None):
+    """An E1c campaign whose T1024 cell straddles only at attempt ``valid_at`` (None: never); every attempt
+    records the ``prompt_end`` of the offset it was sized for."""
+    camp = _e1c_camp(tmp_path)
+    base = json.loads((tmp_path / P537_PICK / "e1c-pair-a0" / "req-0.json").read_text())
+    n = len(orchestrate.SEEDS) * len(orchestrate.STRADDLE_OFFSETS)
+    for k in range(n):
+        offset = orchestrate.STRADDLE_OFFSETS[k // len(orchestrate.SEEDS)]
+        d = tmp_path / P537_PICK / f"e1c-pair-a{k}"
+        d.mkdir(exist_ok=True)
+        entry = dict(
+            base,
+            straddle=(k == valid_at),
+            prompt_end=orchestrate.straddle_target(1024, offset),
+        )
+        (d / "req-0.json").write_text(json.dumps(entry))
+    sized = []
+
+    def size(pick, thresholds, offset=orchestrate.STRADDLE_OFFSETS[0]):
+        sized.append((tuple(thresholds), offset))
+        return {t: f"prompt-{t}-{offset}" for t in thresholds}
+
+    camp.size = size
+    return camp, sized
+
+
+def test_the_straddle_offsets_are_pre_registered_and_start_at_the_historical_one():
+    assert orchestrate.STRADDLE_OFFSETS == (64, 65, 66)
+    assert orchestrate.straddle_target(8192) == 8192 - 64
+    assert orchestrate.straddle_target(8192, 65) == 8192 - 65
+
+
+def test_e1c_retries_a_cell_invalid_on_every_seed_at_the_next_offset(tmp_path):
+    k = len(orchestrate.SEEDS)  # the first attempt at offset 65
+    camp, sized = _offset_camp(tmp_path, valid_at=k)
+    got = camp.e1c(P537_PICK, {1024: "x"}, smoke=True)
+    cell = got["T1024"]
+    assert cell["pass_"], cell
+    assert sized == [((1024,), 65)]  # re-sized once, only the pending thresholded cell
+    assert [a["offset"] for a in cell["attempts"]] == [64] * k + [65]
+    assert [a["valid"] for a in cell["attempts"]] == [False] * k + [True]
+    assert cell["offset"] == 65
+
+
+def test_e1c_verdict_checks_the_prompt_end_of_the_offset_used():
+    entry = dict(
+        straddle=True,
+        verdict={"pass": True},
+        draft_rounds=5,
+        prompt_end=orchestrate.straddle_target(1024, 65),
+        response={},
+    )
+    pair = dict(rows={"pass": True}, states={"pass": True}, forced={"pass": True})
+    v = orchestrate.e1c_verdict(
+        entry, pair, threshold=1024, verify_policy=None, offset=65
+    )
+    assert v["pass_"], v
+    v = orchestrate.e1c_verdict(entry, pair, threshold=1024, verify_policy=None)
+    assert not v["pass_"] and any("prompt_end" in p for p in v["problems"])
+
+
+def test_e1c_cells_invalid_at_every_offset_and_seed_report_all_attempts(tmp_path):
+    camp, sized = _offset_camp(tmp_path, valid_at=None)
+    got = camp.e1c(P537_PICK, {1024: "x"}, smoke=True)
+    n = len(orchestrate.SEEDS) * len(orchestrate.STRADDLE_OFFSETS)
+    assert got["T1024"]["pass_"] is False
+    assert len(got["T1024"]["rejected"]) == n
+    assert got["T1024"]["problems"] == [f"invalid on all {n} attempts"]
+    assert sized == [((1024,), 65), ((1024,), 66)]
+    assert orchestrate.pick_outcome(got)["e1c"] == "INCOMPLETE"
+
+
+def test_a_pick_that_is_on_in_the_stack_root_registry_is_refused():
+    """P527: the OFF arm is the stack root's registry; a pick ON there would compare ON with ON."""
+    assert orchestrate.registry_off_problems([P537_PICK], {P537_PICK}) == []
+    problems = orchestrate.registry_off_problems([P537_PICK], set())
+    assert problems and P537_PICK in problems[0] and "ON" in problems[0]
