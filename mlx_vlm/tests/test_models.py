@@ -2574,7 +2574,8 @@ def _run_distributed_model_test(family, dtype, world_size):
             sockets = [stack.enter_context(socket.socket()) for _ in range(world_size)]
             port = rng.randrange(20000, _EPHEMERAL_FIRST - world_size)
             try:
-                for rank, sock in enumerate(sockets):
+                sockets[0].bind(("127.0.0.1", port))
+                for rank, sock in enumerate(sockets[1:], 1):
                     sock.bind(("127.0.0.1", port + rank))
             except OSError:
                 continue
