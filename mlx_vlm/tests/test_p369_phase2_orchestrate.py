@@ -2850,3 +2850,53 @@ def test_prepare_refuses_a_pick_that_is_on_in_the_stack_root_registry(
     with pytest.raises(orchestrate.Refused, match="MTP-ON in the stack root"):
         orchestrate.Campaign(args).prepare()
     assert built == []
+
+
+def test_cells_accepted_at_different_offsets_keep_their_own_offset_and_the_short_cell_runs_once(
+    tmp_path,
+):
+    """P537 code review round 1 (scope request, operator-approved): the non-smoke path with two thresholded cells —
+    T1024 accepted at offset 64 on the first seed, T8192 only at offset 66 — and the short cell, which runs once.
+    """
+    camp = _e1c_camp(tmp_path)
+    base = json.loads((tmp_path / P537_PICK / "e1c-pair-a0" / "req-0.json").read_text())
+    n_seeds = len(orchestrate.SEEDS)
+
+    def entry(t, offset, straddle):
+        return dict(
+            base, straddle=straddle, prompt_end=orchestrate.straddle_target(t, offset)
+        )
+
+    def write(attempt, reqs):
+        d = tmp_path / P537_PICK / f"e1c-pair-a{attempt}"
+        d.mkdir(exist_ok=True)
+        for i, e in enumerate(reqs):
+            (d / f"req-{i}.json").write_text(json.dumps(e))
+
+    short = dict(base, straddle=None, prompt_end=None)
+    write(0, [entry(1024, 64, True), entry(8192, 64, False), short])
+    for a in range(1, n_seeds):  # offset 64, seeds 2..5: only T8192 pending
+        write(a, [entry(8192, 64, False)])
+    for a in range(n_seeds, 2 * n_seeds):  # offset 65: invalid on every seed
+        write(a, [entry(8192, 65, False)])
+    write(2 * n_seeds, [entry(8192, 66, True)])  # offset 66, first seed
+    c2 = json.loads((tmp_path / P537_PICK / "e1c-c2" / "req-0.json").read_text())
+    for i in range(3):
+        (tmp_path / P537_PICK / "e1c-c2" / f"req-{i}.json").write_text(json.dumps(c2))
+    sized = []
+
+    def size(pick, thresholds, offset=64, strict=True):
+        sized.append((tuple(thresholds), offset))
+        return {t: f"prompt-{t}-{offset}" for t in thresholds}
+
+    camp.size = size
+    got = camp.e1c(P537_PICK, {1024: "x1024", 8192: "x8192"}, smoke=False)
+    assert sized == [((8192,), 65), ((8192,), 66)]
+    assert got["T1024"]["pass_"] and got["T1024"]["offset"] == 64
+    assert got["T8192"]["pass_"] and got["T8192"]["offset"] == 66
+    assert got["short"]["pass_"] and len(got["short"]["attempts"]) == 1
+    assert [a["offset"] for a in got["T8192"]["attempts"]] == [64] * n_seeds + [
+        65
+    ] * n_seeds + [66]
+    assert camp.accepted_prompts[P537_PICK] == {1024: "x1024", 8192: "prompt-8192-66"}
+    assert orchestrate.pick_outcome(got)["e1c"] == "PASS"
