@@ -1891,7 +1891,9 @@ def test_e1c_cells_invalid_on_every_seed_keep_their_attempts_evidence(
     INCOMPLETE).
     """
     camp = _e1c_camp(tmp_path)
-    camp.size = lambda pick, thresholds, offset=64: {t: "x" for t in thresholds}
+    camp.size = lambda pick, thresholds, offset=64, strict=True: {
+        t: "x" for t in thresholds
+    }
     entry = json.loads((tmp_path / FABLE / "e1c-pair-a0" / "req-0.json").read_text())
     entry["straddle"] = False
     n = len(orchestrate.SEEDS) * len(orchestrate.STRADDLE_OFFSETS)
@@ -2678,7 +2680,7 @@ def _offset_camp(tmp_path, *, valid_at=None):
         (d / "req-0.json").write_text(json.dumps(entry))
     sized = []
 
-    def size(pick, thresholds, offset=orchestrate.STRADDLE_OFFSETS[0]):
+    def size(pick, thresholds, offset=orchestrate.STRADDLE_OFFSETS[0], strict=True):
         sized.append((tuple(thresholds), offset))
         return {t: f"prompt-{t}-{offset}" for t in thresholds}
 
@@ -2737,3 +2739,114 @@ def test_a_pick_that_is_on_in_the_stack_root_registry_is_refused():
     assert orchestrate.registry_off_problems([P537_PICK], {P537_PICK}) == []
     problems = orchestrate.registry_off_problems([P537_PICK], set())
     assert problems and P537_PICK in problems[0] and "ON" in problems[0]
+
+
+# ------------------------------------------------------------------ P537 code review round 1 (stack C252)
+def test_the_retry_sends_the_re_sized_prompt_and_the_accepted_prompt_feeds_e2(tmp_path):
+    k = len(orchestrate.SEEDS)
+    camp, _ = _offset_camp(tmp_path, valid_at=k)
+    sent = []
+    camp.job = lambda pick, name, mode, arm, requests: (name, requests)
+    camp.run = lambda job: sent.append(job)
+    camp.e1c(P537_PICK, {1024: "x"}, smoke=True)
+    texts = [
+        r["payload"]["messages"][0]["content"]
+        for name, reqs in sent
+        if name.startswith("e1c-pair")
+        for r in reqs
+    ]
+    assert texts == ["x"] * k + ["prompt-1024-65"]
+    assert camp.accepted_prompts[P537_PICK] == {1024: "prompt-1024-65"}
+    assert orchestrate.e2_prompts({1024: "x", 8192: "y"}, {1024: "z"}) == {
+        1024: "z",
+        8192: "y",
+    }
+
+
+def test_a_re_size_that_finds_no_exact_prompt_parks_the_cell_for_the_next_offset(
+    tmp_path,
+):
+    k = 2 * len(orchestrate.SEEDS)  # offset 66's first seed (65 never sized)
+    camp, _ = _offset_camp(tmp_path, valid_at=len(orchestrate.SEEDS))
+    # attempt files are written per attempt index; with 65 skipped, offset 66 runs as attempt 5
+    calls = []
+
+    def size(pick, thresholds, offset=64, strict=True):
+        calls.append(offset)
+        if offset == 65:
+            return {}  # strict=False: no exact prompt at 65
+        return {t: f"prompt-{t}-{offset}" for t in thresholds}
+
+    camp.size = size
+    entry = json.loads((tmp_path / P537_PICK / "e1c-pair-a5" / "req-0.json").read_text())
+    entry["prompt_end"] = orchestrate.straddle_target(1024, 66)
+    (tmp_path / P537_PICK / "e1c-pair-a5" / "req-0.json").write_text(json.dumps(entry))
+    got = camp.e1c(P537_PICK, {1024: "x"}, smoke=True)
+    assert calls == [65, 66]
+    cell = got["T1024"]
+    assert cell["pass_"] and cell["offset"] == 66, cell
+    assert cell["size_failures"] == [65]
+    assert k  # documents the schedule this test relies on
+
+
+def test_a_cell_that_no_offset_can_size_is_incomplete_with_the_reason(tmp_path):
+    camp, _ = _offset_camp(tmp_path, valid_at=None)
+
+    def size(pick, thresholds, offset=64, strict=True):
+        assert strict is False  # a re-size never raises
+        return {}
+
+    camp.size = size
+    got = camp.e1c(P537_PICK, {1024: "x"}, smoke=True)
+    cell = got["T1024"]
+    assert cell["pass_"] is False
+    assert any("no exact prompt at offset 65" in p for p in cell["problems"])
+    assert any("no exact prompt at offset 66" in p for p in cell["problems"])
+    assert orchestrate.pick_outcome(got)["e1c"] == "INCOMPLETE"
+
+
+def test_each_sizing_offset_has_its_own_job_directory(tmp_path):
+    camp = object.__new__(orchestrate.Campaign)
+    names = []
+    camp.job = lambda pick, name, mode, arm, requests: names.append(name) or name
+
+    def run(job):
+        return dict(requests=[dict(text="t", tokens=1)])
+
+    assert run(None)["requests"][0]["text"] == "t"
+
+    camp.run = run
+    camp.size(P537_PICK, [1024])
+    camp.size(P537_PICK, [1024], offset=65)
+    assert names == ["size", "size-o65"]
+
+
+def test_prepare_refuses_a_pick_that_is_on_in_the_stack_root_registry(
+    tmp_path, monkeypatch
+):
+    """P527 wired into ``Campaign.prepare``: the classifier's OFF set decides, before any argv is built."""
+    stack = tmp_path / "stack"
+    stack.mkdir()
+    on_text, _ = rs.overlay_on(ALL_OFF, FIXTURE_TEXT, P537_PICK_B)
+    (stack / "main_models.yaml").write_text(on_text)
+    args = argparse.Namespace(
+        stack_root=str(stack),
+        fork_root=str(DEV.parent),
+        out=str(tmp_path / "run"),
+        pick=[P537_PICK_B],
+        phase="smoke",
+        wall_limit_s=None,
+        reviewed_head=None,
+        smoke_summary=None,
+    )
+    for name, value in dict(
+        stack_bench_problems=lambda *a, **k: [],
+        stack_bench_state=lambda *a, **k: {},
+        fork_versions=lambda *a, **k: {},
+    ).items():
+        monkeypatch.setattr(orchestrate, name, value)
+    built = []
+    monkeypatch.setattr(orchestrate, "worker_argv", lambda *a, **k: built.append(a))
+    with pytest.raises(orchestrate.Refused, match="MTP-ON in the stack root"):
+        orchestrate.Campaign(args).prepare()
+    assert built == []
