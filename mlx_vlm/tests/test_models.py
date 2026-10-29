@@ -10,6 +10,7 @@ import json
 import logging
 import math
 import os
+import random
 import signal
 import socket
 import struct
@@ -2557,19 +2558,23 @@ def _distributed_model_worker(family, dtype_name):
     assert passed == group.size(), records
 
 
+_EPHEMERAL_FIRST = 49152  # IANA dynamic range start (macOS net.inet.ip.portrange.first; Linux starts higher)
+
+
 def _run_distributed_model_test(family, dtype, world_size):
     repo = Path(__file__).resolve().parents[2]
     # The ring launcher needs one consecutive port per rank. Probe the entire
     # range while holding the sockets so a four-rank case cannot reuse a port.
+    # P503 (stack): never start in the OS ephemeral range (bind(0) picks from it): the
+    # ranks' own outgoing connections draw source ports from that range and can take a
+    # later rank's listening port between the probe and the launch (EADDRINUSE, 48).
+    rng = random.Random()
     for _ in range(100):
         with ExitStack() as stack:
             sockets = [stack.enter_context(socket.socket()) for _ in range(world_size)]
-            sockets[0].bind(("127.0.0.1", 0))
-            port = sockets[0].getsockname()[1]
-            if port + world_size > 65536:
-                continue
+            port = rng.randrange(20000, _EPHEMERAL_FIRST - world_size)
             try:
-                for rank, sock in enumerate(sockets[1:], 1):
+                for rank, sock in enumerate(sockets):
                     sock.bind(("127.0.0.1", port + rank))
             except OSError:
                 continue
