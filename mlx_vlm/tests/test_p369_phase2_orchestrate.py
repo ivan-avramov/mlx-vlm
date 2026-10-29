@@ -788,6 +788,36 @@ def test_run_pick_saves_each_step_as_it_finishes(monkeypatch):
     )  # code round 2 H16: E7a saved before E7b runs
 
 
+def test_run_pick_hands_e2_the_prompts_e1c_accepted(monkeypatch):
+    """P537 verify (sonnet A): E2's per-threshold straddle prompt is the one E1c accepted, not the T - 64 sizing."""
+    camp = object.__new__(orchestrate.Campaign)
+    camp.stack, camp.bench_paths = None, []
+    camp.arms = {P537_PICK: dict(on=["--kv-bits", "0"], off=["--kv-bits", "0"])}
+    monkeypatch.setattr(orchestrate, "c84_items", lambda stack, pick: [])
+    camp.check_bench = lambda pick: None
+    camp.size = lambda pick, thresholds: {1024: "sized-64", 8192: "sized-64b"}
+    camp.check_reconstruction = lambda pick, items, panel=None: {}
+
+    def e1c(pick, prompts, smoke):
+        camp.accepted_prompts = {pick: {1024: "accepted-65", 8192: "sized-64b"}}
+        return {"T1024": _v(), "T8192": _v()}
+
+    got = {}
+    camp.e1c = e1c
+    camp.e2 = lambda pick, items, prompts, smoke: got.update(prompts) or dict(
+        verdict="PASS"
+    )
+    camp.e7a = lambda pick, items: dict(status="OBSERVED")
+    camp.e7b = lambda pick, items: dict(status="OBSERVED", sessions=[])
+    camp.summary = dict(picks={})
+    camp.write_summary = lambda: None
+    try:
+        camp.run_pick(P537_PICK, smoke=False)
+    except Exception:  # noqa: BLE001 — only the E2 hand-off is the claim here
+        pass
+    assert got == {1024: "accepted-65", 8192: "sized-64b"}
+
+
 def test_a_harness_error_is_recorded_before_it_propagates(tmp_path):
     saved = []
     camp = object.__new__(orchestrate.Campaign)
@@ -1899,6 +1929,11 @@ def test_e1c_cells_invalid_on_every_seed_keep_their_attempts_evidence(
     n = len(orchestrate.SEEDS) * len(orchestrate.STRADDLE_OFFSETS)
     for k in range(n):
         attempt = dict(entry)
+        attempt["prompt_end"] = (
+            orchestrate.straddle_target(  # what the worker records for that offset
+                1024, orchestrate.STRADDLE_OFFSETS[k // len(orchestrate.SEEDS)]
+            )
+        )
         if k == 2:
             attempt["pair"] = dict(
                 rows={"pass": neutral}, states={"pass": True}, forced={"pass": True}
@@ -2766,10 +2801,12 @@ def test_the_retry_sends_the_re_sized_prompt_and_the_accepted_prompt_feeds_e2(tm
 def test_a_re_size_that_finds_no_exact_prompt_parks_the_cell_for_the_next_offset(
     tmp_path,
 ):
-    k = 2 * len(orchestrate.SEEDS)  # offset 66's first seed (65 never sized)
-    camp, _ = _offset_camp(tmp_path, valid_at=len(orchestrate.SEEDS))
-    # attempt files are written per attempt index; with 65 skipped, offset 66 runs as attempt 5
-    calls = []
+    n_seeds = len(orchestrate.SEEDS)
+    camp, _ = _offset_camp(tmp_path, valid_at=n_seeds)
+    # attempt directories are numbered by the attempts that RAN: with 65 unsizable, offset 66's first seed is a5
+    calls, sent = [], []
+    camp.job = lambda pick, name, mode, arm, requests: (name, requests)
+    camp.run = lambda job: sent.append(job)
 
     def size(pick, thresholds, offset=64, strict=True):
         calls.append(offset)
@@ -2786,7 +2823,11 @@ def test_a_re_size_that_finds_no_exact_prompt_parks_the_cell_for_the_next_offset
     cell = got["T1024"]
     assert cell["pass_"] and cell["offset"] == 66, cell
     assert cell["size_failures"] == [65]
-    assert k  # documents the schedule this test relies on
+    assert [a["offset"] for a in cell["attempts"]] == [64] * n_seeds + [66]
+    pairs = [name for name, _ in sent if name.startswith("e1c-pair")]
+    assert pairs == [
+        f"e1c-pair-a{i}" for i in range(n_seeds + 1)
+    ]  # no attempt ran at 65
 
 
 def test_a_cell_that_no_offset_can_size_is_incomplete_with_the_reason(tmp_path):
