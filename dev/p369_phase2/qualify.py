@@ -6,24 +6,24 @@ seed). The expectation is derived from the registry entry independently of mlx-s
 reviewed key → flag table with mlx-serve's own defaults; an unknown registry key refuses.
 """
 
+import hashlib
 import json
 import math
 import os
+import re
+import sys
 from pathlib import Path
 
-ENTRIES = {  # C199 (c): the arm each entry is qualified in
-    "Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed": "mtp_on",
-    "Qwen3.8-27B-mlx-uniform-4bit": "mtp_on",
-    "Qwen3.6-27B-Opus-Distill-OptiQ-4bit": "mtp_on_gated",  # only after its P369 campaign passed
-}
+sys.path.insert(
+    0, str(Path(__file__).resolve().parents[1])
+)  # run as a script: the package is not on sys.path
+from p369_phase2 import registry_states  # noqa: E402
+
 MIN_OUTPUT_TOKENS = (
     2048  # mlx-vlm server: a request leaving less is refused (fork 02e8046d)
 )
 THINKING_CLAMP = 0.8  # mlx-vlm server: THINKING_BUDGET_CLAMP_RATIO
 SEED = 7
-PRODUCTION = (
-    "7207179b"  # the production pin every qualification and its P369 evidence run on
-)
 VISION_SERVER = "mlx_vlm.server"  # mlx-serve _MLX_VLM_SERVER: <stack venv>/bin/mlx_vlm.server for type: vision
 NON_SERVING = ("name", "on_demand", "presentation", "display_name", "description")
 # registry key -> (mlx-serve default, flag, how the value is spelled); mlx-serve config.ModelConfig / _build_command
@@ -56,59 +56,284 @@ class UnknownKey(ValueError):
     pass
 
 
-def arm_for(name, predictor):
-    """P426 B7: the arm ``name`` is measured in — C199's shipped arm without ``--predictor``; ``off`` serves the committed
-    registry (``mtp_off`` for an MTP-certified entry, ``served`` otherwise); ``on`` is the shipped MTP-ON arm.
+# the entry's MTP registry keys (bench.p426_leg.MTP_KEYS / C177); the fork cannot import the stack
+MTP_KEYS = ("draft_kind", "draft_model", "mtp_verify_scan")
+MTP_ON_ARMS = ("served_on", "mtp_on_restored")  # the arms the C199 gate applies to
+
+
+def serves_mtp(entry):
+    """The committed block is served MTP-ON: ``expected_config``'s drafter (``draft_kind: mtp`` with a ``draft_model``).
+    A block with only some MTP keys, or a non-MTP ``draft_kind``, refuses (spec v1.2).
     """
-    shipped = ENTRIES[name]
+    drafter = expected_config(entry)["drafter"]
+    if not drafter and any(k in entry for k in MTP_KEYS):
+        raise ValueError(f"{entry.get('name')}: a partial or non-MTP draft block")
+    return drafter
+
+
+def arm_for(name, predictor, *, registry_entry, registry_state):
+    """C254: the arm ``name`` is measured in, derived from its COMMITTED registry block. No ``predictor``: served as
+    committed (``served_on`` / ``served_off``); ``off``: an MTP-ON entry gets a derived registry without its MTP keys
+    (``mtp_off``); ``on``: ``served_on`` as committed, or ``mtp_on_restored`` for an OFF entry the 16-state generator
+    restores. ``registry_state`` is ``registry_states.classify``'s result, used only to decide a restore.
+    """
+    on = serves_mtp(registry_entry)
     if predictor is None:
-        return shipped
+        return "served_on" if on else "served_off"
     if predictor == "off":
-        return "served" if shipped == "served" else "mtp_off"
-    if shipped == "served":
-        raise ValueError(f"{name}: no MTP-ON arm (not MTP-certified)")
-    return shipped
+        return "mtp_off" if on else "served_off"
+    if on:
+        return "served_on"
+    if name not in registry_states.ENTRY_OFF:
+        raise ValueError(f"{name}: no MTP drafter to restore")
+    if registry_state is None:
+        raise ValueError(
+            f"{name}: the registry is not one of the 16 accepted states (a restore needs the pinned fixture)"
+        )
+    if name not in registry_state:
+        raise ValueError(
+            f"{name}: no MTP drafter to restore (the registry does not classify "
+            "it as MTP-OFF)"
+        )
+    return "mtp_on_restored"
 
 
-def default_entries():
-    """Code round 1 D8: the full qualification is all three MTP entries (`Qwen3.6-27B-Opus-Distill-OptiQ-4bit` then needs its P369 evidence); a subset only via
-    ``--entry``."""
-    return list(ENTRIES)
+def default_entries(registry_entries):
+    """The registry's entries that are P369 picks (the MTP-certified ones), in registry order."""
+    from p369_phase2 import orchestrate
+
+    return [n for n in registry_entries if n in orchestrate.PICKS]
 
 
-def entry_problems(names, *, p369_summary, predictor=None):
-    """Every name is one of the three MTP entries; ``Qwen3.6-27B-Opus-Distill-OptiQ-4bit`` MTP-ON only with a P369 FULL-run PASS for it
-    (its ``--predictor off`` arm needs none, P426 B7)."""
-    problems = [f"unknown entry {n!r}" for n in names if n not in ENTRIES]
+def mtp_off_registry(text, name):
+    """``text`` with exactly ``name``'s MTP-key lines removed (its block's span, every other byte unchanged). Refuses when
+    the result is not the entry's settings minus those keys with everything else equal.
+    """
+    import yaml
+
+    old = registry_states.parse(text)  # the strict parse first
+    lines = text.split("\n")
+    root = yaml.compose(text, Loader=yaml.SafeLoader)
+    models = next(v for k, v in root.value if getattr(k, "value", None) == "models")
+    items = [i for i in models.value if registry_states._node_name(i) == name]
+    if len(items) != 1:
+        raise ValueError(f"{name}: {len(items)} registry blocks")
+    item = items[0]
+    for key in _merged_mtp_keys(item):  # inherited keys have no line of the entry's own
+        raise ValueError(
+            f"{name}: {key.value} (line {key.start_mark.line + 1}): inherited "
+            "through a merge key; it cannot be removed line-wise"
+        )
+    drop = set()
+    for key, value in item.value:
+        if getattr(key, "value", None) not in MTP_KEYS:
+            continue
+        where = f"{name}: {key.value} (line {key.start_mark.line + 1})"
+        if item.flow_style:
+            raise ValueError(f"{where}: a flow-style entry block cannot be edited")
+        first = key.start_mark.line
+        last = value.end_mark.line - (1 if value.end_mark.column == 0 else 0)
+        tail = (
+            lines[last][value.end_mark.column :] if value.end_mark.line == last else ""
+        ).strip()
+        if lines[first][: key.start_mark.column].strip() or (
+            tail and not tail.startswith("#")
+        ):
+            raise ValueError(f"{where}: shares its line with other content")
+        drop.update(range(first, last + 1))
+    derived = "\n".join(l for i, l in enumerate(lines) if i not in drop)
+    new = registry_states.parse(derived)
+    want = dict(
+        old,
+        models=[_without_mtp(m) if m["name"] == name else m for m in old["models"]],
+    )
+    if new != want:
+        keys = [k for k in MTP_KEYS if k in registry_states.settings(text)[name]]
+        raise ValueError(
+            f"{name}: the MTP keys {keys} could not be removed textually "
+            "(the result differs from the entry minus those keys)"
+        )
+    return derived
+
+
+def _merged_mtp_keys(node, seen=None):
+    """The MTP key nodes a mapping node inherits through its ``<<`` merge keys (recursively), in source order."""
+    seen = seen if seen is not None else set()
+    found = []
+    for key, value in node.value:
+        if getattr(key, "tag", None) != "tag:yaml.org,2002:merge":
+            continue
+        sources = value.value if str(value.tag).endswith(":seq") else [value]
+        for source in sources:
+            if id(source) in seen or not isinstance(source.value, list):
+                continue
+            seen.add(id(source))
+            found += [
+                k for k, _ in source.value if getattr(k, "value", None) in MTP_KEYS
+            ]
+            found += _merged_mtp_keys(source, seen)
+    return found
+
+
+def _without_mtp(entry):
+    return {k: v for k, v in entry.items() if k not in MTP_KEYS}
+
+
+def summary_arguments(raw, names):
+    """``--p369-summary`` values -> (``{entry: path}``, problems): ``name=path`` (split on the first ``=``, the name one of
+    the run's entries) or a bare path, which is for a single entry only."""
+    if raw is None:
+        raw = []
+    elif isinstance(raw, (str, Path)):
+        raw = [raw]
+    mapping, problems = {}, []
+    for value in map(str, raw):
+        head, sep, rest = value.partition("=")
+        if sep and head and (head in names or "/" not in head):
+            key, path = head, rest  # an --entry name may itself contain "/"
+            if key not in names:
+                problems.append(
+                    f"--p369-summary names {key!r}, which is not an --entry"
+                )
+                continue
+        elif len(names) == 1:
+            key, path = names[0], value
+        else:
+            problems.append(
+                f"--p369-summary {value!r}: a bare path needs exactly one entry; use name=path"
+            )
+            continue
+        if key in mapping:
+            problems.append(f"--p369-summary given twice for {key!r}")
+        mapping[key] = path
+    return mapping, problems
+
+
+def _production_matches(value, production, resolve):
+    """The summary's production, resolved to a full fork sha (``resolve``), equals THIS run's resolved production."""
+    if not (isinstance(value, str) and re.fullmatch(r"[0-9a-f]{7,40}", value)):
+        return False
+    try:
+        return resolve(value) == production
+    except ValueError:
+        return False
+
+
+def certified_argv(summary_path, name):
+    """The worker argv the entry's P369 run certified MTP-ON: ``picks[name].argv_on`` of the ``manifest.json`` beside the
+    summary (None when absent or malformed)."""
+    try:
+        manifest = json.loads((Path(summary_path).parent / "manifest.json").read_text())
+        argv = manifest["picks"][name]["argv_on"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    ok = isinstance(argv, list) and all(isinstance(a, str) for a in argv)
+    return argv if ok else None
+
+
+def argv_binding_problems(name, certified, argv):
+    """The MTP-ON argv qualify derives must equal the certified one; the first differing flag is named."""
+    if list(argv) == list(certified):
+        return []
+    try:
+        want, got = _parse_flags(list(certified)), _parse_flags(list(argv))
+    except ValueError as exc:
+        return [f"{name}: {CERTIFIED_DIFFERS} (argv: {exc})"]
+    first = next((f for f, v in want.items() if got.get(f) != v), None)
+    first = first or next((f for f in got if f not in want), "argument order")
+    return [f"{name}: {CERTIFIED_DIFFERS} ({first})"]
+
+
+CERTIFIED_DIFFERS = (
+    "the served configuration differs from the one its P369 run certified"
+)
+
+
+def entry_problems(
+    names,
+    *,
+    registry_text,
+    predictor=None,
+    summaries=None,
+    production,
+    resolve,
+    certified=None,
+    classify=lambda: None,
+    artifact=None,
+):
+    """C254 refusals, all before the run: a name outside the registry (listed), an arm without a drafter to restore, a
+    registry that cannot give the restore, and every MTP-ON arm (C199, generalized) without a P369 FULL-run PASS for exactly
+    that entry on THIS run's production. ``production`` is a full sha and ``resolve(ref)`` resolves a summary's ref to one
+    (ValueError when it cannot); ``certified`` is ``{entry: the P369 run's argv_on or None}``, read once by the caller;
+    ``classify()`` supplies the 16-state result (called only for a restore);
+    ``artifact(path, summary)`` is the campaign-artifact check.
+    """
+    from p369_phase2 import orchestrate
+
+    entries = registry_states.settings(registry_text)
+    summaries = summaries or {}
+    problems = []
+    for name in sorted({n for n in names if names.count(n) > 1}):
+        problems.append(f"duplicate --entry {name!r}")
     for name in names:
-        if name not in ENTRIES:
+        if name not in entries:
+            problems.append(
+                f"unknown entry {name!r}: the registry's entries are {list(entries)}"
+            )
             continue
         try:
-            arm = arm_for(name, predictor)
+            restore = predictor == "on" and not serves_mtp(entries[name])
+            arm = arm_for(
+                name,
+                predictor,
+                registry_entry=entries[name],
+                registry_state=classify() if restore else None,
+            )
+            if arm == "mtp_off":
+                mtp_off_registry(registry_text, name)
         except ValueError as exc:
             problems.append(str(exc))
             continue
-        if arm != "mtp_on_gated":
+        if arm not in MTP_ON_ARMS:
             continue
-        summary = json.loads(Path(p369_summary).read_text()) if p369_summary else None
-        pick = ((summary or {}).get("picks") or {}).get(name) or {}
-        binding = (summary or {}).get("binding") or {}
-        manifest = (summary or {}).get("manifest") or {}
+        if name not in orchestrate.PICKS:
+            problems.append(
+                f"{name}: MTP-ON needs the entry in orchestrate.PICKS (its drafter shape for the draft-kernel check)"
+            )
+            continue
+        gate = f"{name}: MTP-ON only after its P369 full-run PASS (C199)"
+        path = summaries.get(name)
+        try:
+            summary = json.loads(Path(path).read_text()) if path else None
+        except (OSError, ValueError):
+            summary = None
+        if not isinstance(summary, dict):
+            problems.append(gate)
+            continue
+        pick = (summary.get("picks") or {}).get(name) or {}
+        binding = summary.get("binding") or {}
+        manifest = summary.get("manifest") or {}
         passed = (
-            summary is not None
-            and summary.get("phase") == "full"
+            summary.get("phase") == "full"
             and summary.get("status") == "PASS"
             and (pick.get("outcome") or {}).get("e1c") == "PASS"
             and (pick.get("e2") or {}).get("verdict") == "PASS"
-            # code round 1 D10: the run's own provenance — the production pin and a bound reviewed head
-            and binding.get("production") == PRODUCTION
-            and manifest.get("production") == PRODUCTION
+            # code round 1 D10: the run's own provenance — THIS run's production and a bound reviewed head
+            and _production_matches(binding.get("production"), production, resolve)
+            and _production_matches(manifest.get("production"), production, resolve)
             and bool(binding.get("reviewed_head"))
             and binding.get("reviewed_head") == binding.get("fork_head")
             and list(summary.get("picks") or {}) == [name]
         )
         if not passed:
-            problems.append(f"{name}: MTP-ON only after its P369 full-run PASS (C199)")
+            problems.append(gate)
+            continue
+        if artifact is not None:
+            problems += artifact(path, summary)  # code round 2 D10
+        if (certified or {}).get(name) is None:
+            problems.append(
+                f"{name}: its P369 manifest.json has no picks[{name}].argv_on"
+            )
     return problems
 
 
@@ -161,7 +386,17 @@ def _spelled(kind, value):
 
 def expected_config(entry):
     """The served configuration the registry entry asks for (plan v2 Q1): flags, drafter, verify policy, KV, request
-    defaults and the prompt size (C198: cap − MIN_OUTPUT_TOKENS)."""
+    defaults and the prompt size (C198: cap − MIN_OUTPUT_TOKENS). A value that cannot be converted (``null`` for an
+    integer key, say) is a ``ValueError`` naming the entry (v1.4), never a TypeError."""
+    try:
+        return _expected_config(entry)
+    except UnknownKey:
+        raise
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise ValueError(f"{entry.get('name')}: {exc}") from exc
+
+
+def _expected_config(entry):
     unknown = sorted(k for k in entry if k not in SERVING and k not in NON_SERVING)
     if unknown:
         raise UnknownKey(
@@ -582,8 +817,6 @@ def load_references(path, *, table=None, blob_exists=None):
     """
     table = json.loads(Path(path).read_text()) if table is None else table
     for name, ref in table.items():
-        if name not in ENTRIES:
-            raise ValueError(f"reference for an unknown entry {name!r}")
         if ref is None:
             continue
         if not (ref.get("source") and _finite_positive(ref.get("peak_gb"))):
@@ -768,6 +1001,48 @@ def _git_head(path):
     ).stdout.strip()
 
 
+def _arm_registry(arm, name, registry, stack, fork, out, orchestrate):
+    """``(path, text)`` of the registry an arm serves, from the snapshot ``registry``: the committed file (``served_*``),
+    the entry's MTP keys removed (``mtp_off``, C254) or the 16-state overlay (``mtp_on_restored``, C199); the derived
+    ones are written under ``out`` (safe ids)."""
+    if arm in ("served_on", "served_off"):
+        return stack / "main_models.yaml", registry
+    if arm == "mtp_off":
+        text = mtp_off_registry(registry, name)
+        path = out_path(out, f"mtp-off-{safe_id(name)}.yaml")
+    else:
+        fixture = registry_states.fixture_text(fork / "mlx_vlm" / "tests" / "fixtures")
+        text, _ = orchestrate.overlay_registry(registry, name, fixture)
+        path = out_path(out, f"overlay-{safe_id(name)}.yaml")
+    path.write_bytes(text.encode("utf-8"))
+    return path, text
+
+
+def safe_id(name):
+    """One safe path component for a registry name: ``[A-Za-z0-9._-]`` kept, everything else ``_``, plus the first 8 hex
+    of sha256(name) so two names never collide."""
+    clean = re.sub(r"[^A-Za-z0-9._-]", "_", name)
+    return f"{clean}-{hashlib.sha256(name.encode('utf-8')).hexdigest()[:8]}"
+
+
+def out_path(out, component):
+    """``out / component``, which must resolve under ``out`` (else ValueError: refuse)."""
+    path = Path(out) / component
+    if not path.resolve().is_relative_to(Path(out).resolve()):
+        raise ValueError(f"{path} is not under {out}")
+    return path
+
+
+def _full_sha(fork, ref):
+    """``ref`` resolved to a full commit sha in the fork (ValueError when it is not a commit)."""
+    import subprocess
+
+    try:
+        return _resolve_ref(fork, ref)
+    except (subprocess.CalledProcessError, OSError) as exc:
+        raise ValueError(f"{ref!r} is not a commit in {fork}") from exc
+
+
 def _atomic(path, obj):
     tmp = Path(str(path) + ".tmp")
     tmp.write_text(json.dumps(obj, indent=1, default=str))
@@ -822,34 +1097,104 @@ def drive(args):
     stack, fork, out = (
         Path(p).resolve() for p in (args.stack_root, args.fork_root, args.out)
     )
-    names = list(args.entry or default_entries())
     predictor = getattr(args, "predictor", None)
-    problems = entry_problems(
-        names, p369_summary=args.p369_summary, predictor=predictor
-    )
-    if problems:
-        raise SystemExit(f"refused: {problems}")
-    reviewed = _resolve_ref(fork, args.reviewed_head)
-    if args.p369_summary and any(
-        arm_for(n, predictor) == "mtp_on_gated" for n in names
-    ):
-        problems = summary_artifact_problems(  # code round 2 D10
-            args.p369_summary,
-            json.loads(Path(args.p369_summary).read_text()),
-            root=Path(os.environ.get("STACK_WORKDIR", "/nonexistent"))
-            / "p369"
-            / "phase2",
-            is_commit=lambda c: _is_commit(fork, c),
-            contains_reviewed=lambda c: _is_ancestor(fork, V13_REVIEWED, c),
+    lock = orchestrate.acquire_lock(orchestrate.lock_path(dict(os.environ)))
+    try:  # code round 2 D13: the lock is released whatever the cleanup below does
+        # C254 v1.2: the ONE registry snapshot, read right after the lock; the gate, the derived / restored registries,
+        # the hashes and the execution all use exactly these bytes
+        registry_text = orchestrate.read_registry(stack / "main_models.yaml")
+        start = _tree_state(fork, stack)
+        try:
+            registry_entries = registry_states.settings(registry_text)  # strict
+        except ValueError as exc:
+            raise SystemExit(f"refused: ['the registry does not parse: {exc}']")
+        names = list(args.entry or default_entries(list(registry_entries)))
+        summaries, problems = summary_arguments(args.p369_summary, names)
+        reviewed = _resolve_ref(fork, args.reviewed_head)
+        production = getattr(args, "production_ref", None) or orchestrate.PRODUCTION
+        try:  # P452 F3 / C254: one resolved FULL sha, diffed by the preflight and recorded in the report
+            production = args.production_ref = orchestrate.resolve_production_ref(
+                fork, production, reviewed
+            )
+        except ValueError as exc:
+            raise SystemExit(f"refused: {exc}")
+        classified = []
+
+        def classify():  # only a restore needs the pinned fixture
+            if not classified:
+                fixture = registry_states.fixture_text(
+                    fork / "mlx_vlm" / "tests" / "fixtures"
+                )
+                classified.append(registry_states.classify(registry_text, fixture))
+            return classified[0]
+
+        certified = {n: certified_argv(p, n) for n, p in summaries.items()}  # once
+        problems += entry_problems(
+            names,
+            registry_text=registry_text,
+            predictor=predictor,
+            summaries=summaries,
+            production=production,
+            resolve=lambda ref: _full_sha(fork, ref),
+            certified=certified,
+            classify=classify,
+            artifact=lambda path, summary: summary_artifact_problems(
+                path,
+                summary,
+                root=Path(os.environ.get("STACK_WORKDIR", "/nonexistent"))
+                / "p369"
+                / "phase2",
+                is_commit=lambda c: _is_commit(fork, c),
+                contains_reviewed=lambda c: _is_ancestor(fork, V13_REVIEWED, c),
+            ),
         )
         if problems:
             raise SystemExit(f"refused: {problems}")
-    out.mkdir(parents=True, exist_ok=False)
-    lock = orchestrate.acquire_lock(orchestrate.lock_path(dict(os.environ)))
-    try:  # code round 2 D13: the lock is released whatever the cleanup below does
+        arms = {
+            n: arm_for(
+                n,
+                predictor,
+                registry_entry=registry_entries[n],
+                registry_state=(
+                    classify()
+                    if predictor == "on" and not serves_mtp(registry_entries[n])
+                    else None
+                ),
+            )
+            for n in names
+        }
+        out.mkdir(parents=True, exist_ok=False)
+        commands, problems = {}, []
+        for (
+            n
+        ) in (
+            names
+        ):  # C254 v1.2 / v1.4: the MTP-ON argv is bound to the certified one BEFORE the run
+            if arms[n] not in MTP_ON_ARMS:
+                continue
+            try:
+                path, _ = _arm_registry(
+                    arms[n], n, registry_text, stack, fork, out, orchestrate
+                )
+                commands[n] = full_command(stack, path, n)
+            except Exception as exc:
+                problems.append(f"{n}: cannot derive the served argv: {exc}")
+                continue
+            problems += argv_binding_problems(n, certified[n], commands[n][0][1:])
+        if problems:
+            raise SystemExit(f"refused: {problems}")
+        snapshot = dict(
+            text=registry_text,
+            sha256=hashlib.sha256(registry_text.encode("utf-8")).hexdigest(),
+            start=start,
+            certified=certified,  # read once; the gate and the binding use this value
+            commands=commands,
+        )
         return _drive_locked(
             args,
             names,
+            arms,
+            snapshot,
             reviewed,
             stack,
             fork,
@@ -866,6 +1211,8 @@ def drive(args):
 def _drive_locked(
     args,
     names,
+    arms,
+    snapshot,
     reviewed,
     stack,
     fork,
@@ -880,7 +1227,6 @@ def _drive_locked(
     import time
 
     predictor = getattr(args, "predictor", None)
-    arms = {n: arm_for(n, predictor) for n in names}  # P426 B7
     report = dict(
         predictor=predictor,
         entries={n: dict(status="PENDING", arm=arms[n]) for n in names},
@@ -892,26 +1238,14 @@ def _drive_locked(
         BOOT_S  # code round 2 E2: the qualification's own boot limit
     )
     try:  # code round 1 D13: everything after the lock is inside the cleanup scope
-        if getattr(args, "production_ref", None) not in (None, orchestrate.PRODUCTION):
-            try:  # P452 code round 1 F3: one resolved sha, diffed by the preflight and recorded in the report
-                args.production_ref = orchestrate.resolve_production_ref(
-                    fork, args.production_ref, reviewed
-                )
-            except ValueError as exc:
-                raise SystemExit(f"refused: {exc}")
         pre = orchestrate.preflight(args, out)
         if pre["problems"]:
             raise SystemExit(f"refused: {pre['problems']}")
-        start = _tree_state(fork, stack)
-        problems = guard_problems(start, start, reviewed=reviewed)  # D5
-        registry = orchestrate.read_registry(stack / "main_models.yaml")
-        registry_sha = orchestrate.sha256_file(stack / "main_models.yaml")
-        fixture = registry_states.fixture_text(fork / "mlx_vlm" / "tests" / "fixtures")
-        off_entries = registry_states.classify(registry, fixture)
-        if off_entries is None:
-            problems.append(
-                "the live registry is not one of the 16 accepted byte states"
-            )
+        start = snapshot[
+            "start"
+        ]  # taken with the registry snapshot: a moved stack HEAD refuses
+        problems = guard_problems(start, _tree_state(fork, stack), reviewed=reviewed)
+        registry, registry_sha = snapshot["text"], snapshot["sha256"]
         console = console_script_info(stack)
         problems += entry_point_problems(
             dict(console, delegates_to_cli_main=True), stack / ".venv" / "bin"
@@ -974,19 +1308,19 @@ def _drive_locked(
                     problems = guard_problems(
                         start, _tree_state(fork, stack), reviewed=reviewed
                     )
-                    if arms[name] == "mtp_off" and name not in (off_entries or ()):
-                        problems.append(  # P426 B7: OFF means the committed registry's OFF block
-                            f"--predictor off: the committed registry serves {name} MTP-ON"
-                        )
-                    if arms[name] in ("served", "mtp_off"):
-                        path, text = stack / "main_models.yaml", registry
-                    else:  # C199: the shipped MTP-ON form, the 16-state generator's exact block
-                        text, _ = orchestrate.overlay_registry(registry, name, fixture)
-                        path = out / f"overlay-{name}.yaml"
-                        path.write_text(text)
-                    entry = {e["name"]: e for e in yaml.safe_load(text)["models"]}[name]
+                    path, text = _arm_registry(
+                        arms[name], name, registry, stack, fork, out, orchestrate
+                    )
+                    if arms[name] not in ("served_on", "served_off"):
+                        state["overlay_sha256"] = hashlib.sha256(
+                            text.encode("utf-8")
+                        ).hexdigest()
+                    entry = registry_states.settings(text)[name]
                     expected = expected_config(entry)
-                    cmd, module_file = full_command(stack, path, name)
+                    # MTP-ON arms: the argv was derived and bound to the certified one before the run (v1.4)
+                    cmd, module_file = snapshot["commands"].get(name) or full_command(
+                        stack, path, name
+                    )
                     problems += binding_problems(
                         stack, module_file, registry_sha, orchestrate.sha256_file
                     ) + command_problems(expected, cmd, stack / ".venv" / "bin")
@@ -1040,6 +1374,8 @@ def _drive_locked(
             )
             # code round 1 D6: every piece of evidence is final BEFORE the terminal status is written
             final = dict(problems=problems[:50], before=before, after=after, record=rec)
+            if rec:  # C254: capacity AND speed per arm, whatever the entry's status
+                final.update(arm=arms[name], rates=rec.get("rates"))
             if rec and not error and not problems:
                 peak = capacity_gb(rec["peaks"])
                 ref = references.get(name)
@@ -1194,7 +1530,7 @@ def _job(name, argv, expected, fork, out, orchestrate, kvmanifest):
         ),
         source_root=str(fork),
         dev_dir=str(fork / "dev"),
-        out_dir=str(out / name),
+        out_dir=str(out_path(out, safe_id(name))),
         requests=[
             dict(
                 name="max-context",
@@ -1261,7 +1597,9 @@ def build_parser():
     ap.add_argument("--fork-root", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--entry", action="append")
-    ap.add_argument("--p369-summary")
+    ap.add_argument(  # C254: a bare path (one entry) or name=path, once per MTP-ON entry
+        "--p369-summary", action="append"
+    )
     ap.add_argument("--reviewed-head", required=True)  # code round 1 D5
     ap.add_argument(  # P426 B7: the M1 memory axis measures both predictor states
         "--predictor", choices=("on", "off"), default=None

@@ -15,14 +15,14 @@ import pytest
 DEV = Path(__file__).resolve().parents[2] / "dev"
 sys.path.insert(0, str(DEV))
 
-from p369_phase2 import qualify  # noqa: E402
+from p369_phase2 import orchestrate, qualify, registry_states  # noqa: E402
 
-FABLE = "Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed"
+PICK_A = "Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed"
 UNIFORM = "Qwen3.8-27B-mlx-uniform-4bit"
-QWEN36 = "Qwen3.6-27B-Opus-Distill-OptiQ-4bit"
+PICK_C = "Qwen3.6-27B-Opus-Distill-OptiQ-4bit"
 # P476: the real registry no longer ships a non-MTP "served" entry; the served-arm code path is covered by a SYNTHETIC
-# entry injected into ``qualify.ENTRIES`` by the tests that need it (``_with_served``), never by a registry name.
-STATIC = "synthetic-served-27B"  # allow-shorthand
+# entry in the synthetic registries these tests write (P542: the fixed ENTRIES table is gone), never by a registry name.
+SYNTH_S = "synthetic-served-27B"  # allow-shorthand
 VENV_BIN = Path("/stack/.venv/bin")
 
 GEN = dict(
@@ -35,11 +35,11 @@ GEN = dict(
     enable_thinking=True,
     thinking_budget=81920,
 )
-FABLE_ENTRY = dict(
-    name=FABLE,
+PICK_A_ENTRY = dict(
+    name=PICK_A,
     type="vision",
     on_demand=True,
-    hf_path=f"caslca/{FABLE}",
+    hf_path=f"caslca/{PICK_A}",
     max_kv_cache_size=262144,
     kv_prealloc_tokens=262144,
     cache_session_shrink=True,
@@ -55,11 +55,11 @@ FABLE_ENTRY = dict(
     generation_defaults=GEN,
     presentation=dict(role="main"),
 )
-STATIC_ENTRY = dict(
-    name=STATIC,
+SYNTH_S_ENTRY = dict(
+    name=SYNTH_S,
     type="vision",
     on_demand=True,
-    hf_path=f"caslca/{STATIC}",
+    hf_path=f"caslca/{SYNTH_S}",
     max_kv_cache_size=262144,
     kv_prealloc_tokens=262144,
     kv_quant_scheme="turboquant",
@@ -68,15 +68,29 @@ STATIC_ENTRY = dict(
     prefill_step_size=512,
     generation_defaults=GEN,
 )
+PICK_C_ENTRY = dict(
+    SYNTH_S_ENTRY,
+    name=PICK_C,
+    hf_path=f"caslca/{PICK_C}",
+    draft_kind="mtp",
+    draft_model="/d/q",
+)
+
+
+def _registry(*entries):
+    """P542: a synthetic committed registry holding ``entries`` (the tests' own entries, never the stack's)."""
+    import yaml
+
+    return yaml.safe_dump(dict(models=list(entries)), sort_keys=False)
 
 
 def _cmd(entry):
     """What mlx-serve's ``_build_command`` emits for ``entry`` (hand-written per fixture, never generated)."""
-    if entry is FABLE_ENTRY:
+    if entry is PICK_A_ENTRY:
         return [
             str(VENV_BIN / "mlx_vlm.server"),
             "--model",
-            f"caslca/{FABLE}",
+            f"caslca/{PICK_A}",
             "--host",
             "127.0.0.1",
             "--port",
@@ -110,7 +124,7 @@ def _cmd(entry):
     return [
         str(VENV_BIN / "mlx_vlm.server"),
         "--model",
-        f"caslca/{STATIC}",
+        f"caslca/{SYNTH_S}",
         "--host",
         "127.0.0.1",
         "--port",
@@ -135,45 +149,57 @@ def _cmd(entry):
 
 
 # ------------------------------------------------------------------ T1: the entries and their arms (C199)
-def _with_served(monkeypatch):
-    """P476: inject the synthetic served-arm entry (the real ENTRIES keep only the three MTP entries)."""
-    monkeypatch.setitem(qualify.ENTRIES, STATIC, "served")  # allow-shorthand
+def _problems(names, tmp_path, summary=None, **kw):
+    """``qualify.entry_problems`` over the synthetic registry (P542 signature); ``summary`` = the PICK_C summary file
+    (v1.4: the run's certified ``argv_on`` is passed in, read once by the caller; production refs resolve to themselves).
+    """
+    return qualify.entry_problems(
+        names,
+        registry_text=_registry(PICK_A_ENTRY, SYNTH_S_ENTRY, PICK_C_ENTRY),
+        summaries={PICK_C: summary} if summary else {},
+        production=orchestrate.PRODUCTION,
+        resolve=lambda ref: ref,
+        certified={PICK_C: ["--model", "x"]},
+        **kw,
+    )
 
 
-def test_t1_the_three_entries_and_their_arms():
-    assert set(qualify.ENTRIES) == {FABLE, UNIFORM, QWEN36}  # allow-shorthand
-    assert qualify.ENTRIES[FABLE] == qualify.ENTRIES[UNIFORM] == "mtp_on"
-    assert qualify.ENTRIES[QWEN36] == "mtp_on_gated"
-    assert QWEN36 in qualify.default_entries() and len(qualify.default_entries()) == 3
+def test_t1_the_default_entries_are_the_registrys_picks():
+    """P542 (was: the three ENTRIES and their arms): the default run is the registry entries that are P369 picks."""
+    names = [PICK_A, SYNTH_S, UNIFORM, PICK_C]
+    assert qualify.default_entries(names) == [PICK_A, UNIFORM, PICK_C]
+    assert not hasattr(qualify, "ENTRIES")
 
 
-def test_t1_a_synthetic_served_entry_takes_the_served_arm(monkeypatch):
-    assert STATIC not in qualify.ENTRIES  # allow-shorthand
-    _with_served(monkeypatch)
-    assert qualify.ENTRIES[STATIC] == "served"
-    assert qualify.arm_for(STATIC, None) == "served"  # allow-shorthand
+def test_t1_a_synthetic_served_entry_takes_the_served_arm():
+    """P542 (was: a table lookup): the arm comes from the committed block."""
+    assert (
+        qualify.arm_for(
+            SYNTH_S, None, registry_entry=SYNTH_S_ENTRY, registry_state=None
+        )
+        == "served_off"
+    )
+    assert (
+        qualify.arm_for(PICK_C, None, registry_entry=PICK_C_ENTRY, registry_state=None)
+        == "served_on"
+    )
 
 
-def test_t1_an_unknown_entry_or_an_ungated_qwen36_refuses(tmp_path, monkeypatch):
-    _with_served(monkeypatch)
-    assert qualify.entry_problems(["nope"], p369_summary=None)
-    assert qualify.entry_problems(
-        [QWEN36], p369_summary=None
-    )  # its campaign must have passed
+def test_t1_an_unknown_entry_or_an_ungated_qwen36_refuses(tmp_path):
+    assert _problems(["nope"], tmp_path)
+    assert _problems([PICK_C], tmp_path)  # its campaign must have passed
     bad = tmp_path / "s.json"
-    bad.write_text(json.dumps(dict(status="SMOKE_PASS", picks={QWEN36: {}})))
-    assert qualify.entry_problems(
-        [QWEN36], p369_summary=bad
-    )  # a smoke is not the campaign
+    bad.write_text(json.dumps(dict(status="SMOKE_PASS", picks={PICK_C: {}})))
+    assert _problems([PICK_C], tmp_path, bad)  # a smoke is not the campaign
     good = tmp_path / "f.json"
     good.write_text(json.dumps(_summary()))
-    assert qualify.entry_problems([QWEN36], p369_summary=good) == []
-    assert qualify.entry_problems([FABLE, STATIC], p369_summary=None) == []
+    assert _problems([PICK_C], tmp_path, good) == []
+    assert _problems([SYNTH_S], tmp_path) == []  # served OFF: no gate
 
 
 # ------------------------------------------------------------------ T8 / T14 / T18: registry → full command (Q1 / Q9)
 def test_t8_the_expectation_comes_from_the_registry_entry():
-    want = qualify.expected_config(FABLE_ENTRY)
+    want = qualify.expected_config(PICK_A_ENTRY)
     assert want["flags"]["--prefill-step-size"] == "512"
     assert (
         want["flags"]["--memory-limit-frac"] == "0.85"
@@ -182,15 +208,17 @@ def test_t8_the_expectation_comes_from_the_registry_entry():
     assert want["drafter"] is True and want["verify_policy"] == "joint_v1"
     assert want["generation_defaults"] == GEN
     assert want["prompt_tokens"] == 262144 - 2048
-    assert qualify.expected_config(STATIC_ENTRY)["drafter"] is False
+    assert qualify.expected_config(SYNTH_S_ENTRY)["drafter"] is False
 
 
 def test_t8_an_unknown_registry_key_refuses():
     with pytest.raises(qualify.UnknownKey, match="new_knob"):
-        qualify.expected_config(dict(STATIC_ENTRY, new_knob=1))
+        qualify.expected_config(dict(SYNTH_S_ENTRY, new_knob=1))
 
 
-@pytest.mark.parametrize("entry", [FABLE_ENTRY, STATIC_ENTRY], ids=["fable", "static"])
+@pytest.mark.parametrize(
+    "entry", [PICK_A_ENTRY, SYNTH_S_ENTRY], ids=["pick-a", "synth-s"]
+)
 def test_t8_the_shipping_command_matches(entry):
     assert (
         qualify.command_problems(qualify.expected_config(entry), _cmd(entry), VENV_BIN)
@@ -217,17 +245,17 @@ def test_t8_the_shipping_command_matches(entry):
 )
 def test_t8_t14_any_command_drift_fails(mutate):
     assert qualify.command_problems(
-        qualify.expected_config(FABLE_ENTRY), mutate(_cmd(FABLE_ENTRY)), VENV_BIN
+        qualify.expected_config(PICK_A_ENTRY), mutate(_cmd(PICK_A_ENTRY)), VENV_BIN
     )
 
 
 def test_t18_a_wrong_backend_prefix_fails():
-    cmd = _cmd(STATIC_ENTRY)
+    cmd = _cmd(SYNTH_S_ENTRY)
     cmd[0] = str(VENV_BIN / "mlx_lm.server")  # valid trailing arguments, wrong backend
     assert any(
         "prefix" in p
         for p in qualify.command_problems(
-            qualify.expected_config(STATIC_ENTRY), cmd, VENV_BIN
+            qualify.expected_config(SYNTH_S_ENTRY), cmd, VENV_BIN
         )
     )
 
@@ -308,7 +336,7 @@ def _record(**changes):
             heads=24,
             set_memory_limit=[int(min(0.85 * 128e9, 110e9))],
             set_cache_limit=[
-                qualify.expected_cache_limit(24, qualify.expected_config(FABLE_ENTRY))
+                qualify.expected_cache_limit(24, qualify.expected_config(PICK_A_ENTRY))
             ],
         ),
         server_defaults=GEN,
@@ -320,7 +348,7 @@ def _record(**changes):
 
 def test_t9_a_valid_fable_record_passes():
     assert (
-        qualify.request_problems(_record(), qualify.expected_config(FABLE_ENTRY)) == []
+        qualify.request_problems(_record(), qualify.expected_config(PICK_A_ENTRY)) == []
     )
 
 
@@ -346,7 +374,7 @@ def test_t9_a_valid_fable_record_passes():
 )
 def test_t9_t15_each_invalid_fable_record_fails(change, why):
     problems = qualify.request_problems(
-        _record(**change), qualify.expected_config(FABLE_ENTRY)
+        _record(**change), qualify.expected_config(PICK_A_ENTRY)
     )
     assert any(why in p for p in problems), (why, problems)
 
@@ -360,13 +388,13 @@ def test_t16_every_prompt_digest_must_agree(field, value):
     rec["prompt"][field] = dict(tokens=260096, sha256=value * 32)
     assert any(
         "prompt" in p
-        for p in qualify.request_problems(rec, qualify.expected_config(FABLE_ENTRY))
+        for p in qualify.request_problems(rec, qualify.expected_config(PICK_A_ENTRY))
     )
 
 
 def test_c198_the_request_resolves_the_registry_defaults_with_the_servers_own_clamp():
     """C198 (1): no override except the seed; the server clamps max_tokens to the remaining 2,048 and thinking to 0.8."""
-    want = qualify.expected_config(FABLE_ENTRY)
+    want = qualify.expected_config(PICK_A_ENTRY)
     for key, bad in (
         ("max_tokens", 32),
         ("thinking_budget", 81920),
@@ -379,7 +407,7 @@ def test_c198_the_request_resolves_the_registry_defaults_with_the_servers_own_cl
 
 
 def test_t15_a_served_auto_entry_must_not_take_the_fused_or_lazy_paths():
-    want = qualify.expected_config(STATIC_ENTRY)
+    want = qualify.expected_config(SYNTH_S_ENTRY)
     ok = _record(
         sdpa_forced=0,
         lazy_calls=0,
@@ -401,12 +429,12 @@ def test_t15_preallocated_kv_leaves_must_hold_the_registry_floor():
     rec = _record(capacities_by_path={"0": None, "1": 262144, "2": None, "3": 4096})
     assert any(
         "capacity" in p
-        for p in qualify.request_problems(rec, qualify.expected_config(FABLE_ENTRY))
+        for p in qualify.request_problems(rec, qualify.expected_config(PICK_A_ENTRY))
     )
     rec = _record(capacities_by_path={})
     assert any(
         "capacity" in p
-        for p in qualify.request_problems(rec, qualify.expected_config(FABLE_ENTRY))
+        for p in qualify.request_problems(rec, qualify.expected_config(PICK_A_ENTRY))
     )
 
 
@@ -415,10 +443,10 @@ def test_t15_the_memory_limit_is_mlx_serves_fraction_of_physical_memory():
     rec["memory"] = dict(rec["memory"], set_memory_limit=[64e9])
     assert any(
         "memory limit" in p
-        for p in qualify.request_problems(rec, qualify.expected_config(FABLE_ENTRY))
+        for p in qualify.request_problems(rec, qualify.expected_config(PICK_A_ENTRY))
     )
     rec["memory"] = dict(rec["memory"], set_memory_limit=[], set_cache_limit=[])
-    assert qualify.request_problems(rec, qualify.expected_config(FABLE_ENTRY))
+    assert qualify.request_problems(rec, qualify.expected_config(PICK_A_ENTRY))
 
 
 def test_q2_capacity_is_the_max_of_the_three_phases():
@@ -471,7 +499,7 @@ def test_t13_an_absent_reference_field_is_a_difference():
 
 def test_t6_the_reference_table_loads_and_refuses_bad_rows(tmp_path):
     good = {
-        FABLE: dict(
+        PICK_A: dict(
             peak_gb=37.97,
             source="docs/campaign-results.md:294",
             source_path="docs/campaign-results.md",
@@ -481,11 +509,10 @@ def test_t6_the_reference_table_loads_and_refuses_bad_rows(tmp_path):
     }
     p = tmp_path / "refs.json"
     p.write_text(json.dumps(good))
-    assert qualify.load_references(p)[FABLE]["peak_gb"] == 37.97
+    assert qualify.load_references(p)[PICK_A]["peak_gb"] == 37.97
     for bad in (
-        {"not-an-entry": None},
-        {FABLE: dict(peak_gb=37.97, fingerprint=FP)},  # no source
-    ):
+        {PICK_A: dict(peak_gb=37.97, fingerprint=FP)},  # no source
+    ):  # P542: a name outside any fixed table is no longer a bad row (references are optional per entry)
         p.write_text(json.dumps(bad))
         with pytest.raises(ValueError):
             qualify.load_references(p)
@@ -493,10 +520,11 @@ def test_t6_the_reference_table_loads_and_refuses_bad_rows(tmp_path):
 
 # ------------------------------------------------------------------ T5 / T10 / T7 / T11: outcomes and the schedule
 def test_p476_the_real_reference_table_loads_against_the_real_entries():
-    """P476: ``load_references`` refuses a reference for an entry outside ``ENTRIES``; the REAL file must pass."""
+    """P476: the REAL reference file must load (P542: no fixed table to be a subset of; the names stay registry entries)."""
     table = qualify.load_references(qualify.REFERENCES)
-    assert set(table) <= set(qualify.ENTRIES)
-    assert table[FABLE]["peak_gb"] == 37.97  # allow-shorthand
+    golden = registry_states.fixture_text(Path(__file__).resolve().parent / "fixtures")
+    assert set(table) <= set(registry_states.settings(golden))
+    assert table[PICK_A]["peak_gb"] == 37.97  # allow-shorthand
 
 
 def test_t5_idle_before_every_entry_after_the_first():
@@ -532,22 +560,54 @@ def test_t7_the_run_exits_nonzero_unless_every_entry_completed():
 
 
 # ------------------------------------------------------------------ T7 / T11: the driver's lifecycle (orchestrator mocked)
+def _without_drafter(cmd):
+    """``cmd`` without the MTP flags and their values (what mlx-serve emits for an entry without the MTP keys)."""
+    flags = {"--mtp-verify-scan", "--draft-kind", "--draft-model"}
+    return [
+        a
+        for i, a in enumerate(cmd)
+        if a not in flags and (i == 0 or cmd[i - 1] not in flags)
+    ]
+
+
 def _drive(
     tmp_path,
     monkeypatch,
     run_job,
-    names=(FABLE, STATIC),
+    names=(PICK_A, SYNTH_S),
     keep_refs=False,
     console=None,
     release=None,
+    predictor=None,
 ):
     import argparse
 
-    from p369_phase2 import orchestrate
-
-    _with_served(monkeypatch)
-    registry = "models: []\n"
-    blocks = {FABLE: FABLE_ENTRY, STATIC: STATIC_ENTRY}
+    # P542: the harness's committed registry is a real (synthetic) one: PICK_A served MTP-ON — gated by a P369 summary
+    # written as a campaign artifact — and SYNTH_S served OFF
+    blocks = {PICK_A: PICK_A_ENTRY, SYNTH_S: SYNTH_S_ENTRY}
+    registry = _registry(*blocks.values())
+    workdir = tmp_path / "workdir"
+    run = workdir / "p369" / "phase2" / "fable-full"
+    run.mkdir(parents=True)
+    (run / "summary.json").write_text(json.dumps(_summary(PICK_A)))
+    (run / "manifest.json").write_text(
+        json.dumps(
+            dict(
+                fork_head="f" * 40,
+                production=orchestrate.PRODUCTION,
+                picks={
+                    PICK_A: dict(argv_on=_cmd(PICK_A_ENTRY)[1:])
+                },  # the certified argv
+            )
+        )
+    )
+    monkeypatch.setenv("STACK_WORKDIR", str(workdir))
+    # v1.2: production refs resolve to full shas in the fork (a tmp dir here)
+    monkeypatch.setattr(
+        orchestrate, "resolve_production_ref", lambda fork, ref, reviewed: "a" * 40
+    )
+    monkeypatch.setattr(qualify, "_is_commit", lambda path, ref: True)
+    monkeypatch.setattr(qualify, "_is_ancestor", lambda path, a, ref: True)
     for name, value in dict(
         acquire_lock=lambda lock: 3,
         release_lock=release or (lambda fd: None),
@@ -556,17 +616,12 @@ def _drive(
         read_registry=lambda p: registry,
         sha256_file=lambda p: "s",
         fork_versions=lambda f: {"mlx": "0.32.3"},
-        overlay_registry=lambda text, name, fixture: (text, True),
         weights_record=lambda m: dict(revision="r", files={}),
         run_job=run_job,
         worker_env=lambda env: env,
     ).items():
         monkeypatch.setattr(orchestrate, name, value)
     monkeypatch.setattr(orchestrate, "Monitor", _NullMonitor)
-    from p369_phase2 import registry_states
-
-    monkeypatch.setattr(registry_states, "fixture_text", lambda d: "fx")
-    monkeypatch.setattr(registry_states, "classify", lambda text, fx: set())
     if not keep_refs:
         monkeypatch.setattr(qualify, "load_references", lambda p, **k: {})
     monkeypatch.setattr(qualify, "_resolve_ref", lambda path, ref: "a" * 40)
@@ -601,23 +656,27 @@ def _drive(
         stack, path, name
     ):  # the shipping command, under the run's own stack venv
         cmd = _cmd(blocks[name])
+        served = registry_states.settings(Path(path).read_bytes().decode("utf-8"))[name]
+        if not qualify.serves_mtp(
+            served
+        ):  # an MTP-OFF arm: the argv without the drafter flags
+            cmd = _without_drafter(cmd)
         return [str(Path(stack) / ".venv" / "bin" / "mlx_vlm.server"), *cmd[1:]], "m"
 
     monkeypatch.setattr(qualify, "full_command", full_command)
-    monkeypatch.setattr(
-        "yaml.safe_load", lambda text: dict(models=list(blocks.values()))
-    )
     monkeypatch.setattr("time.sleep", lambda s: None)
     args = argparse.Namespace(
         stack_root=str(tmp_path / "stack"),
         fork_root=str(tmp_path / "fork"),
         out=str(tmp_path / "run"),
         entry=list(names),
-        p369_summary=None,
+        p369_summary=[f"{PICK_A}={run / 'summary.json'}"] if PICK_A in names else None,
         idle_s=600.0,
         reviewed_head="a" * 40,
+        predictor=predictor,
     )
     (tmp_path / "stack" / ".venv" / "bin").mkdir(parents=True)
+    (tmp_path / "stack" / "main_models.yaml").write_text(registry)
     code = qualify.drive(args)
     return code, json.loads((tmp_path / "run" / "report.json").read_text())
 
@@ -642,7 +701,7 @@ class _NullMonitor:
 def _good(job, *a, **k):
     rec = (
         _record()
-        if job["name"].startswith(FABLE)
+        if job["name"].startswith(PICK_A)
         else _record(
             sdpa_forced=0,
             lazy_calls=0,
@@ -652,11 +711,11 @@ def _good(job, *a, **k):
             manifest=_tq_manifest(),
         )
     )
-    if not job["name"].startswith(FABLE):
+    if not job["name"].startswith(PICK_A):
         rec["memory"] = dict(
             rec["memory"],
             set_cache_limit=[
-                qualify.expected_cache_limit(24, qualify.expected_config(STATIC_ENTRY))
+                qualify.expected_cache_limit(24, qualify.expected_config(SYNTH_S_ENTRY))
             ],
         )
     return dict(requests=[dict(qualify=rec)])
@@ -666,22 +725,22 @@ def test_t7_every_entry_completed_exits_zero(tmp_path, monkeypatch):
     code, report = _drive(tmp_path, monkeypatch, _good)
     assert code == 0, report
     assert {n: e["status"] for n, e in report["entries"].items()} == {
-        FABLE: "COMPLETED",
-        STATIC: "COMPLETED",
+        PICK_A: "COMPLETED",
+        SYNTH_S: "COMPLETED",
     }
-    assert report["entries"][FABLE]["capacity_gb"] == pytest.approx(37.1)
+    assert report["entries"][PICK_A]["capacity_gb"] == pytest.approx(37.1)
 
 
 def test_t11_a_failing_entry_is_recorded_and_the_run_continues(tmp_path, monkeypatch):
     def run_job(job, *a, **k):
-        if job["name"].startswith(FABLE):
+        if job["name"].startswith(PICK_A):
             raise RuntimeError("job failed (rc 1)")
         return _good(job)
 
     code, report = _drive(tmp_path, monkeypatch, run_job)
     assert code == 1
-    assert report["entries"][FABLE]["status"] == "FAILED"
-    assert report["entries"][STATIC]["status"] == "COMPLETED"
+    assert report["entries"][PICK_A]["status"] == "FAILED"
+    assert report["entries"][SYNTH_S]["status"] == "COMPLETED"
 
 
 def test_t11_an_interruption_marks_the_rest_not_run(tmp_path, monkeypatch):
@@ -696,7 +755,7 @@ def test_t11_an_interruption_marks_the_rest_not_run(tmp_path, monkeypatch):
 
 # ------------------------------------------------------------------ P415 code round 1 (D1–D13)
 UNIFORM_ENTRY = dict(
-    STATIC_ENTRY,
+    SYNTH_S_ENTRY,
     name=UNIFORM,
     hf_path=f"caslca/{UNIFORM}",
     draft_kind="mtp",
@@ -707,7 +766,7 @@ UNIFORM_ENTRY = dict(
 def test_d1_an_omitted_verify_scan_is_the_default_policy_object_none():
     """D1: production represents the default per-query scan as NO policy object (``served_state`` → None)."""
     assert qualify.expected_config(UNIFORM_ENTRY)["verify_policy"] is None
-    assert qualify.expected_config(FABLE_ENTRY)["verify_policy"] == "joint_v1"
+    assert qualify.expected_config(PICK_A_ENTRY)["verify_policy"] == "joint_v1"
 
 
 def test_d2_the_record_producer_and_the_check_agree_on_memory_fields():
@@ -732,17 +791,17 @@ def test_d2_the_record_producer_and_the_check_agree_on_memory_fields():
         set_memory_limit=[int(min(0.85 * 128e9, 110e9))],
         set_cache_limit=[
             qualify.expected_cache_limit(
-                FABLE_ENTRY_EXPECTED_HEADS, qualify.expected_config(FABLE_ENTRY)
+                PICK_A_ENTRY_EXPECTED_HEADS, qualify.expected_config(PICK_A_ENTRY)
             )
         ],
         phys=128e9,
         rec_wss=110e9,
-        heads=FABLE_ENTRY_EXPECTED_HEADS,
+        heads=PICK_A_ENTRY_EXPECTED_HEADS,
     )
-    assert qualify.request_problems(rec, qualify.expected_config(FABLE_ENTRY)) == []
+    assert qualify.request_problems(rec, qualify.expected_config(PICK_A_ENTRY)) == []
 
 
-FABLE_ENTRY_EXPECTED_HEADS = 24
+PICK_A_ENTRY_EXPECTED_HEADS = 24
 
 
 def _manifest(kinds):
@@ -752,7 +811,7 @@ def _manifest(kinds):
 
 
 def test_d3_the_measured_cache_must_be_the_exact_leaf_layout_with_exact_capacity():
-    want = qualify.expected_config(STATIC_ENTRY)  # TurboQuant 4-bit
+    want = qualify.expected_config(SYNTH_S_ENTRY)  # TurboQuant 4-bit
     template = _manifest(["ArraysCache", "native", "ArraysCache", "native", "native"])
     good = [
         dict(path="0", kind="ArraysCache", cls="ArraysCache", batch=False),
@@ -842,12 +901,18 @@ def test_d5_the_fork_must_be_at_the_reviewed_head_and_the_stack_unchanged():
     assert qualify.guard_problems(base, dict(base, fork_clean=False), reviewed="a" * 40)
 
 
-def test_d8_the_default_run_is_all_three_and_needs_the_qwen36_evidence():
-    assert len(qualify.default_entries()) == 3 and QWEN36 in qualify.default_entries()
+def test_d8_the_default_run_is_all_the_picks_and_needs_their_evidence(tmp_path):
+    """P542 (was: all three ENTRIES): the registry's picks; each served MTP-ON needs its own P369 summary."""
+    names = qualify.default_entries([PICK_A, SYNTH_S, UNIFORM, PICK_C])
+    assert names == [PICK_A, UNIFORM, PICK_C]
+    problems = _problems(
+        [PICK_A, PICK_C], tmp_path
+    )  # both served MTP-ON, neither with a summary
+    assert len(problems) == 2 and PICK_A in problems[0] and PICK_C in problems[1]
 
 
 def test_d9_the_auto_cache_limit_is_mlx_vlms_derivation():
-    want = qualify.expected_config(FABLE_ENTRY)
+    want = qualify.expected_config(PICK_A_ENTRY)
     gb = -(-24 * 512 * 262144 * 2 // 10**9) + 2  # ceil + 2 GB margin
     assert qualify.expected_cache_limit(24, want) == int(gb * 2**30)
     rec = _record()
@@ -855,13 +920,15 @@ def test_d9_the_auto_cache_limit_is_mlx_vlms_derivation():
     assert any("cache limit" in p for p in qualify.request_problems(rec, want))
 
 
-def _summary(**changes):
+def _summary(name=PICK_C, **changes):
+    """A P369 FULL-run PASS for ``name`` on the run's default production (P542: no longer qualify's old 7207179b)."""
+    prod = orchestrate.PRODUCTION
     s = dict(
         phase="full",
         status="PASS",
-        binding=dict(production="7207179b", fork_head="f" * 40, reviewed_head="f" * 40),
-        manifest=dict(production="7207179b", fork_head="f" * 40),
-        picks={QWEN36: dict(outcome=dict(e1c="PASS"), e2=dict(verdict="PASS"))},
+        binding=dict(production=prod, fork_head="f" * 40, reviewed_head="f" * 40),
+        manifest=dict(production=prod, fork_head="f" * 40),
+        picks={name: dict(outcome=dict(e1c="PASS"), e2=dict(verdict="PASS"))},
     )
     s.update(changes)
     return s
@@ -876,7 +943,11 @@ def _summary(**changes):
             )
         ),
         dict(
-            binding=dict(production="7207179b", fork_head="f" * 40, reviewed_head=None)
+            binding=dict(
+                production=orchestrate.PRODUCTION,
+                fork_head="f" * 40,
+                reviewed_head=None,
+            )
         ),
         dict(manifest=dict(production="4e6d0e03", fork_head="f" * 40)),
         dict(picks={UNIFORM: dict(outcome=dict(e1c="PASS"), e2=dict(verdict="PASS"))}),
@@ -885,16 +956,16 @@ def _summary(**changes):
 def test_d10_the_qwen36_gate_checks_the_summarys_provenance(tmp_path, change):
     good = tmp_path / "good.json"
     good.write_text(json.dumps(_summary()))
-    assert qualify.entry_problems([QWEN36], p369_summary=good) == []
+    assert _problems([PICK_C], tmp_path, good) == []
     bad = tmp_path / "bad.json"
     bad.write_text(json.dumps(_summary(**change)))
-    assert qualify.entry_problems([QWEN36], p369_summary=bad)
+    assert _problems([PICK_C], tmp_path, bad)
 
 
 def test_d11_references_need_an_existing_source_blob_and_the_fingerprint_carries_weights():
     p = Path(__file__)
     refs = {
-        FABLE: dict(
+        PICK_A: dict(
             peak_gb=1.0,
             source="x",
             source_path="docs/x.md",
@@ -911,7 +982,7 @@ def test_d11_references_need_an_existing_source_blob_and_the_fingerprint_carries
             snapshots={"--model": "r1"},  # check_snapshots' real shape (round 2 E1)
             versions={"mlx": "0.32.3"},
         ),
-        qualify.expected_config(FABLE_ENTRY),
+        qualify.expected_config(PICK_A_ENTRY),
     )
     assert fp["snapshot"] == {"--model": "r1"} and fp["mlx"] == "0.32.3"
 
@@ -940,9 +1011,9 @@ def test_d6_d13_an_interruption_after_the_job_never_leaves_completed(
         qualify, "capacity_gb", lambda peaks: (_ for _ in ()).throw(SystemExit(143))
     )
     with pytest.raises(SystemExit):
-        _drive(tmp_path, monkeypatch, _good, names=(FABLE,))
+        _drive(tmp_path, monkeypatch, _good, names=(PICK_A,))
     report = json.loads((tmp_path / "run" / "report.json").read_text())
-    assert report["entries"][FABLE]["status"] == "NOT_RUN"
+    assert report["entries"][PICK_A]["status"] == "NOT_RUN"
 
 
 # ------------------------------------------------------------------ P415 code round 2 (D5 D10 D11 D12 D13 E1 E2)
@@ -957,7 +1028,7 @@ def test_e1_a_completed_entry_with_a_reference_uses_the_real_snapshot_shape(
     tmp_path, monkeypatch
 ):
     refs = {
-        FABLE: dict(
+        PICK_A: dict(
             peak_gb=37.97,
             source="x",
             source_path="docs/x.md",
@@ -967,10 +1038,10 @@ def test_e1_a_completed_entry_with_a_reference_uses_the_real_snapshot_shape(
     }
     monkeypatch.setattr(qualify, "load_references", lambda p, **k: refs)
     code, report = _drive(
-        tmp_path, monkeypatch, _good_snapshots, names=(FABLE,), keep_refs=True
+        tmp_path, monkeypatch, _good_snapshots, names=(PICK_A,), keep_refs=True
     )
-    assert code == 0, report["entries"][FABLE]
-    ref = report["entries"][FABLE]["reference"]
+    assert code == 0, report["entries"][PICK_A]
+    ref = report["entries"][PICK_A]["reference"]
     assert ref["comparable"] is False and "snapshot" in ref["differs"]
 
 
@@ -983,7 +1054,7 @@ def test_e2_the_qualification_boot_limit_is_600_s(tmp_path, monkeypatch):
         seen.append(orchestrate.BOOT_TIMEOUT_S)
         return _good(job)
 
-    _drive(tmp_path, monkeypatch, run_job, names=(FABLE,))
+    _drive(tmp_path, monkeypatch, run_job, names=(PICK_A,))
     assert seen == [600] and orchestrate.BOOT_TIMEOUT_S == 900  # restored after the run
 
 
@@ -998,8 +1069,8 @@ def test_d5_a_console_script_changed_during_the_run_invalidates(tmp_path, monkey
             stack_mlx_vlm="x",
         )
 
-    code, report = _drive(tmp_path, monkeypatch, _good, names=(FABLE,), console=info)
-    assert code == 1 and report["entries"][FABLE]["status"] != "COMPLETED"
+    code, report = _drive(tmp_path, monkeypatch, _good, names=(PICK_A,), console=info)
+    assert code == 1 and report["entries"][PICK_A]["status"] != "COMPLETED"
 
 
 def test_d10_the_summary_must_be_a_real_campaign_artifact(tmp_path):
@@ -1039,7 +1110,7 @@ def test_d10_the_summary_must_be_a_real_campaign_artifact(tmp_path):
 
 def test_d11_the_blob_must_belong_to_the_named_path_and_the_fingerprint_names_weights_and_harness():
     refs = {
-        FABLE: dict(
+        PICK_A: dict(
             peak_gb=1.0,
             source="x",
             source_path="docs/x.md",
@@ -1055,7 +1126,7 @@ def test_d11_the_blob_must_belong_to_the_named_path_and_the_fingerprint_names_we
     with pytest.raises(ValueError, match="source_path"):
         qualify.load_references(
             Path(__file__),
-            table={FABLE: dict(refs[FABLE], source_path=None)},
+            table={PICK_A: dict(refs[PICK_A], source_path=None)},
             blob_exists=lambda b, p: True,
         )
     rec = dict(
@@ -1064,7 +1135,7 @@ def test_d11_the_blob_must_belong_to_the_named_path_and_the_fingerprint_names_we
         weights={"--model": "w" * 64},
         harness="a" * 40,
     )
-    fp = qualify.fingerprint_of(rec, qualify.expected_config(FABLE_ENTRY))
+    fp = qualify.fingerprint_of(rec, qualify.expected_config(PICK_A_ENTRY))
     assert (
         fp["snapshot"] == {"--model": "r1"}
         and fp["weights"] == {"--model": "w" * 64}
@@ -1089,7 +1160,7 @@ def test_d13_the_lock_is_released_even_when_the_cleanup_itself_fails(
             tmp_path,
             monkeypatch,
             _good,
-            names=(FABLE,),
+            names=(PICK_A,),
             release=lambda fd: released.append(fd),
         )
     assert released == [3]
@@ -1162,9 +1233,9 @@ def test_r3_d5_an_unreadable_console_script_at_exit_invalidates_completed_entrie
             stack_mlx_vlm="x",
         )
 
-    code, report = _drive(tmp_path, monkeypatch, _good, names=(FABLE,), console=info)
+    code, report = _drive(tmp_path, monkeypatch, _good, names=(PICK_A,), console=info)
     assert code == 1
-    assert report["entries"][FABLE]["status"] == "INVALID"
+    assert report["entries"][PICK_A]["status"] == "INVALID"
     assert any("console script" in p for p in report["end_problems"])
 
 
@@ -1261,7 +1332,7 @@ def test_full1_the_chunk_sequence_lands_on_productions_offsets():
 
 
 def test_full1_a_served_record_with_its_landing_passes_and_without_fails():
-    want = qualify.expected_config(STATIC_ENTRY)
+    want = qualify.expected_config(SYNTH_S_ENTRY)
     rec = _record(
         sdpa_forced=0,
         lazy_calls=0,
