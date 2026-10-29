@@ -577,8 +577,25 @@ def clopper_pearson(k, n, alpha=0.05):
     return (lower, upper)
 
 
-def straddle_target(threshold):
-    return threshold - 64
+STRADDLE_OFFSETS = (
+    64,
+    65,
+    66,
+)  # P537 (stack C252): pre-registered prompt_end offsets below a threshold, in order
+
+
+def straddle_target(threshold, offset=STRADDLE_OFFSETS[0]):
+    return threshold - offset
+
+
+def registry_off_problems(picks, off):
+    """P527 (stack C252): the OFF arm is the stack root's ``main_models.yaml`` as committed, so every pick must be
+    MTP-OFF there — a pick ON in it would compare ON with ON."""
+    return [
+        f"{pick} is MTP-ON in the stack root registry: the OFF arm would be ON (use an all-OFF stack root)"
+        for pick in picks
+        if pick not in off
+    ]
 
 
 class MalformedEvidence(RuntimeError):
@@ -1143,7 +1160,9 @@ def overall_status(summary):
     return ("PASS", 0) if ok else ("NOT_PASS", 2)
 
 
-def e1c_verdict(on_entry, off_entry, *, threshold, verify_policy):
+def e1c_verdict(
+    on_entry, off_entry, *, threshold, verify_policy, offset=STRADDLE_OFFSETS[0]
+):
     """Per-request E1c rule (plan §2.2; code round 2 H15): NEUTRALITY = rows and states equal; EVIDENCE =
     kernels, engagement, the exact prompt and the straddle. ``pass_`` needs both; ``pick_outcome`` reports
     a neutrality failure as FAIL and an evidence-only failure as INCOMPLETE. Malformed comparator / kernel
@@ -1169,9 +1188,9 @@ def e1c_verdict(on_entry, off_entry, *, threshold, verify_policy):
     if not on_entry.get("draft_rounds"):
         evidence.append("no MTP rounds")
     if threshold is not None:
-        if on_entry.get("prompt_end") != straddle_target(threshold):
+        if on_entry.get("prompt_end") != straddle_target(threshold, offset):
             evidence.append(
-                f"prompt_end {on_entry.get('prompt_end')} != {straddle_target(threshold)}"
+                f"prompt_end {on_entry.get('prompt_end')} != {straddle_target(threshold, offset)}"
             )
         if verify_policy == "joint_v1":
             timings = (on_entry.get("response") or {}).get("timings") or {}
@@ -2147,6 +2166,9 @@ class Campaign:
                 "refused: the live registry is not one of the 16 accepted byte states"
             )
         manifest["registry_off"] = sorted(off)
+        problems = registry_off_problems(self.picks, off)  # P527 (stack C252)
+        if problems:
+            raise Refused(f"refused: {problems}")
         for pick in self.picks:
             text, restored = overlay_registry(self.registry, pick, fixture)
             overlay = self.out / f"overlay-{pick}.yaml"
@@ -2215,12 +2237,12 @@ class Campaign:
         return run_job(job, self.fork, self.env, self.monitor, deadline=self.deadline)
 
     # -- steps
-    def size(self, pick, thresholds):
+    def size(self, pick, thresholds, offset=STRADDLE_OFFSETS[0]):
         base = dict(model=pick, max_tokens=1, stream=False)
         requests = [
             dict(
                 name=f"T{t}",
-                target=straddle_target(t),
+                target=straddle_target(t, offset),
                 prefix=SIZE_PREFIX,
                 suffix=SIZE_SUFFIX,
                 payload=base,
@@ -2244,9 +2266,19 @@ class Campaign:
         )
         accepted, attempts = {}, {}
         pending = list(cells)
-        for attempt, seed in enumerate(SEEDS):
+        # P537 (stack C252): an invalid straddle cell takes the next seed; a cell invalid on every seed is
+        # re-sized to the next pre-registered offset and takes the seeds again (the short cell never retries)
+        schedule = [(offset, seed) for offset in STRADDLE_OFFSETS for seed in SEEDS]
+        for attempt, (offset, seed) in enumerate(schedule):
             if not pending:
                 break
+            if offset != STRADDLE_OFFSETS[0] and seed == SEEDS[0]:
+                pending = [(t, text) for t, text in pending if t is not None]
+                if not pending:
+                    break
+                pending = list(
+                    self.size(pick, [t for t, _ in pending], offset=offset).items()
+                )
             requests = [
                 dict(
                     name=f"T{t}" if t else "short",
@@ -2280,10 +2312,12 @@ class Campaign:
                     entry["pair"],
                     threshold=t,
                     verify_policy=PICKS[pick]["verify_policy"],
+                    offset=offset,
                 )
                 attempts.setdefault(req["name"], []).append(
                     dict(
                         seed=seed,
+                        offset=offset,
                         path=str(path),
                         valid=valid,
                         neutral=seen["neutral"],
@@ -2296,7 +2330,7 @@ class Campaign:
                 )
                 if valid:
                     accepted[req["name"]] = dict(
-                        threshold=t, req=req, dir=path.parent, index=i
+                        threshold=t, req=req, dir=path.parent, index=i, offset=offset
                     )
                 else:
                     still.append((t, text))
@@ -2327,6 +2361,7 @@ class Campaign:
                 on["pair"],  # the verdict is the SAME-INSTANCE pair (P391)
                 threshold=cell["threshold"],
                 verify_policy=PICKS[pick]["verify_policy"],
+                offset=cell["offset"],
             )
             c1_ok = exact_bool(  # code round 6 H34
                 on["c1"]["acceptance"].get("pass"), f"{name}.c1.acceptance.pass"
@@ -2358,6 +2393,7 @@ class Campaign:
                 draft_kernels=on.get("draft_verdict"),  # v13 V15
                 attempts=attempts[name],
                 rejected=[a for a in attempts[name] if not a["valid"]],
+                offset=cell["offset"],
             )
             verdicts[name] = v
         for (
@@ -2370,9 +2406,9 @@ class Campaign:
                 pass_=False,
                 neutral=True,
                 evidence_ok=False,
-                problems=[f"invalid on all {len(SEEDS)} seeds"],
+                problems=[f"invalid on all {len(rejected)} attempts"],
                 neutrality_problems=[],
-                evidence_problems=[f"invalid on all {len(SEEDS)} seeds"],
+                evidence_problems=[f"invalid on all {len(rejected)} attempts"],
                 c1=dict(identical=True),
                 c2=dict(identical=False),
                 attempts=rejected,
