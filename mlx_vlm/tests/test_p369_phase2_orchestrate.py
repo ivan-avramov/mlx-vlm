@@ -2695,7 +2695,10 @@ def test_m2r2_each_draft_invocation_is_well_formed(kind, invocation):
 
 
 # ------------------------------------------------------------------ P537 / P527 (stack C252)
-P537_PICK, P537_PICK_B = list(orchestrate.PICKS)[:2]  # the first two P369 picks, by position
+P537_PICK, P537_PICK_B = list(orchestrate.PICKS)[
+    :2
+]  # the first two P369 picks, by position
+
 
 def _offset_camp(tmp_path, *, valid_at=None):
     """An E1c campaign whose T1024 cell straddles only at attempt ``valid_at`` (None: never); every attempt
@@ -2815,7 +2818,9 @@ def test_a_re_size_that_finds_no_exact_prompt_parks_the_cell_for_the_next_offset
         return {t: f"prompt-{t}-{offset}" for t in thresholds}
 
     camp.size = size
-    entry = json.loads((tmp_path / P537_PICK / "e1c-pair-a5" / "req-0.json").read_text())
+    entry = json.loads(
+        (tmp_path / P537_PICK / "e1c-pair-a5" / "req-0.json").read_text()
+    )
     entry["prompt_end"] = orchestrate.straddle_target(1024, 66)
     (tmp_path / P537_PICK / "e1c-pair-a5" / "req-0.json").write_text(json.dumps(entry))
     got = camp.e1c(P537_PICK, {1024: "x"}, smoke=True)
