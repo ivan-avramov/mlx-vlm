@@ -10,7 +10,7 @@ import json
 import logging
 import math
 import os
-import random
+import random  # Fork: ring test ports drawn below the ephemeral range (P503)
 import signal
 import socket
 import struct
@@ -2558,14 +2558,14 @@ def _distributed_model_worker(family, dtype_name):
     assert passed == group.size(), records
 
 
-_EPHEMERAL_FIRST = 49152  # IANA dynamic range start (macOS net.inet.ip.portrange.first; Linux starts higher)
+_EPHEMERAL_FIRST = 49152  # Fork: (P503) IANA dynamic range start (macOS net.inet.ip.portrange.first; Linux starts higher)
 
 
 def _run_distributed_model_test(family, dtype, world_size):
     repo = Path(__file__).resolve().parents[2]
     # The ring launcher needs one consecutive port per rank. Probe the entire
     # range while holding the sockets so a four-rank case cannot reuse a port.
-    # P503 (stack): never start in the OS ephemeral range (bind(0) picks from it): the
+    # Fork: (P503) never start in the OS ephemeral range (bind(0) picks from it): the
     # ranks' own outgoing connections draw source ports from that range and can take a
     # later rank's listening port between the probe and the launch (EADDRINUSE, 48).
     rng = random.Random()
