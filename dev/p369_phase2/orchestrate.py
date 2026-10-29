@@ -588,6 +588,11 @@ def straddle_target(threshold, offset=STRADDLE_OFFSETS[0]):
     return threshold - offset
 
 
+def e2_prompts(sized, accepted):
+    """P537: E2's per-threshold straddle prompt is the one E1c accepted (its offset may not be 64)."""
+    return {t: accepted.get(t, text) for t, text in sized.items()}
+
+
 def registry_off_problems(picks, off):
     """P527 (stack C252): the OFF arm is the stack root's ``main_models.yaml`` as committed, so every pick must be
     MTP-OFF there — a pick ON in it would compare ON with ON."""
@@ -1887,6 +1892,8 @@ def phase_projection(step_s):
     """P369 v13 V13: the full run per phase from the smoke's measured steps × the full cardinalities — prep (sizing
     four thresholds, reconstructing 20 items) × 1.5; E1c × the threshold-token ratio (+ the short cell, negligible);
     E2 × 10 items + its four straddles at the E1c rate; E7a = 20 requests at E7b's per-turn time (3 turns); E7b × 5.
+    Retries are not projected: a cell's further seeds and P537's further offsets (up to 15 attempts and two re-sizes
+    per thresholded cell) can take a full run past this projection (no wall cap is enforced, C184 / C194).
     """
     e1c = step_s["e1c"] * sum(THRESHOLDS) / sum(SMOKE_THRESHOLDS)
     nominal = (
@@ -2237,7 +2244,9 @@ class Campaign:
         return run_job(job, self.fork, self.env, self.monitor, deadline=self.deadline)
 
     # -- steps
-    def size(self, pick, thresholds, offset=STRADDLE_OFFSETS[0]):
+    def size(self, pick, thresholds, offset=STRADDLE_OFFSETS[0], strict=True):
+        """Exact prompts ending ``offset`` tokens below each threshold; ``strict=False`` (a P537 re-size) leaves a
+        threshold without an exact prompt out instead of raising."""
         base = dict(model=pick, max_tokens=1, stream=False)
         requests = [
             dict(
@@ -2250,10 +2259,13 @@ class Campaign:
             )
             for t in thresholds
         ]
-        result = self.run(self.job(pick, "size", "size", "off", requests))
+        name = "size" if offset == STRADDLE_OFFSETS[0] else f"size-o{offset}"
+        result = self.run(self.job(pick, name, "size", "off", requests))
         prompts = {}
         for r, t in zip(result["requests"], thresholds):
             if r["text"] is None:
+                if not strict:
+                    continue
                 raise RuntimeError(
                     f"{pick}: no exact prompt for T={t} (closest {r['tokens']})"
                 )
@@ -2264,21 +2276,29 @@ class Campaign:
         cells = [(t, text) for t, text in prompts.items()] + (
             [] if smoke else [(None, SHORT_PROMPT)]
         )
-        accepted, attempts = {}, {}
-        pending = list(cells)
+        accepted, attempts, size_failures = {}, {}, {}
+        pending, parked = list(cells), []
         # P537 (stack C252): an invalid straddle cell takes the next seed; a cell invalid on every seed is
-        # re-sized to the next pre-registered offset and takes the seeds again (the short cell never retries)
+        # re-sized to the next pre-registered offset and takes the seeds again (the short cell never retries).
+        # A cell with no exact prompt at an offset is parked for the next one (code review round 1).
         schedule = [(offset, seed) for offset in STRADDLE_OFFSETS for seed in SEEDS]
-        for attempt, (offset, seed) in enumerate(schedule):
-            if not pending:
-                break
+        attempt = 0
+        for offset, seed in schedule:
             if offset != STRADDLE_OFFSETS[0] and seed == SEEDS[0]:
-                pending = [(t, text) for t, text in pending if t is not None]
-                if not pending:
-                    break
-                pending = list(
-                    self.size(pick, [t for t, _ in pending], offset=offset).items()
+                waiting = [t for t, _ in pending + parked if t is not None]
+                sized = (
+                    self.size(pick, waiting, offset=offset, strict=False)
+                    if waiting
+                    else {}
                 )
+                pending = [(t, sized[t]) for t in waiting if t in sized]
+                parked = [(t, None) for t in waiting if t not in sized]
+                for t, _ in parked:
+                    size_failures.setdefault(f"T{t}", []).append(offset)
+            if not pending:
+                if not parked:
+                    break
+                continue
             requests = [
                 dict(
                     name=f"T{t}" if t else "short",
@@ -2296,6 +2316,7 @@ class Campaign:
                 for t, text in pending
             ]
             name = f"e1c-pair-a{attempt}"
+            attempt += 1
             self.run(self.job(pick, name, "e1c_pair", "on", requests))
             still = []
             for i, ((t, text), req) in enumerate(zip(pending, requests)):
@@ -2330,7 +2351,12 @@ class Campaign:
                 )
                 if valid:
                     accepted[req["name"]] = dict(
-                        threshold=t, req=req, dir=path.parent, index=i, offset=offset
+                        threshold=t,
+                        req=req,
+                        dir=path.parent,
+                        index=i,
+                        offset=offset,
+                        text=text,
                     )
                 else:
                     still.append((t, text))
@@ -2394,21 +2420,36 @@ class Campaign:
                 attempts=attempts[name],
                 rejected=[a for a in attempts[name] if not a["valid"]],
                 offset=cell["offset"],
+                size_failures=size_failures.get(name, []),
             )
             verdicts[name] = v
+        # P537: E2's per-threshold straddle requests use the prompt E1c accepted (code review round 1)
+        if not hasattr(self, "accepted_prompts"):
+            self.accepted_prompts = {}
+        self.accepted_prompts[pick] = {
+            cell["threshold"]: cell["text"]
+            for cell in accepted.values()
+            if cell["threshold"] is not None
+        }
         for (
             t,
             _,
-        ) in pending:  # round 3 E7: invalid on every seed — the attempts still decide
+        ) in (
+            pending + parked
+        ):  # round 3 E7: invalid on every seed — the attempts still decide
             name = f"T{t}" if t else "short"
             rejected = list(attempts[name])
+            problems = [f"invalid on all {len(rejected)} attempts"] + [
+                f"no exact prompt at offset {o}" for o in size_failures.get(name, [])
+            ]
             verdicts[name] = dict(
                 pass_=False,
                 neutral=True,
                 evidence_ok=False,
-                problems=[f"invalid on all {len(rejected)} attempts"],
+                problems=problems,
                 neutrality_problems=[],
-                evidence_problems=[f"invalid on all {len(rejected)} attempts"],
+                evidence_problems=list(problems),
+                size_failures=size_failures.get(name, []),
                 c1=dict(identical=True),
                 c2=dict(identical=False),
                 attempts=rejected,
@@ -2668,7 +2709,14 @@ class Campaign:
         save("e1c")
         if record["outcome"]["run_e2_e7"]:  # Q37 precedence
             try:
-                record["e2"] = self.e2(pick, items, prompts, smoke=smoke)
+                record["e2"] = self.e2(
+                    pick,
+                    items,
+                    e2_prompts(
+                        prompts, getattr(self, "accepted_prompts", {}).get(pick, {})
+                    ),
+                    smoke=smoke,
+                )
             except JobTimeout as exc:
                 record["e2"] = dict(
                     verdict="INCOMPLETE", reason=f"E2 worker stopped: {exc.info}"
