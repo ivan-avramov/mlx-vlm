@@ -427,7 +427,7 @@ def _expected_config(entry):
         ),
         kv_quant_mode=values["kv_quant_mode"] or None,
         quantized_kv_start=int(values["quantized_kv_start"]),
-        kv_bits=int(values["kv_bits"]) or None,
+        kv_bits=_exact_width(values["kv_bits"]),
         kv_quant_scheme=values["kv_quant_scheme"] or None,
         prefill_step=int(values["prefill_step_size"]),
         prealloc=int(values["kv_prealloc_tokens"]),
@@ -440,6 +440,13 @@ def _expected_config(entry):
         generation_defaults=dict(values["generation_defaults"]),
         prompt_tokens=cap - MIN_OUTPUT_TOKENS,
     )
+
+
+def _exact_width(value):
+    """P475a: the KV width exactly as served (no ``int()`` truncation; 0 = native, None); a value ``int()`` cannot convert
+    still refuses as before (v1.4)."""
+    int(value)
+    return value or None
 
 
 def _parse_flags(args):
@@ -615,11 +622,17 @@ def request_problems(rec, expected):
     from p369_phase2 import kvmanifest
 
     observed, template = rec.get("manifest"), rec.get("template")
+    # P475a: unset without a manifest — the attention rule is then not judged
+    native_attention = None
     if not observed or not template:
         problems.append("no leaf manifest / template of the measured cache")
     else:
         problems += kvmanifest.manifest_problems(
             observed, template, expected_kv(expected)
+        )
+        native_attention = any(
+            e["kind"] == "native"
+            for e in kvmanifest.expected_manifest(template, expected_kv(expected))
         )
         caps = rec.get("capacities_by_path") or {}
         kv_paths = [
@@ -632,12 +645,26 @@ def request_problems(rec, expected):
                 problems.append(
                     f"layer {path} capacity {caps.get(path)} != {expected['prealloc']}"
                 )
-    fused = expected["attention_policy"] == "fused_v1"
-    forced = rec.get("sdpa_forced") or 0
-    if fused != (forced > 0):
-        problems.append(
-            f"sdpa_forced {forced} (attention {expected['attention_policy']})"
-        )
+    # P475a: fused_v1 forces SDPA only on a native-KV attention leaf of the EXPECTED manifest (N16; TurboQuant's retained
+    # layer); affine KV takes the quantized-attention path, so forced calls are required iff such a leaf is expected
+    # (v4.1) with the expected manifest known the counter is a present integer >= 0: > 0 iff fused_v1 with a native
+    # leaf, exactly 0 otherwise; with it unknown there is no attention verdict under any policy
+    # (fix round 2) only fused_v1 always emits the counter; under any other policy the server omits it when unset
+    # (schemas._omit_unset_sdpa) and the worker records None, so absent / None reads as 0 there, a present value is checked
+    if native_attention is not None:
+        fused = expected["attention_policy"] == "fused_v1"
+        forced = rec.get("sdpa_forced")
+        if not fused and forced is None:
+            forced = 0
+        if type(forced) is not int or forced < 0:
+            problems.append(
+                f"sdpa_forced {forced!r} is not an integer >= 0 "
+                f"(attention {expected['attention_policy']})"
+            )
+        elif (fused and native_attention) != (forced > 0):
+            problems.append(
+                f"sdpa_forced {forced} (attention {expected['attention_policy']})"
+            )
     if expected["lazy_embeddings"] != ((rec.get("lazy_calls") or 0) > 0):
         problems.append(
             f"lazy embedding calls {rec.get('lazy_calls')} ({expected['lazy_embeddings']})"
@@ -1018,6 +1045,58 @@ def _arm_registry(arm, name, registry, stack, fork, out, orchestrate):
     return path, text
 
 
+KV_ARM_LABEL = "non-comparable: KV arm"
+
+
+def kv_arm_reference(comparison, kv_arm):
+    """C199 under ``--kv-arm`` (P475a): the reference comparison labelled non-comparable, never a refusal."""
+    if kv_arm is None:
+        return comparison
+    return dict(comparison, label=KV_ARM_LABEL, comparable=False)
+
+
+def kv_arm_gate(entries, predictor, registry_text, fork):
+    """P475a ``--kv-arm``: exactly one ``--entry``, a P475 pick, ``--predictor off`` (or ``on`` when the registry already
+    serves the entry MTP-ON with an EMPTY KV delta: today's ``--predictor on``, no overlay; v4.1), and the registry an accepted state except that entry's KV-arm keys
+    (``registry_states.classify_kv_arm``). Returns ``dict(entry, delta, off)``; any other case refuses (SystemExit).
+    """
+    entries = list(entries or [])
+    if len(entries) != 1:
+        raise SystemExit(
+            f"refused: ['--kv-arm needs exactly one --entry, got {len(entries)}']"
+        )
+    name = entries[0]
+    if name not in registry_states.KV_ARM_ENTRIES:
+        raise SystemExit(
+            f"refused: ['--kv-arm: {name!r} is not one of {list(registry_states.KV_ARM_ENTRIES)}']"
+        )
+    if predictor not in ("off", "on"):
+        raise SystemExit("refused: ['--kv-arm needs --predictor off or on']")
+    try:
+        fixture = registry_states.fixture_text(fork / "mlx_vlm" / "tests" / "fixtures")
+    except (OSError, ValueError, IndexError) as exc:
+        raise SystemExit(f"refused: ['--kv-arm: the pinned fixture: {exc}']")
+    got = registry_states.classify_kv_arm(registry_text, fixture, name)
+    if got is None:
+        raise SystemExit(
+            f"refused: ['--kv-arm: the registry is not an accepted state with only {name}'s KV keys "
+            f"{list(registry_states.KV_ARM_KEYS)} forming a P475 arm row']"
+        )
+    off, delta = got
+    if predictor == "on" and name in off:
+        raise SystemExit(
+            f"refused: ['--kv-arm --predictor on: the registry serves {name} MTP-OFF (no overlay is built)']"
+        )
+    if (
+        predictor == "on" and delta
+    ):  # v4.1: the C199 certified-argv binding is never waived
+        raise SystemExit(
+            "refused: ['--kv-arm --predictor on: an MTP-ON KV arm is uncertified; "
+            "preflight it with --predictor off']"
+        )
+    return dict(entry=name, delta=delta, off=off)
+
+
 def safe_id(name):
     """One safe path component for a registry name: ``[A-Za-z0-9._-]`` kept, everything else ``_``, plus the first 8 hex
     of sha256(name) so two names never collide."""
@@ -1104,6 +1183,10 @@ def drive(args):
         # the hashes and the execution all use exactly these bytes
         registry_text = orchestrate.read_registry(stack / "main_models.yaml")
         start = _tree_state(fork, stack)
+        kv_arm = None
+        if getattr(args, "kv_arm", False):
+            # P475a: before any other read of the snapshot (a malformed one refuses)
+            kv_arm = kv_arm_gate(args.entry, predictor, registry_text, fork)
         try:
             registry_entries = registry_states.settings(registry_text)  # strict
         except ValueError as exc:
@@ -1121,6 +1204,8 @@ def drive(args):
         classified = []
 
         def classify():  # only a restore needs the pinned fixture
+            if kv_arm is not None:  # P475a: classify_kv_arm's off set, never classify
+                return kv_arm["off"]
             if not classified:
                 fixture = registry_states.fixture_text(
                     fork / "mlx_vlm" / "tests" / "fixtures"
@@ -1190,6 +1275,8 @@ def drive(args):
             certified=certified,  # read once; the gate and the binding use this value
             commands=commands,
         )
+        if kv_arm is not None:
+            snapshot["kv_arm"] = dict(entry=kv_arm["entry"], delta=kv_arm["delta"])
         return _drive_locked(
             args,
             names,
@@ -1231,6 +1318,10 @@ def _drive_locked(
         predictor=predictor,
         entries={n: dict(status="PENDING", arm=arms[n]) for n in names},
     )
+    kv_arm = snapshot.get("kv_arm")
+    if kv_arm is not None:
+        # P475a: only under --kv-arm (the report is otherwise unchanged)
+        report["kv_arm"] = kv_arm
     stop = dict(signal=None)
     monitor = None
     boot = orchestrate.BOOT_TIMEOUT_S
@@ -1385,8 +1476,11 @@ def _drive_locked(
                     reference=(
                         None
                         if ref is None
-                        else reference_comparison(
-                            ref, peak, fingerprint_of(rec, expected)
+                        else kv_arm_reference(
+                            reference_comparison(
+                                ref, peak, fingerprint_of(rec, expected)
+                            ),
+                            kv_arm,
                         )
                     ),
                 )
@@ -1603,6 +1697,9 @@ def build_parser():
     ap.add_argument("--reviewed-head", required=True)  # code round 1 D5
     ap.add_argument(  # P426 B7: the M1 memory axis measures both predictor states
         "--predictor", choices=("on", "off"), default=None
+    )
+    ap.add_argument(  # P475a: accept one pick's P475 KV-format arm of an accepted registry state
+        "--kv-arm", action="store_true"
     )
     ap.add_argument("--idle-s", type=float, default=IDLE_S)
     ap.add_argument(  # P452: the production tree this run attests (P426: stack S carries B1's log-only counters)

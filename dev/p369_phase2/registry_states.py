@@ -234,6 +234,11 @@ def classify(text, fixture):
         doc, ref = parse(text), parse(fixture)
     except ValueError:
         return None
+    return _states(doc, ref)
+
+
+def _states(doc, ref):
+    """``classify`` on parsed documents."""
     if not isinstance(doc, dict) or not _same(
         {k: v for k, v in doc.items() if k != "models"},
         {k: v for k, v in ref.items() if k != "models"},
@@ -254,6 +259,84 @@ def classify(text, fixture):
             continue
         return None
     return frozenset(off)
+
+
+# P475a (C230 / C280): a KV-format arm of one P475 pick — the KV keys and the entries an arm may change, and the arm rows
+# of p475-kv-matrix.md (N16 changes only ``kv_bits``; the scheme stays the fixture's)
+KV_ARM_KEYS = ("kv_bits", "kv_quant_scheme")
+KV_ARM_ENTRIES = (
+    "Qwen3.8-27B-mlx-uniform-4bit",
+    "Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed",
+)
+KV_ARM_ROWS = {
+    "N16": (0, None),
+    "AF8": (8, "uniform"),
+    "TQ8": (8, "turboquant"),
+    "AF4": (4, "uniform"),
+    "TQ4": (4, "turboquant"),
+}
+_ABSENT = object()
+
+
+def _kv_arm_row(got, want):
+    """The P475 arm row ``got``'s KV keys form (``want``: the fixture's entry), else None. Integer widths only."""
+    bits = got.get("kv_bits", _ABSENT)
+    scheme = got.get("kv_quant_scheme", _ABSENT)
+    for row, (row_bits, row_scheme) in KV_ARM_ROWS.items():
+        if type(bits) is not int or bits != row_bits:
+            continue
+        if row_scheme is None:  # N16: the scheme key exactly as the fixture has it
+            ref = want.get("kv_quant_scheme", _ABSENT)
+            same = (scheme is _ABSENT and ref is _ABSENT) or (
+                scheme is not _ABSENT and ref is not _ABSENT and _same(scheme, ref)
+            )
+            if same:
+                return row
+        elif type(scheme) is str and scheme == row_scheme:
+            return row
+    return None
+
+
+def classify_kv_arm(text, fixture, entry):
+    """P475a: ``(off, kv_delta)`` when ``text``'s settings equal one of the 16 accepted states (``classify``) except that
+    ``entry`` — one of ``KV_ARM_ENTRIES`` — may also differ in ``KV_ARM_KEYS``, forming a ``KV_ARM_ROWS`` row; ``kv_delta``
+    is ``{key: (fixture value, arm value)}`` for the keys that differ (empty: ``classify``'s result). Anything else — another
+    key, another entry, an unknown entry, malformed structure — is None, never an exception.
+    """
+    if entry not in KV_ARM_ENTRIES:
+        return None
+    try:
+        doc, ref = parse(text), parse(fixture)
+    except ValueError:
+        return None
+    if not isinstance(doc, dict) or not isinstance(doc.get("models"), list):
+        return None
+    models = doc["models"]
+    if not all(isinstance(m, dict) for m in models):
+        return None
+    hits = [i for i, m in enumerate(models) if m.get("name") == entry]
+    wants = [m for m in ref.get("models") or [] if m.get("name") == entry]
+    if len(hits) != 1 or len(wants) != 1:
+        return None
+    got, want = models[hits[0]], wants[0]
+    if _kv_arm_row(got, want) is None:
+        return None
+    restored = {k: v for k, v in got.items() if k not in KV_ARM_KEYS}
+    restored.update({k: want[k] for k in KV_ARM_KEYS if k in want})
+    delta = {}
+    for key in KV_ARM_KEYS:
+        theirs, ours = want.get(key, _ABSENT), got.get(key, _ABSENT)
+        if theirs is _ABSENT or ours is _ABSENT:
+            if theirs is not ours:
+                delta[key] = (
+                    None if theirs is _ABSENT else theirs,
+                    None if ours is _ABSENT else ours,
+                )
+        elif not _same(theirs, ours):
+            delta[key] = (theirs, ours)
+    models = [restored if i == hits[0] else m for i, m in enumerate(models)]
+    off = _states(dict(doc, models=models), ref)
+    return None if off is None else (off, delta)
 
 
 def overlay_on(text, fixture, entry):
