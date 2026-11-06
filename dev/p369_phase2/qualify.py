@@ -260,6 +260,7 @@ def entry_problems(
     certified=None,
     classify=lambda: None,
     artifact=None,
+    engagement_only=False,
 ):
     """C254 refusals, all before the run: a name outside the registry (listed), an arm without a drafter to restore, a
     registry that cannot give the restore, and every MTP-ON arm (C199, generalized) without a P369 FULL-run PASS for exactly
@@ -267,6 +268,7 @@ def entry_problems(
     (ValueError when it cannot); ``certified`` is ``{entry: the P369 run's argv_on or None}``, read once by the caller;
     ``classify()`` supplies the 16-state result (called only for a restore);
     ``artifact(path, summary)`` is the campaign-artifact check.
+    P658 ``engagement_only``: the MTP-ON arm must be ``served_on`` and needs no P369 summary (it certifies nothing).
     """
     from p369_phase2 import orchestrate
 
@@ -300,6 +302,14 @@ def entry_problems(
             problems.append(
                 f"{name}: MTP-ON needs the entry in orchestrate.PICKS (its drafter shape for the draft-kernel check)"
             )
+            continue
+        if (
+            engagement_only
+        ):  # P658: engagement evidence, not certification (no C199 summary)
+            if arm != "served_on":
+                problems.append(
+                    f"{name}: --engagement-only serves the registry's MTP-ON entry as committed (arm {arm})"
+                )
             continue
         gate = f"{name}: MTP-ON only after its P369 full-run PASS (C199)"
         path = summaries.get(name)
@@ -1055,10 +1065,11 @@ def kv_arm_reference(comparison, kv_arm):
     return dict(comparison, label=KV_ARM_LABEL, comparable=False)
 
 
-def kv_arm_gate(entries, predictor, registry_text, fork):
+def kv_arm_gate(entries, predictor, registry_text, fork, *, engagement_only=False):
     """P475a ``--kv-arm``: exactly one ``--entry``, a P475 pick, ``--predictor off`` (or ``on`` when the registry already
     serves the entry MTP-ON with an EMPTY KV delta: today's ``--predictor on``, no overlay; v4.1), and the registry an accepted state except that entry's KV-arm keys
     (``registry_states.classify_kv_arm``). Returns ``dict(entry, delta, off)``; any other case refuses (SystemExit).
+    P658 ``engagement_only``: ``--predictor on`` with ANY accepted delta (the entry still served MTP-ON).
     """
     entries = list(entries or [])
     if len(entries) != 1:
@@ -1088,13 +1099,35 @@ def kv_arm_gate(entries, predictor, registry_text, fork):
             f"refused: ['--kv-arm --predictor on: the registry serves {name} MTP-OFF (no overlay is built)']"
         )
     if (
-        predictor == "on" and delta
-    ):  # v4.1: the C199 certified-argv binding is never waived
+        predictor == "on" and delta and not engagement_only
+    ):  # v4.1: the C199 certified-argv binding is never waived (P658: engagement-only certifies nothing)
         raise SystemExit(
             "refused: ['--kv-arm --predictor on: an MTP-ON KV arm is uncertified; "
             "preflight it with --predictor off']"
         )
     return dict(entry=name, delta=delta, off=off)
+
+
+NO_DRAFTER_MANIFEST = "no drafter cache manifest"
+
+
+def drafter_manifest_problems(rec):
+    """P658 ``--engagement-only``: the worker's ``drafter_manifest`` (the MTP drafter's live cache and its own template)
+    judged by ``kvmanifest.drafter_problems`` (K3); absent, empty or not a list is a problem.
+    """
+    from p369_phase2 import kvmanifest
+
+    got = (rec or {}).get("drafter_manifest")
+    if not isinstance(got, dict):
+        return [NO_DRAFTER_MANIFEST]
+    observed, template = got.get("observed"), got.get("template")
+    if not all(isinstance(m, list) and m for m in (observed, template)):
+        return [NO_DRAFTER_MANIFEST]
+    if not all(
+        isinstance(e, dict) and "path" in e and "kind" in e for e in observed + template
+    ):
+        return [f"{NO_DRAFTER_MANIFEST} (malformed leaf record)"]
+    return kvmanifest.drafter_problems(observed, template)
 
 
 def safe_id(name):
@@ -1177,6 +1210,14 @@ def drive(args):
         Path(p).resolve() for p in (args.stack_root, args.fork_root, args.out)
     )
     predictor = getattr(args, "predictor", None)
+    engagement = getattr(args, "engagement_only", False) is True
+    if engagement:  # P658: refused before the lock
+        if not (getattr(args, "kv_arm", False) and predictor == "on"):
+            raise SystemExit(
+                "refused: ['--engagement-only needs --kv-arm --predictor on']"
+            )
+        if getattr(args, "p369_summary", None):
+            raise SystemExit("refused: ['--engagement-only takes no --p369-summary']")
     lock = orchestrate.acquire_lock(orchestrate.lock_path(dict(os.environ)))
     try:  # code round 2 D13: the lock is released whatever the cleanup below does
         # C254 v1.2: the ONE registry snapshot, read right after the lock; the gate, the derived / restored registries,
@@ -1186,7 +1227,13 @@ def drive(args):
         kv_arm = None
         if getattr(args, "kv_arm", False):
             # P475a: before any other read of the snapshot (a malformed one refuses)
-            kv_arm = kv_arm_gate(args.entry, predictor, registry_text, fork)
+            kv_arm = kv_arm_gate(
+                args.entry,
+                predictor,
+                registry_text,
+                fork,
+                **(dict(engagement_only=True) if engagement else {}),
+            )
         try:
             registry_entries = registry_states.settings(registry_text)  # strict
         except ValueError as exc:
@@ -1232,6 +1279,7 @@ def drive(args):
                 is_commit=lambda c: _is_commit(fork, c),
                 contains_reviewed=lambda c: _is_ancestor(fork, V13_REVIEWED, c),
             ),
+            **(dict(engagement_only=True) if engagement else {}),
         )
         if problems:
             raise SystemExit(f"refused: {problems}")
@@ -1265,6 +1313,10 @@ def drive(args):
             except Exception as exc:
                 problems.append(f"{n}: cannot derive the served argv: {exc}")
                 continue
+            if (
+                engagement
+            ):  # P658: no certified argv; command_problems binds it per entry
+                continue
             problems += argv_binding_problems(n, certified[n], commands[n][0][1:])
         if problems:
             raise SystemExit(f"refused: {problems}")
@@ -1277,6 +1329,8 @@ def drive(args):
         )
         if kv_arm is not None:
             snapshot["kv_arm"] = dict(entry=kv_arm["entry"], delta=kv_arm["delta"])
+        if engagement:
+            snapshot["engagement_only"] = True
         return _drive_locked(
             args,
             names,
@@ -1322,6 +1376,9 @@ def _drive_locked(
     if kv_arm is not None:
         # P475a: only under --kv-arm (the report is otherwise unchanged)
         report["kv_arm"] = kv_arm
+    engagement = snapshot.get("engagement_only") is True
+    if engagement:  # P658: engagement evidence that certifies nothing
+        report.update(engagement_only=True, certifies=False)
     stop = dict(signal=None)
     monitor = None
     boot = orchestrate.BOOT_TIMEOUT_S
@@ -1419,6 +1476,8 @@ def _drive_locked(
                         job = _job(
                             name, cmd[1:], expected, fork, out, orchestrate, kvmanifest
                         )
+                        if engagement:  # P658: the worker records the drafter's cache
+                            job["drafter_manifest"] = True
                         result = orchestrate.run_job(
                             job,
                             fork,
@@ -1434,6 +1493,8 @@ def _drive_locked(
                             versions=report["versions"],
                         )
                         problems = request_problems(rec, expected)
+                        if engagement:  # P658 (K3): the drafter's own cache
+                            problems += drafter_manifest_problems(rec)
                         # D5: the bindings again after the job
                         problems += guard_problems(
                             start, _tree_state(fork, stack), reviewed=reviewed
@@ -1467,9 +1528,12 @@ def _drive_locked(
             final = dict(problems=problems[:50], before=before, after=after, record=rec)
             if rec:  # C254: capacity AND speed per arm, whatever the entry's status
                 final.update(arm=arms[name], rates=rec.get("rates"))
+                if engagement and "drafter_manifest" in rec:
+                    final["drafter_manifest"] = rec["drafter_manifest"]
             if rec and not error and not problems:
                 peak = capacity_gb(rec["peaks"])
-                ref = references.get(name)
+                # P658: no capacity comparison under --engagement-only
+                ref = None if engagement else references.get(name)
                 final.update(
                     capacity_gb=peak,
                     vs_guidance_gb=round(peak - 48.0, 3),
@@ -1700,6 +1764,9 @@ def build_parser():
     )
     ap.add_argument(  # P475a: accept one pick's P475 KV-format arm of an accepted registry state
         "--kv-arm", action="store_true"
+    )
+    ap.add_argument(  # P658: --kv-arm --predictor on as committed, engagement evidence only (no C199 summary)
+        "--engagement-only", action="store_true"
     )
     ap.add_argument("--idle-s", type=float, default=IDLE_S)
     ap.add_argument(  # P452: the production tree this run attests (P426: stack S carries B1's log-only counters)

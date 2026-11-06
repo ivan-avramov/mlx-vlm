@@ -1407,11 +1407,13 @@ def _find_key(obj, key):
     return None
 
 
-def qualify_request(client, capture, rg, spec, memory):
+def qualify_request(client, capture, rg, spec, memory, *, drafter_manifest=False):
     """P415 (plan v5): ONE request at the largest accepted prompt with the registry's own settings (only the seed set),
     observed where production consumes each setting: the resolved arguments, the ids actually prefilled, the prefill
     chunk sequence, the prefill / decode boundary (Q11), the retire shrink, the lazy-embedding path, the fused attention
-    counter and every KV leaf's allocated capacity at the boundary."""
+    counter and every KV leaf's allocated capacity at the boundary. P658 ``drafter_manifest``: also the MTP drafter's
+    own cache manifest and template (K3), read after the response and before the session is released.
+    """
     import mlx.core as mx
     from p369_phase2 import kvmanifest
 
@@ -1573,6 +1575,12 @@ def qualify_request(client, capture, rg, spec, memory):
         while patched:
             owner, name, value = patched.pop()
             setattr(owner, name, value)
+    if drafter_manifest:  # P658: the response is complete; the session is still held
+        drafter = rg.draft_model
+        rec["drafter_manifest"] = dict(
+            observed=kvmanifest.manifest(drafter._cache or []),
+            template=kvmanifest.manifest(drafter.make_cache()),
+        )
     release_session(got["chat_id"])
     final = got["final"]
     rec["prompt"]["preprocessed"] = dict(got["prompt"])
@@ -1678,7 +1686,10 @@ def run_job(job, out_dir, result):
                 out_dir, index=0, name=spec["name"], deadline_s=spec["timeout_s"]
             )
             undo_memory()  # the CLI has set its limits; the request runs on the real functions
-            record = qualify_request(client, capture, rg, spec, memory)
+            extra = {}  # P658: only when the job asks (the call is otherwise today's)
+            if job.get("drafter_manifest") is True:
+                extra["drafter_manifest"] = True
+            record = qualify_request(client, capture, rg, spec, memory, **extra)
             record["drafter_live_checks"] = result.get("drafter_live_checks")
             result["requests"].append(dict(name=spec["name"], qualify=record))
             return

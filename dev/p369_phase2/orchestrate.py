@@ -1229,6 +1229,7 @@ def sha256_file(path):
 LAUNCHER_MODULES = (
     "bench.p426_leg",
     "bench.p426_wave1",
+    "bench.p475_kv",  # P656 item 6: the P475 orchestrator that launches qualify
 )  # P452: the only refused ancestors allowed
 
 
