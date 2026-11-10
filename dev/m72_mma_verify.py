@@ -4,7 +4,7 @@ One launch computes a whole k-token MTP verify block (query j attends to tokens 
 matrix multiply-accumulate over KV tiles loaded once into threadgroup memory, reading the cache's full-cap preallocated
 buffers in place (per-head stride = the buffer's capacity). Two tile loaders share one kernel body:
 
-- TurboQuant 4 (MSE codec): unpacks the 4-bit indices to the codebook's unit values in the codec's rotated space; the key
+- TurboQuant 4 (MSE codec): unpacks each token's packed indices (4 bits per dimension) to the codebook's unit values in the codec's rotated space; the key
   norm scales S, the value norm is folded into P before P.V; the output is rotated back with the value codec.
 - native16: copies the bf16 K / V rows; the softmax scale is applied to S in fp32.
 
