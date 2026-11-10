@@ -34,13 +34,18 @@ def production_num_blocks(total_tokens: int, n_repeats: int) -> int:
 
 
 @lru_cache(maxsize=None)
-def mq_pass1_kernel(key_bits: int, val_bits: int, dim: int, heads_per_group: int, n_queries: int):
+def mq_pass1_kernel(
+    key_bits: int, val_bits: int, dim: int, heads_per_group: int, n_queries: int
+):
     G, NQ = heads_per_group, n_queries
     elems = dim // 32
     k_off = "k_bit_off" if (elems * key_bits) % 8 else ""
     v_off = "v_bit_off" if (elems * val_bits) % 8 else ""
     key_exprs = tq._gen_unrolled_extract(key_bits, elems, "key_codebook", k_off)
-    val_exprs = [e.replace("kb[", "vb[") for e in tq._gen_unrolled_extract(val_bits, elems, "val_codebook", v_off)]
+    val_exprs = [
+        e.replace("kb[", "vb[")
+        for e in tq._gen_unrolled_extract(val_bits, elems, "val_codebook", v_off)
+    ]
     L = [
         "        constexpr int BD = 32;",
         "        constexpr int qk_per_thread = Dim / BD;",
@@ -104,7 +109,11 @@ def mq_pass1_kernel(key_bits: int, val_bits: int, dim: int, heads_per_group: int
     L += [f"            kd[{i}] = {e};" for i, e in enumerate(key_exprs)]
     L += [f"            vd[{i}] = {e};" for i, e in enumerate(val_exprs)]
     for j in range(NQ):
-        L.append(f"            if (t < T_{j}) {{" if j < NQ - 1 else "            {  // t < t1 <= T_last")
+        L.append(
+            f"            if (t < T_{j}) {{"
+            if j < NQ - 1
+            else "            {  // t < t1 <= T_last"
+        )
         for r in range(G):
             s = f"{j}_{r}"
             L += [
@@ -136,8 +145,16 @@ def mq_pass1_kernel(key_bits: int, val_bits: int, dim: int, heads_per_group: int
             ]
     return mx.fast.metal_kernel(
         name=f"m72_tq_mq_decode_pass1_k{key_bits}_v{val_bits}_d{dim}_g{G}_q{NQ}",
-        input_names=["queries", "lengths", "key_norms", "key_packed", "key_codebook", "val_norms", "val_packed",
-                     "val_codebook"],
+        input_names=[
+            "queries",
+            "lengths",
+            "key_norms",
+            "key_packed",
+            "key_codebook",
+            "val_norms",
+            "val_packed",
+            "val_codebook",
+        ],
         output_names=["out_acc", "out_sums", "out_maxs"],
         source="\n".join(L),
     )
@@ -161,7 +178,9 @@ def mq_decode_attention(cache, queries, scale, lengths, heads_per_group=None):
     keys, values = cache.keys, cache.values  # full-cap preallocated states (D2)
     B, n_q, k, D = queries.shape
     assert len(lengths) == k and list(lengths) == sorted(lengths)
-    assert lengths[0] > 2048, "T <= 2048 uses the single-pass kernel; not covered by the prototype"
+    assert (
+        lengths[0] > 2048
+    ), "T <= 2048 uses the single-pass kernel; not covered by the prototype"
     assert lengths[-1] <= cache.offset
     n_kv = keys.norms.shape[1]
     R = n_q // n_kv
@@ -174,21 +193,42 @@ def mq_decode_attention(cache, queries, scale, lengths, heads_per_group=None):
     outs = []
     for (nb, _tpb), idx in _classes(lengths, R):
         nq = len(idx)
-        q_cls = mx.transpose(q_rot[:, :, :, idx[0]:idx[-1] + 1, :], (3, 0, 1, 2, 4)).reshape(nq * B * n_q, D)
+        q_cls = mx.transpose(
+            q_rot[:, :, :, idx[0] : idx[-1] + 1, :], (3, 0, 1, 2, 4)
+        ).reshape(nq * B * n_q, D)
         lens = mx.array([lengths[j] for j in idx], dtype=mx.int32)
         BQH = B * n_q
         acc, sums, maxs = mq_pass1_kernel(kb, vb, D, G, nq)(
-            inputs=[q_cls, lens, keys.norms, keys.indices, cache.key_codec.codebook, values.norms, values.indices,
-                    cache.value_codec.codebook],
-            template=[("Dim", D), ("RepeatCount", R), ("Blocks", nb), ("KPackedWidth", keys.indices.shape[-1]),
-                      ("VPackedWidth", values.indices.shape[-1])],
+            inputs=[
+                q_cls,
+                lens,
+                keys.norms,
+                keys.indices,
+                cache.key_codec.codebook,
+                values.norms,
+                values.indices,
+                cache.value_codec.codebook,
+            ],
+            template=[
+                ("Dim", D),
+                ("RepeatCount", R),
+                ("Blocks", nb),
+                ("KPackedWidth", keys.indices.shape[-1]),
+                ("VPackedWidth", values.indices.shape[-1]),
+            ],
             grid=(B * n_kv * (R // G) * nb * 32, 1, 1),
             threadgroup=(32, 1, 1),
             output_shapes=[(nq * BQH * nb, D), (nq * BQH * nb,), (nq * BQH * nb,)],
             output_dtypes=[mx.float32] * 3,
         )
-        out = pass2(inputs=[acc, sums, maxs], template=[("Dim", D), ("Blocks", nb)], grid=(nq * BQH * 1024, 1, 1),
-                    threadgroup=(1024, 1, 1), output_shapes=[(nq * BQH, D)], output_dtypes=[mx.float32])[0]
+        out = pass2(
+            inputs=[acc, sums, maxs],
+            template=[("Dim", D), ("Blocks", nb)],
+            grid=(nq * BQH * 1024, 1, 1),
+            threadgroup=(1024, 1, 1),
+            output_shapes=[(nq * BQH, D)],
+            output_dtypes=[mx.float32],
+        )[0]
         out = cache.value_codec._rotate_inverse(out.reshape(nq, B, n_kv, R, D))
         outs.append(mx.transpose(out.reshape(nq, B, n_q, D), (1, 2, 0, 3)))
     out = outs[0] if len(outs) == 1 else mx.concatenate(outs, axis=2)
