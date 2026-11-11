@@ -477,6 +477,34 @@ def scaled_dot_product_attention(
     )
 
 
+def tq4_scaled_dot_product_attention(
+    queries,
+    keys,
+    values,
+    cache,
+    scale: float,
+    mask: Optional[mx.array],
+    sinks: Optional[mx.array] = None,
+    policy=None,
+    *,
+    tq4,
+) -> mx.array:
+    """Fork (M72): the TQ branch of ``scaled_dot_product_attention`` under a stamped TQ4 mode
+    (``tq4_attention.Tq4Mode``). The mode serves in-scope TurboQuant 4 prefill / decode calls with its
+    kernels; a None from it (native cache, out of scope) runs ``scaled_dot_product_attention`` with the
+    same arguments. Only modules stamped with a mode call this; the mode absent never reaches it.
+    """
+    result = tq4.attend(
+        queries, keys, values, cache=cache, scale=scale, mask=mask, sinks=sinks
+    )
+    if result is not None:
+        return result
+    # Positional: the caller's attention policy passes through unchanged (one policy call site, M57).
+    return scaled_dot_product_attention(
+        queries, keys, values, cache, scale, mask, sinks, policy
+    )
+
+
 def expand2square(pil_img, background_color):
     width, height = pil_img.size
     if width == height:

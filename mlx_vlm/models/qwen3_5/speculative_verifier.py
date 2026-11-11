@@ -1,3 +1,4 @@
+from functools import partial  # Fork (M72)
 from typing import Any, Optional
 
 import mlx.core as mx
@@ -13,6 +14,7 @@ from ...speculative.ops.linear import (
     _target_verify_quantized_linear,
 )
 from ..activations import swiglu
+from ..base import tq4_scaled_dot_product_attention  # Fork (M72)
 from ..base import (
     LanguageModelOutput,
     kv_sequence_length,
@@ -21,6 +23,14 @@ from ..base import (
 )
 from ..quantized_verifier import pad_token_mask as _pad_token_mask_to_head
 from .gated_delta import gated_delta_update
+
+
+def _singleton_attention(tq4):  # Fork (M72)
+    """The verifier's singleton attention call: the base function, or (TQ4 mode stamped) the
+    mode's entry point bound to the mode."""
+    if tq4 is None:
+        return scaled_dot_product_attention
+    return partial(tq4_scaled_dot_product_attention, tq4=tq4)
 
 
 class Qwen3_5BatchInvariantForward:
@@ -110,6 +120,22 @@ class Qwen3_5BatchInvariantForward:
                 scale=attention.scale,
                 mask=mask,
             )
+
+        # Fork (M72): the TQ4 mode serves TQ4 verify blocks first (k 2..5); None means
+        # today's code below (joint_v1 for the native layer, else the per-query loop).
+        tq4 = getattr(attention, "tq4_attention", None)  # Fork (M72)
+        if tq4 is not None and output is None and length > 1:  # Fork (M72)
+            output = tq4.verify(  # Fork (M72)
+                queries,
+                keys,
+                values,
+                cache=cache,
+                scale=attention.scale,
+                mask=mask,
+            )
+        # Fork (M72): under a stamped mode the two calls below route each singleton through it
+        # (own T_eff per query); with the mode off this is the module's own function, unchanged.
+        scaled_dot_product_attention = _singleton_attention(tq4)  # Fork (M72)
 
         # Fork (M58): joint_v1 serves the block with one joint call (or a straddling
         # block per query); None means "not eligible": the code below runs unchanged.

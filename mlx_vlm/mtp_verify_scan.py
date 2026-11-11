@@ -511,14 +511,23 @@ def require_gpu():
 
 
 def require_environment(
-    *, draft_kind, kv_bits, kv_quant_scheme=None
-):  # scheme: informational only
+    *, draft_kind, kv_bits, kv_quant_scheme=None, tq4_mode=None
+):  # scheme: informational only (unless tq4_mode)
     if draft_kind != "mtp":
         _fail(f"requires --draft-kind mtp (got {draft_kind!r}); refusing")
     # Effective-cache predicate (kv_quant.from_legacy / turboquant_enabled): with kv_bits None or 0
     # the worker builds a NATIVE cache whatever kv_quant_scheme says (the shipped first pick declares
     # scheme turboquant with kv_bits 0). Refuse only when the resolved cache WOULD be quantized.
-    if kv_bits:
+    # Fork (M72): a resolved TQ4 mode serves the TQ4 layers itself; joint_v1 then serves only the
+    # native last layer, so TurboQuant kv_bits 4 is accepted with it (and only with it).
+    if (
+        kv_bits
+        and tq4_mode in ("m72_v1", "m72_exact")
+        and str(kv_bits) in ("4", "4.0")
+        and kv_quant_scheme == "turboquant"
+    ):
+        pass
+    elif kv_bits:
         _fail(
             "quantized KV (kv_bits > 0, uniform or TurboQuant) is not supported; refusing"
         )

@@ -201,7 +201,53 @@ def _apply_attention_policy_from_env(model):
     return policy
 
 
-def _apply_mtp_verify_from_env(model, *, draft_kind, kv_bits, kv_quant_scheme=None):
+def _resolve_tq4_mode_from_env(*, kv_bits, kv_quant_scheme):
+    # Fork (M72): resolved ONCE at load, before the attention policy; never re-read.
+    if (os.environ.get("MLX_VLM_TQ4_ATTENTION") or "off") == "off":
+        return None  # default: nothing from the module is imported or executed
+    from .. import tq4_attention as _t4
+
+    try:
+        mode = _t4.resolve_mode(os.environ.get(_t4.ENV))
+    except ValueError as exc:
+        _t4._fail(str(exc))
+    if mode is None:
+        return None
+    _t4.require_environment(
+        mode,
+        kv_bits=kv_bits,
+        kv_quant_scheme=kv_quant_scheme,
+        attention_policy=os.environ.get("MLX_VLM_ATTENTION_POLICY") or "auto",
+        mtp_verify_scan=os.environ.get("MLX_VLM_MTP_VERIFY_SCAN") or "per_query",
+        # kv_quant_mode omitted: read from the cache constructor's own resolution
+    )
+    return mode
+
+
+def _apply_tq4_attention_from_env(model, mode):
+    # Fork (M72): after the attention policy and the verify scan are stamped.
+    if mode is None:
+        return None
+    from .. import tq4_attention as _t4
+
+    _t4.require_policy_stamps(model)
+    rng = _t4.check_fp16_range(model)
+    _t4.apply_to_model(model, mode)
+    hook = getattr(model, "tq4_attention", None)
+    result = _t4.self_test_model(model, hook)
+    line = (
+        f"tq4_attention={mode} self-test: {result['cells']} cells in "
+        f"{result['elapsed_s']:.2f}s; R1 max q bound {rng['max_q_bound']:.4g} "
+        f"(limit 2^14), max |codebook| {rng['max_codebook']:.4g}"
+    )
+    logger.info(line)
+    print(line, file=sys.stderr, flush=True)
+    return hook
+
+
+def _apply_mtp_verify_from_env(
+    model, *, draft_kind, kv_bits, kv_quant_scheme=None, tq4_mode=None
+):
     # Fork (M58): resolved ONCE at load, stamped on the instance; never re-read.
     if (os.environ.get("MLX_VLM_MTP_VERIFY_SCAN") or "per_query") == "per_query" and (
         os.environ.get("MLX_VLM_MTP_VERIFY_AB", "0") != "1"
@@ -217,8 +263,9 @@ def _apply_mtp_verify_from_env(model, *, draft_kind, kv_bits, kv_quant_scheme=No
         _mv._fail(str(exc))
     if policy is None:
         return None
+    _tq4 = {} if tq4_mode is None else {"tq4_mode": tq4_mode}  # Fork (M72)
     _mv.require_environment(
-        draft_kind=draft_kind, kv_bits=kv_bits, kv_quant_scheme=kv_quant_scheme
+        draft_kind=draft_kind, kv_bits=kv_bits, kv_quant_scheme=kv_quant_scheme, **_tq4
     )
     _mv.require_gpu()
     _mv.apply_to_model(model, policy)
@@ -1518,12 +1565,23 @@ class ResponseGenerator:
         if moe_expand_spec:
             _apply_moe_expand_and_log(model, moe_expand_spec)
 
+        tq4_mode = (
+            _resolve_tq4_mode_from_env(  # Fork (M72): resolve + environment first
+                kv_bits=getattr(self, "kv_bits", None),
+                kv_quant_scheme=getattr(self, "kv_quant_scheme", None),
+            )
+        )
         self.attention_policy = _apply_attention_policy_from_env(model)  # Fork (M57)
+        _mtp_tq4 = {} if tq4_mode is None else {"tq4_mode": tq4_mode}  # Fork (M72)
         self.mtp_verify_policy = _apply_mtp_verify_from_env(  # Fork (M58)
             model,
             draft_kind=self.draft_kind_override or os.environ.get("MLX_VLM_DRAFT_KIND"),
             kv_bits=self.kv_bits,
             kv_quant_scheme=getattr(self, "kv_quant_scheme", None),
+            **_mtp_tq4,
+        )
+        self.tq4_attention = _apply_tq4_attention_from_env(  # Fork (M72)
+            model, tq4_mode
         )
         _apply_lazy_embeddings_from_env(model)  # Fork (M57)
 

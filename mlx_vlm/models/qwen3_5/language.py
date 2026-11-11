@@ -10,6 +10,8 @@ from ...speculative.cache_state import (
 )
 from ...speculative.mtp_profile import cache_state_arrays  # Fork (M57)
 from ..activations import swiglu
+from ..base import TurboQuantKVCache  # Fork (M72)
+from ..base import tq4_scaled_dot_product_attention  # Fork (M72)
 from ..base import (
     LanguageModelOutput,
     cache_position_offset,
@@ -921,6 +923,7 @@ def _suspend_attention_policy(model):  # Fork (M57)
 
 class Qwen3_5Attention(nn.Module):
     attention_policy = None  # Fork (M57): stamped once at load; None == auto
+    tq4_attention = None  # Fork (M72): stamped once at load; None == off
 
     def __init__(self, args: TextConfig):
         super().__init__()
@@ -995,6 +998,21 @@ class Qwen3_5Attention(nn.Module):
         else:
             output = None
 
+        if output is None and self.tq4_attention is not None:  # Fork (M72)
+            output = tq4_scaled_dot_product_attention(
+                queries,
+                keys,
+                values,
+                cache=cache,
+                scale=self.scale,
+                mask=mask,
+                policy=self.attention_policy,
+                tq4=self.tq4_attention,
+            )
+            if L > 1 and type(cache) is TurboQuantKVCache:
+                # One evaluation per TQ4 layer per prefill chunk: a lazy multi-layer graph keeps
+                # several capacity-sized scratches alive at once.
+                mx.eval(output)
         if output is None:
             output = scaled_dot_product_attention(
                 queries,

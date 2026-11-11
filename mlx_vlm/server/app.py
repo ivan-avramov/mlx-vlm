@@ -1225,19 +1225,24 @@ async def health_check(request: Request):
     Check if the server is healthy and what model is loaded.
     """
     _require_management_api_key(request)
-    runtime = _server_runtime_snapshot()
-    return {
+    snapshot = _server_runtime_snapshot()
+    body = {
         "status": "healthy",
-        "loaded_model": runtime["loaded_model"],
-        "loaded_adapter": runtime["loaded_adapter"],
-        "loaded_models": runtime["loaded_models"],
-        "loaded_context_size": runtime["loaded_context_size"],
-        "configured_context_limit": runtime["configured_context_limit"],
-        "effective_context_limit": runtime["effective_context_limit"],
-        "loaded_tool_parser": runtime["loaded_tool_parser"],
-        "continuous_batching_enabled": runtime["continuous_batching_enabled"],
-        "apc_enabled": runtime["apc"]["enabled"],
+        "loaded_model": snapshot["loaded_model"],
+        "loaded_adapter": snapshot["loaded_adapter"],
+        "loaded_models": snapshot["loaded_models"],
+        "loaded_context_size": snapshot["loaded_context_size"],
+        "configured_context_limit": snapshot["configured_context_limit"],
+        "effective_context_limit": snapshot["effective_context_limit"],
+        "loaded_tool_parser": snapshot["loaded_tool_parser"],
+        "continuous_batching_enabled": snapshot["continuous_batching_enabled"],
+        "apc_enabled": snapshot["apc"]["enabled"],
     }
+    # Fork (M72): the TQ4 mode and its per-process route counters; absent when the mode is off.
+    tq4 = getattr(runtime.response_generator, "tq4_attention", None)
+    if tq4 is not None:
+        body["tq4_attention"] = {"mode": tq4.name, "route_counts": tq4.counters()}
+    return body
 
 
 @app.get("/metrics")
