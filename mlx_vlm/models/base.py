@@ -477,7 +477,7 @@ def scaled_dot_product_attention(
     )
 
 
-def tq4_scaled_dot_product_attention(
+def tq4_scaled_dot_product_attention(  # Fork (M72): the TQ4 mode's entry; the base function is unchanged
     queries,
     keys,
     values,
