@@ -19,18 +19,22 @@ from pathlib import Path
 
 import pytest
 
-TW = Path(__file__).resolve().parents[3]  # <copy root>/mlx-vlm/mlx_vlm/tests/this file
-FORK = TW / "mlx-vlm"
+FORK = (
+    Path(__file__).resolve().parents[2]
+)  # the fork checkout (whatever its directory is named): <fork>/mlx_vlm/tests/this file
 DEV = FORK / "dev"
 sys.path.insert(0, str(DEV))
+SIBLING = (
+    FORK.parent
+)  # where a sibling ``mlx-serve`` copy would sit (absent in a clean clone: the guard skips)
 
 from p369_phase2 import registry_states  # noqa: E402
 
 from mlx_vlm.tests import test_p475a_kv_arm as kv  # noqa: E402
 
-MLX_SERVE_SRC = TW / "mlx-serve" / "src"
+MLX_SERVE_SRC = SIBLING / "mlx-serve" / "src"
 MLX_SERVE_PY = (
-    TW / "mlx-serve" / ".venv" / "bin" / "python"
+    SIBLING / "mlx-serve" / ".venv" / "bin" / "python"
 )  # never resolved: the venv symlink is the interpreter
 
 FIXTURE = kv.FIXTURE
