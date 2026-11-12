@@ -683,13 +683,15 @@ def main():
         help="Gate-1 instrument (requires --mtp-verify-scan joint_v1): compute both "
         "paths per block, serve the joint one, count bitwise mismatches.",
     )
-    parser.add_argument(  # Fork (M72)
+    parser.add_argument(  # Fork (M72, M77)
         "--tq4-attention",
         choices=["off", "m72_v1", "m72_exact"],
         default="off",
         help="TQ4 production attention mode for qwen3_5 TurboQuant 4 caches (requires "
-        "--kv-bits 4 --kv-quant-scheme turboquant --attention-policy fused_v1 "
-        "--mtp-verify-scan joint_v1). off = unchanged. Env: MLX_VLM_TQ4_ATTENTION.",
+        "--kv-bits 4 --kv-quant-scheme turboquant --attention-policy fused_v1; "
+        "with --draft-kind mtp also --mtp-verify-scan joint_v1; with no drafter "
+        "the verify scan must be absent (per_query)). off = unchanged. "
+        "Env: MLX_VLM_TQ4_ATTENTION.",
     )
     parser.add_argument(  # Fork (M57)
         "--lazy-prompt-embeddings",

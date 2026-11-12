@@ -201,8 +201,14 @@ def _apply_attention_policy_from_env(model):
     return policy
 
 
-def _resolve_tq4_mode_from_env(*, kv_bits, kv_quant_scheme):
+_TQ4_DRAFT_UNSET = object()  # Fork (M77): draft_kind omitted => the MTP ON checks
+
+
+def _resolve_tq4_mode_from_env(
+    *, kv_bits, kv_quant_scheme, draft_kind=_TQ4_DRAFT_UNSET
+):
     # Fork (M72): resolved ONCE at load, before the attention policy; never re-read.
+    # Fork (M77): draft_kind = the configured drafter kind (None / "" = MTP OFF).
     if (os.environ.get("MLX_VLM_TQ4_ATTENTION") or "off") == "off":
         return None  # default: nothing from the module is imported or executed
     from .. import tq4_attention as _t4
@@ -213,6 +219,7 @@ def _resolve_tq4_mode_from_env(*, kv_bits, kv_quant_scheme):
         _t4._fail(str(exc))
     if mode is None:
         return None
+    _dk = {} if draft_kind is _TQ4_DRAFT_UNSET else {"draft_kind": draft_kind}
     _t4.require_environment(
         mode,
         kv_bits=kv_bits,
@@ -220,17 +227,22 @@ def _resolve_tq4_mode_from_env(*, kv_bits, kv_quant_scheme):
         attention_policy=os.environ.get("MLX_VLM_ATTENTION_POLICY") or "auto",
         mtp_verify_scan=os.environ.get("MLX_VLM_MTP_VERIFY_SCAN") or "per_query",
         # kv_quant_mode omitted: read from the cache constructor's own resolution
+        **_dk,
     )
     return mode
 
 
-def _apply_tq4_attention_from_env(model, mode):
+def _apply_tq4_attention_from_env(model, mode, *, draft_kind=_TQ4_DRAFT_UNSET):
     # Fork (M72): after the attention policy and the verify scan are stamped.
+    # Fork (M77): draft_kind = the configured drafter kind (None / "" = no verify stamp allowed).
     if mode is None:
         return None
     from .. import tq4_attention as _t4
 
-    _t4.require_policy_stamps(model)
+    if draft_kind is _TQ4_DRAFT_UNSET:
+        _t4.require_policy_stamps(model)
+    else:
+        _t4.require_policy_stamps(model, draft_kind=draft_kind)
     rng = _t4.check_fp16_range(model)
     _t4.apply_to_model(model, mode)
     hook = getattr(model, "tq4_attention", None)
@@ -1565,23 +1577,34 @@ class ResponseGenerator:
         if moe_expand_spec:
             _apply_moe_expand_and_log(model, moe_expand_spec)
 
+        # Fork (M77): the configured drafter kind, before any drafter is loaded ("mtp" = MTP ON).
+        configured_draft_kind = self.draft_kind_override or os.environ.get(
+            "MLX_VLM_DRAFT_KIND"
+        )
         tq4_mode = (
             _resolve_tq4_mode_from_env(  # Fork (M72): resolve + environment first
                 kv_bits=getattr(self, "kv_bits", None),
                 kv_quant_scheme=getattr(self, "kv_quant_scheme", None),
+                draft_kind=configured_draft_kind,  # Fork (M77)
             )
         )
         self.attention_policy = _apply_attention_policy_from_env(model)  # Fork (M57)
         _mtp_tq4 = {} if tq4_mode is None else {"tq4_mode": tq4_mode}  # Fork (M72)
         self.mtp_verify_policy = _apply_mtp_verify_from_env(  # Fork (M58)
             model,
-            draft_kind=self.draft_kind_override or os.environ.get("MLX_VLM_DRAFT_KIND"),
+            draft_kind=configured_draft_kind,
             kv_bits=self.kv_bits,
             kv_quant_scheme=getattr(self, "kv_quant_scheme", None),
             **_mtp_tq4,
         )
+        # Fork (M77): "mtp" keeps the M72 call (the omitted draft_kind means MTP ON).
+        _tq4_dk = (
+            {}
+            if tq4_mode is None or configured_draft_kind == "mtp"
+            else {"draft_kind": configured_draft_kind}
+        )
         self.tq4_attention = _apply_tq4_attention_from_env(  # Fork (M72)
-            model, tq4_mode
+            model, tq4_mode, **_tq4_dk
         )
         _apply_lazy_embeddings_from_env(model)  # Fork (M57)
 
@@ -1676,6 +1699,17 @@ class ResponseGenerator:
 
             _mv.require_loaded_mtp_drafter(
                 self.mtp_verify_policy, draft_model, draft_kind
+            )
+        if (
+            tq4_mode is not None
+            and configured_draft_kind in (None, "")
+            and draft_model is not None
+        ):  # Fork (M77): a mode configured with no drafter must not serve with one loaded
+            from .. import tq4_attention as _t4
+
+            _t4._fail(
+                f"{tq4_mode} was configured with no drafter but a {draft_kind!r} drafter "
+                "was loaded; refusing"
             )
         self.model = model
         self.processor = processor

@@ -46,6 +46,20 @@ def _fail(message: str):
     raise Tq4AttentionError(line)
 
 
+_UNSET = object()  # ``draft_kind`` omitted: the MTP ON requirements (M72)
+
+
+def _mtp_off(draft_kind, what) -> bool:
+    """M77: True for no drafter (None / ``""``), False for omitted / ``"mtp"``; refuses any other drafter kind."""
+    if draft_kind is _UNSET or draft_kind == "mtp":
+        return False
+    if draft_kind in (None, ""):
+        return True
+    _fail(
+        f"{what} supports draft_kind mtp or no drafter (got {draft_kind!r}); refusing"
+    )
+
+
 def resolve_mode(value: str | None) -> str | None:
     """``None`` for absent / empty / ``off`` (today's behaviour); the mode name otherwise."""
     if value in (None, "", "off"):
@@ -63,14 +77,20 @@ def require_environment(
     attention_policy,
     mtp_verify_scan,
     kv_quant_mode=None,
+    draft_kind=_UNSET,
 ) -> None:
     """Refuse unless kv_bits == 4, scheme turboquant, attention_policy fused_v1, mtp_verify_scan joint_v1, the MSE key
     codec and TQ_DECODE_2PASS_LEGACY off (production's parse). ``kv_quant_mode`` None: the value the served cache is
-    built with (``effective_kv_quant_mode``). ``mode`` None is a no-op."""
+    built with (``effective_kv_quant_mode``). ``mode`` None is a no-op.
+
+    ``draft_kind`` (the configured drafter kind, M77): omitted or ``"mtp"`` => the checks above; None / ``""`` (MTP
+    OFF) => the same except ``mtp_verify_scan`` must be ``per_query`` / ``""`` / None; any other kind => refused.
+    """
     if mode is None:
         return
     if mode not in MODES:
         _fail(f"unknown mode {mode!r}; expected one of {MODES}")
+    mtp_off = _mtp_off(draft_kind, mode)
     try:
         bits_ok = kv_bits is not None and float(kv_bits) == 4.0
     except (TypeError, ValueError):
@@ -85,7 +105,15 @@ def require_environment(
         _fail(
             f"{mode} requires attention_policy fused_v1 (got {attention_policy!r}); refusing"
         )
-    if mtp_verify_scan != "joint_v1":
+    if mtp_off:
+        if mtp_verify_scan == "joint_v1":
+            _fail(f"{mode}: mtp_verify_scan joint_v1 requires a drafter; refusing")
+        if mtp_verify_scan not in ("per_query", "", None):
+            _fail(
+                f"{mode} with no drafter requires mtp_verify_scan per_query "
+                f"(got {mtp_verify_scan!r}); refusing"
+            )
+    elif mtp_verify_scan != "joint_v1":
         _fail(
             f"{mode} requires mtp_verify_scan joint_v1 (got {mtp_verify_scan!r}); refusing"
         )
@@ -342,17 +370,26 @@ def apply_to_model(model, mode) -> int:
     return len(modules)
 
 
-def require_policy_stamps(model) -> int:
+def require_policy_stamps(model, *, draft_kind=_UNSET) -> int:
     """The native last layer is served by the shipped native16 paths: every full-attention module must carry the
     ``fused_v1`` attention policy and the ``joint_v1`` verify scan. Refuses otherwise; returns the module count.
+    ``draft_kind`` (M77): omitted or ``"mtp"`` => as above; None / ``""`` (MTP OFF) => ``fused_v1`` and no verify
+    stamp on any module; any other kind => refused.
     """
+    mtp_off = _mtp_off(draft_kind, "tq4_attention")
     _, modules = _attention_modules(model)
     for name, module in modules:
         ap = getattr(module, "attention_policy", None)
         vp = getattr(module, "mtp_verify_policy", None)
         if getattr(ap, "name", None) != "fused_v1":
             _fail(f"module {name!r} is not stamped with attention_policy fused_v1")
-        if getattr(vp, "name", None) != "joint_v1":
+        if mtp_off:
+            if vp is not None:
+                _fail(
+                    f"module {name!r} is stamped with mtp_verify_scan "
+                    f"{getattr(vp, 'name', vp)!r} but no drafter is configured; refusing"
+                )
+        elif getattr(vp, "name", None) != "joint_v1":
             _fail(f"module {name!r} is not stamped with mtp_verify_scan joint_v1")
     return len(modules)
 
