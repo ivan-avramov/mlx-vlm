@@ -274,15 +274,35 @@ KV_ARM_ROWS = {
     "TQ8": (8, "turboquant"),
     "AF4": (4, "uniform"),
     "TQ4": (4, "turboquant"),
+    # M76 B2: the 1.3 TQ4 attention mode (registry key ``tq4_attention``); a third element = the mode the row requires
+    "TQ4X": (4, "turboquant", "m72_exact"),
+    "TQ4V": (4, "turboquant", "m72_v1"),
 }
+# M76 B2: the mode key and the only entry a mode row is accepted for; every other row requires the key absent.
+# ``KV_ARM_KEYS`` keeps its P475a value (pinned by test_p475a_kv_arm); ``KV_ARM_DELTA_KEYS`` is what an arm may change.
+TQ4_MODE_KEY = "tq4_attention"
+KV_ARM_DELTA_KEYS = KV_ARM_KEYS + (TQ4_MODE_KEY,)
+KV_ARM_MODE_ENTRIES = ("Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed",)
 _ABSENT = object()
 
 
-def _kv_arm_row(got, want):
-    """The P475 arm row ``got``'s KV keys form (``want``: the fixture's entry), else None. Integer widths only."""
+def _kv_arm_row(got, want, entry=None):
+    """The arm row ``got``'s KV keys form (``want``: the fixture's entry), else None. Integer widths only; a row without a
+    mode needs ``tq4_attention`` absent, a mode row (TQ4X / TQ4V) needs exactly its mode string and ``entry`` in
+    ``KV_ARM_MODE_ENTRIES``."""
     bits = got.get("kv_bits", _ABSENT)
     scheme = got.get("kv_quant_scheme", _ABSENT)
-    for row, (row_bits, row_scheme) in KV_ARM_ROWS.items():
+    mode = got.get(TQ4_MODE_KEY, _ABSENT)
+    for row, spec in KV_ARM_ROWS.items():
+        row_bits, row_scheme = spec[:2]
+        row_mode = spec[2] if len(spec) > 2 else None
+        if row_mode is None:
+            if mode is not _ABSENT:
+                continue
+        elif not (
+            entry in KV_ARM_MODE_ENTRIES and type(mode) is str and mode == row_mode
+        ):
+            continue
         if type(bits) is not int or bits != row_bits:
             continue
         if row_scheme is None:  # N16: the scheme key exactly as the fixture has it
@@ -299,9 +319,10 @@ def _kv_arm_row(got, want):
 
 def classify_kv_arm(text, fixture, entry):
     """P475a: ``(off, kv_delta)`` when ``text``'s settings equal one of the 16 accepted states (``classify``) except that
-    ``entry`` — one of ``KV_ARM_ENTRIES`` — may also differ in ``KV_ARM_KEYS``, forming a ``KV_ARM_ROWS`` row; ``kv_delta``
-    is ``{key: (fixture value, arm value)}`` for the keys that differ (empty: ``classify``'s result). Anything else — another
-    key, another entry, an unknown entry, malformed structure — is None, never an exception.
+    ``entry`` — one of ``KV_ARM_ENTRIES`` — may also differ in ``KV_ARM_DELTA_KEYS``, forming a ``KV_ARM_ROWS`` row;
+    ``kv_delta`` is ``{key: (fixture value, arm value)}`` for the keys that differ (an absent key is None; empty:
+    ``classify``'s result). Anything else — another key, another entry, an unknown entry, malformed structure — is None,
+    never an exception. M76 B2: ``tq4_attention`` only on a TQ4X / TQ4V row of ``KV_ARM_MODE_ENTRIES``.
     """
     if entry not in KV_ARM_ENTRIES:
         return None
@@ -319,12 +340,12 @@ def classify_kv_arm(text, fixture, entry):
     if len(hits) != 1 or len(wants) != 1:
         return None
     got, want = models[hits[0]], wants[0]
-    if _kv_arm_row(got, want) is None:
+    if _kv_arm_row(got, want, entry) is None:
         return None
-    restored = {k: v for k, v in got.items() if k not in KV_ARM_KEYS}
-    restored.update({k: want[k] for k in KV_ARM_KEYS if k in want})
+    restored = {k: v for k, v in got.items() if k not in KV_ARM_DELTA_KEYS}
+    restored.update({k: want[k] for k in KV_ARM_DELTA_KEYS if k in want})
     delta = {}
-    for key in KV_ARM_KEYS:
+    for key in KV_ARM_DELTA_KEYS:
         theirs, ours = want.get(key, _ABSENT), got.get(key, _ABSENT)
         if theirs is _ABSENT or ours is _ABSENT:
             if theirs is not ours:

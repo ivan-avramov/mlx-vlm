@@ -47,6 +47,8 @@ SERVING = {
     "quantized_kv_start": (0, "--quantized-kv-start", "always"),
     "cache_limit_gb": (0.0, "--cache-limit-gb", "positive"),
     "memory_limit_frac": (0.85, "--memory-limit-frac", "positive"),
+    # M76 B2: the 1.3 mode (mlx-serve passes it only for ``type: vision``; ``command_problems`` qualifies vision only)
+    "tq4_attention": ("", "--tq4-attention", "nonempty"),
 }
 FIXED = {"--host": "127.0.0.1", "--port": None}  # present, value not the registry's
 VALUELESS = ("--lazy-prompt-embeddings",)
@@ -831,6 +833,7 @@ FINGERPRINT = (
     "backend",
     "prompt_identity",
 )
+TQ4_FIELD = "tq4_attention"  # M76 B2: in a fingerprint only when the expected config serves a mode
 
 
 def reference_comparison(ref, peak_gb, fingerprint):
@@ -839,6 +842,11 @@ def reference_comparison(ref, peak_gb, fingerprint):
     differs = [
         f for f in FINGERPRINT if f not in theirs or theirs[f] != fingerprint.get(f)
     ]
+    # M76 B2: the TQ4 mode is a field only where either side has one (absent on both: today's comparison)
+    if (TQ4_FIELD in theirs or TQ4_FIELD in fingerprint) and theirs.get(
+        TQ4_FIELD
+    ) != fingerprint.get(TQ4_FIELD):
+        differs.append(TQ4_FIELD)
     return dict(
         reference_gb=ref["peak_gb"],
         delta_gb=round(peak_gb - ref["peak_gb"], 4),
@@ -1065,11 +1073,22 @@ def kv_arm_reference(comparison, kv_arm):
     return dict(comparison, label=KV_ARM_LABEL, comparable=False)
 
 
-def kv_arm_gate(entries, predictor, registry_text, fork, *, engagement_only=False):
+def kv_arm_gate(
+    entries,
+    predictor,
+    registry_text,
+    fork,
+    *,
+    engagement_only=False,
+    certified_by=None,
+):
     """P475a ``--kv-arm``: exactly one ``--entry``, a P475 pick, ``--predictor off`` (or ``on`` when the registry already
     serves the entry MTP-ON with an EMPTY KV delta: today's ``--predictor on``, no overlay; v4.1), and the registry an accepted state except that entry's KV-arm keys
-    (``registry_states.classify_kv_arm``). Returns ``dict(entry, delta, off)``; any other case refuses (SystemExit).
+    (``registry_states.classify_kv_arm``). Returns ``dict(entry, delta, off)`` (plus ``tq4_attention`` when the entry serves
+    a mode, M76 B2); any other case refuses (SystemExit).
     P658 ``engagement_only``: ``--predictor on`` with ANY accepted delta (the entry still served MTP-ON).
+    M76 B2 ``certified_by``: ``--predictor on`` with a NON-EMPTY delta, bound later to that stage-2 record
+    (``certification_problems``); with an empty delta, predictor off or engagement-only it refuses.
     """
     entries = list(entries or [])
     if len(entries) != 1:
@@ -1091,21 +1110,104 @@ def kv_arm_gate(entries, predictor, registry_text, fork, *, engagement_only=Fals
     if got is None:
         raise SystemExit(
             f"refused: ['--kv-arm: the registry is not an accepted state with only {name}'s KV keys "
-            f"{list(registry_states.KV_ARM_KEYS)} forming a P475 arm row']"
+            f"{list(registry_states.KV_ARM_DELTA_KEYS)} forming a KV arm row']"
         )
     off, delta = got
     if predictor == "on" and name in off:
         raise SystemExit(
             f"refused: ['--kv-arm --predictor on: the registry serves {name} MTP-OFF (no overlay is built)']"
         )
+    certifying = predictor == "on" and delta and not engagement_only
+    if certified_by is not None and not certifying:
+        raise SystemExit(
+            "refused: ['--certified-by binds only a certifying --kv-arm --predictor on run of an MTP-ON KV arm "
+            "(a non-empty KV delta, no --engagement-only)']"
+        )
     if (
-        predictor == "on" and delta and not engagement_only
+        certifying and certified_by is None
     ):  # v4.1: the C199 certified-argv binding is never waived (P658: engagement-only certifies nothing)
         raise SystemExit(
             "refused: ['--kv-arm --predictor on: an MTP-ON KV arm is uncertified; "
             "preflight it with --predictor off']"
         )
-    return dict(entry=name, delta=delta, off=off)
+    out = dict(entry=name, delta=delta, off=off)
+    mode = registry_states.settings(registry_text)[name].get(
+        registry_states.TQ4_MODE_KEY
+    )
+    if mode is not None:  # M76 B2: recorded only when served (absent: today's block)
+        out["tq4_attention"] = mode
+    return out
+
+
+CERTIFIED_BY = "--certified-by"
+
+
+def certification_problems(path, summary, *, name, mode, start):
+    """M76 B2: the stage-2 record ``--certified-by`` names (a P369 phase-2 ``summary.json``, its ``manifest.json``
+    beside it) certifies THIS arm: (a) a campaign-tuple run of ``orchestrate.TUPLES`` for ``name`` with this run's mode,
+    E1c and E2 PASS; the summary's ``binding`` is ``orchestrate.binding`` of that manifest, the summary's ``manifest``
+    block agrees with it, and the record's production is the tuple's ``production``; (b) the same stack root commit (the
+    arm commit) and fork head as this run. (c), its ON argv equal to this run's served argv, is ``argv_binding_problems``
+    on the manifest's ``picks[name].argv_on``. The C199 gate (``entry_problems``: a full-run PASS on this production, the
+    campaign artifact) applies as for ``--p369-summary``.
+    """
+    from p369_phase2 import orchestrate
+
+    where = f"{name}: {CERTIFIED_BY} {path}"
+    summary = summary if isinstance(summary, dict) else {}
+    try:
+        manifest = json.loads((Path(path).parent / "manifest.json").read_text())
+    except (OSError, ValueError):
+        manifest = None
+    manifest = manifest if isinstance(manifest, dict) else {}
+    binding = summary.get("binding") if isinstance(summary.get("binding"), dict) else {}
+    problems = []
+    label = summary.get("tuple")
+    spec = orchestrate.TUPLES.get(label) if isinstance(label, str) else None
+    if spec is None or manifest.get("tuple") != label or binding.get("tuple") != label:
+        problems.append(f"{where}: not a P369 campaign-tuple run ({label!r})")
+    elif spec["pick"] != name or spec["tq4_attention"] != mode:
+        problems.append(
+            f"{where}: tuple {label} certifies {spec['pick']} {spec['tq4_attention']}, not {name} {mode}"
+        )
+    try:  # the summary is bound to THIS manifest (a replaced manifest.json refuses)
+        bound = orchestrate.binding(manifest)
+    except (KeyError, TypeError, AttributeError):
+        bound = None
+    if bound is None or binding != bound:
+        problems.append(
+            f"{where}: its binding is not the binding of the manifest.json beside it"
+        )
+    recorded = (
+        summary.get("manifest") if isinstance(summary.get("manifest"), dict) else {}
+    )
+    differs = [
+        k
+        for k in ("fork_head", "production") + orchestrate.TUPLE_BINDING_KEYS
+        if k not in manifest or recorded.get(k) != manifest.get(k)
+    ]
+    if differs:
+        problems.append(
+            f"{where}: the summary's manifest {differs} differs from the manifest.json beside it"
+        )
+    if spec is not None and manifest.get("production") != spec["production"]:
+        problems.append(
+            f"{where}: production {manifest.get('production')!r} is not tuple {label}'s {spec['production']!r}"
+        )
+    pick = (summary.get("picks") or {}).get(name) or {}
+    if not (
+        isinstance(pick, dict)
+        and (pick.get("outcome") or {}).get("e1c") == "PASS"
+        and (pick.get("e2") or {}).get("verdict") == "PASS"
+    ):
+        problems.append(f"{where}: E1c / E2 not both PASS")
+    for key in ("stack_head", "fork_head"):
+        recorded = {binding.get(key), manifest.get(key)}
+        if recorded != {start.get(key)}:
+            problems.append(
+                f"{where}: {key} {sorted(map(str, recorded))} != this run's {start.get(key)}"
+            )
+    return problems
 
 
 NO_DRAFTER_MANIFEST = "no drafter cache manifest"
@@ -1218,6 +1320,16 @@ def drive(args):
             )
         if getattr(args, "p369_summary", None):
             raise SystemExit("refused: ['--engagement-only takes no --p369-summary']")
+    certified_by = getattr(args, "certified_by", None)
+    if certified_by is not None:  # M76 B2: refused before the lock
+        if not (getattr(args, "kv_arm", False) and predictor == "on") or engagement:
+            raise SystemExit(
+                "refused: ['--certified-by needs --kv-arm --predictor on (no --engagement-only)']"
+            )
+        if getattr(args, "p369_summary", None):
+            raise SystemExit(
+                "refused: ['--certified-by is the P369 record; it takes no --p369-summary']"
+            )
     lock = orchestrate.acquire_lock(orchestrate.lock_path(dict(os.environ)))
     try:  # code round 2 D13: the lock is released whatever the cleanup below does
         # C254 v1.2: the ONE registry snapshot, read right after the lock; the gate, the derived / restored registries,
@@ -1233,6 +1345,7 @@ def drive(args):
                 registry_text,
                 fork,
                 **(dict(engagement_only=True) if engagement else {}),
+                **(dict(certified_by=certified_by) if certified_by is not None else {}),
             )
         try:
             registry_entries = registry_states.settings(registry_text)  # strict
@@ -1240,8 +1353,17 @@ def drive(args):
             raise SystemExit(f"refused: ['the registry does not parse: {exc}']")
         names = list(args.entry or default_entries(list(registry_entries)))
         summaries, problems = summary_arguments(args.p369_summary, names)
+        if (
+            certified_by is not None
+        ):  # M76 B2: the stage-2 record is the entry's P369 summary
+            summaries = {kv_arm["entry"]: certified_by}
         reviewed = _resolve_ref(fork, args.reviewed_head)
-        production = getattr(args, "production_ref", None) or orchestrate.PRODUCTION
+        production = default_production(
+            getattr(args, "production_ref", None),
+            tq4=(kv_arm is not None and "tq4_attention" in kv_arm)
+            or certified_by is not None,
+            orchestrate=orchestrate,
+        )
         try:  # P452 F3 / C254: one resolved FULL sha, diffed by the preflight and recorded in the report
             production = args.production_ref = orchestrate.resolve_production_ref(
                 fork, production, reviewed
@@ -1281,6 +1403,33 @@ def drive(args):
             ),
             **(dict(engagement_only=True) if engagement else {}),
         )
+        certification = None
+        if certified_by is not None:  # M76 B2 (a) / (b); (c) is the argv binding below
+            name = kv_arm["entry"]
+            try:
+                raw = Path(certified_by).read_bytes()
+                record = json.loads(raw)
+            except (OSError, ValueError):
+                raw, record = None, None
+            problems += certification_problems(
+                certified_by,
+                record,
+                name=name,
+                mode=kv_arm.get("tq4_attention"),
+                start=start,
+            )
+            beside = Path(certified_by).parent / "manifest.json"
+            try:
+                manifest_raw = beside.read_bytes()
+            except OSError:
+                manifest_raw = None
+            if raw is not None and manifest_raw is not None:
+                certification = dict(  # both files of the stage-2 record, by sha256
+                    path=str(Path(certified_by).resolve()),
+                    sha256=hashlib.sha256(raw).hexdigest(),
+                    manifest_path=str(beside.resolve()),
+                    manifest_sha256=hashlib.sha256(manifest_raw).hexdigest(),
+                )
         if problems:
             raise SystemExit(f"refused: {problems}")
         arms = {
@@ -1329,6 +1478,10 @@ def drive(args):
         )
         if kv_arm is not None:
             snapshot["kv_arm"] = dict(entry=kv_arm["entry"], delta=kv_arm["delta"])
+            if "tq4_attention" in kv_arm:  # M76 B2: the mode, only when served
+                snapshot["kv_arm"]["tq4_attention"] = kv_arm["tq4_attention"]
+        if certification is not None:
+            snapshot["certified_by"] = certification
         if engagement:
             snapshot["engagement_only"] = True
         return _drive_locked(
@@ -1379,6 +1532,10 @@ def _drive_locked(
     engagement = snapshot.get("engagement_only") is True
     if engagement:  # P658: engagement evidence that certifies nothing
         report.update(engagement_only=True, certifies=False)
+    if (
+        "certified_by" in snapshot
+    ):  # M76 B2: the certifying ON run and its stage-2 record
+        report["certified_by"] = snapshot["certified_by"]
     stop = dict(signal=None)
     monitor = None
     boot = orchestrate.BOOT_TIMEOUT_S
@@ -1670,22 +1827,26 @@ def _job(name, argv, expected, fork, out, orchestrate, kvmanifest):
         revisions["--draft-model"] = orchestrate.weights_record(
             argv[argv.index("--draft-model") + 1]
         )
+    expect = dict(
+        drafter=expected["drafter"],
+        verify_policy=expected["verify_policy"],
+        revisions={
+            k: dict(revision=v["revision"], files=v["files"])
+            for k, v in revisions.items()
+        },
+        kv=kvmanifest.kv_from_argv(argv),
+        drafter_shape=(
+            orchestrate.PICKS[name]["drafter"] if expected["drafter"] else None
+        ),
+    )
+    mode = expected["flags"].get("--tq4-attention")
+    if mode:  # M76 B2: the worker checks the served hook's mode (absent: today's job)
+        expect["tq4_attention"] = mode
     return dict(
         name=f"{name}/qualify",
         mode="qualify",
         argv=argv,
-        expect=dict(
-            drafter=expected["drafter"],
-            verify_policy=expected["verify_policy"],
-            revisions={
-                k: dict(revision=v["revision"], files=v["files"])
-                for k, v in revisions.items()
-            },
-            kv=kvmanifest.kv_from_argv(argv),
-            drafter_shape=(
-                orchestrate.PICKS[name]["drafter"] if expected["drafter"] else None
-            ),
-        ),
+        expect=expect,
         source_root=str(fork),
         dev_dir=str(fork / "dev"),
         out_dir=str(out_path(out, safe_id(name))),
@@ -1706,7 +1867,15 @@ def _job(name, argv, expected, fork, out, orchestrate, kvmanifest):
 
 
 def fingerprint_of(rec, expected):
-    """This run's comparability fingerprint (plan v4 Q7)."""
+    """This run's comparability fingerprint (plan v4 Q7); M76 B2: ``tq4_attention`` only when a mode is served."""
+    mode = expected["flags"].get("--tq4-attention")
+    fingerprint = _fingerprint(rec, expected)
+    if mode:
+        fingerprint[TQ4_FIELD] = mode
+    return fingerprint
+
+
+def _fingerprint(rec, expected):
     return dict(
         prompt_tokens=expected["prompt_tokens"],
         kv_codec=(
@@ -1768,11 +1937,35 @@ def build_parser():
     ap.add_argument(  # P658: --kv-arm --predictor on as committed, engagement evidence only (no C199 summary)
         "--engagement-only", action="store_true"
     )
+    ap.add_argument(  # M76 B2: a certifying --kv-arm --predictor on run, bound to a P369 tuple run's summary.json
+        CERTIFIED_BY,
+        dest="certified_by",
+        help="the summary.json of a P369 phase-2 campaign-tuple full PASS (manifest.json beside it) for this arm commit; "
+        "the production ref defaults to the tuple's",
+    )
     ap.add_argument("--idle-s", type=float, default=IDLE_S)
     ap.add_argument(  # P452: the production tree this run attests (P426: stack S carries B1's log-only counters)
-        "--production-ref", default=orchestrate.PRODUCTION
+        # M76 B2: the default is marked (``DefaultRef``) so a tq4_attention arm can default to M77's production
+        "--production-ref",
+        default=DefaultRef(orchestrate.PRODUCTION),
     )
     return ap
+
+
+class DefaultRef(str):
+    """M76 B2: ``--production-ref``'s parser default (equal to ``orchestrate.PRODUCTION``), told apart from an explicit one."""
+
+
+def default_production(ref, *, tq4, orchestrate):
+    """M76 B2: the production ref a run attests before resolution — an explicit ``--production-ref`` wins; otherwise a
+    ``--kv-arm`` run of a ``tq4_attention`` arm or a ``--certified-by`` run defaults to the tuple's / M77's production
+    (``orchestrate.M77_PRODUCTION``), every other run to ``orchestrate.PRODUCTION`` (unchanged).
+    """
+    if ref is not None and not isinstance(ref, DefaultRef):
+        return ref
+    if tq4:
+        return orchestrate.M77_PRODUCTION
+    return ref or orchestrate.PRODUCTION
 
 
 def main(argv=None):

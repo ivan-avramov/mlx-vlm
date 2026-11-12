@@ -1138,32 +1138,137 @@ def greedy_turn(client, capture, tel, payload, key, timeout):
     )
 
 
-def instance_identity(rg):
-    """The loaded target and its verify-policy object, held by reference (C185 review round 1 E3)."""
-    return rg.model, getattr(rg, "mtp_verify_policy", None)
+def instance_identity(rg, tq4=False):
+    """The loaded target and its verify-policy object, held by reference (C185 review round 1 E3). M76 B2 ``tq4``: also
+    the target's ``tq4_attention`` hook object and its ``name``."""
+    ident = (rg.model, getattr(rg, "mtp_verify_policy", None))
+    if tq4:
+        hook = getattr(rg, "tq4_attention", None)
+        ident += (hook, getattr(hook, "name", None))
+    return ident
 
 
 def same_instance(rg, ident):
-    """Re-reads the LIVE target and verify policy: both are still the very objects of ``ident``."""
-    model, policy = ident
-    return rg.model is model and getattr(rg, "mtp_verify_policy", None) is policy
+    """Re-reads the LIVE target and verify policy: both are still the very objects of ``ident`` (and, for a tq4
+    identity, the very ``tq4_attention`` hook with the same ``name``)."""
+    model, policy = ident[:2]
+    same = rg.model is model and getattr(rg, "mtp_verify_policy", None) is policy
+    if len(ident) == 4:
+        hook, name = ident[2:]
+        live = getattr(rg, "tq4_attention", None)
+        same = same and live is hook and getattr(live, "name", None) == name
+    return same
 
 
-def e2_pair_entry(rg, metrics, client, capture, lm, manifest, spec, timeout):
+def tq4_route_counts():
+    """M76 B2: the per-process TQ4 route counters (``mlx_vlm.tq4_fast.route_counts``)."""
+    from mlx_vlm import tq4_fast
+
+    return tq4_fast.route_counts()
+
+
+def _tq4_limits():
+    from mlx_vlm import tq4_fast
+
+    return tq4_fast.SINGLE_PASS_MAX, tq4_fast.MAX_VERIFY
+
+
+TQ4_ENGAGEMENT_MODES = ("m72_exact",)  # M76 B2: the only mode a campaign tuple serves
+
+
+def tq4_engagement(before, after, *, prompt_tokens, generated, mode="m72_exact"):
+    """M76 B2 (Errata v1.1): an ON trajectory engaged ``m72_exact``'s verify routes, from the deltas of the per-process
+    route counters read before / after it. ``m72_exact`` routes a block whose ``lengths[0]`` exceeds ``SINGLE_PASS_MAX``
+    (2,048) to ``d2_verify`` and a shorter one to ``per_query:short`` (``tq4_attention.verify_lengths``). By the key-length
+    span [prompt, prompt + generated]: entirely above the limit -> ``d2_verify`` moved; entirely at or below ->
+    ``per_query:short`` moved; crossing -> each side's route moved, except that a span edge within ONE draft block of the
+    limit (``limit - block < edge <= limit + block``, block = ``MAX_VERIFY``) does not require its side's route; a crossing
+    with both edges in that band needs either route. Every ``fallback:*`` counter unchanged. Any other mode refuses.
+    """
+    if mode not in TQ4_ENGAGEMENT_MODES:
+        raise ValueError(
+            f"tq4 engagement supports {TQ4_ENGAGEMENT_MODES} only, not {mode!r}"
+        )
+    keys = sorted(set(before) | set(after))
+    delta = {k: after.get(k, 0) - before.get(k, 0) for k in keys}
+    fallbacks = {k: v for k, v in delta.items() if k.startswith("fallback:")}
+    limit, block = _tq4_limits()
+    lo, hi = prompt_tokens, prompt_tokens + generated
+    if lo > limit:
+        want = ["d2_verify"]
+    elif hi <= limit:
+        want = ["per_query:short"]
+    else:  # crossing: an edge outside the one-block band requires its side's route
+        want = [
+            r
+            for r, on in (
+                ("d2_verify", hi > limit + block),
+                ("per_query:short", lo <= limit - block),
+            )
+            if on
+        ]
+    problems = []
+    if not want and delta.get("d2_verify", 0) + delta.get("per_query:short", 0) <= 0:
+        problems.append("neither d2_verify nor per_query:short moved")
+    problems += [f"{r} did not move" for r in want if delta.get(r, 0) <= 0]
+    moved = {k: v for k, v in fallbacks.items() if v != 0}
+    if moved:
+        problems.append(f"fallbacks {moved}")
+    return dict(
+        ok=not problems,
+        problems=problems,
+        expected=want,
+        prompt_tokens=prompt_tokens,
+        generated=generated,
+        d2_verify=delta.get("d2_verify", 0),
+        per_query_short=delta.get("per_query:short", 0),
+        fallbacks=fallbacks,
+        before=dict(before),
+        after=dict(after),
+    )
+
+
+def trajectory_tokens(part):
+    """``dict(prompt_tokens, generated)`` of a posted trajectory (``post``'s record)."""
+    return dict(
+        prompt_tokens=int(part["prompt"]["tokens"]),
+        generated=len(part["final"]["token_ids"]),
+    )
+
+
+def tq4_mode_problems(rg, mode):
+    """M76 B2: the served target carries a ``tq4_attention`` hook of exactly ``mode``."""
+    hook = getattr(rg, "tq4_attention", None)
+    name = getattr(hook, "name", None)
+    return (
+        []
+        if hook is not None and name == mode
+        else [f"tq4_attention={name!r} expected {mode!r}"]
+    )
+
+
+def e2_pair_entry(rg, metrics, client, capture, lm, manifest, spec, timeout, tq4=None):
     """C185 (plan v8 §3 E2): greedy ON, then OFF1 / OFF2 with the drafter detached on the SAME loaded target;
     each trajectory on a fresh chat id, the worker idle and its session released before the next starts
     (Q35 / Q38 pattern); the instance re-checked live (round 1 E3); the triple's cleanliness enforced.
+    M76 B2 ``tq4`` (the served mode): the identity includes the ``tq4_attention`` hook; the ON trajectory's route
+    engagement recorded.
     """
     from p369_phase2 import telemetry
 
-    ident = instance_identity(rg)
+    ident = instance_identity(rg, tq4=True) if tq4 else instance_identity(rg)
     payload = spec["payload"]
     tel = telemetry.KernelTelemetry(lm)
+    before = tq4_route_counts() if tq4 else None
     on = greedy_turn(client, capture, tel, payload, spec["name"], timeout)
     entry = dict(
         turns=[on], telemetry=on["telemetry"], verdict=telemetry.verdict(tel, manifest)
     )
     wait_idle(rg, metrics)
+    if tq4:  # after the ON trajectory is idle, before OFF1 starts
+        entry["tq4_engagement"] = tq4_engagement(
+            before, tq4_route_counts(), mode=tq4, **trajectory_tokens(on)
+        )
     release_session(on["chat_id"])
     offs, guards = [], []
     with drafter_detached(rg):
@@ -1183,7 +1288,9 @@ def e2_pair_entry(rg, metrics, client, capture, lm, manifest, spec, timeout):
             guards.append(list(guard.problems))
             if not same_instance(rg, ident):
                 raise RuntimeError(
-                    "the target / verify policy changed during the E2 triple"
+                    "the target / verify policy"
+                    + (" / tq4_attention hook" if tq4 else "")
+                    + " changed during the E2 triple"
                 )
     entry["off"] = offs
     problems = e2_detached_problems(on, offs, guards)
@@ -1625,6 +1732,12 @@ def run_job(job, out_dir, result):
 
         rg = server.runtime.response_generator
         lm = rg.model.language_model
+        tq4 = job["expect"].get("tq4_attention")  # M76 B2: tuple jobs only
+        if tq4 is not None:
+            problems = tq4_mode_problems(rg, tq4)
+            if problems:
+                raise RuntimeError("served state mismatch: " + "; ".join(problems))
+            result["tq4_attention"] = tq4
         shape = job["expect"].get("drafter_shape")
         if shape:  # P369 v13 V11: the LOADED drafter, not its config file
             ident, problems = check_loaded_drafter(
@@ -1715,6 +1828,7 @@ def run_job(job, out_dir, result):
                 wait_idle(rg, server.runtime.metrics)
                 release_trajectory(rec, part["chat_id"])
             elif job["mode"] == "e1c_pair":
+                routes = tq4_route_counts() if tq4 is not None else None
                 part, on = e1c_request(
                     client,
                     capture,
@@ -1739,7 +1853,11 @@ def run_job(job, out_dir, result):
                     on, tokens, finish_reason=part["final"]["finish_reason"]
                 )
                 entry["forced_positions"] = forced
-                ident = instance_identity(rg)  # P397: held by reference, re-read live
+                ident = (  # P397: held by reference, re-read live (M76 B2: + the tq4 hook)
+                    instance_identity(rg, tq4=True)
+                    if tq4 is not None
+                    else instance_identity(rg)
+                )
                 from mlx_vlm.speculative.cache_state import iter_leaf_caches
 
                 # smoke 4: the leaf classes the state hash and the smoke positives saw
@@ -1761,6 +1879,12 @@ def run_job(job, out_dir, result):
                 metrics = server.runtime.metrics
                 replays = []
                 wait_idle(rg, metrics)
+                if (
+                    routes is not None
+                ):  # M76 B2: the ON trajectory only, before any replay
+                    entry["tq4_engagement"] = tq4_engagement(
+                        routes, tq4_route_counts(), mode=tq4, **trajectory_tokens(part)
+                    )
                 release_trajectory(
                     on, part["chat_id"]
                 )  # Q35: before the next trajectory
@@ -1799,7 +1923,9 @@ def run_job(job, out_dir, result):
                         replays.append((off_part, off))
                 if not same_instance(rg, ident):
                     raise RuntimeError(
-                        "the target / verify policy changed during the pair"
+                        "the target / verify policy"
+                        + (" / tq4_attention hook" if tq4 is not None else "")
+                        + " changed during the pair"
                     )
                 (off1_part, off1), (off2_part, off2) = replays
                 save_rows(out_dir / f"rows-off-{index}.npz", off1.rows)
@@ -1873,6 +1999,7 @@ def run_job(job, out_dir, result):
                         manifest,
                         spec,
                         timeout,
+                        **(dict(tq4=tq4) if tq4 is not None else {}),
                     )
                 )
             elif job["mode"] in ("e2", "e7a", "e7b"):

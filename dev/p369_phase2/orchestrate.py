@@ -68,6 +68,30 @@ PICKS = {  # P369 v13 §3.1: every MTP-certified registry entry; one entry per c
 }
 THRESHOLDS = (1024, 8192, 32768, 65536)
 SMOKE_THRESHOLDS = (1024, 65536)  # the positive block rides the last (code round 2 C2)
+# M76 B2: a campaign TUPLE (``--tuple``) beside the model-keyed PICKS. Its pick keeps its PICKS row (verify policy,
+# drafter, C84 items); ON and OFF are two committed arm worktrees (no overlay), validated by ``classify_kv_arm``.
+M77_PRODUCTION = "f9bf743f"  # M77 (M76 B0): the fork whose production serves tq4_attention with MTP OFF
+TUPLES = {
+    "m76-x": dict(
+        pick="Qwen3.8-27B-Fable-Distill-OptiQ-4.5bpw-mixed",
+        kv="tq4",
+        verify_policy="joint_v1",
+        tq4_attention="m72_exact",
+        drafter=_DENSE,
+        items_from_kv="native16",
+        production=M77_PRODUCTION,
+    )
+}
+TUPLE_KV_BITS = {"tq4": 4}
+# tq4_fast: verify lengths[0] crosses SINGLE_PASS_MAX (2,048); the D2 block-count tier changes above 65,536
+TQ4_THRESHOLDS = (2048, 65536)
+SCALE_CELLS = (
+    131072,
+    260096,
+)  # M76 §7 stage 2: scale cells, sized to exactly this many prompt tokens
+TUPLE_MTP_FLAGS = ("--mtp-verify-scan", "--draft-kind", "--draft-model")
+TUPLE_BINDING_KEYS = ("tuple", "stack_head", "off_stack_head")
+TUPLE_BINDING_PICK_KEYS = ("registry_on_sha256", "registry_off_sha256")
 C84_AXES = ("math500", "humanevalplus", "mbppplus", "cjudge")
 # Code round 1 H3: the worker env is an ALLOWLIST (process / locale / Hugging Face cache plumbing); every
 # generation knob (MLX_*, KV_*, TQ_*, APC_*, MIN_OUTPUT_TOKENS, future ones) is dropped, then exactly
@@ -375,13 +399,20 @@ def binding(manifest):
     production pin, the fork head and harness tree, the reviewed head, the dependency versions, the worker
     env digest, the stack bench tree + C84 bundle shas, and per pick the overlay / argv / params / weights.
     """
-    return dict(
+    tuple_run = (
+        "tuple" in manifest
+    )  # M76 B2: a tuple run also binds its arm commits and registries
+    pick_keys = BINDING_PICK_KEYS + (TUPLE_BINDING_PICK_KEYS if tuple_run else ())
+    out = dict(
         {key: manifest[key] for key in BINDING_KEYS},
         picks={
-            pick: {k: entry[k] for k in BINDING_PICK_KEYS}
+            pick: {k: entry[k] for k in pick_keys}
             for pick, entry in sorted(manifest["picks"].items())
         },
     )
+    if tuple_run:
+        out.update({key: manifest[key] for key in TUPLE_BINDING_KEYS})
+    return out
 
 
 def binding_problems(smoke_summary, manifest):
@@ -407,6 +438,16 @@ def binding_problems(smoke_summary, manifest):
         for key in BINDING_PICK_KEYS:
             if want.get("picks", {}).get(pick, {}).get(key) != entry[key]:
                 problems.append(f"{pick} {key} differs from the smoke")
+    if "tuple" in have or "tuple" in want:  # M76 B2
+        problems += [
+            f"{key}: smoke {want.get(key)!r} != now {have.get(key)!r}"
+            for key in TUPLE_BINDING_KEYS
+            if want.get(key) != have.get(key)
+        ]
+        for pick, entry in have["picks"].items():
+            for key in TUPLE_BINDING_PICK_KEYS:
+                if want.get("picks", {}).get(pick, {}).get(key) != entry.get(key):
+                    problems.append(f"{pick} {key} differs from the smoke")
     return problems
 
 
@@ -603,6 +644,198 @@ def registry_off_problems(picks, off):
     ]
 
 
+# ------------------------------------------------------------------ M76 B2: campaign tuples (pure)
+def tuple_selection_problems(tuple_name, picks, off_stack_root):
+    """``--tuple`` replaces ``--pick`` (never both) and needs ``--off-stack-root``; ``--off-stack-root`` needs a tuple."""
+    if tuple_name is None:
+        return ["--off-stack-root needs --tuple"] if off_stack_root is not None else []
+    problems = []
+    if tuple_name not in TUPLES:
+        problems.append(f"unknown tuple {tuple_name!r}: one of {sorted(TUPLES)}")
+    if picks:
+        problems.append("--tuple and --pick are mutually exclusive")
+    if off_stack_root is None:
+        problems.append("--tuple needs --off-stack-root (the MTP-OFF arm worktree)")
+    if not problems:
+        spec, pick = TUPLES[tuple_name], TUPLES[tuple_name]["pick"]
+        row = PICKS.get(pick) or {}
+        # the campaign reads the pick's PICKS row (jobs, verdicts, items): the tuple must agree with it
+        if (
+            row.get("verify_policy") != spec["verify_policy"]
+            or row.get("drafter") != spec["drafter"]
+            or items_source(pick) != (pick, spec["items_from_kv"])
+        ):
+            problems.append(f"tuple {tuple_name}: disagrees with PICKS[{pick!r}]")
+    return problems
+
+
+def tuple_thresholds(tuple_name):
+    """The tuple's E1c straddle thresholds: the native layer's MLX thresholds and, under TurboQuant 4, the TQ4 ones."""
+    spec = TUPLES[tuple_name]
+    extra = TQ4_THRESHOLDS if spec["kv"] == "tq4" and spec["tq4_attention"] else ()
+    return tuple(sorted(set(THRESHOLDS) | set(extra)))
+
+
+def tuple_delta(tuple_name):
+    """The ``classify_kv_arm`` delta keys and arm values the tuple's ON and OFF registries must carry."""
+    spec = TUPLES[tuple_name]
+    return {
+        "kv_bits": TUPLE_KV_BITS[spec["kv"]],
+        registry_states.TQ4_MODE_KEY: spec["tq4_attention"],
+    }
+
+
+def tuple_registry_problems(tuple_name, on_text, off_text, fixture):
+    """``(problems, (off of ON, off of OFF))``: the ``--stack-root`` registry is the tuple's ON arm (``classify_kv_arm``
+    with exactly the tuple's delta, the pick MTP-ON), the ``--off-stack-root`` one its OFF arm (the same delta, the pick
+    MTP-OFF), and the two differ in nothing else (the OFF set of OFF = that of ON plus the pick).
+    """
+    pick, want = TUPLES[tuple_name]["pick"], tuple_delta(tuple_name)
+    problems, offs = [], []
+    for label, text, mtp_on in (
+        ("--stack-root", on_text, True),
+        ("--off-stack-root", off_text, False),
+    ):
+        got = registry_states.classify_kv_arm(text, fixture, pick)
+        if got is None:
+            problems.append(
+                f"{label}: the registry is not an accepted state with only {pick}'s KV keys changed"
+            )
+            offs.append(None)
+            continue
+        off, delta = got
+        offs.append(off)
+        arm = {k: v[1] for k, v in delta.items()}
+        if arm != want:
+            problems.append(
+                f"{label}: {pick} KV delta {delta} is not the {tuple_name} arm {want}"
+            )
+        if (pick not in off) != mtp_on:
+            state = "MTP-ON" if mtp_on else "MTP-OFF"
+            problems.append(f"{label}: the registry does not serve {pick} {state}")
+    if not problems and offs[1] != offs[0] | {pick}:
+        problems.append(
+            f"the OFF arm differs from the ON arm beyond {pick}'s MTP keys: "
+            f"OFF entries {sorted(offs[0])} vs {sorted(offs[1])}"
+        )
+    return problems, tuple(offs)
+
+
+def _flag_values(argv):
+    return {a: b for a, b in zip(argv, argv[1:]) if a.startswith("--")}
+
+
+def strip_mtp_flags(argv):
+    """``argv`` without the MTP flags and their values (``TUPLE_MTP_FLAGS``)."""
+    out, i = [], 0
+    while i < len(argv):
+        if argv[i] in TUPLE_MTP_FLAGS:
+            i += 2
+            continue
+        out.append(argv[i])
+        i += 1
+    return out
+
+
+def tuple_argv_problems(tuple_name, on, off):
+    """The ON argv carries the tuple's verify scan, mode and the MTP drafter; the OFF argv is exactly the ON argv without
+    the MTP flags (the arm XO: the mode kept, no scan, no drafter)."""
+    spec = TUPLES[tuple_name]
+    pick, mode = spec["pick"], spec["tq4_attention"]
+    a, b = _flag_values(on), _flag_values(off)
+    problems = []
+    if a.get("--mtp-verify-scan") != spec["verify_policy"]:
+        problems.append(
+            f"{pick}: ON argv verify scan {a.get('--mtp-verify-scan')!r}, expected {spec['verify_policy']!r}"
+        )
+    if a.get("--draft-kind") != "mtp" or "--draft-model" not in a:
+        problems.append(f"{pick}: ON argv serves no MTP drafter")
+    for label, flags in (("ON", a), ("OFF", b)):
+        if flags.get("--tq4-attention") != mode:
+            problems.append(
+                f"{pick}: {label} argv --tq4-attention {flags.get('--tq4-attention')!r}, expected {mode!r}"
+            )
+    present = [f for f in TUPLE_MTP_FLAGS if f in off]
+    if present:
+        problems.append(f"{pick}: OFF argv carries {present}")
+    elif not problems and off != strip_mtp_flags(on):
+        problems.append(f"{pick}: OFF argv is not the ON argv without its MTP flags")
+    return problems
+
+
+def cell_name(key):
+    """An E1c cell's name: ``T<threshold>`` (straddle), ``S<tokens>`` (scale, already a name) or ``short``."""
+    if key is None:
+        return "short"
+    return key if isinstance(key, str) else f"T{key}"
+
+
+def cell_tokens(key):
+    """The token count that sizes a cell's timeouts (a straddle's threshold, a scale cell's prompt), None for short."""
+    if isinstance(key, str):
+        return int(key[1:])
+    return key
+
+
+def tuple_cells(tuple_name, *, smoke):
+    """The tuple's E1c cell list: straddles below each threshold (route ``mlx`` = the native layer's thresholds, ``tq4`` =
+    the TQ4-only ones), then (full) the scale cells and the short cell."""
+    thresholds = SMOKE_THRESHOLDS if smoke else tuple_thresholds(tuple_name)
+    cells = [
+        dict(
+            name=cell_name(t),
+            threshold=t,
+            prompt_tokens=straddle_target(t),
+            route="mlx" if t in THRESHOLDS else "tq4",
+        )
+        for t in thresholds
+    ]
+    if not smoke:
+        cells += [
+            dict(name=f"S{n}", threshold=None, prompt_tokens=n, route="scale")
+            for n in SCALE_CELLS
+        ]
+        cells.append(
+            dict(name="short", threshold=None, prompt_tokens=None, route="short")
+        )
+    return cells
+
+
+def bundle_items(stack_root, source, kv):
+    """The C84 items as their bundles store them (name, sampler seed, prompt tokens), without the stack bench; 20 or
+    refused."""
+    items = []
+    for axis in C84_AXES:
+        path = (
+            Path(stack_root)
+            / "benchmark"
+            / "results"
+            / source
+            / f"{axis}.c84bundle-after-{kv}-20260914.jsonl"
+        )
+        try:
+            rows = [
+                json.loads(line)
+                for line in path.read_text().splitlines()
+                if line.strip()
+            ]
+        except (OSError, ValueError) as exc:
+            raise Refused(f"refused: C84 bundle {path}: {exc}") from None
+        items += [
+            dict(
+                name=f"{axis}/{row['id']}",
+                seed=row.get("sampler_seed"),
+                prompt_tokens=row.get("prompt_tokens"),
+            )
+            for row in rows
+        ]
+    if len(items) != 5 * len(C84_AXES):
+        raise Refused(
+            f"refused: {len(items)} C84 items in the {kv} bundles of {source}, expected 20"
+        )
+    return items
+
+
 class MalformedEvidence(RuntimeError):
     """Code round 6 H34 (C186): evidence not of its exact type — a harness defect, never an MTP outcome."""
 
@@ -619,7 +852,8 @@ def pick_outcome(verdicts):
     no bound); else an ESTABLISHED same-instance row / state difference FAILs (that pick's E1c finished for
     the bound, E2 / E7 skipped); else invalid evidence (kernels, engagement, prompt_end, straddle) is
     INCOMPLETE — never reported as non-neutrality; else PASS. The cross-load / configuration comparison (C2)
-    never decides E1c: ``identical`` or ``unestablished``.
+    never decides E1c: ``identical`` or ``unestablished``. M76 B2: a rejected attempt carrying ``tq4_engaged`` False
+    (a tuple run's TQ4 engagement failure on any attempt) is INCOMPLETE, after the C1 / neutrality precedence.
     """
 
     def flag(name, v, path):
@@ -641,6 +875,11 @@ def pick_outcome(verdicts):
                     f"{name}.rejected[{k}].{key}",
                 )
                 for key in ("neutral", "c1")
+                + (
+                    ("tq4_engaged",)
+                    if isinstance(a, dict) and "tq4_engaged" in a
+                    else ()
+                )
             }
             for k, a in enumerate(attempts)
         ]
@@ -658,7 +897,12 @@ def pick_outcome(verdicts):
         not v["neutral"] or any(not a["neutral"] for a in v["rejected"]) for v in values
     ):
         e1c = "FAIL"
-    elif any(not v["evidence_ok"] or not v["pass_"] for v in values):
+    elif any(
+        not v["evidence_ok"] or not v["pass_"]
+        # M76 B2: a rejected attempt's TQ4 engagement failure (tuple runs record ``tq4_engaged``)
+        or any(a.get("tq4_engaged") is False for a in v["rejected"])
+        for v in values
+    ):
         e1c = "INCOMPLETE"
     else:
         e1c = "PASS"
@@ -716,11 +960,12 @@ def e2_turn_checked(where, turn, *, readout=False):
     return turn
 
 
-def e2_summary(pair, cross, *, digests):
+def e2_summary(pair, cross, *, digests, tq4=False):
     """C185: E2 from the same-instance triples (``pair``: name -> the ``e2_pair`` entry, ``turns[0]`` = ON,
     ``off`` = [OFF1, OFF2]) and the cross-load OFF arm (``cross``: name -> the ``e2`` entry). The verdict is
     ON vs OFF1 under the C1-E2 control; ``cross_load`` (OFF arm vs OFF1) is reported and never decides. The
     four trajectories of a request share one templated prompt; C84 items are bound to the reconstruction.
+    M76 B2 ``tq4`` (tuple runs): an ON trajectory is engaged only with its TQ4 route engagement too.
     """
 
     def bad(what, value):
@@ -769,6 +1014,8 @@ def e2_summary(pair, cross, *, digests):
             and kernel
             and on["mtp_rounds"] > 0
         )
+        if tq4 and tq4_engagement_problems(entry, f"E2 {n}"):
+            engaged[n] = False
         shas = [(t.get("prompt") or {}).get("sha256") for t in (on, off1, off2, far)]
         if not all(
             is_sha256(x) for x in shas
@@ -993,11 +1240,13 @@ def leaf_manifest_problems(pick, name, cell, kv):
     return [f"{where}: leaf manifest {p}" for p in found]
 
 
-def smoke_gate(picks):
+def smoke_gate(picks, tuple_name=None):
     """Every live positive fired (TurboQuant's required where TurboQuant KV is served), every E1c cell
     passed, E2 passed, exactly the first reconstructed C84 item's E7b session ran and reported (its
     continuity is descriptive; code round 6 H38), and the projected full run fits ESTIMATE_LIMIT_S. Pure
     (code round 6 H36): ``main`` recomputes it from a loaded smoke summary; malformed evidence RAISES.
+    M76 B2 ``tuple_name``: the full run is projected from the tuple's full cells (``tuple_phase_projection``) and fits
+    ``TUPLE_APPROVAL_LIMIT_S``; the gate also records ``tuple`` and ``limit_s``.
     """
     problems, e7b_status_of = [], {}
     projected = 0
@@ -1066,23 +1315,35 @@ def smoke_gate(picks):
             )
         ):
             raise MalformedEvidence(f"malformed evidence: {pick}.step_s = {steps!r}")
-        projected += phase_projection(steps)["nominal_s"]  # v13 V13 (was wall × 6)
-    return dict(
+        if tuple_name is None:
+            projected += phase_projection(steps)["nominal_s"]  # v13 V13 (was wall × 6)
+        else:  # M76 B2: the tuple's full cell list (T2048, the scale cells and their E2 repetitions)
+            projected += tuple_phase_projection(steps, tuple_name)["nominal_s"]
+    limit = ESTIMATE_LIMIT_S if tuple_name is None else TUPLE_APPROVAL_LIMIT_S
+    gate = dict(
         problems=problems,
         projected_full_s=projected,
         projected_with_tail_s=projected + TAIL_RESERVE_S * len(picks),
-        fits=projected <= ESTIMATE_LIMIT_S,
+        fits=projected <= limit,
         pass_=not problems,
         e7b=e7b_status_of,
     )
+    if tuple_name is not None:
+        gate.update(tuple=tuple_name, limit_s=limit)
+    return gate
 
 
-def smoke_authorization_problems(summary, projection_ruling=None):
+def smoke_authorization_problems(
+    summary, projection_ruling=None, operator_approved_hours=None
+):
     """Code round 6 H36: a full run is authorized only by a smoke summary (as loaded from its JSON) whose
     phase is smoke, status ``SMOKE_PASS`` with exit code 0, whose stored gate holds exact ``True`` for
     ``pass_`` and ``fits``, and which equals the gate recomputed from the summary's own evidence.
     C193: with a ``projection_ruling`` from ``PROJECTION_RULINGS`` whose pick is the summary's only pick, a
     ``SMOKE_NOT_PASS`` / exit 2 smoke whose gate PASSED but does not fit authorizes too — nothing else is lifted.
+    M76 B2: a campaign-tuple smoke (``tuple`` in the summary) is recomputed with its tuple; one that does not fit
+    (projected > ``TUPLE_APPROVAL_LIMIT_S``, stage 2's operator cell) authorizes only with ``operator_approved_hours``
+    covering the recomputed projection — again nothing else is lifted.
     """
     if not isinstance(summary, dict):
         return ["the smoke summary is not an object"]
@@ -1090,6 +1351,19 @@ def smoke_authorization_problems(summary, projection_ruling=None):
     if summary.get("phase") != "smoke":
         problems.append(f"phase {summary.get('phase')!r} is not smoke")
     code = summary.get("exit_code")
+    tuple_name = summary.get("tuple")
+    if tuple_name is not None and tuple_name not in TUPLES:
+        return problems + [f"unknown tuple {tuple_name!r}"]
+    if operator_approved_hours is not None and tuple_name is None:
+        return problems + [
+            "--operator-approved-hours approves a campaign-tuple run only"
+        ]
+    stored = summary.get("smoke_gate")
+    approving = (
+        operator_approved_hours is not None
+        and isinstance(stored, dict)
+        and stored.get("fits") is False
+    )
     ruled = None
     if projection_ruling is not None:
         ruled = (PROJECTION_RULINGS.get(projection_ruling) or {}).get("pick")
@@ -1099,7 +1373,7 @@ def smoke_authorization_problems(summary, projection_ruling=None):
             return problems + [
                 f"ruling {projection_ruling} covers {ruled} only, not {list(summary.get('picks') or {})}"
             ]
-    want = ("SMOKE_NOT_PASS", 2) if ruled else ("SMOKE_PASS", 0)
+    want = ("SMOKE_NOT_PASS", 2) if ruled or approving else ("SMOKE_PASS", 0)
     if (summary.get("status"), code) != want or type(code) is not int:
         problems.append(f"status {summary.get('status')!r} / exit code {code!r}")
     gate = summary.get("smoke_gate")
@@ -1108,7 +1382,7 @@ def smoke_authorization_problems(summary, projection_ruling=None):
     try:
         passed = exact_bool(gate.get("pass_"), "smoke_gate.pass_")
         fits = exact_bool(gate.get("fits"), "smoke_gate.fits")
-        if not (passed and (fits or ruled)):
+        if not (passed and (fits or ruled or approving)):
             problems.append(f"the smoke gate did not pass / fit: {gate}")
         if (
             ruled and fits
@@ -1116,10 +1390,18 @@ def smoke_authorization_problems(summary, projection_ruling=None):
             problems.append(
                 f"ruling {projection_ruling} covers a smoke that does not fit; this one fits"
             )
-        again = smoke_gate(summary.get("picks") or {})
+        if tuple_name is None:
+            again = smoke_gate(summary.get("picks") or {})
+        else:
+            again = smoke_gate(summary.get("picks") or {}, tuple_name=tuple_name)
         if again != gate:
             problems.append(
                 f"the stored smoke gate {gate} != its recomputation {again}"
+            )
+        elif approving and operator_approved_hours * 3600 < again["projected_full_s"]:
+            problems.append(
+                f"--operator-approved-hours {operator_approved_hours} < the projected full run "
+                f"{again['projected_full_s'] / 3600:.2f} h"
             )
     except MalformedEvidence as exc:
         problems.append(str(exc))
@@ -1165,14 +1447,54 @@ def overall_status(summary):
     return ("PASS", 0) if ok else ("NOT_PASS", 2)
 
 
+def tq4_engagement_problems(entry, where):
+    """M76 B2: the ON trajectory's TQ4 route engagement (the worker's ``tq4_engagement``): the verify routes its key-length
+    span requires moved and every ``fallback:*`` counter stayed (delta 0). Malformed evidence RAISES.
+    """
+    got = entry.get("tq4_engagement") if isinstance(entry, dict) else None
+    if not isinstance(got, dict):
+        raise MalformedEvidence(f"malformed evidence: {where}.tq4_engagement = {got!r}")
+    ok = exact_bool(got.get("ok"), f"{where}.tq4_engagement.ok")
+    return [] if ok else [f"tq4 engagement {got.get('problems')}"]
+
+
+TQ4_SHORT_REASON = "cache"  # joint_v1's reason for a TurboQuant-cache block (mtp_verify_scan.JointV1Policy.classify)
+
+
+def tq4_fallback_reason_problems(reasons, entry, where):
+    """M76 B2 (tuple runs): ``m72_exact`` sends a verify block with ``lengths[0] <= 2,048`` to the per-query loop
+    (``per_query:short``), where joint_v1 then records reason ``cache`` for that TQ4 layer. Reason ``cache`` is accepted
+    only when its count equals the trajectory's ``per_query:short`` route-counter delta; any other reason, or an unequal
+    ``cache`` count, is a problem. Malformed evidence RAISES."""
+    got = entry.get("tq4_engagement") if isinstance(entry, dict) else None
+    short = got.get("per_query_short") if isinstance(got, dict) else None
+    if type(short) is not int or not isinstance(reasons, dict):
+        raise MalformedEvidence(
+            f"malformed evidence: {where} per_query:short {short!r} / reasons {reasons!r}"
+        )
+    if set(reasons) == {TQ4_SHORT_REASON} and reasons[TQ4_SHORT_REASON] == short:
+        return []
+    return [f"fallback reasons {reasons} (per_query:short delta {short})"]
+
+
 def e1c_verdict(
-    on_entry, off_entry, *, threshold, verify_policy, offset=STRADDLE_OFFSETS[0]
+    on_entry,
+    off_entry,
+    *,
+    threshold,
+    verify_policy,
+    offset=STRADDLE_OFFSETS[0],
+    tq4=False,
+    prompt_end=None,
 ):
     """Per-request E1c rule (plan §2.2; code round 2 H15): NEUTRALITY = rows and states equal; EVIDENCE =
     kernels, engagement, the exact prompt and the straddle. ``pass_`` needs both; ``pick_outcome`` reports
     a neutrality failure as FAIL and an evidence-only failure as INCOMPLETE. Malformed comparator / kernel
     evidence (a missing or non-boolean ``pass``) RAISES — a harness defect, never an MTP finding (code round
-    5 H34)."""
+    5 H34). M76 B2 (tuple runs only): ``tq4`` adds the TQ4 route engagement; a joint_v1 straddle at a TQ4-only
+    threshold (not one of ``THRESHOLDS``, where the scan counts straddles) is the observed key-length straddle; joint_v1's
+    ``cache`` reasons are accepted only as ``per_query:short``'s (``tq4_fallback_reason_problems``); ``prompt_end`` pins a
+    scale cell's exact prompt."""
 
     def verdict_of(entry, key):
         value = (entry.get(key) or {}).get("pass") if isinstance(entry, dict) else None
@@ -1199,14 +1521,24 @@ def e1c_verdict(
             )
         if verify_policy == "joint_v1":
             timings = (on_entry.get("response") or {}).get("timings") or {}
-            if not timings.get("verify_blocks_straddle"):
+            if tq4 and threshold not in THRESHOLDS:
+                if not exact_bool(on_entry.get("straddle"), "straddle"):
+                    evidence.append("no observed straddle at the TQ4 threshold")
+            elif not timings.get("verify_blocks_straddle"):
                 evidence.append("no straddle counter")
-            if timings.get("verify_fallback_reasons"):
+            reasons = timings.get("verify_fallback_reasons")
+            if reasons and tq4:  # M76 B2: per_query:short's ``cache`` reasons only
+                evidence += tq4_fallback_reason_problems(reasons, on_entry, "E1c ON")
+            elif reasons:
                 evidence.append(
                     f"fallback reasons {timings['verify_fallback_reasons']}"
                 )
         elif not exact_bool(on_entry.get("straddle"), "straddle"):  # code round 6 H34
             evidence.append("no observed per-query straddle")
+    if prompt_end is not None and on_entry.get("prompt_end") != prompt_end:
+        evidence.append(f"prompt_end {on_entry.get('prompt_end')} != {prompt_end}")
+    if tq4:
+        evidence += tq4_engagement_problems(on_entry, "E1c ON")
     return dict(
         pass_=not (neutrality or evidence),
         neutral=not neutrality,
@@ -1378,6 +1710,87 @@ def worker_argv(stack_root, overlay, pick):
         cwd=stack_root,
     )
     return json.loads(out.stdout.strip().splitlines()[-1])
+
+
+def arm_commit(root):
+    """M76 B2: ``(HEAD sha, problems)`` of an arm worktree — a git commit whose ``main_models.yaml`` is committed as is."""
+
+    def git(*a):
+        return subprocess.run(
+            ["git", "-C", str(root), *a], capture_output=True, text=True
+        )
+
+    head = git("rev-parse", "--verify", "HEAD^{commit}")
+    if head.returncode != 0 or not head.stdout.strip():
+        return None, [f"{root} is not a git commit"]
+    status = git("status", "--porcelain", "--", "main_models.yaml")
+    tracked = git("ls-files", "--error-unmatch", "main_models.yaml")
+    problems = []
+    if status.returncode != 0 or status.stdout.strip() or tracked.returncode != 0:
+        problems.append(f"{root}: main_models.yaml is not committed as is")
+    return head.stdout.strip(), problems
+
+
+def tuple_arms(tuple_name, stack_root, off_stack_root, fork_root):
+    """M76 B2: the tuple's two arm commits validated (``classify_kv_arm`` against the pinned fixture; never ``classify``,
+    the all-OFF-root rule or an overlay) and their worker argvs through mlx-serve's ``_build_command``. Refuses.
+    """
+    pick = TUPLES[tuple_name]["pick"]
+    stack, off_stack = Path(stack_root).resolve(), Path(off_stack_root).resolve()
+    fixture = registry_states.fixture_text(
+        Path(fork_root) / "mlx_vlm" / "tests" / "fixtures"
+    )
+    on_text = read_registry(stack / "main_models.yaml")
+    off_text = read_registry(off_stack / "main_models.yaml")
+    problems, (on_off, off_off) = tuple_registry_problems(
+        tuple_name, on_text, off_text, fixture
+    )
+    heads = {}
+    for label, root in (("stack_head", stack), ("off_stack_head", off_stack)):
+        heads[label], found = arm_commit(root)
+        problems += found
+    if problems:
+        raise Refused(f"refused: {problems}")
+    on = worker_argv(stack, stack / "main_models.yaml", pick)
+    off = worker_argv(off_stack, off_stack / "main_models.yaml", pick)
+    problems = tuple_argv_problems(tuple_name, on, off)
+    if problems:
+        raise Refused(f"refused: {problems}")
+    return dict(
+        on=on,
+        off=off,
+        registry_off=sorted(on_off),
+        off_registry_off=sorted(off_off),
+        registry_on_sha256=sha256_file(stack / "main_models.yaml"),
+        registry_off_sha256=sha256_file(off_stack / "main_models.yaml"),
+        **heads,
+    )
+
+
+def tuple_plan(args):
+    """``--plan-only --tuple``: the validated ON / OFF argv pair, the E1c cell list and the C84 item list (from the
+    bundles; no worker, no bench venv)."""
+    name = args.tuple
+    spec = TUPLES[name]
+    pick = spec["pick"]
+    arms = tuple_arms(name, args.stack_root, args.off_stack_root, args.fork_root)
+    smoke = args.phase == "smoke"
+    items = bundle_items(args.stack_root, *items_source(pick))
+    cells = tuple_cells(name, smoke=smoke)
+    straddles = [] if smoke else [c["name"] for c in cells if c["route"] != "short"]
+    return dict(
+        tuple=name,
+        pick=pick,
+        production=spec["production"],
+        tq4_attention=spec["tq4_attention"],
+        stack_head=arms["stack_head"],
+        off_stack_head=arms["off_stack_head"],
+        argv_on=arms["on"],
+        argv_off=arms["off"],
+        cells=cells,
+        items=items,
+        e2=[i["name"] for i in (items[:2] if smoke else items)] + straddles,
+    )
 
 
 class Monitor:
@@ -1911,6 +2324,47 @@ def phase_projection(step_s):
     )
 
 
+TUPLE_APPROVAL_LIMIT_S = (
+    8 * 3600
+)  # M76 §7 stage 2: a longer projected tuple full run goes to the operator
+
+
+def tuple_phase_projection(step_s, tuple_name):
+    """M76 B2: ``phase_projection`` for a campaign tuple's full run, from ``tuple_cells(tuple_name, smoke=False)``: E1c ×
+    the full cells' prompt tokens (every straddle incl. the TQ4 ones, and the scale cells) over the smoke cells'; E2 × 10
+    items + its repetitions of those cells at the E1c rate; prep and E7 as ``phase_projection``. Retries unprojected.
+    """
+
+    def tokens(smoke):
+        return sum(
+            c["prompt_tokens"]
+            for c in tuple_cells(tuple_name, smoke=smoke)
+            if c["prompt_tokens"] is not None
+        )
+
+    e1c = step_s["e1c"] * tokens(False) / tokens(True)
+    nominal = (
+        step_s["prep"] * 1.5
+        + e1c
+        + step_s["e2"] * 10
+        + e1c
+        + step_s["e7b"] * (20 / 3 + 5)
+    )
+    return dict(
+        nominal_s=nominal,
+        tail_reserve_s=TAIL_RESERVE_S,
+        with_tail_s=nominal + TAIL_RESERVE_S,
+    )
+
+
+def positive_hours(raw):
+    """``--operator-approved-hours``: finite hours > 0."""
+    value = float(raw)
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError(f"expected finite hours > 0, got {raw!r}")
+    return value
+
+
 # C193 (operator 2026-10-20): recorded rulings that lift ONLY the smoke gate's `fits` for one pick's full run; the
 # P369 v13 phase-based projection replaces this in the v13 build. C194 ("no hard stop"): a ruling brings NO campaign
 # wall cap — C184 stands; the per-request watchdogs remain the only automatic stops.
@@ -2087,10 +2541,25 @@ class Campaign:
         )
         self.out = Path(args.out).resolve()
         self.dev = self.fork / "dev"
-        problems = campaign_pick_problems(args.pick)  # v13 V9
+        self.tuple = getattr(
+            args, "tuple", None
+        )  # M76 B2: a campaign tuple instead of a pick
+        if self.tuple is None:
+            problems = campaign_pick_problems(args.pick)  # v13 V9
+        else:
+            problems = tuple_selection_problems(
+                self.tuple, args.pick, getattr(args, "off_stack_root", None)
+            )
         if problems:
             raise SystemExit(f"refused: {problems}")
-        self.picks = list(args.pick)
+        if self.tuple is None:
+            self.picks = list(args.pick)
+            self.production, self.tq4 = PRODUCTION, None
+        else:
+            spec = TUPLES[self.tuple]
+            self.picks = [spec["pick"]]
+            self.off_stack = Path(args.off_stack_root).resolve()
+            self.production, self.tq4 = spec["production"], spec["tq4_attention"]
         # code round 5 H23: construction reads nothing — the registry and params load in prepare(), inside
         # the persistence boundary, once the run directory exists
         self.env = worker_env(dict(os.environ))
@@ -2106,6 +2575,11 @@ class Campaign:
             phase=args.phase,
             wall_limit_s=self.wall_limit_s,
         )
+        if self.tuple is not None:
+            self.summary["tuple"] = self.tuple
+            hours = getattr(args, "operator_approved_hours", None)
+            if hours is not None:  # M76 §7 stage 2: the operator's approval, recorded
+                self.summary["operator_approved_hours"] = hours
 
     # -- setup
     def prepare(self):
@@ -2150,7 +2624,7 @@ class Campaign:
         if problems:  # code round 3 H9: the reconstruction imports these files
             raise Refused(f"refused: {problems}")
         manifest = dict(
-            production=PRODUCTION,
+            production=self.production,
             fork_head=self.head,
             harness_tree=rev("HEAD:dev/p369_phase2"),
             reviewed_head=self.args.reviewed_head,
@@ -2164,6 +2638,12 @@ class Campaign:
             picks={},
         )
         self.stack_bench = manifest["stack_bench"]
+        if (
+            self.tuple is not None
+        ):  # M76 B2: two arm commits, no classify / all-OFF rule / overlay
+            self._prepare_tuple(manifest)
+            (self.out / "manifest.json").write_text(json.dumps(manifest, indent=1))
+            return manifest
         # P369 v13 V5: the live registry must be one of the 16 byte states of the pinned fixture (refused otherwise)
         fixture = registry_states.fixture_text(
             self.fork / "mlx_vlm" / "tests" / "fixtures"
@@ -2210,6 +2690,41 @@ class Campaign:
         (self.out / "manifest.json").write_text(json.dumps(manifest, indent=1))
         return manifest
 
+    def _prepare_tuple(self, manifest):
+        """M76 B2: ON from the ``--stack-root`` arm commit, OFF from the ``--off-stack-root`` one (``tuple_arms``)."""
+        pick = self.picks[0]
+        arms = tuple_arms(self.tuple, self.stack, self.off_stack, self.fork)
+        on, off = arms["on"], arms["off"]
+        self.arms[pick] = dict(on=on, off=off)
+        manifest.update(
+            tuple=self.tuple,
+            tq4_attention=self.tq4,
+            stack_head=arms["stack_head"],
+            off_stack_head=arms["off_stack_head"],
+            registry_off=arms["registry_off"],
+            off_registry_off=arms["off_registry_off"],
+        )
+        model = on[on.index("--model") + 1]
+        drafter = on[on.index("--draft-model") + 1]
+        entry = manifest["picks"][pick] = dict(
+            overlay_sha256=None,  # no overlay: both arms are commits
+            restored=[],
+            registry_on_sha256=arms["registry_on_sha256"],
+            registry_off_sha256=arms["registry_off_sha256"],
+            argv_on=on,
+            argv_off=off,
+            params=self.params[pick],
+            target=weights_record(model),
+            drafter=weights_record(drafter),
+        )
+        problems = pins_problems(load_pins(), pick, entry["target"], entry["drafter"])
+        if problems:
+            raise Refused(f"refused: {problems}")
+        self.attested[pick] = {
+            role: dict(revision=entry[role]["revision"], files=entry[role]["files"])
+            for role in ("target", "drafter")
+        }
+
     def job(self, pick, name, mode, arm, requests, **extra):
         attested = self.attested[pick]
         revisions = {
@@ -2224,6 +2739,8 @@ class Campaign:
             kv=kvmanifest.kv_from_argv(self.arms[pick][arm]),  # P405 F3
             drafter_shape=PICKS[pick]["drafter"] if arm == "on" else None,  # v13 V11
         )
+        if getattr(self, "tq4", None) is not None:  # M76 B2: both arms serve the mode
+            expect["tq4_attention"] = self.tq4
         timeout = sum(int(r["timeout_s"]) for r in requests) + 900
         return dict(
             name=f"{pick}/{name}",
@@ -2273,9 +2790,37 @@ class Campaign:
             prompts[t] = r["text"]
         return prompts
 
-    def e1c(self, pick, prompts, *, smoke):
-        cells = [(t, text) for t, text in prompts.items()] + (
-            [] if smoke else [(None, SHORT_PROMPT)]
+    def size_scale(self, pick, totals):
+        """M76 B2: scale-cell prompts of exactly ``totals`` tokens each (the same sizer), keyed ``S<tokens>``."""
+        base = dict(model=pick, max_tokens=1, stream=False)
+        requests = [
+            dict(
+                name=f"S{n}",
+                target=n,
+                prefix=SIZE_PREFIX,
+                suffix=SIZE_SUFFIX,
+                payload=base,
+                timeout_s=600,
+            )
+            for n in totals
+        ]
+        result = self.run(self.job(pick, "size-scale", "size", "off", requests))
+        prompts = {}
+        for r, n in zip(result["requests"], totals):
+            if r["text"] is None:
+                raise RuntimeError(
+                    f"{pick}: no exact prompt for S{n} (closest {r['tokens']})"
+                )
+            prompts[f"S{n}"] = r["text"]
+        return prompts
+
+    def e1c(self, pick, prompts, *, smoke, scale=None):
+        tq4 = getattr(self, "tq4", None) is not None  # M76 B2: tuple runs only
+        # M76 B2: a scale cell (key ``S<tokens>``) is a non-straddle cell, like the short one (never retried)
+        cells = (
+            [(t, text) for t, text in prompts.items()]
+            + list((scale or {}).items())
+            + ([] if smoke else [(None, SHORT_PROMPT)])
         )
         accepted, attempts, size_failures = {}, {}, {}
         pending, parked = list(cells), []
@@ -2286,7 +2831,7 @@ class Campaign:
         attempt = 0
         for offset, seed in schedule:
             if offset != STRADDLE_OFFSETS[0] and seed == SEEDS[0]:
-                waiting = [t for t, _ in pending + parked if t is not None]
+                waiting = [t for t, _ in pending + parked if isinstance(t, int)]
                 sized = (
                     self.size(pick, waiting, offset=offset, strict=False)
                     if waiting
@@ -2302,8 +2847,8 @@ class Campaign:
                 continue
             requests = [
                 dict(
-                    name=f"T{t}" if t else "short",
-                    threshold=t,
+                    name=cell_name(t),
+                    threshold=t if isinstance(t, int) else None,
                     smoke_positives=smoke and t == max(prompts),
                     payload=dict(
                         model=pick,
@@ -2312,7 +2857,7 @@ class Campaign:
                         seed=seed,
                         stream=False,
                     ),
-                    timeout_s=3 * e1c_timeout(t),  # ON + OFF1 + OFF2 (Q40)
+                    timeout_s=3 * e1c_timeout(cell_tokens(t)),  # ON + OFF1 + OFF2 (Q40)
                 )
                 for t, text in pending
             ]
@@ -2324,7 +2869,7 @@ class Campaign:
                 path = self.out / pick / name / f"req-{i}.json"
                 entry = json.loads(path.read_text())
                 n = len(entry["final"]["token_ids"])
-                valid = t is None or (
+                valid = not isinstance(t, int) or (
                     exact_bool(entry.get("straddle"), f"{req['name']}.straddle")
                     and n >= 65
                 )
@@ -2332,24 +2877,32 @@ class Campaign:
                 seen = e1c_verdict(
                     entry,
                     entry["pair"],
-                    threshold=t,
                     verify_policy=PICKS[pick]["verify_policy"],
                     offset=offset,
+                    **self._cell_verdict_args(t, tq4),
                 )
-                attempts.setdefault(req["name"], []).append(
-                    dict(
-                        seed=seed,
-                        offset=offset,
-                        path=str(path),
-                        valid=valid,
-                        neutral=seen["neutral"],
-                        c1=exact_bool(
-                            entry["c1"]["acceptance"].get("pass"),
-                            f"{req['name']}.c1.acceptance.pass",
+                record = dict(
+                    seed=seed,
+                    offset=offset,
+                    path=str(path),
+                    valid=valid,
+                    neutral=seen["neutral"],
+                    c1=exact_bool(
+                        entry["c1"]["acceptance"].get("pass"),
+                        f"{req['name']}.c1.acceptance.pass",
+                    ),
+                    problems=seen["problems"],
+                )
+                if (
+                    tq4
+                ):  # M76 B2: every attempt's engagement evidence is kept and decides
+                    record.update(
+                        tq4_engagement=entry.get("tq4_engagement"),
+                        tq4_engaged=not tq4_engagement_problems(
+                            entry, f"{req['name']} attempt"
                         ),
-                        problems=seen["problems"],
                     )
-                )
+                attempts.setdefault(req["name"], []).append(record)
                 if valid:
                     accepted[req["name"]] = dict(
                         threshold=t,
@@ -2386,9 +2939,9 @@ class Campaign:
             v = e1c_verdict(
                 on,
                 on["pair"],  # the verdict is the SAME-INSTANCE pair (P391)
-                threshold=cell["threshold"],
                 verify_policy=PICKS[pick]["verify_policy"],
                 offset=cell["offset"],
+                **self._cell_verdict_args(cell["threshold"], tq4),
             )
             c1_ok = exact_bool(  # code round 6 H34
                 on["c1"]["acceptance"].get("pass"), f"{name}.c1.acceptance.pass"
@@ -2438,7 +2991,7 @@ class Campaign:
         ) in (
             pending + parked
         ):  # round 3 E7: invalid on every seed — the attempts still decide
-            name = f"T{t}" if t else "short"
+            name = cell_name(t)
             rejected = list(attempts[name])
             problems = [f"invalid on all {len(rejected)} attempts"] + [
                 f"no exact prompt at offset {o}" for o in size_failures.get(name, [])
@@ -2457,6 +3010,18 @@ class Campaign:
                 rejected=rejected,
             )
         return verdicts
+
+    @staticmethod
+    def _cell_verdict_args(key, tq4):
+        """``e1c_verdict``'s per-cell arguments: the straddle threshold (None for the short and scale cells) and, under a
+        tuple (M76 B2), the TQ4 engagement and a scale cell's exact prompt end; without a tuple exactly today's call.
+        """
+        args = dict(threshold=key if isinstance(key, int) else None)
+        if tq4:
+            args["tq4"] = True
+            if isinstance(key, str):
+                args["prompt_end"] = cell_tokens(key)
+        return args
 
     def c84_payloads(self, pick, items, *, greedy, limit=None):
         out = []
@@ -2561,7 +3126,9 @@ class Campaign:
             if smoke
             else [
                 dict(
-                    name=f"T{t}",
+                    name=cell_name(
+                        t
+                    ),  # M76 B2: a scale prompt keeps its ``S<tokens>`` name
                     payload=dict(
                         model=pick,
                         messages=[dict(role="user", content=text)],
@@ -2569,7 +3136,7 @@ class Campaign:
                         max_tokens=E1C_TOKENS,
                         stream=False,
                     ),
-                    timeout_s=e1c_timeout(t),
+                    timeout_s=e1c_timeout(cell_tokens(t)),
                 )
                 for t, text in prompts.items()
             ]
@@ -2588,8 +3155,12 @@ class Campaign:
                 )
                 for i, r in enumerate(batch)
             }
+        extra = dict(tq4=True) if getattr(self, "tq4", None) is not None else {}
         return e2_summary(
-            loaded["e2-pair"], loaded["e2-off"], digests=self.digests.get(pick, {})
+            loaded["e2-pair"],
+            loaded["e2-off"],
+            digests=self.digests.get(pick, {}),
+            **extra,
         )
 
     def batch_runner(self, pick, base, mode, arm):
@@ -2684,8 +3255,17 @@ class Campaign:
             mark_at[0] = now
             self.write_summary()
 
-        thresholds = SMOKE_THRESHOLDS if smoke else THRESHOLDS
+        tuple_name = getattr(self, "tuple", None)
+        if tuple_name is None:
+            thresholds = SMOKE_THRESHOLDS if smoke else THRESHOLDS
+        else:  # M76 B2: the tuple's TQ4 + native-layer thresholds (the smoke's are today's)
+            thresholds = SMOKE_THRESHOLDS if smoke else tuple_thresholds(tuple_name)
         prompts = self.size(pick, thresholds)
+        scale = (
+            self.size_scale(pick, SCALE_CELLS)
+            if tuple_name is not None and not smoke
+            else None
+        )
         self.check_bench(pick)  # still exactly the bound bench inputs, before...
         items = c84_items(self.stack, pick)
         self.check_bench(pick)  # ...and after the reconstruction imported them (H9)
@@ -2701,7 +3281,10 @@ class Campaign:
         )
         save("prep")
         try:
-            record["e1c"] = self.e1c(pick, prompts, smoke=smoke)
+            if scale is None:
+                record["e1c"] = self.e1c(pick, prompts, smoke=smoke)
+            else:
+                record["e1c"] = self.e1c(pick, prompts, smoke=smoke, scale=scale)
             record["outcome"] = pick_outcome(record["e1c"])
         except JobTimeout as exc:
             record["outcome"] = dict(
@@ -2714,7 +3297,8 @@ class Campaign:
                     pick,
                     items,
                     e2_prompts(
-                        prompts, getattr(self, "accepted_prompts", {}).get(pick, {})
+                        dict(prompts, **(scale or {})),  # M76 B2: + the scale prompts
+                        getattr(self, "accepted_prompts", {}).get(pick, {}),
                     ),
                     smoke=smoke,
                 )
@@ -2791,8 +3375,13 @@ class Campaign:
                 self.run_pick(pick, smoke=smoke)
         tree_guard(self.fork, self.head)  # code round 2 H9: unchanged through the end
         self.summary["manifest"] = dict(
-            fork_head=manifest["fork_head"], production=PRODUCTION
+            fork_head=manifest["fork_head"],
+            production=getattr(self, "production", PRODUCTION),
         )
+        if "tuple" in manifest:  # M76 B2: the arm commits the tuple run certifies
+            self.summary["manifest"].update(
+                {key: manifest[key] for key in TUPLE_BINDING_KEYS}
+            )
         if smoke:
             self.summary["smoke_gate"] = self.smoke_gate()
         self.summary["status"], self.summary["exit_code"] = overall_status(self.summary)
@@ -2800,7 +3389,10 @@ class Campaign:
         return self.summary
 
     def smoke_gate(self):
-        return smoke_gate(self.summary["picks"])
+        tuple_name = getattr(self, "tuple", None)
+        if tuple_name is None:
+            return smoke_gate(self.summary["picks"])
+        return smoke_gate(self.summary["picks"], tuple_name=tuple_name)  # M76 B2
 
     def write_summary(self):
         tmp = self.out / ".summary.json.tmp"
@@ -2845,6 +3437,10 @@ def main(argv=None):
     ap.add_argument("--out", required=True)
     ap.add_argument("--phase", choices=("smoke", "full", "panel"), required=True)
     ap.add_argument("--pick", action="append")
+    ap.add_argument(  # M76 B2: a campaign tuple (ON = --stack-root's arm commit, OFF = --off-stack-root's); not with --pick
+        "--tuple", choices=sorted(TUPLES)
+    )
+    ap.add_argument("--off-stack-root", help="--tuple: the MTP-OFF arm worktree")
     ap.add_argument("--plan-only", action="store_true")
     ap.add_argument(
         "--smoke-summary", help="full runs refuse unless this passed smoke summary fits"
@@ -2862,7 +3458,21 @@ def main(argv=None):
         "--reviewed-head",
         help="the Cursor-cleared fork commit; must equal HEAD; required for --phase full (P394)",
     )
+    ap.add_argument(  # M76 B2 / M76 §7 stage 2: the operator's approval of a tuple full run projected past 8 h
+        "--operator-approved-hours",
+        type=positive_hours,
+        help="--tuple --phase full: the hours the operator approved for a smoke projecting more than 8 h",
+    )
     args = ap.parse_args(argv)
+    problems = tuple_selection_problems(args.tuple, args.pick, args.off_stack_root)
+    if args.operator_approved_hours is not None and (
+        args.tuple is None or args.phase != "full"
+    ):
+        problems.append("--operator-approved-hours needs --tuple --phase full")
+    if problems:
+        raise SystemExit(f"refused: {problems}")
+    if args.tuple is not None:  # M76 B2: the preflight diffs the tuple's production pin
+        args.production_ref = TUPLES[args.tuple]["production"]
     out = Path(args.out).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
     head = subprocess.run(
@@ -2881,13 +3491,29 @@ def main(argv=None):
         if not args.smoke_summary:
             raise SystemExit("full: --smoke-summary of a passed smoke is required")
         smoke = json.loads(Path(args.smoke_summary).read_text())
+        approval = (
+            {}
+            if args.operator_approved_hours is None
+            else dict(operator_approved_hours=args.operator_approved_hours)  # M76 B2
+        )
         problems = smoke_authorization_problems(  # code round 6 H36; C193
-            smoke, projection_ruling=args.projection_ruling
+            smoke, projection_ruling=args.projection_ruling, **approval
         )
         if problems:
             raise SystemExit(f"full: the smoke summary does not authorize: {problems}")
+    plan = None
+    if (
+        args.tuple is not None and args.plan_only
+    ):  # M76 B2: validated before anything prints
+        try:
+            plan = tuple_plan(args)
+        except Refused as exc:
+            raise SystemExit(str(exc)) from None
     checks = preflight(args, out.parent)
-    print(json.dumps(dict(preflight=checks), indent=1))
+    if plan is None:
+        print(json.dumps(dict(preflight=checks), indent=1))
+    else:
+        print(json.dumps(dict(preflight=checks, plan=plan), indent=1))
     if args.plan_only:
         return
     if checks["problems"]:
